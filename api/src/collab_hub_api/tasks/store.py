@@ -8,6 +8,7 @@ from typing import Any, Callable, TypeVar
 
 import psycopg
 
+from ..frames.db import locked_schema_connection
 from .models import (
     MAX_RETAINED_RUNS_PER_TASK,
     DeviceHeartbeat,
@@ -362,7 +363,9 @@ class PostgresTaskStore:
         return self.db.connection()
 
     def _ensure_schema(self) -> None:
-        with self._connect() as connection:
+        # Advisory-locked (issue #42): bare CREATE TABLE IF NOT EXISTS races
+        # under concurrent replica startup.
+        with locked_schema_connection(self.db) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS nexus_task_state (

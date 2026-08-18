@@ -122,6 +122,48 @@ class _CancelWatchdog:
                 pass
 
 
+# Shared advisory-lock key for the pre-existing `frames_server_*` and
+# `nexus_task_*` startup DDL (issue #42). Bare `CREATE TABLE IF NOT EXISTS` is
+# not concurrency-safe in Postgres: two replicas starting at the same instant
+# can both pass the existence check and then race the catalog insert, so one
+# pod dies at startup with a duplicate-key error on `pg_type`/`pg_class`.
+# `replicaCount: 1` has masked this so far, but the chart supports autoscaling.
+#
+# One shared key serializes all five stores' schema creation against each
+# other, which is deliberately coarse: none of this DDL is large or slow, it
+# only ever runs once per replica at startup, and a single well-known key is
+# simpler to reason about (and to grep for) than a family of near-identical
+# ones. This mirrors `frames.collab_schema.COLLAB_SCHEMA_LOCK_KEY`, which uses
+# the same `int.from_bytes(<8 ASCII bytes>, "big")` derivation so the constant
+# stays readable; any distinct 64-bit value would do, and deriving it from a
+# name just makes a collision with another advisory-lock user of the shared
+# database unlikely.
+FRAMES_SERVER_SCHEMA_LOCK_KEY = int.from_bytes(b"fsvrddl1", "big")
+
+
+@contextmanager
+def locked_schema_connection(db: "PostgresDatabase", lock_key: int = FRAMES_SERVER_SCHEMA_LOCK_KEY):
+    """Check out a pooled connection with the schema advisory lock already held.
+
+    Every Postgres store's ``_ensure_schema`` should open its ``with`` block on
+    this instead of ``db.connection()`` directly. ``pg_advisory_xact_lock`` is
+    taken as the connection's first statement, before any catalog access —
+    including the guarded ``CREATE TABLE IF NOT EXISTS`` itself, which is
+    exactly the statement that races under concurrent replica startup (issue
+    #42). The lock is transaction-scoped (the ``_xact_`` variant), so it
+    releases automatically on commit or rollback when the ``with`` block
+    exits — no unlock bookkeeping, and no leak if the pod dies mid-migration.
+
+    Whichever replica loses the race simply waits: it blocks on the lock, then
+    runs its own ``CREATE TABLE IF NOT EXISTS`` against a catalog that already
+    has the table, which is a no-op.
+    """
+
+    with db.connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+        yield conn
+
+
 def postgres_error_classes() -> tuple[type[Exception], ...]:
     """Exception types that mean "the frames database is unavailable" (→ 503).
 
