@@ -177,6 +177,54 @@ def test_missing_jwks_url_is_a_decode_error():
         auth.decode_verified_jwt(_token(KEY_1_PEM, "key-1"), jwks_url=None, issuer=None, audience=None)
 
 
+# --- IdToken cookie fallback inherits the bearer audience (issue #83) -------
+
+
+def _audience_token(private_pem: bytes, kid: str, audience: str) -> str:
+    return jwt.encode(
+        {"preferred_username": "signed-user", "aud": audience},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def test_id_token_fallback_inherits_the_bearer_audience(jwks, monkeypatch):
+    # Bearer-only verifier config (no dedicated FRAMES_IDTOKEN_JWKS_URL):
+    # cookie verification falls back to the bearer verifier and must inherit
+    # its audience too — a same-realm token minted for a different audience
+    # must not be accepted as a cookie, or the bearer audience restriction is
+    # bypassed entirely.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_AUDIENCE", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "another-client"))
+
+
+def test_id_token_own_audience_still_wins_over_bearer(jwks, monkeypatch):
+    # A dedicated FRAMES_IDTOKEN_AUDIENCE, even without a dedicated
+    # FRAMES_IDTOKEN_JWKS_URL, must be enforced instead of the bearer
+    # audience.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+
+
 def test_separate_urls_do_not_share_a_client(jwks):
     other = _JWKSEndpoint()
     other.keys = [KEY_2_JWK]
