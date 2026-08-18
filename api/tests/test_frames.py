@@ -11,6 +11,7 @@ from collab_hub_api.core import make_app
 from collab_hub_api.frames.models import (
     FRAME_BODY_MAX_LENGTH,
     FRAME_NAME_MAX_LENGTH,
+    MAX_OWNERS,
     MAX_TAGS,
     SUGGESTION_BODY_MAX_LENGTH,
 )
@@ -849,6 +850,47 @@ async def test_owners_management_add_remove_and_last_owner(client):
         json={"owners": []},
     )
     assert empty.status_code == 422
+
+
+async def test_add_owner_past_max_owners_returns_409_not_500(client):
+    # Regression for issue #85: add_owner's unguarded normalize_owners() call
+    # raised ValueError inside the handler once a frame held MAX_OWNERS
+    # owners, and FastAPI turned that into a bare 500. The boundary itself
+    # (49 -> 50) must keep succeeding; only crossing it (50 -> 51) is refused.
+    frame = await create_frame(client)
+    frame_id = frame["id"]
+
+    # "alice" plus MAX_OWNERS - 2 others = MAX_OWNERS - 1 owners total.
+    crowd = [f"owner-{i}" for i in range(MAX_OWNERS - 2)]
+    filled = await client.put(
+        f"/v1/frames/{frame_id}/owners",
+        cookies=auth_cookie("alice"),
+        json={"owners": ["alice", *crowd]},
+    )
+    assert filled.status_code == 200
+    assert len(filled.json()["owners"]) == MAX_OWNERS - 1
+
+    # 49 -> 50 succeeds.
+    at_cap = await client.post(
+        f"/v1/frames/{frame_id}/owners",
+        cookies=auth_cookie("alice"),
+        json={"email": "owner-at-cap"},
+    )
+    assert at_cap.status_code == 200
+    assert len(at_cap.json()["owners"]) == MAX_OWNERS
+
+    # 50 -> 51 is refused in the frames error envelope, not a 500.
+    over_cap = await client.post(
+        f"/v1/frames/{frame_id}/owners",
+        cookies=auth_cookie("alice"),
+        json={"email": "one-too-many"},
+    )
+    assert over_cap.status_code == 409
+    assert over_cap.json()["error"]["code"] == "max_owners"
+    assert str(MAX_OWNERS) in over_cap.json()["error"]["message"]
+    # And the frame is left unchanged at the cap, not partially written.
+    listed = await client.get(f"/v1/frames/{frame_id}/owners", cookies=auth_cookie("alice"))
+    assert len(listed.json()["owners"]) == MAX_OWNERS
 
 
 async def test_mutation_on_unreadable_frame_is_404_not_403(client):
