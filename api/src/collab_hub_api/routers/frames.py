@@ -477,7 +477,7 @@ def add_owner(
         owners = normalize_owners([*frame.owners, payload.email])
     except ValueError:
         # A frame already holding MAX_OWNERS owners cannot take another (issue
-        # #85): unguarded, this call raised inside the handler and answered a
+        # #43): unguarded, this call raised inside the handler and answered a
         # bare 500. ``normalize_owners`` also dedupes, so a resubmission of an
         # existing owner never reaches this branch — only genuine growth past
         # the cap does. Same envelope and status as the sibling "last_owner"

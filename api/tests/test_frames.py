@@ -853,7 +853,7 @@ async def test_owners_management_add_remove_and_last_owner(client):
 
 
 async def test_add_owner_past_max_owners_returns_409_not_500(client):
-    # Regression for issue #85: add_owner's unguarded normalize_owners() call
+    # Regression for issue #43: add_owner's unguarded normalize_owners() call
     # raised ValueError inside the handler once a frame held MAX_OWNERS
     # owners, and FastAPI turned that into a bare 500. The boundary itself
     # (49 -> 50) must keep succeeding; only crossing it (50 -> 51) is refused.
@@ -877,7 +877,8 @@ async def test_add_owner_past_max_owners_returns_409_not_500(client):
         json={"email": "owner-at-cap"},
     )
     assert at_cap.status_code == 200
-    assert len(at_cap.json()["owners"]) == MAX_OWNERS
+    owners_at_cap = at_cap.json()["owners"]
+    assert len(owners_at_cap) == MAX_OWNERS
 
     # 50 -> 51 is refused in the frames error envelope, not a 500.
     over_cap = await client.post(
@@ -888,9 +889,10 @@ async def test_add_owner_past_max_owners_returns_409_not_500(client):
     assert over_cap.status_code == 409
     assert over_cap.json()["error"]["code"] == "max_owners"
     assert str(MAX_OWNERS) in over_cap.json()["error"]["message"]
-    # And the frame is left unchanged at the cap, not partially written.
+    # And the frame is left unchanged at the cap, not partially written:
+    # the exact owner list from before the refused add, not merely 50 entries.
     listed = await client.get(f"/v1/frames/{frame_id}/owners", cookies=auth_cookie("alice"))
-    assert len(listed.json()["owners"]) == MAX_OWNERS
+    assert listed.json()["owners"] == owners_at_cap
 
 
 async def test_mutation_on_unreadable_frame_is_404_not_403(client):
