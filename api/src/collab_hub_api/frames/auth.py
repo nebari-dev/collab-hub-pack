@@ -272,14 +272,18 @@ def decode_id_token_payload(token: str) -> dict:
             audience=os.environ.get("FRAMES_IDTOKEN_AUDIENCE"),
         )
 
-    # No dedicated IdToken verifier: cookies fall back to the bearer verifier
-    # as a whole — including its audience. Inheriting only jwks/issuer would
-    # accept a same-realm token minted for a different audience as a cookie,
-    # bypassing the bearer audience restriction (issue #83).
+    # No dedicated IdToken verifier: cookies fall back to the bearer JWKS —
+    # but issuer and audience each still let a dedicated FRAMES_IDTOKEN_*
+    # value win over the bearer one first. A deployment with a shared JWKS
+    # but a distinct IdToken issuer must keep working exactly as before;
+    # only the previously-missing audience inheritance changes (issue #41).
+    # Inheriting audience unconditionally (dropping the dedicated override)
+    # would accept a same-realm token minted for a different audience as a
+    # cookie, bypassing the bearer audience restriction.
     return decode_verified_jwt(
         token,
         jwks_url=os.environ.get("FRAMES_BEARER_JWKS_URL"),
-        issuer=os.environ.get("FRAMES_BEARER_ISSUER"),
+        issuer=os.environ.get("FRAMES_IDTOKEN_ISSUER") or os.environ.get("FRAMES_BEARER_ISSUER"),
         audience=os.environ.get("FRAMES_IDTOKEN_AUDIENCE") or os.environ.get("FRAMES_BEARER_AUDIENCE"),
     )
 
