@@ -1,0 +1,72 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | \
+            sudo tar -xz -C /usr/local/bin kubeconform
+
+      # Vanilla YAML example
+      - name: Validate vanilla-yaml manifests
+        run: |
+          kubeconform -strict -ignore-missing-schemas \
+            examples/vanilla-yaml/deployment.yaml \
+            examples/vanilla-yaml/service.yaml \
+            examples/vanilla-yaml/nebariapp.yaml
+
+      # Kustomize example
+      - name: Validate kustomize base
+        run: kubectl kustomize examples/kustomize-nginx/base/ | kubeconform -strict -ignore-missing-schemas
+
+      - name: Validate kustomize dev overlay
+        run: kubectl kustomize examples/kustomize-nginx/overlays/dev/ | kubeconform -strict -ignore-missing-schemas
+
+      - name: Validate kustomize production overlay
+        run: kubectl kustomize examples/kustomize-nginx/overlays/production/ | kubeconform -strict -ignore-missing-schemas
+
+      # Basic nginx Helm example
+      - name: Lint basic-nginx
+        run: helm lint examples/basic-nginx/chart/
+
+      - name: Template basic-nginx (NebariApp disabled)
+        run: helm template test examples/basic-nginx/chart/ --set nebariapp.enabled=false
+
+      - name: Template basic-nginx (NebariApp enabled)
+        run: helm template test examples/basic-nginx/chart/ --set nebariapp.enabled=true --set nebariapp.hostname=test.example.com
+
+      # Auth-aware FastAPI Helm example
+      - name: Lint auth-fastapi
+        run: helm lint examples/auth-fastapi/chart/
+
+      - name: Template auth-fastapi (NebariApp disabled)
+        run: helm template test examples/auth-fastapi/chart/ --set nebariapp.enabled=false
+
+      - name: Template auth-fastapi (NebariApp enabled)
+        run: helm template test examples/auth-fastapi/chart/ --set nebariapp.enabled=true --set nebariapp.hostname=test.example.com
+
+      # Wrap existing chart (Podinfo) Helm example
+      - name: Update podinfo dependency
+        run: helm dependency update examples/wrap-existing-chart/chart/
+
+      - name: Lint wrap-existing-chart
+        run: helm lint examples/wrap-existing-chart/chart/
+
+      - name: Template wrap-existing-chart (NebariApp disabled)
+        run: helm template test examples/wrap-existing-chart/chart/ --set nebariapp.enabled=false
+
+      - name: Template wrap-existing-chart (NebariApp enabled)
+        run: helm template test examples/wrap-existing-chart/chart/ --set nebariapp.enabled=true --set nebariapp.hostname=test.example.com

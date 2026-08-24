@@ -1,0 +1,10 @@
+apiVersion: v2
+name: my-pack
+description: A Nebari Software Pack wrapping Podinfo
+type: application
+version: 0.1.0
+appVersion: "6.10.1"
+dependencies:
+  - name: podinfo
+    version: 6.10.1
+    repository: oci://ghcr.io/stefanprodan/charts

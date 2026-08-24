@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-pack
+  labels:
+    app: my-pack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-pack
+  template:
+    metadata:
+      labels:
+        app: my-pack
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi

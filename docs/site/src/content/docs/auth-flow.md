@@ -1,0 +1,396 @@
+---
+title: Authentication Flow
+---
+
+Detailed explanation of how OIDC authentication works for Nebari Software Packs.
+
+## Overview
+
+When a NebariApp has `auth.enabled: true`, the nebari-operator sets up a complete
+OIDC authentication flow using Keycloak and Envoy Gateway. Users are required to
+log in before accessing the application.
+
+## Components
+
+| Component | Role |
+|-----------|------|
+| **Envoy Gateway** | Reverse proxy that enforces the SecurityPolicy (OIDC filter) |
+| **Keycloak** | OIDC identity provider that handles login and issues tokens |
+| **nebari-operator** | Creates and manages all the glue resources (HTTPRoute, SecurityPolicy, Certificate, Keycloak client) |
+| **cert-manager** | Provisions TLS certificates for the application hostname |
+
+## The Flow
+
+```
+                                        Nebari Cluster
+    User        Envoy Gateway         Keycloak          Your App
+     |               |                    |                 |
+     |--1. GET /---->|                    |                 |
+     |               |--2. No session---->|                 |
+     |<--3. 302 -----|   cookie?          |                 |
+     |   redirect    |                    |                 |
+     |               |                    |                 |
+     |--4. Login ----|---------------+--->|                 |
+     |   page        |               |   |                 |
+     |               |               |   |                 |
+     |--5. Submit----|---------------+--->|                 |
+     |   credentials |               |   |                 |
+     |               |               |   |                 |
+     |<--6. 302 -----|<--auth code--------|                 |
+     |   redirect    |                    |                 |
+     |               |                    |                 |
+     |--7. GET / --->|                    |                 |
+     |  (with code)  |--8. Exchange------>|                 |
+     |               |    code for tokens |                 |
+     |               |<--9. ID + Access---|                 |
+     |               |    tokens          |                 |
+     |               |                    |                 |
+     |<--10. Set ----|                    |                 |
+     |  cookies +    |                    |                 |
+     |  redirect     |                    |                 |
+     |               |                    |                 |
+     |--11. GET / -->|                    |                 |
+     |  (with        |--12. Forward-------|---------------->|
+     |   cookies)    |    request         |                 |
+     |               |                    |                 |
+     |<--13. Response from your app------|<-----------------|
+```
+
+### Step by step
+
+1. **User visits the app** at `https://my-pack.nebari.example.com`
+
+2. **Envoy Gateway checks for session cookies.** The OIDC filter (configured by the
+   SecurityPolicy) looks for valid `IdToken-*` and `AccessToken-*` cookies.
+
+3. **No valid session - redirect to Keycloak.** Envoy Gateway sends a 302 redirect
+   to the Keycloak authorization endpoint with the client ID, redirect URI, and
+   requested scopes.
+
+4. **Keycloak presents the login page.** The user sees the Keycloak login form
+   (or SSO if already authenticated with Keycloak).
+
+5. **User submits credentials.** Keycloak validates the username/password (or
+   delegates to an external IdP if configured).
+
+6. **Keycloak redirects back with an authorization code.** The redirect goes to the
+   `redirectURI` configured in the NebariApp (default: `/oauth2/callback`), which
+   is handled by Envoy Gateway's OIDC filter.
+
+7. **Browser follows the redirect** back to Envoy Gateway with the authorization code.
+
+8. **Envoy Gateway exchanges the code for tokens.** A server-to-server call from
+   Envoy Gateway to Keycloak's token endpoint.
+
+9. **Keycloak returns ID token, access token, and refresh token.**
+
+10. **Envoy Gateway sets session cookies.** The tokens are stored in cookies:
+    - `IdToken-<suffix>` (JWT containing user claims)
+    - `AccessToken-<suffix>`
+    - `OauthHMAC-<suffix>`, `OauthExpires-<suffix>`, `RefreshToken-<suffix>`
+
+    The `<suffix>` is an 8-character hex string derived from the SecurityPolicy's
+    Kubernetes UID (e.g., `IdToken-a1b2c3d4`).
+
+11. **Browser retries the original request** with the session cookies attached.
+
+12. **Envoy Gateway validates the cookies** and forwards the request to your service
+    via the HTTPRoute.
+
+13. **Your app receives the request.** The IdToken cookies are available for your app
+    to read if it needs user identity information.
+
+## Cookie Format
+
+Envoy Gateway's OIDC filter sets cookies with the following naming convention:
+
+```
+IdToken-<suffix>
+AccessToken-<suffix>
+OauthHMAC-<suffix>
+OauthExpires-<suffix>
+RefreshToken-<suffix>
+OauthNonce-<suffix>
+```
+
+The `<suffix>` is an 8-character hexadecimal string generated by FNV-32a hashing the
+SecurityPolicy resource's Kubernetes UID. This ensures unique cookie names when
+multiple SecurityPolicies exist on the same domain.
+
+For example: `IdToken-a1b2c3d4`, `AccessToken-a1b2c3d4`.
+
+Cookie names can be customized via the `cookieNames` field in the SecurityPolicy's
+OIDC configuration.
+
+### Reading the IdToken in your app
+
+Find the cookie starting with `IdToken-`:
+
+```python
+for name, value in request.cookies.items():
+    if name.startswith("IdToken-"):
+        full_token = value
+        break
+```
+
+### Decoding the JWT payload
+
+The IdToken is a standard JWT with three base64url-encoded sections separated by dots:
+`header.payload.signature`
+
+Since Envoy Gateway already verified the signature, you can safely decode just the
+payload to extract claims:
+
+```python
+import base64, json
+
+parts = full_token.split(".")
+payload = parts[1]
+# Add base64 padding
+payload += "=" * (4 - len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload))
+```
+
+### Common JWT claims
+
+| Claim | Description |
+|-------|-------------|
+| `preferred_username` | Keycloak username |
+| `email` | User's email address |
+| `name` | Display name |
+| `given_name` | First name |
+| `family_name` | Last name |
+| `groups` | Keycloak group memberships (if `groups` scope requested) |
+| `realm_access.roles` | Keycloak realm roles |
+| `sub` | Unique subject identifier |
+| `iss` | Token issuer URL (Keycloak realm) |
+| `exp` | Token expiration timestamp |
+
+## What the Operator Creates
+
+When `auth.enabled: true`, the nebari-operator creates these resources:
+
+### 1. Keycloak Client (when `provisionClient: true`)
+
+The operator calls the Keycloak Admin API to create an OIDC client:
+
+- **Client ID:** `<namespace>-<nebariapp-name>` (namespace-scoped to prevent collisions)
+- **Client protocol:** `openid-connect`
+- **Access type:** `confidential` (not public)
+- **Standard Flow:** enabled (OAuth2 Authorization Code flow)
+- **Redirect URIs:** Both HTTP and HTTPS variants of the hostname
+- **Web Origins:** `*` (allows CORS)
+- **Scopes:** As configured in `spec.auth.scopes`
+
+### 2. Kubernetes Secret
+
+Client credentials are stored in a Secret named `<nebariapp-name>-oidc-client`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <nebariapp-name>-oidc-client
+  labels:
+    app.kubernetes.io/name: nebariapp
+    app.kubernetes.io/instance: <nebariapp-name>
+    app.kubernetes.io/managed-by: nebari-operator
+data:
+  client-id: <base64-encoded>       # Always present. Value: <namespace>-<nebariapp-name>
+  client-secret: <base64-encoded>   # Always present. Cryptographically generated.
+  issuer-url: <base64-encoded>      # Present when external consumers are configured.
+                                    # Value: Keycloak issuer URL (e.g., https://keycloak.example.com/realms/nebari)
+  spa-client-id: <base64-encoded>   # Present when spaClient is enabled.
+  device-client-id: <base64-encoded> # Present when deviceFlowClient is enabled.
+```
+
+The operator also creates RBAC resources granting your app's ServiceAccount read
+access to the secret:
+
+- **Role:** `<nebariapp-name>-oidc-secret-reader`
+- **RoleBinding:** `<nebariapp-name>-oidc-secret-reader`
+
+This means your app's pods can reference the secret in `env.valueFrom.secretKeyRef`
+without additional RBAC configuration.
+
+### 3. Envoy Gateway SecurityPolicy (when `enforceAtGateway: true`)
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: <nebariapp-name>-oidc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: <nebariapp-name>
+  oidc:
+    provider:
+      issuer: https://<keycloak-host>/realms/<realm>
+    clientID: <from-secret>
+    clientSecret:
+      name: <nebariapp-name>-oidc-client
+    redirectURL: https://<hostname><redirectURI>
+    scopes: [openid, profile, email]
+```
+
+### 4. HTTPRoute
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: <nebariapp-name>
+spec:
+  parentRefs:
+    - name: <gateway-name>
+      namespace: <gateway-namespace>
+  hostnames:
+    - <hostname>
+  rules:
+    - backendRefs:
+        - name: <service-name>
+          port: <service-port>
+```
+
+### 5. cert-manager Certificate (when `routing.tls.enabled: true`)
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: <nebariapp-name>-tls
+spec:
+  secretName: <nebariapp-name>-tls
+  dnsNames:
+    - <hostname>
+  issuerRef:
+    name: <cluster-issuer>
+    kind: ClusterIssuer
+```
+
+## App-Native OAuth
+
+Some applications handle OAuth natively (e.g., Grafana, Superset, Gitea). For these
+apps, the operator provisions the Keycloak client and stores credentials, but the app
+handles the OAuth flow itself. This is useful when the app needs deeper integration
+with the OAuth flow, such as mapping Keycloak groups/roles to app-internal roles.
+
+### Gateway-only auth (app reads JWT from cookies)
+
+If your app just needs user identity (not role mapping), use `enforceAtGateway: true`
+(the default) and read the IdToken cookie as described above.
+
+### App-native auth only (no gateway enforcement)
+
+Set `enforceAtGateway: false` to skip gateway auth. The operator will:
+- Provision a Keycloak client
+- Store credentials in a Secret
+- **NOT** create a SecurityPolicy
+
+```yaml
+auth:
+  enabled: true
+  provider: keycloak
+  provisionClient: true
+  enforceAtGateway: false
+```
+
+### Dual-layer auth (recommended for RBAC apps)
+
+Use both gateway enforcement AND app-native OAuth. The gateway ensures users are
+authenticated, while the app reads roles/groups for authorization:
+
+```yaml
+auth:
+  enabled: true
+  provider: keycloak
+  provisionClient: true
+  # enforceAtGateway defaults to true
+```
+
+The app also authenticates against the same Keycloak client to get roles/groups.
+
+### Wiring credentials to your app
+
+Reference the operator-created OIDC secret to inject credentials as environment
+variables. Use `valueFrom.secretKeyRef` to map specific keys:
+
+```yaml
+# In your Helm values (e.g., for an upstream chart's extraEnv/extraEnvRaw)
+extraEnvRaw:
+  - name: OAUTH_CLIENT_ID
+    valueFrom:
+      secretKeyRef:
+        name: <nebariapp-name>-oidc-client
+        key: client-id
+  - name: OAUTH_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: <nebariapp-name>-oidc-client
+        key: client-secret
+  - name: OAUTH_ISSUER_URL
+    valueFrom:
+      secretKeyRef:
+        name: <nebariapp-name>-oidc-client
+        key: issuer-url
+        optional: true  # May not be present in all configurations
+```
+
+The OIDC discovery URL can be constructed as:
+`<issuer-url>/.well-known/openid-configuration`
+
+Your app then configures its OAuth provider using these environment variables.
+
+> **Note on `extraEnv` vs `extraEnvRaw`:** Many upstream Helm charts support
+> multiple env var formats. Use `extraEnvRaw` (or the equivalent) when you need
+> `valueFrom.secretKeyRef` syntax. Check your upstream chart's documentation for
+> the correct field name.
+
+## NebariApp CRD vs Envoy Gateway SecurityPolicy
+
+The fields documented in the [NebariApp CRD Reference](/nebariapp-crd-reference/) are
+the fields the **operator** understands - they go on `spec.auth` of the NebariApp
+resource. At runtime, the operator generates an Envoy Gateway `SecurityPolicy` from
+the NebariApp, and that SecurityPolicy has its own (much larger) set of OIDC tuning
+knobs.
+
+For the OIDC filter fields specifically, mentally place each one in one of these
+buckets:
+
+1. **Surfaced on NebariApp.** The operator exposes the field as a NebariApp
+   `spec.auth.*` field and copies it into the SecurityPolicy at reconcile time.
+   Currently this includes `forwardAccessToken` (`auth.forwardAccessToken`) and
+   redirect-deny rules (`auth.denyRedirect`). Set these on the NebariApp.
+
+2. **Not surfaced on NebariApp.** Most fine-grained OIDC filter fields - including
+   `cookieNames`, `disableIdToken`, `disableAccessToken`, `passThroughAuthHeader`,
+   custom logout URLs, and similar - are not exposed on NebariApp today. To use
+   them, either:
+   - File an issue / PR on
+     [nebari-operator](https://github.com/nebari-dev/nebari-operator) asking for the
+     field to be plumbed through.
+   - Set `auth.enforceAtGateway: false` and manage your own `SecurityPolicy`
+     resource alongside the NebariApp. The operator will still provision the
+     Keycloak client and Secret, but won't generate a SecurityPolicy to conflict
+     with yours.
+
+Refer to the [Envoy Gateway SecurityPolicy reference](https://gateway.envoyproxy.io/docs/api/extension_types/#securitypolicy)
+for the full set of OIDC fields.
+
+## Limitations
+
+- **Local development:** The OIDC flow requires Keycloak and Envoy Gateway. When
+  developing locally with kind, set `nebariapp.enabled=false` and test without auth.
+  The FastAPI example shows "Not Authenticated" when no IdToken cookie is present.
+
+- **Token expiration:** Envoy Gateway handles token refresh automatically via refresh
+  tokens stored in cookies. Your app does not need to handle token refresh.
+
+- **Cookie size:** Very large JWTs (many groups/roles) may exceed browser cookie
+  size limits (typically 4KB). If this is an issue, reduce token size by limiting
+  scopes/claims at the Keycloak level. Token-cookie suppression
+  (`disableIdToken`/`disableAccessToken`) is a SecurityPolicy field the operator
+  does not currently expose - see the boundary section above for how to use it
+  if you need to.

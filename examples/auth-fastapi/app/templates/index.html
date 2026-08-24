@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auth-Aware Nebari Pack</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 640px;
+            margin: 40px auto;
+            padding: 0 20px;
+            color: #333;
+            line-height: 1.6;
+        }
+        h1 { color: #2c3e50; }
+        .card {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .label {
+            font-weight: 600;
+            color: #495057;
+            display: inline-block;
+            min-width: 100px;
+        }
+        .tag {
+            display: inline-block;
+            background: #e9ecef;
+            border-radius: 4px;
+            padding: 2px 8px;
+            margin: 2px;
+            font-size: 0.9em;
+        }
+        .not-authenticated {
+            background: #fff3cd;
+            border-color: #ffc107;
+        }
+        code {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <h1>Auth-Aware Nebari Pack</h1>
+
+    {% if authenticated %}
+    <div class="card">
+        <h2>Authenticated User</h2>
+        <p><span class="label">Username:</span> {{ user_info.username }}</p>
+        <p><span class="label">Name:</span> {{ user_info.name }}</p>
+        <p><span class="label">Email:</span> {{ user_info.email }}</p>
+        {% if user_info.groups %}
+        <p>
+            <span class="label">Groups:</span>
+            {% for group in user_info.groups %}
+            <span class="tag">{{ group }}</span>
+            {% endfor %}
+        </p>
+        {% endif %}
+        {% if user_info.roles %}
+        <p>
+            <span class="label">Roles:</span>
+            {% for role in user_info.roles %}
+            <span class="tag">{{ role }}</span>
+            {% endfor %}
+        </p>
+        {% endif %}
+    </div>
+    <p>
+        This information was extracted from the <code>IdToken</code> cookie
+        set by Envoy Gateway after Keycloak authentication.
+    </p>
+    {% else %}
+    <div class="card not-authenticated">
+        <h2>Not Authenticated</h2>
+        <p>
+            No IdToken cookie found. This app reads authenticated user identity
+            from the IdToken cookie set by Envoy Gateway's OIDC filter.
+        </p>
+        <p>To see authentication in action:</p>
+        <ol>
+            <li>Deploy this pack on a Nebari cluster</li>
+            <li>Enable auth: <code>--set nebariapp.auth.enabled=true</code></li>
+            <li>Access the app through the configured hostname</li>
+        </ol>
+    </div>
+    {% endif %}
+</body>
+</html>

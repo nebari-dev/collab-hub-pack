@@ -1,0 +1,8 @@
+apiVersion: reconcilers.nebari.dev/v1
+kind: NebariApp
+metadata:
+  name: my-pack
+spec:
+  hostname: my-pack.dev.nebari.example.com
+  auth:
+    enabled: false

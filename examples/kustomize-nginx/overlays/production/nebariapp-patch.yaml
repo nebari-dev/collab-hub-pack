@@ -1,0 +1,11 @@
+apiVersion: reconcilers.nebari.dev/v1
+kind: NebariApp
+metadata:
+  name: my-pack
+spec:
+  hostname: my-pack.nebari.example.com
+  auth:
+    enabled: true
+    groups:
+      - admin
+      - data-science-team

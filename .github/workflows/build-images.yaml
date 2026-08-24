@@ -1,0 +1,37 @@
+name: Build Docker Images
+
+# Builds and publishes the pack's first-party image(s) via the shared reusable
+# workflow in nebari-dev/.github. Each image is pushed to GHCR and quay.io with
+# `sha-<short>` and `latest` tags. Publishing to quay.io/nebari/* uses the
+# org-provided QUAY_TOKEN / QUAY_USERNAME secrets, so this works for official
+# packs in the nebari-dev org.
+#
+# The Chart.yaml path is included in the trigger on purpose: release.yaml pins
+# image tags to sha-<release-commit>, so the release commit (a Chart.yaml bump)
+# must produce images with that sha. Building here on the bump ensures they
+# exist. This runs in parallel with the release workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/auth-fastapi/app/**"
+      - "examples/auth-fastapi/Dockerfile"
+      - ".github/workflows/build-images.yaml"
+      - "examples/auth-fastapi/chart/Chart.yaml"
+  pull_request:
+    paths:
+      - "examples/auth-fastapi/app/**"
+      - "examples/auth-fastapi/Dockerfile"
+  workflow_dispatch:
+
+jobs:
+  auth-fastapi-example:
+    uses: nebari-dev/.github/.github/workflows/pack-build-image.yaml@v1
+    with:
+      image: auth-fastapi-example
+      context: examples/auth-fastapi
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
