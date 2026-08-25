@@ -161,6 +161,17 @@ that, which the router's dependency enforces.
 ORG_INVITATIONS_REVOKE_PATH = "/web/org/invitations/revoke"
 """The owner page's revoke ``POST``. Same session and owner gating."""
 
+ORG_INVITATIONS_NAME_PATH = "/web/org/invitations/name"
+"""The owner page's first-invite naming ``POST`` (#188, the flow #92 specified).
+
+Every organization starts with the neutral placeholder name, and the owner
+page refuses to issue an invitation while it stands — the invitee's email
+would otherwise name "Unnamed organization". This route gives the organization
+its name, once, recorded as ``org.rename``. Same session and owner gating; a
+sub-path of the page rather than a page of its own, so it inherits the
+``/web`` nesting decision recorded on :data:`ORG_INVITATIONS_PATH`.
+"""
+
 DATA_STATEMENT_PATH = "/web/data-statement"
 """The data statement page (#146): what is stored, who can see it, how to ask
 for deletion. The copy itself lives in :mod:`.data_statement`.
@@ -177,7 +188,11 @@ acceptance page is: a static document, rendered from constants, reading
 nothing from the request, with nothing to act on.
 """
 
-ORG_INVITATIONS_PATHS = (ORG_INVITATIONS_PATH, ORG_INVITATIONS_REVOKE_PATH)
+ORG_INVITATIONS_PATHS = (
+    ORG_INVITATIONS_PATH,
+    ORG_INVITATIONS_REVOKE_PATH,
+    ORG_INVITATIONS_NAME_PATH,
+)
 """Every path the owner invitation page serves. Read by
 :data:`CSRF_ENFORCED_IN_ROUTE`, same as :data:`ADMIN_PATHS`."""
 

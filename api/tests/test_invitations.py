@@ -88,13 +88,16 @@ from collab_hub_api.frames.invitations import (  # noqa: E402
     InvitationNotFoundError,
     InvitationRevokedError,
     InvitationsUnavailableError,
+    OrganizationAlreadyNamedError,
     PostgresInvitationService,
     UnavailableInvitationService,
     effective_status,
     emails_match,
     hash_invitation_secret,
+    is_placeholder_organization_name,
     mint_invitation_secret,
     validate_invited_email,
+    validate_organization_name,
     verified_claim_email,
 )
 from collab_hub_api.frames.org_source import (  # noqa: E402
@@ -3596,3 +3599,131 @@ async def test_live_http_a_malformed_address_is_a_422_that_quotes_nothing(live_c
     assert "somebody@example.com" not in response.text
     with database.connection() as conn:
         assert conn.execute("SELECT count(*) AS n FROM collab_invitations").fetchone()["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Naming a placeholder organization (#188) — the first-invite flow's write half
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stored", [None, "", "  ", "Unnamed organization", "UNNAMED ORGANIZATION"])
+def test_the_placeholder_predicate_matches_what_the_column_default_writes(stored):
+    assert is_placeholder_organization_name(stored)
+
+
+def test_the_placeholder_predicate_agrees_with_the_schema_constant():
+    from collab_hub_api.frames.collab_schema import NEUTRAL_ORG_NAME
+
+    assert is_placeholder_organization_name(NEUTRAL_ORG_NAME)
+    assert not is_placeholder_organization_name("Acme Widgets")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "Unnamed organization",
+        "unnamed ORGANIZATION",
+        "a" * 121,
+        "x\ny",
+        "x\x00",
+        "x\x7f",
+        "Acme\u0085Widgets",  # C1 NEL: a line break to many renderers, not an ASCII control
+        "Acme\u2028Widgets",  # LINE SEPARATOR
+        "Acme\u2029Widgets",  # PARAGRAPH SEPARATOR
+        "Acme\u202eWidgets",  # RIGHT-TO-LEFT OVERRIDE: renders as something other than itself
+        "Acme\u200dWidgets",  # ZERO WIDTH JOINER
+    ],
+)
+def test_an_unusable_organization_name_is_refused(bad):
+    with pytest.raises(ValueError):
+        validate_organization_name(bad)
+
+
+def test_a_usable_organization_name_is_stripped_and_otherwise_kept():
+    assert validate_organization_name("  Acme  Widgets ") == "Acme  Widgets"
+    assert validate_organization_name("a" * 120) == "a" * 120
+    assert validate_organization_name("Ünïcode & Co.") == "Ünïcode & Co."
+
+
+@live_postgres
+def test_live_naming_writes_the_name_and_its_event_together(service, live_db):
+    """The fixture seeds ORG the way acceptance really creates one: no name, so
+    the column default applies and the organization is the placeholder."""
+
+    assert service.organization_name(ORG) == "Unnamed organization"
+    assert service.name_organization(OWNER_CTX, org_id=ORG, name="  Acme Widgets ") == "Acme Widgets"
+    assert service.organization_name(ORG) == "Acme Widgets"
+    (event,) = _audit_rows(live_db)
+    assert (event["action"], event["actor"], event["target_type"], event["target_id"]) == (
+        "org.rename",
+        OWNER,
+        "org",
+        ORG,
+    )
+    assert event["target_label"] == "Acme Widgets"
+    assert event["org_id"] == ORG
+    assert event["detail"] == {"replaced_placeholder": True}
+
+
+@live_postgres
+def test_live_naming_is_one_shot_and_a_refusal_writes_no_row(service, live_db):
+    service.name_organization(OWNER_CTX, org_id=ORG, name="Acme Widgets")
+    with pytest.raises(OrganizationAlreadyNamedError):
+        service.name_organization(OWNER_CTX, org_id=ORG, name="Acme Corp")
+    assert service.organization_name(ORG) == "Acme Widgets"
+    assert [row["action"] for row in _audit_rows(live_db)] == ["org.rename"]
+    # The other organization is untouched: the pin is the org id, not the actor.
+    assert service.organization_name(OTHER_ORG) == "Unnamed organization"
+
+
+@live_postgres
+def test_live_two_owners_naming_at_once_resolve_to_one_row_and_one_refusal(service, live_db):
+    """The one-shot rule under real concurrency: the FOR UPDATE read inside the
+    audited transaction serializes the two, and the loser re-reads the
+    committed name rather than the placeholder it saw on its page."""
+
+    import threading
+
+    start = threading.Barrier(2)
+    outcomes: dict[str, object] = {}
+
+    def attempt(label: str, name: str) -> None:
+        start.wait()
+        try:
+            outcomes[label] = service.name_organization(OWNER_CTX, org_id=ORG, name=name)
+        except Exception as exc:  # noqa: BLE001 - the test classifies it below
+            outcomes[label] = exc
+
+    threads = [
+        threading.Thread(target=attempt, args=("a", "Acme Widgets")),
+        threading.Thread(target=attempt, args=("b", "Acme Corp")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+
+    winners = [v for v in outcomes.values() if isinstance(v, str)]
+    losers = [v for v in outcomes.values() if isinstance(v, OrganizationAlreadyNamedError)]
+    assert len(winners) == 1 and len(losers) == 1, outcomes
+    assert service.organization_name(ORG) == winners[0]
+    events = _audit_rows(live_db)
+    assert [(row["action"], row["target_label"]) for row in events] == [("org.rename", winners[0])]
+
+
+@live_postgres
+def test_live_naming_an_unknown_organization_is_not_found_and_writes_no_row(service, live_db):
+    with pytest.raises(invitations_module.OrgNotFoundError):
+        service.name_organization(OWNER_CTX, org_id="org-nope", name="Acme Widgets")
+    assert _audit_rows(live_db) == []
+
+
+@live_postgres
+def test_live_a_placeholder_name_never_reaches_the_row(service, live_db):
+    with pytest.raises(ValueError):
+        service.name_organization(OWNER_CTX, org_id=ORG, name="unnamed organization")
+    assert _audit_rows(live_db) == []
+    assert service.organization_name(ORG) == "Unnamed organization"
