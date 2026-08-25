@@ -14,7 +14,7 @@ invitation page ([#91], `/admin/invitations`), the owner invitation page
 [#90]: https://github.com/nebari-dev/collab-hub-pack/issues/90
 [#91]: https://github.com/nebari-dev/collab-hub-pack/issues/91
 [#142]: https://github.com/nebari-dev/collab-hub-pack/issues/142
-[#188]: https://github.com/nebari-dev/collab-hub-pack/issues/188
+[#44]: https://github.com/nebari-dev/collab-hub-pack/issues/188
 [#146]: https://github.com/nebari-dev/collab-hub-pack/issues/146
 
 ## Two auth axes, deliberately
@@ -315,9 +315,9 @@ a protection the middleware does not itself enforce.
 | `POST /admin/invitations` | Issues one invitation and renders its link. Session + `operator` + CSRF. |
 | `POST /admin/invitations/revoke` | Revokes one invitation. Session + `operator` + CSRF. |
 | `GET /web/org/invitations` | The owner invitation page ([#142]). Session + org `owner`. |
-| `POST /web/org/invitations` | Issues one invitation into the caller's org and emails it. Refused (409) while the organization still carries the placeholder name ([#188]). Session + org `owner` + CSRF. |
+| `POST /web/org/invitations` | Issues one invitation into the caller's org and emails it. Refused (409) while the organization still carries the placeholder name ([#44]). Session + org `owner` + CSRF. |
 | `POST /web/org/invitations/revoke` | Revokes one of the caller's org's invitations. Session + org `owner` + CSRF. |
-| `POST /web/org/invitations/name` | Gives a placeholder-named organization its name, once; audited as `org.rename` ([#188]). Session + org `owner` + CSRF. |
+| `POST /web/org/invitations/name` | Gives a placeholder-named organization its name, once; audited as `org.rename` ([#44]). Session + org `owner` + CSRF. |
 
 The `/admin` paths must be **map-public** in `security.paths`, like the rest of
 this surface, and for the same reason: the map's `authenticated` level runs the
@@ -514,7 +514,7 @@ routes:
 | `/admin/invitations/revoke` | [#91], open | same |
 | `/web/org/invitations` | [#142] | `web.forms.csrf_ok()` → `csrf_token_matches`, as a predicate |
 | `/web/org/invitations/revoke` | [#142] | same |
-| `/web/org/invitations/name` | [#188] | same |
+| `/web/org/invitations/name` | [#44] | same |
 
 The check and the routes land in **different changes**, and that is the whole
 argument. Split across both — an empty set here, a route there with no
@@ -966,15 +966,25 @@ notices, no JavaScript, render-not-redirect on the POSTs, and the same
 mounting rule — claims-sourced deployments have no org roles, so the page is
 absent there rather than a page that refuses everyone.
 
-### The first-invite naming step ([#188])
+### The first-invite naming step ([#44])
 
 Every organization starts with the neutral placeholder name — `collab_orgs.name`
 defaults to `'Unnamed organization'` and accepting an org-creating invitation
 never supplies one (Gate B revision of 2026-08-04). So the first owner to reach
-this page owns an unnamed organization, and an invitation issued then words the
-placeholder into the invitee's email. [#92] specified a rename → invite sequence
-for exactly this; [#142] shipped without it, and the live hub showed the
-consequence on 2026-08-25.
+this page owns an unnamed organization, and the page identifies the destination
+of every invitation they issue only as "Unnamed organization". [#92] specified
+a rename → invite sequence for exactly this; [#142] shipped without it, and the
+live hub showed the consequence on 2026-08-25.
+
+**Scope: the owner's side only.** The invitation email is organization-neutral
+by decision — `render_invitation_email()` discards `organization_name`, and a
+regression in `test_invitation_email.py` pins that the name appears in neither
+subject nor body. This step does not change that. What it changes is that an
+owner has named, and can see, the organization they are inviting people into
+before the first invitation leaves; the name lives on this page, on the
+organization's record, and on the `org.rename` audit row. The delivery adapter
+still receives the resolved name (as it always did) and the renderer's
+treatment of it remains the renderer's decision.
 
 The page now branches on `is_placeholder_organization_name()`:
 
@@ -1002,12 +1012,22 @@ The page now branches on `is_placeholder_organization_name()`:
   characters, one line by Unicode category (every `Cc` control including the
   C1 block, the `Zl`/`Zp` separators, and `Cf` format characters such as the
   bidi overrides are refused — wider than the audit primitive's ASCII-only
-  rule, so nothing accepted here is refused there), and not the placeholder in
-  any ASCII capitalization — typing "Unnamed organization" would satisfy the
-  check while leaving the email exactly as misleading.
+  rule, so nothing accepted here is refused there), whitespace-normalized
+  (every Unicode space separator becomes one ASCII space, runs collapse) with
+  at least one letter or digit (so a Braille blank, combining marks alone, or
+  bare punctuation cannot be a name), and not the placeholder in any ASCII
+  capitalization or spacing — typing "Unnamed organization" would satisfy the
+  check while leaving the owner exactly as uninformed.
 
 Once named, the page is what [#142] shipped: the issue form, the org's name in
 the intro, and the listing.
+
+Before (shipped [#142], placeholder-named org) · after (naming form) · after
+naming:
+
+![Before: the issue form offered "Invite someone to join Unnamed organization"](images/owner-invitations/44-before-placeholder-issue-form.png)
+![After: the naming form replaces the issue form while the placeholder stands](images/owner-invitations/44-after-naming-form.png)
+![After naming: the confirmation notice and the issue form for "Acme Widgets"](images/owner-invitations/44-after-named.png)
 
 ## What this surface deliberately does not do
 

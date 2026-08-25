@@ -3602,7 +3602,7 @@ async def test_live_http_a_malformed_address_is_a_422_that_quotes_nothing(live_c
 
 
 # ---------------------------------------------------------------------------
-# Naming a placeholder organization (#188) — the first-invite flow's write half
+# Naming a placeholder organization (#44) — the first-invite flow's write half
 # ---------------------------------------------------------------------------
 
 
@@ -3634,6 +3634,11 @@ def test_the_placeholder_predicate_agrees_with_the_schema_constant():
         "Acme\u2029Widgets",  # PARAGRAPH SEPARATOR
         "Acme\u202eWidgets",  # RIGHT-TO-LEFT OVERRIDE: renders as something other than itself
         "Acme\u200dWidgets",  # ZERO WIDTH JOINER
+        "\u2800\u2800",  # Braille blanks: renders as nothing
+        "\u0301\u0308",  # combining marks alone: nothing to combine with
+        "---",  # punctuation alone
+        "Unnamed\u00a0organization",  # the placeholder with a no-break space
+        "Unnamed   organization",  # the placeholder with a run of spaces
     ],
 )
 def test_an_unusable_organization_name_is_refused(bad):
@@ -3641,10 +3646,13 @@ def test_an_unusable_organization_name_is_refused(bad):
         validate_organization_name(bad)
 
 
-def test_a_usable_organization_name_is_stripped_and_otherwise_kept():
-    assert validate_organization_name("  Acme  Widgets ") == "Acme  Widgets"
+def test_a_usable_organization_name_has_its_spacing_normalized_and_is_otherwise_kept():
+    assert validate_organization_name("  Acme  Widgets ") == "Acme Widgets"
+    assert validate_organization_name("Acme\u00a0Widgets") == "Acme Widgets"
     assert validate_organization_name("a" * 120) == "a" * 120
     assert validate_organization_name("Ünïcode & Co.") == "Ünïcode & Co."
+    assert validate_organization_name("株式会社テスト") == "株式会社テスト"
+    assert validate_organization_name("42") == "42"
 
 
 @live_postgres

@@ -6,13 +6,15 @@ web session *and* an active ``role = 'owner'`` membership:
 ``GET  /web/org/invitations``           the page and the listing
 ``POST /web/org/invitations``           issue one invitation into the caller's org
 ``POST /web/org/invitations/revoke``    revoke one of the caller's org's
-``POST /web/org/invitations/name``      give a placeholder-named org its name (#188)
+``POST /web/org/invitations/name``      give a placeholder-named org its name (#44)
 
 The naming route is the first-invite naming flow #92 specified and #142 did
 not ship: every organization starts with the neutral placeholder name, so an
 owner reaching this page for the first time owns "Unnamed organization", and
-an invitation issued then words that placeholder into the invitee's email
-(observed live, #188). While the placeholder stands the page renders the
+the page identifies the destination of every invitation they issue only as
+that (observed live, #44). The invitation email is organization-neutral by
+decision and unaffected; this is the owner's side — knowing what they are
+inviting people into. While the placeholder stands the page renders the
 naming form instead of the issue form, and ``POST /web/org/invitations``
 refuses to issue: a submission that passes the page's ordinary request checks
 (bounded body, CSRF, a valid address) is answered **409** before the issue
@@ -384,15 +386,16 @@ def make_router() -> APIRouter:
 
         # Before the audited transaction, same as the API route: it is only
         # used to word the email, and it must not run between commit and send.
-        # It is also the first-invite gate (#188): an organization still
+        # It is also the first-invite gate (#44): an organization still
         # carrying the placeholder name issues nothing from this page. The
         # checks above (body bound, CSRF, address) answer a malformed
         # submission first, as they always did; anything that passes them is
         # refused here, before the audited action and before delivery — the
         # form the page hides is a rendering of this refusal, not the refusal
-        # itself. A rename racing this read can
-        # only make the emailed name better, never worse, so the gate is read
-        # here rather than locked into the send.
+        # itself. A rename racing this read can only make the name handed to
+        # the delivery adapter better, never worse (and the shipped renderer
+        # is organization-neutral and discards it), so the gate is read here
+        # rather than locked into the send.
         try:
             organization_name = service.organization_name(auth.org_id)
             if is_placeholder_organization_name(organization_name):

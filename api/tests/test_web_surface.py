@@ -2943,7 +2943,7 @@ def test_the_shipped_csrf_exemptions_are_exactly_the_reviewed_one():
             # for the same page-shaped-refusal reason.
             "/web/org/invitations",
             "/web/org/invitations/revoke",
-            # #188's first-invite naming POST: same page, same predicate.
+            # #44's first-invite naming POST: same page, same predicate.
             "/web/org/invitations/name",
         }
     )

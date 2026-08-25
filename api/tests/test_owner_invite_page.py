@@ -17,10 +17,12 @@ organization inside the transaction (``expect_org_id``), so another
 organization's invitation is a plain not-found. And the live tests take an
 owner-issued invitation through #90's acceptance page into an **existing**
 organization — the flow #142 exists to make real. And the first-invite naming
-step (#188): an organization still carrying the placeholder name shows a naming
+step (#44): an organization still carrying the placeholder name shows a naming
 form instead of the issue form, issues nothing however the POST is shaped,
-takes exactly one audited ``org.rename``, and only then issues — with the new
-name handed to the delivery adapter.
+takes exactly one audited ``org.rename``, and only then issues. The delivery
+adapter receives the resolved name as it always did; what the shipped renderer
+does with it is ``test_invitation_email.py``'s subject (today: deliberately
+nothing — the email is organization-neutral), not this file's.
 
 **Deliberately not re-proven here:** the form-handling properties
 (byte-counted caps, no ``request.form()``, ``Connection: close`` on refusal)
@@ -892,7 +894,7 @@ async def test_the_rendered_secret_reaches_no_log_record(tmp_path, idp, caplog):
 
 
 # ===========================================================================
-# The first-invite naming step (#188) — no invitation into "Unnamed organization"
+# The first-invite naming step (#44) — no invitation into "Unnamed organization"
 # ===========================================================================
 
 
@@ -1107,7 +1109,7 @@ async def live_app(tmp_path, idp, live_db):
         app.state.invitation_email_delivery = CapturingDelivery()
         with live_db.connection() as conn:
             # Seeded the way acceptance really creates one: no name supplied,
-            # so the column default — the placeholder — applies (#188).
+            # so the column default — the placeholder — applies (#44).
             conn.execute(
                 "INSERT INTO collab_orgs (id, created_by) VALUES (%s, %s)",
                 (ORG_ID, OWNER_SUB),
@@ -1136,7 +1138,7 @@ async def test_live_an_owner_takes_an_address_into_their_existing_org(live_app, 
         await sign_in(owner, idp, next_path=ORG_INVITATIONS_PATH)
         page = await owner.get(ORG_INVITATIONS_PATH)
         assert page.status_code == 200
-        # #188: the organization was created by acceptance and carries the
+        # #44: the organization was created by acceptance and carries the
         # placeholder, so the page refuses to issue until it is named.
         refused = await owner.post(
             ORG_INVITATIONS_PATH,

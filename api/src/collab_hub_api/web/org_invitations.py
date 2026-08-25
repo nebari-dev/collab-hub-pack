@@ -9,9 +9,9 @@ deletion; the page is the owner half of the invitation lifecycle exactly,
 and a page module is where extra capability arrives unnoticed.
 
 The one addition since #142 is bounded to that lifecycle: the **first-invite
-naming step** (#92's criterion 4, observed missing on the live hub as #188).
-Every organization starts with the neutral placeholder name, and an
-invitation issued from here words that name into the invitee's email — so
+naming step** (#92's criterion 4, observed missing on the live hub as #44).
+Every organization starts with the neutral placeholder name, and an owner
+issuing from here was shown only that placeholder as the destination — so
 while the placeholder stands the page shows a naming form *instead of* the
 issue form, and the server refuses to issue (a well-formed submission gets a
 409 before the issue action; a malformed one fails its usual check first).
@@ -174,12 +174,12 @@ NOTICES: dict[str, str] = {
     ),
     NOTICE_ORGANIZATION_UNNAMED: (
         "Your organization needs a name before anyone can be invited to it, so"
-        " nothing was created and nothing was sent. Name it below first; the"
-        " invitation email tells people which organization they are joining."
+        " nothing was created and nothing was sent. Name it below first, so the"
+        " organization you are inviting people into is one you have identified."
     ),
     NOTICE_NAMED: (
-        "Your organization is now called {address}. Invitations issued from here"
-        " will name it."
+        "Your organization is now called {address}. You can invite people to it"
+        " below."
     ),
     NOTICE_ALREADY_NAMED: (
         "Your organization already has a name, so nothing changed. This page"
@@ -188,8 +188,8 @@ NOTICES: dict[str, str] = {
     ),
     NOTICE_INVALID_ORGANIZATION_NAME: (
         "That is not a usable organization name, so nothing changed. Use one"
-        " line of plain text, up to 120 characters — and not the placeholder"
-        " itself."
+        " line of plain text with at least one letter or digit, up to 120"
+        " characters — and not the placeholder itself."
     ),
 }
 """Every outcome this page can present. A test pins the two directions: every
@@ -372,11 +372,10 @@ def invitations_page(
     else:
         intro = escape(
             "Your organization does not have a name yet. Give it one before"
-            " inviting anyone: the invitation email tells people which"
-            " organization they are joining, and it should not say"
-            f" \u201c{organization_name}\u201d. The name is shown to your members and"
-            " invitees; it is not used to identify your organization anywhere"
-            " else, and it is chosen once here."
+            " inviting anyone, so that you can see which organization you are"
+            f" inviting people into rather than \u201c{organization_name}\u201d. The"
+            " name appears on this page and in your organization's records; it"
+            " is display text, not an identifier, and it is chosen once here."
         )
         form = _name_form(root_path, session.csrf)
     body = (

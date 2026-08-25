@@ -64,12 +64,16 @@ to prevent. So each mutation here declares one action:
   membership — the ratified requirement;
 - an owner giving their placeholder-named organization its name →
   ``org.rename`` (:meth:`PostgresInvitationService.name_organization`, the
-  first-invite naming flow of #92, reopened as #188). It lives on this
+  first-invite naming flow of #92, reopened as #44). It lives on this
   service because it is the write half of
   :meth:`~PostgresInvitationService.organization_name` and exists for one
   caller: the owner invitation page, which refuses to issue while the
-  placeholder stands so no invitee is ever mailed a link to "Unnamed
-  organization".
+  placeholder stands, so an owner has identified the organization they are
+  inviting people into before the first invitation leaves. The invitation
+  email itself is organization-neutral by decision
+  (:func:`.invitation_email.render_invitation_email` discards the name, and
+  a regression pins that); the name is for the owner's page, the
+  organization's record, and the audit row.
 
 That last case therefore produces no ``invitation.redeem`` row, which is a
 real asymmetry and is stated rather than hidden: both acceptance rows carry
@@ -329,8 +333,8 @@ class OrganizationAlreadyNamedError(Exception):
     """The organization already carries a real name, so naming it is refused.
 
     :meth:`PostgresInvitationService.name_organization` is the *first* naming
-    only — the step #92 specified so an invitee is never mailed a link to a
-    placeholder-named organization. Changing a name that was already chosen
+    only — the step #92 specified so an owner names their organization before
+    inviting anyone into it. Changing a name that was already chosen
     is a different action with a different audience (an operator, or a future
     owner settings page) and is not reachable through this one.
 
@@ -631,10 +635,9 @@ MAX_ORGANIZATION_NAME_LENGTH = 120
 """Bound on an organization's display name, in characters.
 
 Long enough for any real organization, short enough that the name fits the
-onboarding email's subject line, the audit row's ``target_label`` (bounded at
-:data:`~.audit.AUDIT_LABEL_MAX_CHARS`), and the page's intro sentence without
-wrapping into a paragraph. The page's ``maxlength`` restates it as a hint; the
-bound is enforced here.
+audit row's ``target_label`` (bounded at :data:`~.audit.AUDIT_LABEL_MAX_CHARS`)
+and the page's intro sentence without wrapping into a paragraph. The page's
+``maxlength`` restates it as a hint; the bound is enforced here.
 """
 
 
@@ -646,7 +649,8 @@ def is_placeholder_organization_name(name: str | None) -> bool:
     the placeholder, and :meth:`PostgresInvitationService.organization_name`
     already words all three the same way. This is the predicate the owner page
     branches on — an organization for which it holds has never been named by
-    anyone, and inviting into it would put the placeholder in someone's inbox.
+    anyone, and an owner inviting into it has never seen it identified as
+    anything but the placeholder.
 
     The comparison is :func:`ascii_folded_bytes`, this module's one fold: the
     placeholder is ASCII, so an ASCII fold catches every capitalization of it,
@@ -662,23 +666,32 @@ def is_placeholder_organization_name(name: str | None) -> bool:
 
 
 def validate_organization_name(value: str) -> str:
-    """Validate a display name an owner typed, returning it stripped.
+    """Validate a display name an owner typed, returning it normalized.
 
-    Display-only text, so the rule is deliberately thin: one line of printable
-    characters, between 1 and :data:`MAX_ORGANIZATION_NAME_LENGTH` of them
-    after stripping surrounding whitespace, and not the placeholder itself in
-    any capitalization — "Unnamed organization" typed by hand is not a name,
-    and accepting it would satisfy the page's check while leaving the
-    invitee's email exactly as misleading as before.
+    Display-only text, so the rule is deliberately thin: one line, between 1
+    and :data:`MAX_ORGANIZATION_NAME_LENGTH` characters once whitespace is
+    normalized, containing at least one letter or digit, and not the
+    placeholder itself in any capitalization — "Unnamed organization" typed
+    by hand is not a name, and accepting it would satisfy the page's check
+    while leaving the owner exactly as uninformed as before.
+
+    Whitespace is normalized rather than merely stripped: every Unicode space
+    separator (``Zs`` — NBSP, ideographic space, and the rest) becomes an
+    ASCII space and runs collapse to one, so ``Unnamed\u00a0organization`` is
+    the placeholder, and a name cannot differ from another only in invisible
+    spacing. "At least one letter or digit" (categories ``L*``/``N*``) is what
+    rules out the visually blank: a Braille blank (U+2800), a string of
+    combining marks, or punctuation alone renders as nothing an owner could
+    recognize their organization by, and naming is one shot.
 
     "One line" is decided by Unicode category, not by the ASCII range: every
     control character (``Cc`` — C0, DEL, and the C1 block including NEL), the
     line and paragraph separators (``Zl``/``Zp``, U+2028/U+2029), and the
     format characters (``Cf`` — among them the bidirectional overrides that
     make text render as something other than what it is) are refused. The
-    name becomes an audit ``target_label`` and the subject line of a
-    plain-text email, and a value that can forge a line break or reorder its
-    own rendering in either is not a name. The audit primitive's own check
+    name becomes an audit ``target_label`` and a heading on the owner page,
+    and a value that can forge a line break or reorder its own rendering in
+    either is not a name. The audit primitive's own check
     covers only the ASCII controls; this rule is deliberately wider than
     that, so nothing this function accepts is later refused there. No other
     normalization — the owner's spelling is stored.
@@ -688,13 +701,16 @@ def validate_organization_name(value: str) -> str:
 
     if not isinstance(value, str):
         raise ValueError("organization name must be a string")
-    name = value.strip()
+    if any(unicodedata.category(ch) in _NOT_A_NAME_CATEGORIES for ch in value):
+        raise ValueError("organization name contains control, separator, or format characters")
+    spaced = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in value)
+    name = " ".join(spaced.split())
     if not name:
         raise ValueError("organization name is empty")
     if len(name) > MAX_ORGANIZATION_NAME_LENGTH:
         raise ValueError(f"organization name exceeds {MAX_ORGANIZATION_NAME_LENGTH} characters")
-    if any(unicodedata.category(ch) in _NOT_A_NAME_CATEGORIES for ch in name):
-        raise ValueError("organization name contains control, separator, or format characters")
+    if not any(unicodedata.category(ch)[0] in "LN" for ch in name):
+        raise ValueError("organization name has no letter or digit")
     if is_placeholder_organization_name(name):
         raise ValueError("organization name is the placeholder")
     return name
@@ -993,7 +1009,7 @@ class PostgresInvitationService:
         """Give a placeholder-named organization its name, recorded as ``org.rename``.
 
         The first-invite naming flow (#92 criterion 4, observed missing live
-        on #188): every organization starts as ``NEUTRAL_ORG_NAME`` —
+        on #44): every organization starts as ``NEUTRAL_ORG_NAME`` —
         acceptance of an org-creating invitation never supplies a name — and
         the owner page refuses to issue while that placeholder stands. This
         is the step that clears it.

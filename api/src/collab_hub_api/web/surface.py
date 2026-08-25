@@ -162,7 +162,7 @@ ORG_INVITATIONS_REVOKE_PATH = "/web/org/invitations/revoke"
 """The owner page's revoke ``POST``. Same session and owner gating."""
 
 ORG_INVITATIONS_NAME_PATH = "/web/org/invitations/name"
-"""The owner page's first-invite naming ``POST`` (#188, the flow #92 specified).
+"""The owner page's first-invite naming ``POST`` (#44, the flow #92 specified).
 
 Every organization starts with the neutral placeholder name, and the owner
 page refuses to issue an invitation while it stands — the invitee's email
