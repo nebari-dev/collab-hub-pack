@@ -581,6 +581,49 @@ owner naming an organization they do not own is a plain 403.
 Acceptance is the *only* thing that creates a membership row. Registering an
 account grants nothing, and neither does being invited.
 
+#### Whether a verified address is also required
+
+Gate B is **two** checks: the accepter's address is verified by the identity
+provider, *and* it equals the invited address. `frames.invitations.requireVerifiedEmail`
+(default `true`) controls the first. The second is not configurable and never
+becomes conditional — a test asserts that relaxing one does not relax the other,
+because an invitation that skipped the match would be a bearer token redeemable
+under any identity.
+
+**The argument for `false`.** The invitation token is already proof of mailbox
+control: a 256-bit secret delivered only to the invited address, which is
+exactly what a verification link proves. Requiring both is defence in depth
+rather than one necessary check, and the second round trip is real friction —
+Keycloak's verification link does not return the reader to the invitation.
+
+**What it costs, stated so the choice is informed.** A forwarded or
+shared-mailbox invitation becomes usable by whoever received it. Today they
+cannot accept — they cannot verify an address they do not control — and the
+invitation simply goes unused until the real invitee asks again. With this
+`false` they can accept, and the account they end up with carries the invited
+person's address **permanently**, which is an identity-confusion problem in the
+member list rather than only an access one.
+
+**Turning it off takes two changes, not one.** The realm must also stop forcing
+verification:
+
+```sh
+kubectl -n keycloak exec keycloak-keycloakx-0 -- /opt/keycloak/bin/kcadm.sh \
+  update realms/nebari -s verifyEmail=false
+```
+
+Without that, Keycloak will not issue a token to an unverified account at all,
+so the relaxed check is never reached and nothing changes. **Order matters:**
+ship the server setting first. Flipping the realm first leaves accounts
+unverified while the server still demands verification, which refuses every
+acceptance.
+
+**When to leave it `true`.** Any deployment whose invitees arrive through an
+identity provider with `trustEmail` — those accounts are verified on creation,
+the check costs nothing, and the invitee never sees a verification step.
+Relaxing it there buys nothing and gives up the forwarded-mail protection for
+free.
+
 #### The invited address must match exactly
 
 The invitee has to sign in with the **exact** address the invitation was sent

@@ -251,6 +251,17 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__EMAIL__SES__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.frames.email.ses.requestTimeoutSeconds | quote }}
             {{- end }}
+            {{- if not .Values.frames.invitations.requireVerifiedEmail }}
+            {{/*
+              Rendered only when turned OFF, so the strict default needs no env
+              var and cannot be weakened by an empty or malformed value. A
+              deployment that wants the relaxation says so explicitly, and the
+              rendered manifest shows it -- which is the point, since it is a
+              security trade rather than a preference.
+            */}}
+            - name: COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL
+              value: "false"
+            {{- end }}
             {{- if .Values.frames.serviceAccess.grantOnAcceptance }}
             {{- /*
               Rendered only when there is something to grant. An empty list is

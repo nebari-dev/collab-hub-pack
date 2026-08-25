@@ -519,6 +519,43 @@ class FramesServiceAccessConfig(BaseModel):
         return self
 
 
+class FramesInvitationsConfig(BaseModel):
+    """What invitation acceptance requires of the accepter's identity."""
+
+    require_verified_email: bool = True
+    """Whether Gate B additionally requires the identity provider to have
+    verified the address (#67).
+
+    **True is the default and must stay the default.** Turning it off is a
+    deliberate deployment trade, and a default that silently weakened an
+    existing deployment on upgrade would be the wrong kind of convenient.
+
+    Gate B is two checks: the accepter's address is verified, *and* it equals
+    the invited address. Setting this false drops the first and keeps the
+    second, on the argument that the invitation token is itself proof of
+    mailbox control — it is a 256-bit secret delivered only to the invited
+    address, which is exactly what a verification link proves. Requiring both
+    is defence in depth rather than one necessary check.
+
+    **What is given up, stated so a deployment chooses it knowingly.** A
+    forwarded or shared-mailbox invitation becomes usable by whoever received
+    it: today they cannot accept, because they cannot verify an address they
+    do not control, and the invitation simply goes unused. With this false they
+    can, and the account they end up with carries the invited person's address
+    permanently -- an identity-confusion problem in the member list, not only
+    an access one.
+
+    **When to leave it true.** Any deployment whose invitees arrive through an
+    identity provider with ``trustEmail``: those accounts are already verified
+    on creation, so the check costs nothing and the invitee never sees a
+    verification step. Turning it off buys nothing there.
+
+    **When false is reasonable.** A password-based deployment with no identity
+    provider, a known invitee list, and a verification round trip that is
+    friction rather than assurance.
+    """
+
+
 class FramesConfig(BaseModel):
     storage_backend: str = "local"
     s3: FramesS3Config = Field(default_factory=FramesS3Config)
@@ -530,6 +567,7 @@ class FramesConfig(BaseModel):
     orgs: FramesOrgsConfig = Field(default_factory=FramesOrgsConfig)
     email: FramesEmailConfig = Field(default_factory=FramesEmailConfig)
     service_access: FramesServiceAccessConfig = Field(default_factory=FramesServiceAccessConfig)
+    invitations: FramesInvitationsConfig = Field(default_factory=FramesInvitationsConfig)
     mcp_session_manager_enabled: bool = True
 
 
@@ -730,7 +768,10 @@ def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> Invita
 
     url = config.frames.postgres.url
     if url:
-        return PostgresInvitationService(pools.database(url))
+        return PostgresInvitationService(
+            pools.database(url),
+            require_verified_email=config.frames.invitations.require_verified_email,
+        )
     return UnavailableInvitationService()
 
 

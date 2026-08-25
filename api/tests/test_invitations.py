@@ -1392,6 +1392,102 @@ def test_a_boolean_true_claim_with_an_address_is_accepted():
     assert verified_claim_email("someone@example.com", True) == "someone@example.com"
 
 
+# ---------------------------------------------------------------------------
+# The token as the proof of mailbox control (frames.invitations.requireVerifiedEmail)
+# ---------------------------------------------------------------------------
+
+
+def test_the_strict_check_is_the_default_everywhere_it_is_spelled():
+    """Fail closed. A caller that forgets the setting must get the strict rule,
+    and an upgrade must not weaken a deployment that never asked."""
+
+    from collab_hub_api.config import FramesInvitationsConfig
+
+    assert FramesInvitationsConfig().require_verified_email is True
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email("someone@example.com", False)  # no keyword passed
+
+
+@pytest.mark.parametrize("verified", [False, None, "true", 1, 0])
+def test_relaxed_accepts_an_unverified_address_whatever_the_claim_says(verified):
+    """The token stood in for the proof, so the flag stops being consulted --
+    including the string and integer shapes the strict path refuses."""
+
+    assert (
+        verified_claim_email("someone@example.com", verified, require_verified=False)
+        == "someone@example.com"
+    )
+
+
+@pytest.mark.parametrize("email", [None, "", 12345, [], {}])
+def test_relaxed_still_needs_an_actual_address(email):
+    """Dropping the verification requirement does not make the address optional.
+    Gate B's match has to compare something."""
+
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email(email, True, require_verified=False)
+
+
+def test_relaxing_verification_does_not_relax_the_address_match():
+    """**The property that matters.** Without this, the relaxation would turn an
+    invitation into a bearer token redeemable under any identity.
+
+    Asserted against `_evaluate_acceptance` rather than the helper, because the
+    helper cannot see the invitation -- the match is the caller's half, and the
+    question is whether the two halves are independently relaxable. They must
+    not be.
+    """
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    invitation = _invitation()
+
+    # Unverified AND the wrong address: still refused, and refused as a
+    # mismatch rather than as a verification failure -- the reader is told the
+    # true reason.
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, "someone-else@example.com", False, require_verified=False
+        )
+
+    # Unverified and the right address: accepted, which is the whole point.
+    assert (
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+        )
+        is None
+    )
+
+    # And with the strict setting the same right-address claim is refused, so
+    # the setting is what decides rather than the address.
+    with pytest.raises(EmailNotVerifiedError):
+        invitations_module._evaluate_acceptance(invitation, now, INVITEE, INVITED_EMAIL, False)
+
+
+def test_a_dead_token_is_still_dead_however_verification_is_configured():
+    """Order is load-bearing: the token's own state is decided before anything
+    about the caller, so relaxing the identity check cannot resurrect a revoked,
+    used, or expired link."""
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    cases = [
+        (_invitation(STATUS_REVOKED), invitations_module.InvitationRevokedError),
+        (_invitation(STATUS_ACCEPTED), invitations_module.InvitationAlreadyUsedError),
+        (_invitation(expires_in=-timedelta(days=1)), invitations_module.InvitationExpiredError),
+    ]
+    for invitation, expected in cases:
+        with pytest.raises(expected):
+            invitations_module._evaluate_acceptance(
+                invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+            )
+
+
+def test_the_service_carries_the_setting_and_defaults_it_closed():
+    from collab_hub_api.frames.invitations import PostgresInvitationService
+
+    assert PostgresInvitationService(object())._require_verified_email is True
+    assert PostgresInvitationService(object(), require_verified_email=False)._require_verified_email is False
+
+
 def test_email_verified_reaches_the_display_identity_only_as_a_boolean():
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": True}).email_verified is True
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": "true"}).email_verified is False
