@@ -80,16 +80,29 @@ def test_the_template_ships_with_the_package() -> None:
     assert SUBJECT == "Your invitation to the OpenTeams Collab beta"
 
 
+CONDITIONAL_MARKERS = {"[IF VERIFIED EMAIL REQUIRED]", "[END IF]"}
+"""Spans kept or dropped by configuration rather than filled in.
+
+Their own set, so the contract test keeps saying which slots are *substituted*
+and which are *selected* -- two different failure modes, and folding them
+together would let a marker be renamed into a placeholder unnoticed.
+"""
+
+
 def test_every_placeholder_in_the_copy_is_one_something_fills_in() -> None:
     """The guard on future copy edits, in both directions.
 
     A placeholder added to the template that nothing substitutes would be sent
     to an invitee verbatim; a placeholder the renderer substitutes that no
     longer appears in the template is a rename that silently stopped working.
+
+    Conditional markers are spelled like placeholders on purpose -- see
+    ``CONDITIONAL_BLOCK`` -- so they appear here too, and one added without
+    being taught to the renderer fails this rather than reaching an invitee.
     """
 
     in_template = set(PLACEHOLDER_PATTERN.findall(_template_text()))
-    assert in_template == SUBSTITUTED | LEFT_FOR_THE_CALLER
+    assert in_template == SUBSTITUTED | LEFT_FOR_THE_CALLER | CONDITIONAL_MARKERS
 
 
 def test_only_the_two_unknowable_placeholders_survive_rendering() -> None:
@@ -206,3 +219,87 @@ def test_automated_delivery_refuses_a_placeholder_added_to_the_copy_later() -> N
             render_for_automated_delivery(**DELIVERY_KWARGS)
     finally:
         module._BODY_TEMPLATE = original
+
+
+# ---------------------------------------------------------------------------
+# Copy that follows the configuration (#190)
+# ---------------------------------------------------------------------------
+
+
+def _rendered_with(*, require_verified_email: bool) -> str:
+    return render_for_automated_delivery(
+        link="https://web.test/invite#token=" + "T" * 43,
+        recipient="invitee@example.com",
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+        app_instructions="Download it from https://example.test/collab",
+        require_verified_email=require_verified_email,
+    )
+
+
+def test_the_verification_instruction_follows_the_configuration() -> None:
+    """The whole point: the copy describes the flow the deployment runs.
+
+    A deployment that stopped requiring verification while still telling
+    invitees to watch for a verification email would have recreated the defect
+    #171 fixed, with the sign flipped -- and the invitee would be waiting for
+    mail that never comes, exactly as they were before #171.
+    """
+
+    strict = _rendered_with(require_verified_email=True)
+    relaxed = _rendered_with(require_verified_email=False)
+
+    assert "verify the address" in strict
+    assert "verify" not in relaxed.lower(), "no instruction about a mail that will not arrive"
+
+
+def test_neither_variant_leaks_a_marker_to_the_reader() -> None:
+    """Kept or dropped, the markers themselves must never be sent."""
+
+    for flag in (True, False):
+        body = _rendered_with(require_verified_email=flag)
+        assert "[IF" not in body and "[END IF]" not in body
+        assert set(PLACEHOLDER_PATTERN.findall(body)) == set()
+
+
+def test_dropping_the_block_leaves_the_paragraphs_correctly_spaced() -> None:
+    """Whitespace asserted rather than reasoned about.
+
+    A dropped span that took its separator with it would run two paragraphs
+    together; one that left its separator behind would open a double blank
+    before step 3. Both read fine in a diff and wrong in a mail client.
+    """
+
+    relaxed = _rendered_with(require_verified_email=False).splitlines()
+    step_three = relaxed.index("3. ACCEPT YOUR INVITATION")
+    assert relaxed[step_three - 1] == "", "step 3 keeps its blank line above"
+    assert relaxed[step_three - 2] == "   not substitute another one.", (
+        "the paragraph above step 3 is the one the dropped span followed"
+    )
+    assert relaxed[step_three - 3] != "", "exactly one blank line, not two"
+
+
+def test_the_step_count_is_the_same_either_way() -> None:
+    """The variable span is a paragraph inside step 2, not a step.
+
+    Which is what keeps this simple: nothing renumbers, and the opening line
+    that promises four steps stays true under both configurations.
+    """
+
+    for flag in (True, False):
+        body = _rendered_with(require_verified_email=flag)
+        numbered = [line for line in body.splitlines() if re.match(r"^\d\. ", line)]
+        assert len(numbered) == 4, numbered
+        assert "four steps" in body
+
+
+def test_the_strict_variant_is_what_a_caller_gets_by_default() -> None:
+    """Fail safe: copy that over-explains is a nuisance, copy that omits a
+    required step strands the reader."""
+
+    default = render_for_automated_delivery(
+        link="https://web.test/invite#token=" + "T" * 43,
+        recipient="invitee@example.com",
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+        app_instructions="Download it from https://example.test/collab",
+    )
+    assert default == _rendered_with(require_verified_email=True)

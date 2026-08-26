@@ -156,9 +156,17 @@ class ConfiguredInvitationEmailDelivery:
         *,
         accept_url: str,
         app_instructions: str,
+        require_verified_email: bool = True,
     ) -> None:
         self._provider = provider
         self._accept_url = validate_accept_url(accept_url)
+        # The copy has to describe the flow the deployment actually runs, so it
+        # is driven by the *same* setting as the acceptance check rather than a
+        # second switch someone could set differently. A deployment that stops
+        # requiring verification and keeps telling invitees to watch for a
+        # verification email has recreated the defect #171 existed to fix, with
+        # the sign flipped.
+        self._require_verified_email = require_verified_email
         # Validated at construction, not at first send: a deployment that
         # enables email without saying how invitees get the desktop app should
         # fail at startup, not silently produce a message with a placeholder in
@@ -186,6 +194,7 @@ class ConfiguredInvitationEmailDelivery:
                 setup_url=setup_url,
                 organization_name=organization_name,
                 expires_at=expires_at,
+                require_verified_email=self._require_verified_email,
             )
         except (TypeError, ValueError):
             # Validation failures are deterministic and happen before a
@@ -373,6 +382,7 @@ def render_invitation_email(
     organization_name: str | None,
     expires_at: datetime,
     app_instructions: str,
+    require_verified_email: bool = True,
 ) -> InvitationEmailMessage:
     """Render the **approved onboarding copy** for one invitation (#93).
 
@@ -423,6 +433,7 @@ def render_invitation_email(
         recipient=recipient,
         expires_at=expires_at,
         app_instructions=app_instructions,
+        require_verified_email=require_verified_email,
     )
     return InvitationEmailMessage(recipient=recipient, subject=SUBJECT, text_body=InvitationSecret(body))
 

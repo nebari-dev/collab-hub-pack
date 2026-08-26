@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import boto3
@@ -507,3 +507,76 @@ def test_ses_provider_rejects_endpoint_shaping_and_invalid_configuration(field, 
 
     with pytest.raises(ValueError):
         SesInvitationEmailProvider(**kwargs)
+
+
+def test_the_delivery_copy_and_the_acceptance_rule_read_one_setting() -> None:
+    """**The coupling that must not come apart.**
+
+    Two independent switches -- one deciding what acceptance requires, one
+    deciding what the email says -- would eventually be set differently, and
+    the failure is silent: invitees told to watch for a verification email that
+    the deployment no longer sends, which is #171's defect with the sign
+    flipped. Asserted against the builder, because that is where a second
+    switch would be introduced.
+    """
+
+    from collab_hub_api.config import Config, build_invitation_email_delivery
+
+    def delivery_for(flag: bool):
+        return build_invitation_email_delivery(
+            Config.parse(
+                {
+                    "frames": {
+                        "invitations": {"require_verified_email": flag},
+                        "email": {
+                            "provider": "ses",
+                            "accept_url": "https://web.test/invite",
+                            "app_instructions": "Download it",
+                            "ses": {
+                                "sender_address": "no-reply@web.test",
+                                "region": "us-west-2",
+                                "configuration_set": "collab-invitations",
+                            },
+                        },
+                    }
+                }
+            )
+        )
+
+    assert delivery_for(True)._require_verified_email is True
+    assert delivery_for(False)._require_verified_email is False
+
+
+def test_a_relaxed_deployment_sends_copy_without_the_verification_step() -> None:
+    """End to end through the delivery seam, not just the renderer."""
+
+    from collab_hub_api.config import Config, build_invitation_email_delivery
+
+    delivery = build_invitation_email_delivery(
+        Config.parse(
+            {
+                "frames": {
+                    "invitations": {"require_verified_email": False},
+                    "email": {
+                        "provider": "ses",
+                        "accept_url": "https://web.test/invite",
+                        "app_instructions": "Download it",
+                        "ses": {
+                            "sender_address": "no-reply@web.test",
+                            "region": "us-west-2",
+                            "configuration_set": "collab-invitations",
+                        },
+                    },
+                }
+            }
+        )
+    )
+    message = render_invitation_email(
+        recipient="invitee@example.com",
+        setup_url="https://web.test/invite#token=" + "T" * 43,
+        organization_name=None,
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+        app_instructions="Download it",
+        require_verified_email=delivery._require_verified_email,
+    )
+    assert "verify" not in message.text_body.reveal().lower()

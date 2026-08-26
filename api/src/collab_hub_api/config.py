@@ -794,6 +794,9 @@ def build_invitation_email_delivery(
             provider,
             accept_url=email.accept_url,
             app_instructions=email.app_instructions,
+            # The same value the acceptance check reads, so the copy and the
+            # rule it describes cannot disagree.
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
     raise RuntimeError(f"Unsupported invitation email provider: {email.provider}")
 

@@ -85,6 +85,31 @@ leaves room for a couple of levels of quoting."""
 
 SUBJECT_PREFIX = "Subject: "
 
+CONDITIONAL_BLOCK = re.compile(
+    r"\[IF VERIFIED EMAIL REQUIRED\]\n(.*?)\[END IF\]\n",
+    re.DOTALL,
+)
+"""A span of copy that belongs in the message only under one configuration.
+
+**Why markers in the template rather than a second template file.** The
+divergence this module's history records -- two versions of the copy drifting
+apart -- came from composing a second version elsewhere. Two files would
+reintroduce exactly that, with 90% shared text and no mechanism keeping the
+shared part shared. So the variants live together, and what varies is marked.
+
+**Why not variant strings in Python.** The subject line is read out of the
+template file specifically so *all* of the copy lives in one reviewable place.
+Moving a paragraph into a Python literal would undo that for the one paragraph
+whose wording is most likely to be argued about.
+
+The marker spellings deliberately match the ``[UPPER CASE IN BRACKETS]``
+placeholder convention, which means :data:`UNRESOLVED_PLACEHOLDER` matches them
+too. That is the safety net rather than a coincidence: a body that reached the
+sending path with a marker still in it is refused, so forgetting to resolve a
+conditional fails the same way forgetting to substitute ``[NAME]`` does.
+"""
+
+
 UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z /]*\]")
 """Matches any ``[UPPER CASE]`` slot still present in a rendered body.
 
@@ -150,6 +175,21 @@ def format_expiry(expires_at: datetime) -> str:
     return expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
+    """Keep or drop each conditional span, leaving no markers behind.
+
+    The kept form is the block's own content, which carries its leading blank
+    line, so a paragraph that stays is separated from the one above it and a
+    paragraph that goes leaves no double blank behind. Both shapes are asserted
+    on the rendered body rather than reasoned about here -- whitespace is
+    exactly the kind of thing that reads correct and renders wrong.
+    """
+
+    if require_verified_email:
+        return CONDITIONAL_BLOCK.sub(lambda match: match.group(1), body)
+    return CONDITIONAL_BLOCK.sub("", body)
+
+
 def render_onboarding_email(
     *,
     link: str,
@@ -157,6 +197,7 @@ def render_onboarding_email(
     expires_at: datetime,
     name: str | None = None,
     app_instructions: str | None = None,
+    require_verified_email: bool = True,
 ) -> str:
     """The complete message body, personalised for one invitation.
 
@@ -201,7 +242,10 @@ def render_onboarding_email(
     if app_instructions is not None:
         substitutions.append((APP_INSTRUCTIONS_PLACEHOLDER, app_instructions))
 
-    body = _BODY_TEMPLATE
+    # Conditionals first, so a dropped block cannot leave a substitution
+    # stranded inside copy nobody will read -- and so the placeholder audit
+    # below sees only spans that survived.
+    body = _resolve_conditionals(_BODY_TEMPLATE, require_verified_email=require_verified_email)
     for placeholder, value in substitutions:
         body = body.replace(placeholder, value)
     return body
@@ -214,6 +258,7 @@ def render_for_automated_delivery(
     expires_at: datetime,
     app_instructions: str,
     name: str = AUTOMATED_GREETING_NAME,
+    require_verified_email: bool = True,
 ) -> str:
     """The body to **send**, with nothing left for a human to fill in (#93).
 
@@ -227,6 +272,13 @@ def render_for_automated_delivery(
     for **any** unresolved slot, not only the two known ones — a placeholder
     added to the copy later is caught by the same check, which is the whole
     reason it is a pattern rather than a list.
+
+    That net covers the conditional markers too, since they are spelled like
+    placeholders: a body that reached here with ``[IF VERIFIED EMAIL
+    REQUIRED]`` still in it is refused rather than sent. ``require_verified_email``
+    defaults to the strict value, matching the server-side check it describes,
+    so a caller that forgets to thread it produces copy that over-explains
+    rather than copy that lies.
     """
 
     if not app_instructions.strip():
@@ -241,6 +293,7 @@ def render_for_automated_delivery(
         expires_at=expires_at,
         name=name,
         app_instructions=app_instructions,
+        require_verified_email=require_verified_email,
     )
     unresolved = sorted(set(UNRESOLVED_PLACEHOLDER.findall(body)))
     if unresolved:

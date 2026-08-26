@@ -624,6 +624,16 @@ the check costs nothing, and the invitee never sees a verification step.
 Relaxing it there buys nothing and gives up the forwarded-mail protection for
 free.
 
+**The invitation email follows this setting.** The onboarding copy's
+verification instruction is conditional on the same value, so a deployment that
+relaxes the check stops telling invitees to watch for a verification email. That
+is one setting rather than two on purpose: two switches would eventually be set
+differently, and the failure is silent — people waiting for mail that is no
+longer sent, which is the defect
+[collab-hub-pack#171](https://github.com/nebari-dev/collab-hub-pack/pull/171)
+fixed, with the sign flipped. A test asserts the copy and the rule read one
+value.
+
 #### The invited address must match exactly
 
 The invitee has to sign in with the **exact** address the invitation was sent
