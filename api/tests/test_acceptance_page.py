@@ -1884,3 +1884,42 @@ async def test_live_an_expired_invitation_renders_its_own_state(live_app, idp, l
     assert response.status_code == 410
     assert response.json() == {"outcome": "invitation_expired"}
     assert datetime.now(tz=timezone.utc) - issued.invitation.created_at < timedelta(minutes=5)
+
+
+def test_the_not_verified_copy_does_not_promise_mail_a_relaxed_deployment_never_sends() -> None:
+    """Review finding: this change made the invitation email's copy
+    configuration-aware and left the page's alone.
+
+    On a deployment with `requireVerifiedEmail: false`, `email_not_verified` is
+    reached only when the token carries no usable address -- not because an
+    address is unverified. The strict copy tells the reader to "follow the
+    verification link that was sent to your mailbox", and no such mail exists
+    there, so the page would send people looking for something that was never
+    sent. On the surface they are actually looking at.
+    """
+
+    strict = acceptance_page(require_verified_email=True)
+    relaxed = acceptance_page(require_verified_email=False)
+
+    assert "verification link that was sent" in strict
+    assert "verification link that was sent" not in relaxed
+    assert "could not read an email address" in relaxed
+
+
+def test_both_modes_render_exactly_the_same_states() -> None:
+    """Copy varies; the wire contract does not.
+
+    If a mode ever added or dropped a state, the client script and the service's
+    outcome mapping would disagree with the page -- so this pins that the
+    override table is a copy table and nothing more.
+    """
+
+    import re as _re
+
+    def states(html: str) -> set[str]:
+        return set(_re.findall(r'data-state="([^"]+)"', html))
+
+    assert states(acceptance_page(require_verified_email=True)) == states(
+        acceptance_page(require_verified_email=False)
+    )
+    assert states(acceptance_page(require_verified_email=True)) == set(PAGE_STATES)

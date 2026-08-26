@@ -274,6 +274,7 @@ def _carriers_of_the_secret() -> dict[str, object]:
             # app, and the renderer refuses to leave a placeholder in a message
             # nobody will proof-read.
             app_instructions="Download from https://example.test/download",
+            require_verified_email=True,
         ),
         # The wrapper itself: everything above inherits its behaviour, so it
         # is the one that actually has to hold.
@@ -1460,7 +1461,9 @@ def test_relaxing_verification_does_not_relax_the_address_match():
     # And with the strict setting the same right-address claim is refused, so
     # the setting is what decides rather than the address.
     with pytest.raises(EmailNotVerifiedError):
-        invitations_module._evaluate_acceptance(invitation, now, INVITEE, INVITED_EMAIL, False)
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=True
+        )
 
 
 def test_a_dead_token_is_still_dead_however_verification_is_configured():
@@ -2498,6 +2501,82 @@ def test_live_a_refused_acceptance_owes_nothing(service, live_db):
         _accept(service, secret=issued.raw_secret.reveal(), service_groups=["/llm"])
 
     assert _owed_rows(live_db) == []
+
+
+@live_postgres
+def test_live_a_relaxed_service_accepts_an_unverified_matching_account(live_db):
+    """The production chain, which the first version of this change never tested.
+
+    Review found that deleting **both** `require_verified` threads in
+    `_accept_once` left the suite green: the helper was tested, the private
+    attribute was read, and the path between them was not exercised at all.
+    The failure that hides behind that is total -- a deployment sets
+    `requireVerifiedEmail: false`, invitees get copy saying no verification is
+    needed, and every acceptance is still refused. Because the operator has
+    also flipped the realm by then, no account can ever verify, so every
+    invitation becomes unredeemable.
+
+    So this goes through the real service, built the way configuration builds
+    it, and asserts the membership landed.
+    """
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    outcome = relaxed.accept(
+        user_id=INVITEE,
+        display=display(INVITED_EMAIL, verified=False),
+        token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+        claim_email=INVITED_EMAIL,
+        email_verified=False,
+    )
+
+    assert outcome.org_id == ORG
+    assert _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_strict_service_refuses_the_same_unverified_account(live_db):
+    """The other half of the pair: same account, same token, strict service.
+
+    Without this, the test above would pass on a build that ignored the setting
+    entirely -- which is precisely the build review produced by deleting the
+    threads.
+    """
+
+    strict = invitations_module.PostgresInvitationService(live_db)
+    issued = strict.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(EmailNotVerifiedError):
+        strict.accept(
+            user_id=INVITEE,
+            display=display(INVITED_EMAIL, verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email=INVITED_EMAIL,
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_relaxed_service_still_refuses_a_mismatched_address(live_db):
+    """Relaxing verification must not relax the match, asserted through the
+    service rather than only through the helper."""
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        relaxed.accept(
+            user_id=INVITEE,
+            display=display("someone-else@example.com", verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email="someone-else@example.com",
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
 
 
 @live_postgres

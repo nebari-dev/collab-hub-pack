@@ -71,11 +71,20 @@ action alone.
 
 Address matching (Gate B, ratified 2026-08-03; amended on #157)
 ---------------------------------------------------------------
-Acceptance requires the caller's OIDC ``email_verified`` claim to be boolean
-``true`` and their ``email`` claim to equal the invited address **but for
-ASCII case**. Gate B chose exact match over canonicalization, and that still
-holds for everything except case: there is no plus-tag stripping, no
+Acceptance requires the caller's ``email`` claim to equal the invited address
+**but for ASCII case**. Gate B chose exact match over canonicalization, and that
+still holds for everything except case: there is no plus-tag stripping, no
 dot-folding, no provider-specific rule, and no canonical column.
+
+Gate B's *other* half — that the caller's OIDC ``email_verified`` claim is
+boolean ``true`` — is a deployment setting since #45:
+``frames.invitations.require_verified_email``, default on. Where it is off, the
+invitation token stands in for the proof of mailbox control and **the address
+match above still applies unchanged**. This paragraph exists because the
+unconditional version of it was the canonical description of Gate B, and a
+reader reasoning from it would conclude a claim with ``email_verified: false``
+can never reach :func:`emails_match` — and might remove the ``require_verified``
+plumbing as dead code.
 
 The original rule was byte-exact, and it was wrong for one specific reason.
 **Keycloak lowercases the email on every account it holds**, so the claim it
@@ -1395,7 +1404,9 @@ class PostgresInvitationService:
         # asking the question again here would either be a no-op or would let a
         # setting change mid-acceptance. The address match still runs, against
         # the locked row's email.
-        replay = _evaluate_acceptance(invitation, locked["server_now"], user_id, verified_email, True)
+        replay = _evaluate_acceptance(
+            invitation, locked["server_now"], user_id, verified_email, True, require_verified=True
+        )
         if replay is not None:
             # Raced by this same login's own duplicate submit. The right
             # answer is the same success, and no second audit row.
@@ -1646,9 +1657,16 @@ def _evaluate_acceptance(
     claim_email: object,
     email_verified: object,
     *,
-    require_verified: bool = True,
+    require_verified: bool,
 ) -> InvitationAcceptance | None:
     """Run the accept-time checks; return a replay outcome or ``None``.
+
+    ``require_verified`` has **no default**, deliberately. It is an internal
+    hop, and a default here is the hazard rather than the safety property: a
+    caller that dropped the keyword would get working code that quietly ignored
+    the deployment's choice, which is exactly the defect review found in the
+    first version of this change (deleting both threads left the suite green).
+    Required, it is a ``TypeError`` at the first call instead.
 
     Raises the terminal state for every failure. The order is fixed and
     load-bearing: the token's own state is decided before anything about the

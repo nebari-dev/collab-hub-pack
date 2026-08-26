@@ -222,7 +222,7 @@ def test_automated_delivery_refuses_a_placeholder_added_to_the_copy_later() -> N
 
 
 # ---------------------------------------------------------------------------
-# Copy that follows the configuration (#190)
+# Copy that follows the configuration (#45)
 # ---------------------------------------------------------------------------
 
 
@@ -303,3 +303,49 @@ def test_the_strict_variant_is_what_a_caller_gets_by_default() -> None:
         app_instructions="Download it from https://example.test/collab",
     )
     assert default == _rendered_with(require_verified_email=True)
+
+
+def test_a_marker_the_pattern_cannot_match_names_itself(monkeypatch) -> None:
+    """CRLF or a trailing space must not turn resolution into a silent no-op.
+
+    Without this guard the failure surfaces far away and unrecognisably: the
+    placeholder net raises, `deliver` catches it, and every invitation email
+    stops sending under `invalid_invitation_email` -- an error code pointing at
+    recipient and URL validation rather than at the template. `_load_template`
+    is CRLF-tolerant, so the conditional narrowed an existing tolerance.
+    """
+
+    import collab_hub_api.web.onboarding_email as module
+
+    crlf = module._BODY_TEMPLATE.replace("[IF VERIFIED EMAIL REQUIRED]\n", "[IF VERIFIED EMAIL REQUIRED]\r\n")
+    monkeypatch.setattr(module, "_BODY_TEMPLATE", crlf)
+
+    for flag in (True, False):
+        with pytest.raises(ValueError, match="conditional marker survived"):
+            render_onboarding_email(
+                link="https://web.test/invite#token=T",
+                recipient="invitee@example.com",
+                expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+                name="Ada",
+                app_instructions="Download it",
+                require_verified_email=flag,
+            )
+
+
+def test_a_trailing_space_after_a_marker_is_caught_too(monkeypatch) -> None:
+    """The copy-edit version of the same hazard."""
+
+    import collab_hub_api.web.onboarding_email as module
+
+    spaced = module._BODY_TEMPLATE.replace("[END IF]\n", "[END IF] \n")
+    monkeypatch.setattr(module, "_BODY_TEMPLATE", spaced)
+
+    with pytest.raises(ValueError, match="conditional marker survived"):
+        render_onboarding_email(
+            link="https://web.test/invite#token=T",
+            recipient="invitee@example.com",
+            expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+            name="Ada",
+            app_instructions="Download it",
+            require_verified_email=True,
+        )

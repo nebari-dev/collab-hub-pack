@@ -608,15 +608,35 @@ member list rather than only an access one.
 verification:
 
 ```sh
-kubectl -n keycloak exec keycloak-keycloakx-0 -- /opt/keycloak/bin/kcadm.sh \
-  update realms/nebari -s verifyEmail=false
+kubectl exec -i -n keycloak keycloak-keycloakx-0 -- bash -s <<'REMOTE'
+/opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 \
+  --realm master --user admin --password "$KEYCLOAK_ADMIN_PASSWORD" >/dev/null 2>&1
+/opt/keycloak/bin/kcadm.sh update realms/nebari -s verifyEmail=false
+/opt/keycloak/bin/kcadm.sh get realms/nebari --fields verifyEmail
+REMOTE
 ```
+
+The `config credentials` line is not optional: each `exec` is a fresh session
+with no `~/.keycloak/kcadm.config`, so a bare `kcadm.sh update` exits with "No
+server or realm configured" and **changes nothing**. Since the server setting
+ships first, an operator who missed that would believe both halves were done
+while Keycloak still refuses tokens to unverified accounts — which presents
+exactly as "nothing appears to happen". Read the last line back rather than
+trusting the exit status.
 
 Without that, Keycloak will not issue a token to an unverified account at all,
 so the relaxed check is never reached and nothing changes. **Order matters:**
 ship the server setting first. Flipping the realm first leaves accounts
 unverified while the server still demands verification, which refuses every
 acceptance.
+
+**Invitations already in flight carry the copy for the previous setting.**
+Anything sent in the preceding 48 hours (the TTL) tells its reader to expect a
+verification email, and after the realm flip that mail is no longer sent — so
+those invitees register, wait, and stop. That is the stranding this change
+exists to prevent, arriving through the transition itself. Either wait out the
+TTL before flipping the realm, or revoke and reissue the live invitations
+afterwards so they carry the new copy.
 
 **When to leave it `true`.** Any deployment whose invitees arrive through an
 identity provider with `trustEmail` — those accounts are verified on creation,
@@ -629,20 +649,27 @@ verification instruction is conditional on the same value, so a deployment that
 relaxes the check stops telling invitees to watch for a verification email. That
 is one setting rather than two on purpose: two switches would eventually be set
 differently, and the failure is silent — people waiting for mail that is no
-longer sent, which is the defect
-[collab-hub-pack#171](https://github.com/nebari-dev/collab-hub-pack/pull/171)
-fixed, with the sign flipped. A test asserts the copy and the rule read one
+longer sent: the copy once promised a
+verification step the deployment could not deliver, and this is the same
+defect with the sign flipped. A test asserts the copy and the rule read one
 value.
 
 #### The invited address must match exactly
 
-The invitee has to sign in with the **exact** address the invitation was sent
-to — same spelling, same case — and their IdP must assert `email_verified`
-as a boolean `true`. There is no canonicalization: `Alice@example.com` and
-`alice@example.com` are different invitations to this server (Gate B,
-ratified 2026-08-03). Type the address the way the IdP will report it. A
+The invitee has to sign in with the address the invitation was sent to. The
+comparison folds **ASCII case and nothing else** (the amendment on
+[#157](https://github.com/nebari-dev/collab-hub-pack/issues/157)), so
+`Alice@example.com` and `alice@example.com` are the same invitation, while
+plus-tags and dots are **not** folded: `a+tag@example.com` is a different
+address from `a@example.com`. There is no provider ruleset beyond that. A
 mismatch does **not** consume the invitation, so the fix is for the right
 mailbox to accept, or for you to revoke and reissue.
+
+Whether the IdP must also assert `email_verified` as a boolean `true` depends
+on `frames.invitations.requireVerifiedEmail` — see
+[Whether a verified address is also required](#whether-a-verified-address-is-also-required)
+above. The address match described here applies either way and is not
+configurable.
 
 The match is against the claim presented *at acceptance time*. If someone
 changes their verified address after being invited, the old invitation stops

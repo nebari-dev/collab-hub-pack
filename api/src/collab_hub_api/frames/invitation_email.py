@@ -382,7 +382,7 @@ def render_invitation_email(
     organization_name: str | None,
     expires_at: datetime,
     app_instructions: str,
-    require_verified_email: bool = True,
+    require_verified_email: bool,
 ) -> InvitationEmailMessage:
     """Render the **approved onboarding copy** for one invitation (#93).
 

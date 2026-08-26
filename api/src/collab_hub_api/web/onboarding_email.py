@@ -85,6 +85,14 @@ leaves room for a couple of levels of quoting."""
 
 SUBJECT_PREFIX = "Subject: "
 
+CONDITIONAL_MARKER = re.compile(r"\[(?:IF [A-Z ]+|END IF)\]")
+"""Any conditional marker, for the post-resolution assertion.
+
+Separate from :data:`CONDITIONAL_BLOCK` because it has to match a marker the
+block pattern *failed* to match -- which is the whole failure mode.
+"""
+
+
 CONDITIONAL_BLOCK = re.compile(
     r"\[IF VERIFIED EMAIL REQUIRED\]\n(.*?)\[END IF\]\n",
     re.DOTALL,
@@ -185,9 +193,21 @@ def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
     exactly the kind of thing that reads correct and renders wrong.
     """
 
-    if require_verified_email:
-        return CONDITIONAL_BLOCK.sub(lambda match: match.group(1), body)
-    return CONDITIONAL_BLOCK.sub("", body)
+    resolved = CONDITIONAL_BLOCK.sub(r"\1" if require_verified_email else "", body)
+    if CONDITIONAL_MARKER.search(resolved):
+        # The regex requires a newline immediately after each marker, so a CRLF
+        # checkout or a trailing space left by a copy edit makes `sub` a no-op
+        # and leaves both markers standing. Without this, the failure surfaces
+        # far away and unrecognisably: the placeholder net raises, `deliver`
+        # catches it, and every invitation email stops sending under
+        # `error_code="invalid_invitation_email"` -- which points at recipient
+        # and URL validation, not at the template. `_load_template` above is
+        # CRLF-tolerant, so this would have narrowed an existing tolerance.
+        raise ValueError(
+            f"{TEMPLATE_FILENAME}: a conditional marker survived resolution. The markers must sit"
+            " alone on their own lines with Unix line endings and no trailing whitespace."
+        )
+    return resolved
 
 
 def render_onboarding_email(

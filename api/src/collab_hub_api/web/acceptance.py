@@ -503,6 +503,35 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
 )
 
+RELAXED_SECTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
+    OUTCOME_EMAIL_NOT_VERIFIED: (
+        "We could not read an email address for this account",
+        (
+            "An invitation can only be accepted for the address it names, so we"
+            " have to be able to read an address from the account you signed in"
+            " with — and this sign-in did not carry one.",
+            "That usually means the account has no email address set. Ask"
+            " whoever invited you for help. Your invitation has not been used.",
+        ),
+    ),
+}
+"""Copy that differs on a deployment which does not require a verified address.
+
+Only the wording changes: the state names, and therefore the wire contract and
+:data:`PAGE_STATES`, are identical in both modes. That is what keeps this a
+copy table rather than a second page.
+
+**Why this exists.** With ``requireVerifiedEmail`` false, ``email_not_verified``
+is no longer reached because an address is unverified — it is reached only when
+the token carries no usable address at all. The strict copy tells the reader to
+"follow the verification link that was sent to your mailbox", and on such a
+deployment no such mail is ever sent, so the page would be sending people to
+look for something that does not exist. Review caught that this change made the
+*invitation email* configuration-aware and left the page — the surface the
+invitee is actually looking at — asserting the old flow.
+"""
+
+
 PAGE_STATES: tuple[str, ...] = tuple(name for name, _, _ in _SECTIONS)
 """Every state the page can render, in document order.
 
@@ -559,7 +588,13 @@ def signin_link(root_path: str, *, renew: bool = False, register: bool = False) 
     return f"{root_path}/web/signin?{urlencode(params)}"
 
 
-def acceptance_page(*, root_path: str = "", session=None, claims_current: bool = False) -> str:
+def acceptance_page(
+    *,
+    root_path: str = "",
+    session=None,
+    claims_current: bool = False,
+    require_verified_email: bool = True,
+) -> str:
     """Render the acceptance page for this request.
 
     The server knows two things the script does not: whether this browser
@@ -620,8 +655,11 @@ def acceptance_page(*, root_path: str = "", session=None, claims_current: bool =
         CLIENT_STATE_READY: statement + button,
         OUTCOME_REAUTHENTICATION_REQUIRED: renew,
     }
+    # Copy only: `RELAXED_SECTIONS` never adds or removes a state, so the wire
+    # contract and PAGE_STATES are the same either way.
+    overrides = {} if require_verified_email else RELAXED_SECTIONS
     sections = "".join(
-        _section(name, heading, paragraphs, extras.get(name, ""))
+        _section(name, *overrides.get(name, (heading, paragraphs)), extras.get(name, ""))
         for name, heading, paragraphs in _SECTIONS
     )
     noscript = (

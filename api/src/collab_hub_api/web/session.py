@@ -82,6 +82,18 @@ permanent (one organization per login, no change afterwards). An assertion up
 to a whole session old could therefore bind a membership on a verification the
 IdP had already withdrawn.
 
+**Where verification is not required, half of this reasoning stops applying and
+the gate stays.** On a deployment with
+``frames.invitations.require_verified_email`` off (#45), acceptance no longer
+reads ``email_verified`` as an authorization input at all, so nothing can bind a
+membership on a withdrawn verification. What still matters is the ``email``
+claim's currency: it *is* an authorization input in both modes -- Gate B's match
+is not configurable -- and an address can be reassigned at the IdP just as a
+verification can be revoked. So the bound is unchanged and its stricter
+justification is simply unused there. Left as it is deliberately: a re-auth
+round trip is a small cost, and loosening a window because one of two reasons
+went away is how a bound stops meaning anything.
+
 This surface cannot read the IdP at will — it holds no access or refresh
 token, deliberately (``web.oidc``), and acquiring one to fix this would be a
 larger regression than the problem. What it can do is re-run the
