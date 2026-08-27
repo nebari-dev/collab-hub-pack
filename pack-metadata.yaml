@@ -1,0 +1,11 @@
+name: collab-hub-pack
+display_name: Collab Hub Pack
+level: experimental
+owner: ns-mkusper
+deprecated: false
+product_owner: null
+description: Collab Hub API pack for Frames and Hub-facing intelligence services.
+nebariapp_integration: full
+scope:
+  standalone-supported: yes
+demo_notes: "Draft Frames API integration; install locally through the Helm chart for review."
