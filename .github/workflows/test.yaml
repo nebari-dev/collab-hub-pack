@@ -25,4 +25,6 @@ jobs:
 
       - name: Run tests
         working-directory: api
-        run: uv run --group test --frozen pytest
+        # Not --frozen: the rename changes the project's own package entry, so
+        # uv reconciles uv.lock's project record on sync. Deps stay pinned.
+        run: uv run --group test pytest
