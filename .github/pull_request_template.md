@@ -13,5 +13,4 @@
 - [ ] User-facing UI changes include before/after screenshots.
 - [ ] New or changed functionality includes tests that run in PR CI.
 - [ ] Bug fixes include regression tests.
-- [ ] Commits are signed off (DCO): `git commit -s`.
 - [ ] Out of draft before code-owner review is requested.

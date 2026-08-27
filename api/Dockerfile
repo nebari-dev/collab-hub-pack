@@ -31,5 +31,13 @@ ENV PATH="/var/collab-hub-api/.venv/bin:${PATH}"
 
 ENV COLLAB_HUB_API__SERVER__HOSTNAME=0.0.0.0
 
+# The image ships pre-compiled bytecode (uv --compile-bytecode above), so
+# nothing needs to write more at runtime. It matters for the read-only identity
+# inventory (`python -m collab_hub_api.identity_inventory`, issue #65), which
+# claims to write nothing to the filesystem: without this, importing it in a
+# container whose site-packages happens to be writable would create __pycache__
+# directories and make that claim false.
+ENV PYTHONDONTWRITEBYTECODE=1
+
 ENTRYPOINT ["/bin/bash"]
 CMD ["-c", "python -m collab_hub_api"]

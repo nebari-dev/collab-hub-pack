@@ -1,0 +1,23 @@
+{
+  "_comment": "Keycloak partial-import for the GitHub identity provider used by the Collab GitHub connector. Import into the hub's realm (Realm settings -> Action -> Partial import, or kcadm). Fill in the two REPLACE_ values from the GitHub OAuth App before importing; prefer injecting clientSecret from your secret store rather than committing it. Alias MUST stay 'github' (apollo-desktop's GitHubConnectorLogin hardcodes it). See docs/github-connector.md.",
+  "identityProviders": [
+    {
+      "alias": "github",
+      "displayName": "GitHub",
+      "providerId": "github",
+      "enabled": true,
+      "storeToken": true,
+      "addReadTokenRoleOnCreate": true,
+      "trustEmail": false,
+      "linkOnly": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "clientId": "REPLACE_WITH_GITHUB_OAUTH_APP_CLIENT_ID",
+        "clientSecret": "REPLACE_WITH_GITHUB_OAUTH_APP_CLIENT_SECRET",
+        "defaultScope": "user:email repo read:org read:project",
+        "hideOnLoginPage": "true",
+        "syncMode": "IMPORT"
+      }
+    }
+  ]
+}

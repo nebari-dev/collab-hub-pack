@@ -9,6 +9,7 @@ import httpx
 from httpx import ASGITransport, AsyncClient, Response
 
 from collab_hub_api.config import Config
+from collab_hub_api.connectors.calendar_client import _event_metadata
 from collab_hub_api.connectors.connector_text import sanitize_connector_text
 from collab_hub_api.connectors.gmail_client import GmailClient, _recipient_headers
 from collab_hub_api.connectors.models import CalendarSearchRequest
@@ -296,6 +297,23 @@ async def test_google_calendar_status_search_and_read_normalize_events(tmp_path,
                             "description": "Assign owners at https://unsafe.example.test/plan.",
                             "start": {"dateTime": "2026-07-10T14:00:00-04:00"},
                             "end": {"dateTime": "2026-07-10T14:30:00-04:00"},
+                            "attendees": [
+                                {
+                                    "displayName": "Alice",
+                                    "email": "alice@example.com",
+                                    "responseStatus": "accepted",
+                                    "organizer": True,
+                                    "self": True,
+                                },
+                                {
+                                    "displayName": "Bob",
+                                    "email": "bob@example.com",
+                                    "responseStatus": "tentative",
+                                    "optional": True,
+                                },
+                            ],
+                            "recurringEventId": "series-1",
+                            "originalStartTime": {"dateTime": "2026-07-03T14:00:00-04:00"},
                         },
                         {
                             "id": "event-2",
@@ -334,13 +352,25 @@ async def test_google_calendar_status_search_and_read_normalize_events(tmp_path,
     assert status_response.json()["scopes"] == ["https://www.googleapis.com/auth/calendar.readonly"]
     assert search_response.status_code == 200
     assert [item["id"] for item in search_response.json()["events"]] == ["event-1", "event-2"]
-    assert search_response.json()["events"][0]["description"] == "Assign owners at [link]."
+    search_event = search_response.json()["events"][0]
+    assert search_event["description"] == "Assign owners at [link]."
+    assert search_event["attendees"] == []
+    assert [attendee["response_status"] for attendee in search_event["attendee_details"]] == [
+        "accepted",
+        "tentative",
+    ]
+    assert search_event["attendee_details"][0]["self"] is True
+    assert search_event["attendee_details"][0]["organizer"] is True
+    assert search_event["attendee_details"][1]["optional"] is True
+    assert search_event["recurring_event_id"] == "series-1"
+    assert search_event["original_start"] == "2026-07-03T14:00:00-04:00"
     assert search_response.json()["events"][1]["all_day"] is True
     assert search_response.json()["next_cursor"] == ""
     assert read_response.status_code == 200
     assert read_response.json()["event"]["description"] == "Review every"
     assert read_response.json()["truncated"] is True
     event_detail = read_response.json()["event"]
+    assert event_detail["attendees"]
     assert event_detail["attendee_details"][0]["response_status"] == "accepted"
     assert event_detail["recurring_event_id"] == "series-1"
     assert event_detail["original_start"] == "2026-07-03T14:00:00-04:00"
@@ -358,6 +388,62 @@ async def test_google_calendar_status_search_and_read_normalize_events(tmp_path,
     assert "google-token-alice" not in status_response.text + search_response.text + read_response.text
     assert seen_authorization
     assert all(value == "Bearer google-token-alice" for value in seen_authorization)
+
+
+def test_calendar_search_projection_removes_only_attendee_aliases() -> None:
+    attendees = [
+        {
+            "displayName": f"Person {index}",
+            "email": f"person-{index}@example.com",
+            "responseStatus": "accepted" if index % 2 == 0 else "tentative",
+            "optional": index % 3 == 0,
+            "organizer": index == 0,
+            "self": index == 1,
+        }
+        for index in range(50)
+    ]
+    payload = {
+        "id": "recurring-event",
+        "summary": "Large recurring meeting",
+        "description": "Agenda",
+        "start": {"dateTime": "2026-07-10T14:00:00-04:00"},
+        "end": {"dateTime": "2026-07-10T15:00:00-04:00"},
+        "attendees": attendees,
+        "recurringEventId": "series-1",
+        "originalStartTime": {"dateTime": "2026-07-03T14:00:00-04:00"},
+        "attachments": [
+            {
+                "title": "Notes",
+                "mimeType": "application/vnd.google-apps.document",
+                "fileId": "notes-1",
+            }
+        ],
+    }
+
+    full_event, full_truncated = _event_metadata(
+        payload,
+        calendar_id="primary",
+        calendar_name="Work",
+        max_description_chars=2000,
+    )
+    search_event, search_truncated = _event_metadata(
+        payload,
+        calendar_id="primary",
+        calendar_name="Work",
+        max_description_chars=2000,
+        include_attendee_aliases=False,
+    )
+
+    assert len(full_event.attendees) == 50
+    assert search_event.attendees == []
+    assert search_event.attendee_details == full_event.attendee_details
+    assert search_event.attendee_details[1].self is True
+    assert search_event.recurring_event_id == full_event.recurring_event_id
+    assert search_event.original_start == full_event.original_start
+    assert search_event.attachments == full_event.attachments
+    assert search_event.model_copy(update={"attendees": full_event.attendees}) == full_event
+    assert len(search_event.model_dump_json()) < len(full_event.model_dump_json())
+    assert search_truncated is full_truncated is False
 
 
 async def test_google_connector_status_requires_new_service_scope(tmp_path, monkeypatch):
@@ -1036,6 +1122,8 @@ def test_google_workspace_openapi_contract_exposes_pagination_without_calendar_u
     assert "cursor" in schemas["CalendarSearchRequest"]["properties"]
     assert "next_cursor" in schemas["CalendarSearchResponse"]["properties"]
     assert "html_url" not in schemas["CalendarEventMetadata"]["properties"]
+    assert "attendees" in schemas["CalendarEventMetadata"]["properties"]
+    assert "attendee_details" in schemas["CalendarEventMetadata"]["properties"]
     assert "web_url" not in schemas["DriveFileMetadata"]["properties"]
     assert "time_zone" in schemas["GmailSearchRequest"]["properties"]
     assert "time_zone" in schemas["CalendarSearchRequest"]["properties"]

@@ -22,6 +22,16 @@ requests with an `Authorization` header.
 
 ## Access model
 
+Owners, readers, and `created_by` hold **identity strings**, and which claim
+that string comes from is a per-deployment setting
+(`frames.auth.identityClaim`; see
+[frames-operations.md](frames-operations.md#acl-identity-framesauthidentityclaim)).
+Deployments pinned to the OIDC `sub` reject owner/reader grants that name an
+email address with a **422** rather than storing a grant that would match no
+one; other subject formats are opaque and accepted. Display name and email are
+carried alongside the caller's identity for presentation only and are never
+principals.
+
 Every Frame is an owned, access-controlled resource. Four concepts, evaluated
 in order — `published` is the master gate:
 

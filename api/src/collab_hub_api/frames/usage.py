@@ -19,6 +19,7 @@ while event recording and all reads raise ``UsageUnavailableError`` (→ 503).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -26,12 +27,22 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from .best_effort import BestEffortWriter
 from .history import cap_detail
+
+usage_logger = logging.getLogger("frames_server.usage")
 
 # Minimum seconds between persisted ``last_seen`` refreshes for one caller.
 # Auth runs on every request; without a throttle each request would cost an
 # extra Postgres write. First sight (or a changed email) always writes.
 SEEN_WRITE_INTERVAL_SECONDS = 300.0
+
+# Backoff after a failed seen-user write. Retrying on the very next request
+# would turn a database outage or a saturated pool into a per-request retry
+# storm on the auth path, so failures back off exponentially from
+# ``SEEN_RETRY_BACKOFF_SECONDS`` up to the ordinary throttle window.
+SEEN_RETRY_BACKOFF_SECONDS = 1.0
+SEEN_RETRY_BACKOFF_MAX_SECONDS = SEEN_WRITE_INTERVAL_SECONDS
 
 
 class UsageUnavailableError(RuntimeError):
@@ -63,6 +74,13 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _seen_retry_delay(failures: int) -> float:
+    """Exponential backoff for a failed seen-user write, capped at the throttle window."""
+
+    delay = SEEN_RETRY_BACKOFF_SECONDS * (2 ** (failures - 1))
+    return min(delay, SEEN_RETRY_BACKOFF_MAX_SECONDS)
+
+
 class UsageStore(ABC):
     """Tenant-scoped roster of authenticated users plus client usage events."""
 
@@ -76,11 +94,17 @@ class UsageStore(ABC):
     ) -> None:
         """Upsert one authenticated caller into the seen-user roster.
 
-        Called from the auth path, so implementations must stay cheap and may
-        throttle repeat writes for the same caller.
+        Called from the auth path, so implementations must stay cheap, may
+        throttle repeat writes for the same caller, and must not make the
+        caller wait on a database.
         """
 
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release anything the store holds. Safe to call on any backend."""
+
+        return None
 
     @abstractmethod
     def record_event(
@@ -282,25 +306,30 @@ class PostgresUsageStore(UsageStore):
     """Postgres-backed usage store for production-style deployments.
 
     Mirrors ``PostgresFrameHistoryStore``: the database lives outside the pack;
-    the pack only needs a connection URL and creates its tables if missing.
-    ``record_user_seen`` throttles repeat writes per caller so the auth path
-    stays cheap under request bursts.
+    the pack only needs a pooled database handle (``db.PostgresDatabase``) and
+    creates its tables if missing. ``record_user_seen`` runs inside auth, so it
+    never touches the database on the calling thread: it throttles per caller,
+    hands the write to a bounded background writer, and backs off after
+    failures instead of retrying on the next request.
     """
 
-    def __init__(self, database_url: str, auto_migrate: bool = False):
+    def __init__(self, db, auto_migrate: bool = False, writer: BestEffortWriter | None = None):
         try:
             import psycopg
-            from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("PostgresUsageStore requires psycopg") from exc
 
-        self.database_url = database_url
+        self.db = db
+        self.database_url = db.database_url
         self.psycopg = psycopg
-        self.dict_row = dict_row
+        self._writer = writer if writer is not None else BestEffortWriter(name="usage-seen-write")
         self._seen_lock = threading.Lock()
-        # (org, workspace, user, email) -> monotonic seconds of the last write.
-        # Keying on the email means a changed claim writes through immediately.
-        self._seen_writes: dict[tuple[str, str, str, str | None], float] = {}
+        # (org, workspace, user, email) -> monotonic deadline before which the
+        # next write is skipped. Keying on the email means a changed claim
+        # writes through immediately.
+        self._seen_next_write: dict[tuple[str, str, str, str | None], float] = {}
+        # Consecutive failures per caller, driving the retry backoff.
+        self._seen_failures: dict[tuple[str, str, str, str | None], int] = {}
         if auto_migrate:
             self._ensure_schema()
 
@@ -311,17 +340,34 @@ class PostgresUsageStore(UsageStore):
         user: str,
         email: str | None,
     ) -> None:
-        """Upsert one caller's roster row, at most once per throttle window."""
+        """Queue one caller's roster upsert, at most once per throttle window.
+
+        Returns without waiting on the database. Auth runs this for every
+        authenticated HTTP request and, through the synchronous authenticator
+        the async MCP middleware calls, for every MCP one — so the only work it
+        may do on the caller's thread is the in-memory throttle bookkeeping.
+        """
 
         key = (org_id, workspace_id, user, email)
         now = time.monotonic()
         with self._seen_lock:
-            last = self._seen_writes.get(key)
-            if last is not None and now - last < SEEN_WRITE_INTERVAL_SECONDS:
+            next_write = self._seen_next_write.get(key)
+            if next_write is not None and now < next_write:
                 return
-            self._seen_writes[key] = now
+            # Claim the window before leaving the lock so concurrent callers
+            # for the same identity do not stampede the pool.
+            self._seen_next_write[key] = now + SEEN_WRITE_INTERVAL_SECONDS
+        if not self._writer.submit(lambda: self._write_user_seen(key)):
+            # The writer is saturated or shutting down. Dropping is the point of
+            # a best-effort write; the caller is simply retried after a backoff.
+            self._record_seen_failure(key, reason="dropped")
+
+    def _write_user_seen(self, key: tuple[str, str, str, str | None]) -> None:
+        """Perform one roster upsert. Runs on a background writer thread."""
+
+        org_id, workspace_id, user, email = key
         try:
-            with self._connect() as conn:
+            with self._connect_best_effort() as conn:
                 conn.execute(
                     """
                     INSERT INTO frames_server_usage_users (
@@ -336,11 +382,36 @@ class PostgresUsageStore(UsageStore):
                     (org_id, workspace_id, user, email),
                 )
         except Exception:
-            # Allow an immediate retry on the next request instead of silently
-            # skipping this caller for a whole throttle window.
+            self._record_seen_failure(key, reason="failed")
+        else:
             with self._seen_lock:
-                self._seen_writes.pop(key, None)
-            raise
+                self._seen_failures.pop(key, None)
+
+    def _record_seen_failure(self, key: tuple[str, str, str, str | None], reason: str) -> None:
+        """Back the caller off after a write that did not land.
+
+        Retried sooner than the ordinary throttle window, but never on the very
+        next request: an outage or a saturated pool would otherwise have every
+        authenticated request queue the same doomed write.
+        """
+
+        from .observability import USAGE_WRITE_FAILURES
+
+        with self._seen_lock:
+            failures = self._seen_failures.get(key, 0) + 1
+            self._seen_failures[key] = failures
+            self._seen_next_write[key] = time.monotonic() + _seen_retry_delay(failures)
+        USAGE_WRITE_FAILURES.labels(kind=f"user_seen_{reason}").inc()
+        usage_logger.warning(
+            "usage_user_seen_write_%s",
+            reason,
+            extra={"user": key[2], "consecutive_failures": failures},
+        )
+
+    def close(self) -> None:
+        """Stop the background writer, bounded; queued accounting is dropped."""
+
+        self._writer.close()
 
     def record_event(
         self,
@@ -465,4 +536,13 @@ class PostgresUsageStore(UsageStore):
             )
 
     def _connect(self):
-        return self.psycopg.connect(self.database_url, row_factory=self.dict_row)
+        # A transaction-scoped checkout from the shared pool — never a fresh
+        # per-request psycopg.connect (issue #58).
+        return self.db.connection()
+
+    def _connect_best_effort(self):
+        # Seen-user capture runs inside auth, on both the HTTP and the MCP
+        # request paths, so it waits milliseconds for a connection rather than
+        # the full pool timeout: losing the write is cheaper than holding the
+        # request (or the MCP event loop) behind a saturated pool.
+        return self.db.best_effort_connection()

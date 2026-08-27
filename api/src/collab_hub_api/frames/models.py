@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .identity import validate_acl_principal, validate_acl_principals
+
 FRAME_BODY_MAX_LENGTH = 2 * 1024 * 1024
 SUGGESTION_BODY_MAX_LENGTH = 64 * 1024
 MAX_TAGS = 20
@@ -82,7 +84,14 @@ def normalize_name(name: str) -> str:
 
 
 def normalize_owners(owners: list[str], *, require_non_empty: bool = True) -> list[str]:
-    """Trim, deduplicate, and cap Frame owner identities (order preserved)."""
+    """Trim, deduplicate, and cap Frame owner identities (order preserved).
+
+    Shape only. Whether a value is an acceptable *principal* is a separate
+    question answered by ``frames.identity.validate_acl_principal``, which the
+    grant-writing request models below apply and the stored-record models
+    deliberately do not — this function runs on both paths, including when a
+    pre-pin record is loaded from storage.
+    """
 
     normalized = []
     seen = set()
@@ -216,7 +225,9 @@ class FrameCreate(BaseModel):
     @field_validator("owners")
     @classmethod
     def validate_owners(cls, owners: list[str]) -> list[str]:
-        return normalize_owners(owners, require_non_empty=False)
+        # Grant-writing request model: seeded co-owners must be valid principals
+        # under the active identity policy (rejected, not silently stored — S1).
+        return validate_acl_principals(normalize_owners(owners, require_non_empty=False))
 
 
 class FrameUpdate(BaseModel):
@@ -242,7 +253,11 @@ class FrameUpdate(BaseModel):
 
 
 class OwnersReplace(BaseModel):
-    """Request body for replacing the full owner list (>=1)."""
+    """Request body for replacing the full owner list (>=1).
+
+    A grant-writing model: every entry must be a valid ACL principal under the
+    active identity policy (``frames.identity``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -251,11 +266,15 @@ class OwnersReplace(BaseModel):
     @field_validator("owners")
     @classmethod
     def validate_owners(cls, owners: list[str]) -> list[str]:
-        return normalize_owners(owners)
+        return validate_acl_principals(normalize_owners(owners))
 
 
 class ReadersReplace(BaseModel):
-    """Request body for replacing the full reader list."""
+    """Request body for replacing the full reader list.
+
+    A grant-writing model: every entry must be a valid ACL principal under the
+    active identity policy (``frames.identity``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -264,11 +283,18 @@ class ReadersReplace(BaseModel):
     @field_validator("readers")
     @classmethod
     def validate_readers(cls, readers: list[str]) -> list[str]:
-        return normalize_readers(readers)
+        return validate_acl_principals(normalize_readers(readers))
 
 
 class EmailBody(BaseModel):
-    """Request body for adding a single owner or reader by identity."""
+    """Request body for adding a single owner or reader by identity.
+
+    The field name is historical. It carries an ACL principal, so under the
+    identity pin an actual email address is rejected rather than stored (S1).
+    The matching removal routes (``DELETE .../owners/{email}``) take the value
+    in the path and are deliberately *not* validated, so principals written
+    before the pin can still be cleaned out.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -280,7 +306,7 @@ class EmailBody(BaseModel):
         value = email.strip()
         if not value:
             raise ValueError("email must not be empty")
-        return value
+        return validate_acl_principal(value)
 
 
 class OwnersResponse(BaseModel):

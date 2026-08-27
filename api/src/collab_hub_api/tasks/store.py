@@ -7,7 +7,6 @@ from threading import RLock
 from typing import Any, Callable, TypeVar
 
 import psycopg
-from psycopg.rows import dict_row
 
 from .models import (
     MAX_RETAINED_RUNS_PER_TASK,
@@ -351,13 +350,16 @@ class PostgresTaskStore:
     heartbeats do not rewrite durable task state.
     """
 
-    def __init__(self, url: str, auto_migrate: bool = False) -> None:
-        self.url = url
+    def __init__(self, db, auto_migrate: bool = False) -> None:
+        self.db = db
+        self.url = db.database_url
         if auto_migrate:
             self._migrate()
 
     def _connect(self):
-        return psycopg.connect(self.url, row_factory=dict_row)
+        # A transaction-scoped checkout from the shared pool — never a fresh
+        # per-request psycopg.connect (issue #58).
+        return self.db.connection()
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:

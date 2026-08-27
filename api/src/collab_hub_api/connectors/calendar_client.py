@@ -326,6 +326,10 @@ class GoogleCalendarClient:
                     calendar_id=calendar.id,
                     calendar_name=calendar.name,
                     max_description_chars=2000,
+                    # ``attendee_details`` is the canonical search shape. Keep
+                    # the legacy alias field in the schema, but do not repeat
+                    # every attendee in high-volume search responses.
+                    include_attendee_aliases=False,
                 )
                 event_identity = (event.id, event.start)
                 if event_identity in seen_events:
@@ -459,6 +463,7 @@ def _event_metadata(
     calendar_id: str,
     calendar_name: str,
     max_description_chars: int,
+    include_attendee_aliases: bool = True,
 ) -> tuple[CalendarEventMetadata, bool]:
     start_data = payload.get("start") if isinstance(payload.get("start"), dict) else {}
     end_data = payload.get("end") if isinstance(payload.get("end"), dict) else {}
@@ -471,9 +476,15 @@ def _event_metadata(
     attendees_data = payload.get("attendees", [])
     if not isinstance(attendees_data, list):
         attendees_data = []
-    attendees = [
-        principal for principal in (_principal(item) for item in attendees_data if isinstance(item, dict)) if principal
-    ]
+    attendees = (
+        [
+            sanitize_connector_text(principal)
+            for principal in (_principal(item) for item in attendees_data if isinstance(item, dict))
+            if principal
+        ]
+        if include_attendee_aliases
+        else []
+    )
     attendee_details = [
         CalendarAttendee(
             display_name=sanitize_connector_text(_string(item.get("displayName"))),
@@ -528,7 +539,7 @@ def _event_metadata(
             location=sanitize_connector_text(_string(payload.get("location"))),
             status=_string(payload.get("status")),
             organizer=sanitize_connector_text(organizer),
-            attendees=[sanitize_connector_text(value) for value in attendees],
+            attendees=attendees,
             attendee_details=attendee_details,
             recurring_event_id=_string(payload.get("recurringEventId")),
             original_start=original_start,

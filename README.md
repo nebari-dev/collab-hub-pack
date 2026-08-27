@@ -1,4 +1,4 @@
-# Collab Hub API
+# Collab Hub
 
 [![Lint](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml)
 [![Test](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml)
@@ -62,6 +62,6 @@ and sourced from [`docs/`](docs/).
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the
-[Apache-2.0 license](LICENSE) with a `Signed-off-by` (DCO) line. Report
+[Apache-2.0 license](LICENSE). Report
 security issues privately via GitHub's
 [Report a vulnerability](https://github.com/nebari-dev/collab-hub-pack/security/advisories/new).

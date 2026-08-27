@@ -226,7 +226,21 @@ def test_postgres_task_store_round_trip_against_real_database() -> None:
     if not url:
         pytest.skip("COLLAB_HUB_TEST_POSTGRES_URL is not set")
 
-    store = PostgresTaskStore(url, auto_migrate=True)
+    # PostgresTaskStore takes a pooled PostgresDatabase, not a URL string
+    # (issue #58). This test kept passing a string and had been silently
+    # skipped everywhere — CI provisions no Postgres — until the collab
+    # migration work gave CI a database.
+    from collab_hub_api.frames.db import PostgresDatabase
+
+    database = PostgresDatabase(url)
+    try:
+        _postgres_task_store_round_trip(database)
+    finally:
+        database.close()
+
+
+def _postgres_task_store_round_trip(database) -> None:
+    store = PostgresTaskStore(database, auto_migrate=True)
     task = store.create_task(
         "org-roundtrip",
         "workspace",

@@ -1,0 +1,251 @@
+"""The onboarding email sent with an invitation (#155, #93).
+
+Everything the message needs is known the moment an invitation is minted — the
+link, the invited address and the expiry — so the server renders the whole
+email and sends it. Nobody composes anything.
+
+It was written for the other order: while delivery was manual (#116) the
+invitation pages rendered this text for an operator to paste, with two slots
+left visible for them to complete. Delivery is automated now, that display is
+deleted, and the same copy is what goes out — which was the point of writing it
+this way.
+
+**The copy names no sender.** It is first person plural, signed by the team,
+and it points the reader at a support address rather than asking them to reply.
+That is not only tone: it is what let one text serve both delivery modes. A
+message signed by whoever happened to be signed in, asking for a reply, works
+from a human mailbox and breaks the moment the server sends the same words from
+an unattended one. So this renderer deliberately does **not** take the session
+identity — there is nothing per-operator in the output at all.
+
+**The copy lives in ``onboarding_email.txt``, beside this module, and nowhere
+else.** To change what invitees are told, edit that file: it is the text, not
+a copy of the text. This module only substitutes the parts that vary per
+invitation, and `docs/invitation-onboarding-email.md` explains *why* the copy
+says what it says without restating it.
+
+Placeholders are ``[UPPER CASE IN BRACKETS]``, uniformly, and substitution is
+plain string replacement — no ``format`` or ``$`` templating, so a brace or a
+dollar sign appearing in the copy one day cannot turn into a rendering error
+in an email somebody is waiting on.
+
+Two of them cannot be derived from the invitation at all:
+:data:`NAME_PLACEHOLDER`, since an invitation records an address rather than a
+person, and :data:`APP_INSTRUCTIONS_PLACEHOLDER`, which comes from deployment
+configuration. :func:`render_onboarding_email` leaves them standing when they
+are not supplied, and a test asserts they are the *only* ones that can survive;
+:func:`render_for_automated_delivery` — the only path that sends — supplies
+both and then **refuses** a body with any placeholder left in it.
+
+**The temporary step is gone, and this note is its receipt.** The copy used to
+carry a step explaining that no verification mail was coming and that an
+operator would confirm the address by hand. That was true only while the realm
+had no SMTP; it lands `verifyEmail=true` as of 2026-08-18
+(an internal issue, #77), so the step was deleted along with
+the "write to us as soon as you've finished step 2" clause in the opening.
+Leaving it would have told people to ignore a verification email that had in
+fact arrived. `docs/invitation-onboarding-email.md` records the same change.
+"""
+
+from __future__ import annotations
+
+import re
+import textwrap
+from datetime import datetime, timezone
+from importlib.resources import files
+
+from .data_statement import DATA_STATEMENT_TEXT
+
+TEMPLATE_FILENAME = "onboarding_email.txt"
+
+NAME_PLACEHOLDER = "[NAME]"
+"""Left in the rendered text for the sender to replace. An invitation carries
+an email address and no name, so this is the one substitution the page cannot
+make for them."""
+
+APP_INSTRUCTIONS_PLACEHOLDER = "[DESKTOP APP DOWNLOAD / INSTALL INSTRUCTIONS]"
+"""Left in the rendered text: how the beta build is distributed has not been
+decided, so there is nothing truthful to render. A candidate for configuration
+once it is."""
+
+LINK_PLACEHOLDER = "[INVITATION LINK]"
+RECIPIENT_PLACEHOLDER = "[INVITEE EMAIL]"
+EXPIRY_PLACEHOLDER = "[EXPIRY]"
+DATA_STATEMENT_PLACEHOLDER = "[DATA STATEMENT]"
+"""The data statement is substituted rather than written into the template:
+#146 makes ``web/data_statement.py`` its single source, and it is also shown
+on the acceptance page and its own page. One paragraph, one owner, three
+places it appears."""
+
+WRAP_WIDTH = 72
+"""Where the substituted data statement wraps, and the width the template
+itself is written to. Plain-text email with unwrapped paragraphs renders as
+one long line in some clients and is wrapped unpredictably by others; 72
+leaves room for a couple of levels of quoting."""
+
+SUBJECT_PREFIX = "Subject: "
+
+UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z /]*\]")
+"""Matches any ``[UPPER CASE]`` slot still present in a rendered body.
+
+Used by :func:`render_for_automated_delivery` as a **runtime** check, not only
+a test one. An operator pasting the message can see and fill a leftover
+placeholder; a server sending it cannot, and the invitee would read
+``[DESKTOP APP DOWNLOAD / INSTALL INSTRUCTIONS]`` verbatim. So the automated
+path refuses to produce a body that still contains one.
+"""
+
+AUTOMATED_GREETING_NAME = "there"
+"""What ``[NAME]`` becomes when nothing can know the person's name.
+
+"Hi there," rather than dropping the salutation, so the automated and pasted
+messages stay one template with one greeting rather than two variants that can
+drift apart. An invitation records an address; if a name ever accompanies it,
+pass it and this is unused.
+"""
+
+
+def _load_template() -> tuple[str, str]:
+    """The subject and body out of the template file.
+
+    Read through ``importlib.resources`` rather than ``__file__`` so it
+    resolves the same whether the package is installed, zipped, or run from a
+    checkout — the file ships inside the wheel, verified against a built
+    artifact rather than assumed.
+
+    The subject is the file's first line so that *all* of the copy lives in
+    one reviewable file; it is split off here rather than being a constant in
+    this module, which would have put one line of the email somewhere
+    different from the other fifty.
+    """
+
+    text = files(__package__).joinpath(TEMPLATE_FILENAME).read_text(encoding="utf-8")
+    first, _, body = text.partition("\n")
+    if not first.startswith(SUBJECT_PREFIX):
+        raise ValueError(
+            f"{TEMPLATE_FILENAME} must begin with a {SUBJECT_PREFIX!r} line"
+        )
+    return first[len(SUBJECT_PREFIX) :].strip(), body.lstrip("\n")
+
+
+SUBJECT, _BODY_TEMPLATE = _load_template()
+
+
+def format_expiry(expires_at: datetime) -> str:
+    """The expiry as an absolute UTC timestamp.
+
+    Absolute rather than "48 hours from now" for two reasons: the reader does
+    not have to reason about when the clock started (it started at issuance,
+    not at whenever the operator got round to sending), and the sentence
+    cannot quietly become false if ``INVITATION_TTL`` changes.
+
+    Naive datetimes are refused rather than assumed to be UTC — the same rule
+    :func:`~..frames.invitation_email.render_invitation_email` applies, and for
+    the same reason: an invitation's expiry is a deadline, and silently
+    reinterpreting its timezone moves it.
+    """
+
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise ValueError("invitation expiry must be timezone-aware")
+    return expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def render_onboarding_email(
+    *,
+    link: str,
+    recipient: str,
+    expires_at: datetime,
+    name: str | None = None,
+    app_instructions: str | None = None,
+) -> str:
+    """The complete message body, personalised for one invitation.
+
+    ``link`` carries the one-time secret in its fragment, so the returned
+    string is credential-bearing: it belongs on the page that already shows
+    that link and nowhere else. It is deliberately **not** logged, returned by
+    any API, or given a ``__repr__``-safe wrapper here — the caller that has
+    the raw link already holds the same secret, and adding a second wrapper
+    would suggest this string is safe to move around when it is not.
+
+    ``name`` and ``app_instructions`` default to ``None``, which **leaves their
+    placeholders in the output**. That existed for the operator-paste page,
+    where a visible ``[NAME]`` was the instruction to fill it in; that page is
+    gone, and the default now survives as the shape the placeholder-contract
+    test measures. **Do not call this to send anything** — use
+    :func:`render_for_automated_delivery`, which supplies both slots and refuses
+    a body with any placeholder still in it.
+    """
+
+    # `break_on_hyphens=False` is not cosmetic: the default split
+    # "collab-support@openteams.com" across two lines at its hyphen, which is
+    # a broken address in the one paragraph that tells someone how to ask for
+    # their data to be deleted. `break_long_words=False` for the same class of
+    # reason — a long token is better overhanging the margin than silently cut
+    # in half.
+    statement = textwrap.fill(
+        DATA_STATEMENT_TEXT,
+        width=WRAP_WIDTH,
+        break_on_hyphens=False,
+        break_long_words=False,
+    )
+    substitutions = [
+        (LINK_PLACEHOLDER, link),
+        (RECIPIENT_PLACEHOLDER, recipient),
+        (EXPIRY_PLACEHOLDER, format_expiry(expires_at)),
+        (DATA_STATEMENT_PLACEHOLDER, statement),
+    ]
+    # Only when supplied: `None` deliberately leaves the placeholder standing,
+    # which is what the contract test measures. Nothing sends this form.
+    if name is not None:
+        substitutions.append((NAME_PLACEHOLDER, name))
+    if app_instructions is not None:
+        substitutions.append((APP_INSTRUCTIONS_PLACEHOLDER, app_instructions))
+
+    body = _BODY_TEMPLATE
+    for placeholder, value in substitutions:
+        body = body.replace(placeholder, value)
+    return body
+
+
+def render_for_automated_delivery(
+    *,
+    link: str,
+    recipient: str,
+    expires_at: datetime,
+    app_instructions: str,
+    name: str = AUTOMATED_GREETING_NAME,
+) -> str:
+    """The body to **send**, with nothing left for a human to fill in (#93).
+
+    The difference from :func:`render_onboarding_email` is not the substitutions
+    — it is the refusal at the end. The message an operator used to paste could
+    carry a visible ``[PLACEHOLDER]``, because they were looking at it. A
+    message the server sends cannot: the invitee reads whatever is there, and
+    nobody proof-reads it.
+
+    So this raises rather than sending a half-finished message, and it raises
+    for **any** unresolved slot, not only the two known ones — a placeholder
+    added to the copy later is caught by the same check, which is the whole
+    reason it is a pattern rather than a list.
+    """
+
+    if not app_instructions.strip():
+        raise ValueError(
+            "app_instructions must be set to send an invitation email:"
+            " the copy tells the invitee how to get the desktop app, and there"
+            " is no truthful default"
+        )
+    body = render_onboarding_email(
+        link=link,
+        recipient=recipient,
+        expires_at=expires_at,
+        name=name,
+        app_instructions=app_instructions,
+    )
+    unresolved = sorted(set(UNRESOLVED_PLACEHOLDER.findall(body)))
+    if unresolved:
+        raise ValueError(
+            "refusing to send an invitation email with unresolved placeholders: "
+            + ", ".join(unresolved)
+        )
+    return body

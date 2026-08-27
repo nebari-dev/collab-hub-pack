@@ -1,0 +1,56 @@
+Subject: Your invitation to the OpenTeams Collab beta
+
+Hi [NAME],
+
+You've been invited to the private beta of OpenTeams Collab. Setup is
+four steps and takes about five minutes.
+
+Your invitation link expires at [EXPIRY].
+If it lapses, tell us and we'll send a fresh one.
+
+1. OPEN YOUR INVITATION LINK
+
+   [INVITATION LINK]
+
+   The link carries a one-time code, so it has to be opened from the
+   link itself — a bookmark of the page it opens will not work.
+
+2. CREATE YOUR ACCOUNT
+
+   Click "Create your account" and register with this exact address:
+
+   [INVITEE EMAIL]
+
+   The invitation can only be accepted by that address, so please do
+   not substitute another one.
+
+   You will then get an email asking you to verify the address. Click
+   the link in it before carrying on.
+
+3. ACCEPT YOUR INVITATION
+
+   Open your invitation link again and click "Accept invitation." You
+   should land on a page headed "You are in."
+
+   In this beta a login belongs to exactly one organization and that
+   does not change later, so accept with the account you mean to keep.
+
+4. INSTALL THE APP AND SIGN IN
+
+   [DESKTOP APP DOWNLOAD / INSTALL INSTRUCTIONS]
+
+   Sign in with the account you just created, once step 3 is done —
+   before that the app can only show a "403 Forbidden" error.
+
+WHAT WE STORE
+
+[DATA STATEMENT]
+
+IF ANYTHING GOES WRONG
+
+Write to collab-support@openteams.com. This is an early beta and
+hearing what breaks is the point of this round — please do not assume a
+problem is your fault or not worth reporting.
+
+Thanks,
+The OpenTeams Collab team

@@ -77,7 +77,7 @@ def start_test_server(app, port: int):
 async def test_mcp_tools_preserve_auth_scope_active_fallback_and_resource(tmp_path):
     store = LocalFsFrameStore(tmp_path)
     active_store = InMemoryActiveFrameStore()
-    auth = AuthContext(user="alice", org_id="org-a", workspace_id="workspace-a")
+    auth = AuthContext(user="alice", home_org_id="org-a", workspace_id="workspace-a")
     first = store.create_frame(
         org_id=auth.org_id,
         workspace_id=auth.workspace_id,
@@ -218,7 +218,7 @@ async def test_mcp_tools_preserve_auth_scope_active_fallback_and_resource(tmp_pa
 async def test_mcp_rejects_invalid_frame_ids_before_store_lookup(tmp_path):
     store = LocalFsFrameStore(tmp_path)
     active_store = InMemoryActiveFrameStore()
-    auth = AuthContext(user="alice", org_id="org-a", workspace_id="workspace-a")
+    auth = AuthContext(user="alice", home_org_id="org-a", workspace_id="workspace-a")
     active_store.set_active_frame_ids(auth.org_id, auth.workspace_id, auth.user, ["../metadata"])
     mcp = create_mcp_server(store, active_store=active_store)
     store_lookup_called = False

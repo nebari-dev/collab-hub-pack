@@ -299,20 +299,19 @@ class PostgresFrameHistoryStore(FrameHistoryStore):
     """Postgres-backed history for production-style deployments.
 
     Mirrors ``PostgresActiveFrameStore``: the database lives outside the pack
-    (for example in RDS); the pack only needs a connection URL and creates its
-    table if it is missing.
+    (for example in RDS); the pack only needs a pooled database handle
+    (``db.PostgresDatabase``) and creates its table if it is missing.
     """
 
-    def __init__(self, database_url: str, auto_migrate: bool = False):
+    def __init__(self, db, auto_migrate: bool = False):
         try:
             import psycopg
-            from psycopg.rows import dict_row
         except ImportError as exc:
             raise RuntimeError("PostgresFrameHistoryStore requires psycopg") from exc
 
-        self.database_url = database_url
+        self.db = db
+        self.database_url = db.database_url
         self.psycopg = psycopg
-        self.dict_row = dict_row
         if auto_migrate:
             self._ensure_schema()
 
@@ -454,4 +453,6 @@ class PostgresFrameHistoryStore(FrameHistoryStore):
             )
 
     def _connect(self):
-        return self.psycopg.connect(self.database_url, row_factory=self.dict_row)
+        # A transaction-scoped checkout from the shared pool — never a fresh
+        # per-request psycopg.connect (issue #58).
+        return self.db.connection()

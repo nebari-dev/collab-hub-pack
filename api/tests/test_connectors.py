@@ -796,7 +796,7 @@ async def test_list_connectors_includes_all_read_only_connectors(tmp_path, monke
 
     assert response.status_code == 200
     ids = [item["id"] for item in response.json()]
-    assert ids == ["google-drive", "gmail", "google-calendar", "slack"]
+    assert ids == ["google-drive", "gmail", "google-calendar", "slack", "github"]
 
 
 def _slack_api_handler(request: httpx.Request, seen_authorization: list[str]) -> Response:

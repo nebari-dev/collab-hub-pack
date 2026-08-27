@@ -122,7 +122,7 @@ def reconcile_active(frame: Frame, active_store: ActiveFrameStore) -> None:
     """
 
     for org_id, workspace_id, user in active_store.find_active_holders(frame.id):
-        probe = AuthContext(user=user, org_id=org_id, workspace_id=workspace_id)
+        probe = AuthContext(user=user, home_org_id=org_id, workspace_id=workspace_id)
         if not can_read(frame, probe):
             active_store.remove_frame_id_for(org_id, workspace_id, user, frame.id)
 

@@ -1,3 +1,117 @@
+{{- /* Standalone exposure (issue #60). These fail the render rather than the
+deployment: an Ingress that publishes an unauthenticated surface is not
+something to discover from the outside. */}}
+{{- if .Values.api.ingress.enabled }}
+{{- if not .Values.api.ingress.host }}
+{{- fail "api.ingress.host is required when api.ingress.enabled=true." }}
+{{- end }}
+{{- if not (has .Values.api.ingress.kind (list "Ingress" "HTTPRoute")) }}
+{{- fail "api.ingress.kind must be Ingress or HTTPRoute." }}
+{{- end }}
+{{- if not .Values.api.ingress.paths }}
+{{- fail "api.ingress.paths must list at least one path when api.ingress.enabled=true." }}
+{{- end }}
+{{- if and (eq .Values.api.ingress.kind "HTTPRoute") (not .Values.api.ingress.parentRefs) }}
+{{- fail "api.ingress.parentRefs is required when api.ingress.kind=HTTPRoute: an HTTPRoute with no parent Gateway routes nothing." }}
+{{- end }}
+{{- if and (eq .Values.api.ingress.kind "HTTPRoute") .Values.api.ingress.tls.certificate.enabled }}
+{{- fail "api.ingress.tls.certificate.enabled is not supported with kind=HTTPRoute: TLS belongs to the parent Gateway's listener, which this chart does not own, and a Secret created here would have nothing pointing at it (and would need a ReferenceGrant across namespaces). Provision the listener certificate with the Gateway — see docs/standalone-deployment.md and an internal issue." }}
+{{- end }}
+{{- if and .Values.api.ingress.tls.enabled .Values.api.ingress.tls.certificate.enabled (not .Values.api.ingress.tls.certificate.issuerRef.name) }}
+{{- fail "api.ingress.tls.certificate.issuerRef.name is required when api.ingress.tls.certificate.enabled=true." }}
+{{- end }}
+{{- /* The unsafe-auth switches accept unsigned tokens, so leaving them on
+behind a public hostname is an authentication bypass, not a dev convenience.
+
+Two ways an entry can turn one on, and the render has to answer for both.
+A literal "true" is decidable here, and exhaustively so: frames/auth.py compares
+against exactly that string, so no other literal enables the switch (a truthy
+parser would make this check too narrow). A valueFrom is not decidable — the
+Secret or ConfigMap resolves in the kubelet, long after this template — so it is
+refused rather than assumed safe. Not setting the variable at all is the safe
+state, so refusing costs an externally routed install nothing. */}}
+{{- $unsafeAuth := list "FRAMES_UNSAFE_AUTH_ENABLED" "FRAMES_IDTOKEN_ALLOW_UNSIGNED" "FRAMES_BEARER_ALLOW_UNSIGNED" "DEV_AUTH_ENABLED" }}
+{{- range .Values.api.deployment.extraEnv }}
+{{- if has .name $unsafeAuth }}
+{{- if eq (toString .value) "true" }}
+{{- fail (printf "api.deployment.extraEnv sets %s=true while api.ingress.enabled=true; unsigned/dev tokens must never be accepted on an externally routed host." .name) }}
+{{- end }}
+{{- if .valueFrom }}
+{{- fail (printf "api.deployment.extraEnv supplies %s from valueFrom while api.ingress.enabled=true: the render cannot see what the Secret or ConfigMap resolves to, and if it resolves to \"true\" the app accepts unsigned tokens on an externally routed host. Drop the entry — not setting it is the safe state — or give it the literal value \"false\"." .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* /metrics is only unauthenticated safely if the ingress does not publish
+it. That covers both ways it can end up open: metricsAccess=public, and an
+install that opts out of enforcement altogether while still routing the path. */}}
+{{- $metricsPublic := or (eq .Values.security.metricsAccess "public") (ne (include "collab-hub.security-enforced" .) "true") }}
+{{- range .Values.security.paths }}
+{{- if and (eq .path "/metrics") (eq .access "public") }}
+{{- $metricsPublic = true }}
+{{- end }}
+{{- end }}
+{{- if $metricsPublic }}
+{{- range .Values.api.ingress.paths }}
+{{- if or (and (eq .pathType "Prefix") (or (eq .path "/") (hasPrefix .path "/metrics"))) (and (eq .pathType "Exact") (eq .path "/metrics")) }}
+{{- fail "/metrics would be unauthenticated and routed by api.ingress.paths: an in-cluster scrape must not also be an internet-facing metrics endpoint. Set security.metricsAccess=authenticated (and keep security.enforce on), or stop routing /metrics from outside." }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and (has "*" (.Values.security.cors.allowedOrigins | default list)) .Values.security.cors.allowCredentials }}
+{{- fail "security.cors.allowedOrigins may not contain \"*\" when security.cors.allowCredentials=true: the server would echo any caller's Origin on credentialed requests." }}
+{{- end }}
+{{- /* A hardened map whose probe paths are not public leaves the pod failing
+its own liveness probe: the Deployment never becomes ready and the failure
+looks like an application fault. */}}
+{{- if and (eq (include "collab-hub.security-enforced" .) "true") (eq .Values.security.defaultAccess "authenticated") }}
+{{- $healthPublic := false }}
+{{- range .Values.security.paths }}
+{{- if and (eq .path "/health") (eq .access "public") }}
+{{- $healthPublic = true }}
+{{- end }}
+{{- end }}
+{{- if not $healthPublic }}
+{{- fail "security.paths must keep a public /health entry while security.defaultAccess=authenticated: the kubelet probes carry no credentials, so the pod would fail its own liveness probe." }}
+{{- end }}
+{{- end }}
+{{- /* Under enforcement the chart's own env vars *are* the protection decision,
+and they render before api.deployment.extraEnv — where a later duplicate of the
+same name is what the container process resolves. Re-declaring one there would
+reopen `/` and `/metrics` on a routed host while every check above still reported
+enforcement, so the collision fails the render instead of being resolved
+silently. No expressiveness is lost: security.paths, security.defaultAccess,
+security.metricsAccess, security.cors.* and
+server.proxyHeaders/forwardedAllowIps say all of it as first-class values, and
+those are the ones the rules above see. An install that has not opted in keeps
+its extraEnv overrides working, so this takes nothing away from gateway mode.
+
+Matched case-insensitively and against the bare hierarchy roots as well:
+pydantic-settings ignores env-name case and resolves COLLAB_HUB_API__SECURITY
+(or __SERVER) as JSON for the whole nested model, so those are override routes
+too. COLLAB_HUB_API__SERVER__{HOSTNAME,PORT,ROOT_PATH} stay available — they
+are not security controls, and blocking them would break an unrelated override
+the moment an install opts in. */}}
+{{- if eq (include "collab-hub.security-enforced" .) "true" }}
+{{- $managed := list "COLLAB_HUB_API__SECURITY" "COLLAB_HUB_API__SERVER" "COLLAB_HUB_API__SERVER__PROXY_HEADERS" "COLLAB_HUB_API__SERVER__FORWARDED_ALLOW_IPS" }}
+{{- range .Values.api.deployment.extraEnv }}
+{{- $name := upper (toString (.name | default "")) }}
+{{- if or (has $name $managed) (hasPrefix "COLLAB_HUB_API__SECURITY__" $name) }}
+{{- fail (printf "api.deployment.extraEnv sets %s, which the chart renders itself while protection is enforced; the duplicate would render last and win, reopening the protection map on a routed host. Configure it through security.paths / security.defaultAccess / security.metricsAccess / security.cors.* / server.proxyHeaders / server.forwardedAllowIps instead, which the chart validates. (security.enforce=false opts the whole install out.)" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* Proxy-header trust. The chart creates no NetworkPolicy, so any workload
+that can reach the ClusterIP Service could otherwise choose the client address
+and scheme this app records. */}}
+{{- if eq (include "collab-hub.proxy-headers-enabled" .) "true" }}
+{{- if and (not .Values.server.forwardedAllowIps) (not .Values.server.trustAnyProxy) }}
+{{- fail "server.forwardedAllowIps must name the proxy's address or CIDR when proxy headers are enabled (set server.trustAnyProxy=true to accept X-Forwarded-* from every peer that can reach the Service, and understand that any pod in the cluster can)." }}
+{{- end }}
+{{- if and (has "*" .Values.server.forwardedAllowIps) (not .Values.server.trustAnyProxy) }}
+{{- fail "server.forwardedAllowIps contains \"*\": set server.trustAnyProxy=true to acknowledge trusting forwarded headers from every peer that can reach the Service, or name the proxy's CIDR instead." }}
+{{- end }}
+{{- end }}
 {{- if and (eq .Values.frames.storage.backend "local") (gt (int .Values.api.deployment.replicaCount) 1) }}
 {{- fail "frames.storage.backend=local supports only api.deployment.replicaCount=1. Use frames.storage.backend=s3 before scaling replicas." }}
 {{- end }}
@@ -22,6 +136,27 @@
 {{- if and (eq .Values.frames.activeState.backend "postgres") (not .Values.frames.activeState.postgres.url) (not .Values.frames.activeState.postgres.existingSecret) (not .Values.frames.postgres.url) (not .Values.frames.postgres.existingSecret) }}
 {{- fail "frames.activeState.backend=postgres requires a URL: set frames.activeState.postgres.url/existingSecret or the shared frames.postgres.url/existingSecret." }}
 {{- end }}
+{{- /* values.schema.json bounds each pool field on its own; the cross-field rule needs a template check. */}}
+{{- if lt (int .Values.frames.postgres.pool.maxSize) (int .Values.frames.postgres.pool.minSize) }}
+{{- fail "frames.postgres.pool.maxSize must be greater than or equal to frames.postgres.pool.minSize." }}
+{{- end }}
+{{- range .Values.api.deployment.extraEnv }}
+{{- $name := default "" .name }}
+{{- if and (hasKey . "value") (or (eq $name "AWS_ACCESS_KEY_ID") (eq $name "AWS_SECRET_ACCESS_KEY") (eq $name "AWS_SESSION_TOKEN") (eq $name "AWS_SECURITY_TOKEN")) }}
+{{- fail (printf "api.deployment.extraEnv may not render AWS credential %s as plaintext; use workload identity or a Secret reference." $name) }}
+{{- end }}
+{{- if or (eq $name "COLLAB_HUB_API__FRAMES") (eq $name "COLLAB_HUB_API__FRAMES__EMAIL") (hasPrefix "COLLAB_HUB_API__FRAMES__EMAIL__" $name) }}
+{{- fail (printf "api.deployment.extraEnv may not set or override invitation email configuration (%s); use frames.email and its existingSecret fields." $name) }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.frames.email.provider "ses" }}
+{{- if not .Values.frames.email.ses.existingSecret }}
+{{- fail "frames.email.ses.existingSecret is required when frames.email.provider=ses; the Secret must contain SES configuration, not credentials." }}
+{{- end }}
+{{- if not (regexMatch "^https://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$" .Values.frames.email.acceptUrl) }}
+{{- fail "frames.email.acceptUrl must be an absolute HTTPS URL with no user information, query string, or fragment when frames.email.provider=ses." }}
+{{- end }}
+{{- end }}
 {{- if .Values.userDirectory.enabled }}
 {{- if ne .Values.userDirectory.provider "keycloak" }}
 {{- fail "userDirectory.provider must be keycloak when userDirectory.enabled=true." }}
@@ -49,4 +184,104 @@
 {{- if not .Values.userDirectory.keycloak.existingSecret }}
 {{- fail "userDirectory.keycloak.existingSecret is required when userDirectory.enabled=true." }}
 {{- end }}
+{{- end }}
+{{- /*
+Identity policy (issue #61). frames.auth.identityClaim decides which claim
+becomes the persisted ACL principal, so it must not be reachable through
+api.deployment.extraEnv: that would bypass the schema enum and the issuer
+checks below, and the setting decides whether existing owners/readers keep
+matching their users.
+*/}}
+{{- range .Values.api.deployment.extraEnv }}
+{{- if eq (toString .name) "FRAMES_AUTH_IDENTITY_CLAIM" }}
+{{- fail "Set frames.auth.identityClaim instead of FRAMES_AUTH_IDENTITY_CLAIM in api.deployment.extraEnv: the chart validates the issuer configuration that a 'sub' principal depends on." }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.frames.auth.identityClaim "sub" }}
+{{- /*
+Mirrors frames.identity.enforce_single_issuer_for_pin: a bare 'sub' identifies
+a person only within one issuer, and the IdToken and bearer verifiers are
+configured independently, so a second trusted issuer could mint a colliding sub
+that IS an existing user. Caught at render time so the misconfiguration never
+reaches a crash-looping pod.
+
+The IdToken verifier is derived exactly as the app's decode path derives it: its
+JWKS URL and its issuer fall back to the bearer values *separately*. So an
+IdToken verifier exists whenever either JWKS URL is set, and it can name its own
+issuer while reusing the shared JWKS — the case that must not render, because
+cookies would then be verified under issuer B while bearer tokens use issuer A.
+*/}}
+{{- $bearerIssuer := trim .Values.frames.auth.bearer.issuer }}
+{{- $idTokenIssuer := default $bearerIssuer (trim .Values.frames.auth.idToken.issuer) }}
+{{- $idTokenJwksUrl := default (trim .Values.frames.auth.bearer.jwksUrl) (trim .Values.frames.auth.idToken.jwksUrl) }}
+{{- $issuers := list }}
+{{- if .Values.frames.auth.bearer.jwksUrl }}
+{{- if not $bearerIssuer }}
+{{- fail "frames.auth.identityClaim=sub requires frames.auth.bearer.issuer: a bare 'sub' is unique only within one issuer." }}
+{{- end }}
+{{- $issuers = append $issuers $bearerIssuer }}
+{{- end }}
+{{- if $idTokenJwksUrl }}
+{{- if not $idTokenIssuer }}
+{{- fail "frames.auth.identityClaim=sub requires frames.auth.idToken.issuer (or the frames.auth.bearer.issuer fallback): a bare 'sub' is unique only within one issuer." }}
+{{- end }}
+{{- $issuers = append $issuers $idTokenIssuer }}
+{{- end }}
+{{- if gt (len (uniq $issuers)) 1 }}
+{{- fail "frames.auth.identityClaim=sub requires a single trusted issuer: frames.auth.idToken.issuer and frames.auth.bearer.issuer name different issuers, whose 'sub' values can collide." }}
+{{- end }}
+{{- end }}
+{{- /*
+Organization source (issue #63). frames.auth.orgSource decides whether a
+caller's organization is asserted by their token (with the defaults below as the
+fallback that in practice becomes everyone's organization) or resolved from the
+server's own collab_org_members table. Like identityClaim, it and the fallbacks
+it retires are kept out of api.deployment.extraEnv: reachable there, an operator
+could select membership resolution while bypassing every precondition below, or
+leave a retired default in place where nothing reviews it.
+*/}}
+{{- range .Values.api.deployment.extraEnv }}
+{{- if has (toString .name) (list "FRAMES_AUTH_ORG_SOURCE" "FRAMES_AUTH_DEFAULT_ORG" "FRAMES_AUTH_DEFAULT_WORKSPACE") }}
+{{- fail "Set frames.auth.orgSource / frames.auth.defaults instead of FRAMES_AUTH_ORG_SOURCE, FRAMES_AUTH_DEFAULT_ORG or FRAMES_AUTH_DEFAULT_WORKSPACE in api.deployment.extraEnv: the chart validates the preconditions that resolving organizations from membership depends on." }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.frames.auth.orgSource "membership" }}
+{{- /*
+Each of these mirrors a startup check in the app (frames.org_source and
+make_app), so the misconfiguration is caught at render time instead of by a
+crash-looping pod.
+*/}}
+{{- if ne .Values.frames.auth.identityClaim "sub" }}
+{{- fail "frames.auth.orgSource=membership requires frames.auth.identityClaim=sub: membership rows are keyed by the OIDC subject, so a legacy (username/email) principal would be resolved against the wrong key." }}
+{{- end }}
+{{- if or .Values.frames.auth.defaults.orgId .Values.frames.auth.defaults.workspaceId }}
+{{- fail "frames.auth.orgSource=membership requires frames.auth.defaults.orgId and frames.auth.defaults.workspaceId to be empty: the default-org fallback is retired there, and a value left set would spring back the moment orgSource is flipped to \"claims\", collapsing every user into one organization." }}
+{{- end }}
+{{- if not (or .Values.frames.postgres.url .Values.frames.postgres.existingSecret) }}
+{{- fail "frames.auth.orgSource=membership requires the shared frames.postgres.url (or frames.postgres.existingSecret): membership is an authorization input, so with no database every authenticated request would answer 503." }}
+{{- end }}
+{{- end }}
+{{- $externallyExposed := or .Values.api.ingress.enabled .Values.api.nebariapp.enabled (has (toString .Values.api.service.type) (list "LoadBalancer" "NodePort")) }}
+{{- if and $externallyExposed .Values.frames.auth.defaults.orgId (not .Values.frames.auth.orgSource) }}
+{{- /*
+The one combination that is dangerous rather than merely unconfigured: an
+externally reachable deployment where every caller falls back to one hard-coded
+organization, because no identity provider in use mints an org claim. There
+"internal" means everyone who can sign in, and nothing in the rendered manifest
+says so.
+
+Every way out of the cluster counts, not just the standalone Ingress. A
+NebariApp is routed through the Nebari gateway and can be public
+(api.nebariapp.gateway); a LoadBalancer or NodePort Service reaches the pod with
+no routing object at all. Recognising only one of them would leave the same
+fallback silently active on the others.
+
+Narrow in the other direction, though: a routed deployment with NO default org
+is not caught here, because it does not disclose anything — a caller with no org
+claim simply gets a 401. So an install that never set frames.auth.defaults is
+untouched by this and needs no values change for a chart upgrade. An install
+that did set it must state which behavior it wants; orgSource="claims" is a
+perfectly good answer and preserves exactly what it does today.
+*/}}
+{{- fail "frames.auth.defaults.orgId on an externally reachable deployment (api.ingress.enabled, api.nebariapp.enabled, or a LoadBalancer/NodePort api.service.type) places every authenticated user in that one organization, where an \"internal\" Frame is readable by everyone who can sign in. Set frames.auth.orgSource=membership to resolve organizations from collab_org_members (and clear frames.auth.defaults), or frames.auth.orgSource=claims to state that the shared-organization behavior is intended." }}
 {{- end }}

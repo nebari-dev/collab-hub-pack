@@ -3,19 +3,6 @@
 Thanks for your interest in contributing. This pack is developed in the open
 under the [Apache-2.0 license](LICENSE).
 
-## Developer Certificate of Origin (DCO)
-
-Contributions are accepted under the [DCO](https://developercertificate.org/):
-every commit must be signed off, certifying you wrote the change or have the
-right to submit it under the project license.
-
-```sh
-git commit -s -m "your message"
-```
-
-The `Signed-off-by` line must match your author identity. There is no separate
-CLA to sign.
-
 ## Development setup
 
 The API lives in [`api/`](api/) and uses [uv](https://docs.astral.sh/uv/).

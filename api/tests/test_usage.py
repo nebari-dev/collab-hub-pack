@@ -292,6 +292,9 @@ async def test_usage_dashboard_requires_auth(client):
 
 
 async def test_root_home_links_to_usage_dashboard(client):
+    # Unconfigured, the landing page is served as it always was — gateway
+    # installs keep relying on enforceAtGateway. A hardened deployment opts
+    # into the protection map; see test_path_protection.
     response = await client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")

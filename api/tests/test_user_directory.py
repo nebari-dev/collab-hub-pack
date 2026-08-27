@@ -261,3 +261,57 @@ def test_user_directory_token_url_defaults_from_issuer_url():
     assert isinstance(client, KeycloakUserDirectoryClient)
     assert client.token_url == "https://keycloak.example/realms/hub/protocol/openid-connect/token"
     client.close()
+
+
+def test_keycloak_user_directory_client_pages_raw_user_records():
+    """The identity inventory (issue #65) enumerates the realm, not a top-N.
+
+    `search_users` answers the member picker's bounded question; walking the
+    whole realm needs Keycloak's `first` offset, and a page that silently
+    stopped at the default limit would report real users as unmapped
+    principals.
+    """
+
+    seen: list[httpx.Request] = []
+    pages = {
+        "0": [{"id": f"user-{index}", "username": f"u{index}", "enabled": True} for index in range(2)],
+        "2": [
+            {
+                "id": "user-2",
+                "username": "u2",
+                "email": "u2@example.com",
+                "enabled": False,
+                "createdTimestamp": 1700000000000,
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/protocol/openid-connect/token"):
+            return httpx.Response(200, json={"access_token": "service-token", "expires_in": 300})
+        assert request.url.path.endswith("/admin/realms/hub/users")
+        assert request.method == "GET"
+        assert request.url.params["max"] == "2"
+        assert "search" not in request.url.params
+        return httpx.Response(200, json=pages[request.url.params["first"]])
+
+    client = KeycloakUserDirectoryClient(
+        token_url="https://keycloak.example/realms/hub/protocol/openid-connect/token",
+        admin_api_base_url="https://keycloak.example/admin/realms/hub",
+        client_id="nexus-user-directory",
+        client_secret="secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    first_page = client.list_user_records_page(first=0, limit=2)
+    second_page = client.list_user_records_page(first=2, limit=2)
+    client.close()
+
+    assert [record["id"] for record in first_page] == ["user-0", "user-1"]
+    assert [(record["id"], record["enabled"]) for record in second_page] == [("user-2", False)]
+    # Raw records, so the inventory can read `createdTimestamp` — the one signal
+    # available for a reassigned address. UserDirectoryUser does not carry it,
+    # and widening that public response model is not issue #65's business.
+    assert second_page[0]["createdTimestamp"] == 1700000000000
+    assert [request.method for request in seen] == ["POST", "GET", "GET"]

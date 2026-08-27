@@ -54,6 +54,54 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{/*
+Whether the app enforces the protection map and the restricted CORS default.
+Returns the string "true" or "false".
+
+`security.enforce` null follows `api.ingress.enabled`: standalone exposure is
+new and is hardened from the start, while an install behind the Nebari gateway
+keeps the behavior it has today until its operator opts in explicitly.
+*/}}
+{{- define "collab-hub.security-enforced" -}}
+{{- if kindIs "invalid" .Values.security.enforce -}}
+{{- ternary "true" "false" .Values.api.ingress.enabled -}}
+{{- else -}}
+{{- ternary "true" "false" .Values.security.enforce -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether uvicorn trusts X-Forwarded-*. Returns "true" or "false".
+Null follows the exposure mode, so gateway installs keep today's behavior
+(the application default, off) and only ingress exposure turns it on.
+*/}}
+{{- define "collab-hub.proxy-headers-enabled" -}}
+{{- if kindIs "invalid" .Values.server.proxyHeaders -}}
+{{- ternary "true" "false" .Values.api.ingress.enabled -}}
+{{- else -}}
+{{- ternary "true" "false" .Values.server.proxyHeaders -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The protection map the app is given: the configured entries plus the
+/metrics rule, appended last so it wins by the documented last-equally-specific
+precedence and an operator never has to restate the map to open one path.
+*/}}
+{{- define "collab-hub.security-paths" -}}
+{{- $paths := .Values.security.paths | default list -}}
+{{- $paths = append $paths (dict "path" "/metrics" "match" "exact" "access" .Values.security.metricsAccess) -}}
+{{- toJson $paths -}}
+{{- end -}}
+
+{{- define "collab-hub.api-tls-secret-name" -}}
+{{- if .Values.api.ingress.tls.secretName -}}
+{{- .Values.api.ingress.tls.secretName -}}
+{{- else -}}
+{{- printf "%s-tls" (include "collab-hub.component-name" (dict "top" . "component" "api")) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 NebariApp helper template.
 Expects a dict with keys: top, component, service, nebariapp
 */}}
