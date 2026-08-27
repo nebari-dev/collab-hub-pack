@@ -63,4 +63,5 @@ and sourced from [`docs/`](docs/).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the
 [Apache-2.0 license](LICENSE) with a `Signed-off-by` (DCO) line. Report
-security issues privately via [SECURITY.md](SECURITY.md).
+security issues privately via GitHub's
+[Report a vulnerability](https://github.com/nebari-dev/collab-hub-pack/security/advisories/new).

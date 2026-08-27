@@ -46,4 +46,6 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
 
 ## Reporting security issues
 
-Do not open a public issue for vulnerabilities — see [SECURITY.md](SECURITY.md).
+Do not open a public issue for vulnerabilities. Use GitHub's
+[Report a vulnerability](https://github.com/nebari-dev/collab-hub-pack/security/advisories/new)
+to open a private advisory with the maintainers.
