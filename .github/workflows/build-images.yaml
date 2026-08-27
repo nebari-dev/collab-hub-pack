@@ -1,37 +1,44 @@
 name: Build Docker Images
 
-# Builds and publishes the pack's first-party image(s) via the shared reusable
-# workflow in nebari-dev/.github. Each image is pushed to GHCR and quay.io with
-# `sha-<short>` and `latest` tags. Publishing to quay.io/nebari/* uses the
-# org-provided QUAY_TOKEN / QUAY_USERNAME secrets, so this works for official
-# packs in the nebari-dev org.
+# Builds and publishes the Collab Hub API image via the shared reusable
+# workflow in nebari-dev/.github. The image is pushed to GHCR and quay.io
+# with `sha-<short>` and (on main) `latest`.
 #
-# The Chart.yaml path is included in the trigger on purpose: release.yaml pins
-# image tags to sha-<release-commit>, so the release commit (a Chart.yaml bump)
-# must produce images with that sha. Building here on the bump ensures they
-# exist. This runs in parallel with the release workflow.
+# The Chart.yaml path is in the trigger because release.yaml pins image tags
+# to sha-<release-commit>, so the release commit (a Chart.yaml bump) must
+# produce images with that sha.
 
 on:
   push:
     branches: [main]
     paths:
-      - "examples/auth-fastapi/app/**"
-      - "examples/auth-fastapi/Dockerfile"
+      - "api/**"
+      - "helm/collab-hub/Chart.yaml"
       - ".github/workflows/build-images.yaml"
-      - "examples/auth-fastapi/chart/Chart.yaml"
   pull_request:
     paths:
-      - "examples/auth-fastapi/app/**"
-      - "examples/auth-fastapi/Dockerfile"
+      - "api/**"
   workflow_dispatch:
 
 jobs:
-  auth-fastapi-example:
+  api:
     uses: nebari-dev/.github/.github/workflows/pack-build-image.yaml@v1
     with:
-      image: auth-fastapi-example
-      context: examples/auth-fastapi
+      image: api
+      context: api
       push: ${{ github.event_name != 'pull_request' }}
     secrets:
       QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
       QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+
+  # Surfaces the tag to deploy so an operator can copy it straight from the
+  # run and bump the infra repo (see the infra repos' "Deploying an update").
+  deploy-tag:
+    needs: api
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show deploy tag
+        run: |
+          short="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          echo "Deploy this build by setting the infra repo image tag to: **sha-${short}**" >> "$GITHUB_STEP_SUMMARY"
