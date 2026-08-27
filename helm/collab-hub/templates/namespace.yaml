@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    nebari.dev/managed: "true"
+    {{- include "collab-hub.labels" (dict "top" . "component" "nebariapp") | nindent 4 }}

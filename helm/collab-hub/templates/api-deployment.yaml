@@ -1,0 +1,211 @@
+{{- if .Values.api.enabled }}
+{{- $component := "api" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "collab-hub.component-name" (dict "top" . "component" $component) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "collab-hub.labels" (dict "top" . "component" $component) | nindent 4 }}
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.deployment.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "collab-hub.selectorLabels" (dict "top" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "collab-hub.labels" (dict "top" . "component" $component) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "collab-hub.api-service-account-name" . }}
+      {{- with .Values.api.deployment.securityContext.pod }}
+      securityContext:
+        {{- . | toYaml | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: "{{ .Values.api.deployment.image.repository }}:{{ .Values.api.deployment.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.api.deployment.image.pullPolicy }}
+          {{- with .Values.api.deployment.securityContext.container }}
+          securityContext:
+            {{- . | toYaml | nindent 12 }}
+          {{- end }}
+          env:
+            - name: COLLAB_HUB_API__STORAGE__FRAMES_PATH
+              value: {{ .Values.frames.storage.mountPath | quote }}
+            - name: COLLAB_HUB_API__FRAMES__STORAGE_BACKEND
+              value: {{ .Values.frames.storage.backend | quote }}
+            - name: COLLAB_HUB_API__FRAMES__S3__BUCKET
+              value: {{ .Values.frames.s3.bucket | quote }}
+            - name: COLLAB_HUB_API__FRAMES__S3__PREFIX
+              value: {{ .Values.frames.s3.prefix | quote }}
+            - name: COLLAB_HUB_API__FRAMES__S3__ENDPOINT_URL
+              value: {{ .Values.frames.s3.endpointUrl | quote }}
+            - name: COLLAB_HUB_API__FRAMES__S3__REGION
+              value: {{ .Values.frames.s3.region | quote }}
+            {{- with .Values.frames.s3.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.frames.s3.accessKeyIdKey | quote }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.frames.s3.secretAccessKeyKey | quote }}
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.frames.s3.sessionTokenKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- with .Values.frames.s3.region }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            - name: COLLAB_HUB_API__FRAMES__ACTIVE_STATE__BACKEND
+              value: {{ .Values.frames.activeState.backend | quote }}
+            - name: COLLAB_HUB_API__FRAMES__ACTIVE_STATE__POSTGRES__URL
+              {{- if .Values.frames.activeState.postgres.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.frames.activeState.postgres.existingSecret | quote }}
+                  key: {{ .Values.frames.activeState.postgres.databaseUrlKey | quote }}
+              {{- else }}
+              value: {{ .Values.frames.activeState.postgres.url | quote }}
+              {{- end }}
+            - name: COLLAB_HUB_API__FRAMES__ACTIVE_STATE__POSTGRES__AUTO_MIGRATE
+              value: {{ .Values.frames.activeState.postgres.autoMigrate | quote }}
+            # Single shared Postgres URL: lights up history + groups and is the
+            # active-state fallback. Unset ⇒ history/group endpoints return 503.
+            - name: COLLAB_HUB_API__FRAMES__POSTGRES__URL
+              {{- if .Values.frames.postgres.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.frames.postgres.existingSecret | quote }}
+                  key: {{ .Values.frames.postgres.databaseUrlKey | quote }}
+              {{- else }}
+              value: {{ .Values.frames.postgres.url | quote }}
+              {{- end }}
+            - name: COLLAB_HUB_API__FRAMES__POSTGRES__AUTO_MIGRATE
+              value: {{ .Values.frames.postgres.autoMigrate | quote }}
+            - name: COLLAB_HUB_API__TASKS__BACKEND
+              value: {{ .Values.tasks.backend | quote }}
+            - name: COLLAB_HUB_API__TASKS__POSTGRES_URL
+              {{- if .Values.tasks.postgres.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.tasks.postgres.existingSecret | quote }}
+                  key: {{ .Values.tasks.postgres.databaseUrlKey | quote }}
+              {{- else }}
+              value: {{ .Values.tasks.postgres.url | quote }}
+              {{- end }}
+            - name: COLLAB_HUB_API__TASKS__AUTO_MIGRATE
+              value: {{ .Values.tasks.postgres.autoMigrate | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GOOGLE__BROKER_TOKEN_URL
+              value: {{ .Values.connectors.google.brokerTokenUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GOOGLE__DRIVE_API_BASE_URL
+              value: {{ .Values.connectors.google.driveApiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GOOGLE__GMAIL_API_BASE_URL
+              value: {{ .Values.connectors.google.gmailApiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GOOGLE__CALENDAR_API_BASE_URL
+              value: {{ .Values.connectors.google.calendarApiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GOOGLE__REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.connectors.google.requestTimeoutSeconds | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__SLACK__BROKER_TOKEN_URL
+              value: {{ .Values.connectors.slack.brokerTokenUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__SLACK__API_BASE_URL
+              value: {{ .Values.connectors.slack.apiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__SLACK__REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.connectors.slack.requestTimeoutSeconds | quote }}
+            {{- with .Values.frames.auth.idToken.jwksUrl }}
+            - name: FRAMES_IDTOKEN_JWKS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.idToken.issuer }}
+            - name: FRAMES_IDTOKEN_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.idToken.audience }}
+            - name: FRAMES_IDTOKEN_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.bearer.jwksUrl }}
+            - name: FRAMES_BEARER_JWKS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.bearer.issuer }}
+            - name: FRAMES_BEARER_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.bearer.audience }}
+            - name: FRAMES_BEARER_AUDIENCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.defaults.orgId }}
+            - name: FRAMES_AUTH_DEFAULT_ORG
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.frames.auth.defaults.workspaceId }}
+            - name: FRAMES_AUTH_DEFAULT_WORKSPACE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.userDirectory.enabled }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__ENABLED
+              value: {{ .Values.userDirectory.enabled | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__PROVIDER
+              value: {{ .Values.userDirectory.provider | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__KEYCLOAK__ISSUER_URL
+              value: {{ .Values.userDirectory.keycloak.issuerUrl | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__KEYCLOAK__TOKEN_URL
+              value: {{ .Values.userDirectory.keycloak.tokenUrl | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__KEYCLOAK__ADMIN_API_BASE_URL
+              value: {{ .Values.userDirectory.keycloak.adminApiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__KEYCLOAK__CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.userDirectory.keycloak.existingSecret | quote }}
+                  key: {{ .Values.userDirectory.keycloak.clientIdKey | quote }}
+            - name: COLLAB_HUB_API__USER_DIRECTORY__KEYCLOAK__CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.userDirectory.keycloak.existingSecret | quote }}
+                  key: {{ .Values.userDirectory.keycloak.clientSecretKey | quote }}
+            {{- end }}
+            {{- with .Values.api.deployment.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.api.deployment.resources | nindent 12 }}
+          ports:
+            - containerPort: {{ .Values.api.service.targetPort }}
+          volumeMounts:
+            - name: frames-storage
+              mountPath: {{ .Values.frames.storage.mountPath }}
+          startupProbe:
+            httpGet:
+              port: {{ .Values.api.service.targetPort }}
+              path: /health
+            periodSeconds: 1
+            timeoutSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              port: {{ .Values.api.service.targetPort }}
+              path: /health
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+      volumes:
+        - name: frames-storage
+          {{- if or .Values.frames.storage.persistence.enabled .Values.frames.storage.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ include "collab-hub.frames-storage-claim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}

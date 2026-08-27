@@ -1,134 +1,30 @@
 name: Test
 
+# Runs the Collab Hub API test suite (pytest, in api/). Fork-safe: no secrets,
+# read-only checkout. uv provisions the pinned Python and the `test` group.
+
 on:
   push:
     branches: [main]
+    paths:
+      - "api/**"
+      - ".github/workflows/test.yaml"
   pull_request:
-    branches: [main]
+    paths:
+      - "api/**"
+      - ".github/workflows/test.yaml"
 
 jobs:
-  integration:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Create kind cluster
-        uses: helm/kind-action@v1
-        with:
-          cluster_name: pack-test
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v5
-
-      # Test vanilla YAML example
-      - name: Apply vanilla-yaml manifests
-        run: |
-          kubectl create namespace test-vanilla
-          kubectl apply -n test-vanilla \
-            -f examples/vanilla-yaml/deployment.yaml \
-            -f examples/vanilla-yaml/service.yaml
-
-      - name: Wait for vanilla-yaml pods
-        run: kubectl wait -n test-vanilla --for=condition=ready pod -l app=my-pack --timeout=120s
-
-      - name: Health check vanilla-yaml
-        run: |
-          kubectl port-forward -n test-vanilla svc/my-pack 8080:80 &
-          sleep 3
-          curl -sf http://localhost:8080
-          kill %1
-
-      - name: Delete vanilla-yaml resources
-        run: kubectl delete namespace test-vanilla --wait
-
-      # Test kustomize example (base only - no NebariApp CRD on kind)
-      - name: Apply kustomize base (without NebariApp)
-        run: |
-          kubectl create namespace test-kustomize
-          kubectl apply -n test-kustomize \
-            -f examples/kustomize-nginx/base/deployment.yaml \
-            -f examples/kustomize-nginx/base/service.yaml
-
-      - name: Wait for kustomize pods
-        run: kubectl wait -n test-kustomize --for=condition=ready pod -l app=my-pack --timeout=120s
-
-      - name: Health check kustomize
-        run: |
-          kubectl port-forward -n test-kustomize svc/my-pack 8081:80 &
-          sleep 3
-          curl -sf http://localhost:8081
-          kill %1
-
-      - name: Delete kustomize resources
-        run: kubectl delete namespace test-kustomize --wait
-
-      # Test basic nginx Helm example
-      - name: Install basic-nginx chart
-        run: |
-          helm install test-basic examples/basic-nginx/chart/ \
-            --create-namespace --namespace test-basic \
-            --set nebariapp.enabled=false \
-            --wait --timeout 2m
-
-      - name: Wait for basic-nginx pods
-        run: kubectl wait -n test-basic --for=condition=ready pod -l app.kubernetes.io/instance=test-basic --timeout=120s
-
-      - name: Health check basic-nginx
-        run: |
-          kubectl port-forward -n test-basic svc/test-basic-my-pack 8082:80 &
-          sleep 3
-          curl -sf http://localhost:8082
-          kill %1
-
-      - name: Uninstall basic-nginx
-        run: helm uninstall test-basic -n test-basic --wait
-
-      # Test auth-fastapi Helm example
-      - name: Build and load auth-fastapi image
-        run: |
-          docker build -t ghcr.io/nebari-dev/software-pack-template/auth-fastapi-example:latest examples/auth-fastapi/
-          kind load docker-image ghcr.io/nebari-dev/software-pack-template/auth-fastapi-example:latest --name pack-test
-
-      - name: Install auth-fastapi chart
-        run: |
-          helm install test-fastapi examples/auth-fastapi/chart/ \
-            --create-namespace --namespace test-fastapi \
-            --set nebariapp.enabled=false \
-            --wait --timeout 2m
-
-      - name: Wait for auth-fastapi pods
-        run: kubectl wait -n test-fastapi --for=condition=ready pod -l app.kubernetes.io/instance=test-fastapi --timeout=120s
-
-      - name: Health check auth-fastapi
-        run: |
-          kubectl port-forward -n test-fastapi svc/test-fastapi-my-pack 8083:80 &
-          sleep 3
-          curl -sf http://localhost:8083
-          kill %1
-
-      - name: Uninstall auth-fastapi
-        run: helm uninstall test-fastapi -n test-fastapi --wait
-
-      # Test podinfo wrapper Helm example
-      - name: Update podinfo dependency
-        run: helm dependency update examples/wrap-existing-chart/chart/
-
-      - name: Install wrap-existing-chart
-        run: |
-          helm install test-podinfo examples/wrap-existing-chart/chart/ \
-            --create-namespace --namespace test-podinfo \
-            --set nebariapp.enabled=false \
-            --wait --timeout 3m
-
-      - name: Wait for podinfo pods
-        run: kubectl wait -n test-podinfo --for=condition=ready pod -l app.kubernetes.io/name=test-podinfo --timeout=120s
-
-      - name: Health check podinfo
-        run: |
-          kubectl port-forward -n test-podinfo svc/test-podinfo 9898:9898 &
-          sleep 3
-          curl -sf http://localhost:9898
-          kill %1
-
-      - name: Uninstall podinfo
-        run: helm uninstall test-podinfo -n test-podinfo --wait
+      - name: Run tests
+        working-directory: api
+        # Not --frozen: the rename changes the project's own package entry, so
+        # uv reconciles uv.lock's project record on sync. Deps stay pinned.
+        run: uv run --group test pytest

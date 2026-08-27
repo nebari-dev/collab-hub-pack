@@ -1,0 +1,24 @@
+Collab Hub API
+Copyright OpenTeams, Inc. and contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Third-party components distributed in the container image
+------------------------------------------------------------------------------
+
+The published container image bundles third-party Python dependencies under
+their own licenses. Most are permissive (Apache-2.0, MIT, BSD). The following
+copyleft dependency is bundled and is called out explicitly:
+
+  psycopg (psycopg 3) — LGPL-3.0-only
+    PostgreSQL adapter for Python.
+    Source: https://github.com/psycopg/psycopg
+    License: https://www.gnu.org/licenses/lgpl-3.0.html
+
+  psycopg is used unmodified as an installed dependency. Its source is publicly
+  available at the URL above, and it may be replaced with a compatible version
+  under the terms of the LGPL.
+
+This NOTICE is informational and does not modify the Apache-2.0 license under
+which Collab Hub API itself is distributed.

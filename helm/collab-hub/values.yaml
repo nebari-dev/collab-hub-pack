@@ -1,0 +1,227 @@
+# -- String to override the default name of the chart deployment
+nameOverride: ""
+# -- String to override the default full name of the chart deployment
+fullnameOverride: ""
+
+api:
+  # -- Whether to deploy the api
+  enabled: true
+  serviceAccount:
+    # -- Whether to create a ServiceAccount for the API pod.
+    create: true
+    # -- ServiceAccount name. Defaults to the API component name.
+    name: ""
+    # -- ServiceAccount annotations, for example EKS IRSA role annotations.
+    annotations: {}
+  deployment:
+    # -- Number of replicas for the main application pod
+    replicaCount: 1
+    # -- Extra environment variables for local smoke tests and advanced deployments.
+    extraEnv: []
+    image:
+      # -- The repository of the main application image
+      repository: ghcr.io/nebari-dev/collab-hub-pack/api
+      # -- The tag of the main application image. If not set, the chart's appVersion is used.
+      tag: ""
+      # -- The pull policy for the main application image
+      pullPolicy: IfNotPresent
+    securityContext:
+      pod:
+        # -- The user ID to run the pod with
+        runAsUser: 1000
+        # -- The group ID to run the pod with
+        runAsGroup: 1000
+        # -- The group ID for the pod's filesystem
+        fsGroup: 1000
+      container:
+        # -- Whether to run the container with a read-only root filesystem
+        readOnlyRootFilesystem: true
+    resources:
+      # -- Resource limits for the main application container
+      limits:
+        # -- CPU limit for the main application container
+        cpu: 500m
+        # -- Memory limit for the main application container
+        memory: 512Mi
+      # -- Resource requests for the main application container
+      requests:
+        # -- CPU request for the main application container
+        cpu: 500m
+        # -- Memory request for the main application container
+        memory: 512Mi
+  autoscaling:
+    # -- Whether to create a HorizontalPodAutoscaler for the API deployment.
+    enabled: false
+    # -- Minimum API replicas when autoscaling is enabled.
+    minReplicas: 2
+    # -- Maximum API replicas when autoscaling is enabled.
+    maxReplicas: 5
+    # -- Target average CPU utilization percentage.
+    targetCPUUtilizationPercentage: 70
+    # -- Optional target average memory utilization percentage.
+    targetMemoryUtilizationPercentage: null
+  service:
+    # -- The type of service to create
+    type: ClusterIP
+    # -- The port that the service should expose
+    port: 80
+    # -- The target port on the container
+    targetPort: 8000
+  nebariapp:
+    # -- Whether to create a NebariApp for Nebari routing/auth integration.
+    enabled: false
+    # -- The hostname for the NebariApp
+    hostname: ""
+    # -- Routing configuration for the NebariApp
+    routing:
+      routes:
+        - pathPrefix: /
+          pathType: PathPrefix
+      publicRoutes:
+        - pathPrefix: /v1
+          pathType: PathPrefix
+        - pathPrefix: /mcp
+          pathType: PathPrefix
+        - pathPrefix: /health
+          pathType: Exact
+      tls:
+        enabled: true
+    auth:
+      # -- Enforce browser auth at the gateway while publicRoutes let native clients reach app-level bearer auth.
+      enabled: true
+      provider: keycloak
+      provisionClient: true
+      enforceAtGateway: true
+      scopes:
+        - openid
+        - profile
+        - email
+    landingPage:
+      enabled: true
+      displayName: Collab Hub Frames
+      description: Manage reusable Markdown context Frames for AI chat sessions.
+      category: AI
+      icon: 🖼️
+      priority: 50
+      healthCheck:
+        enabled: true
+        path: /health
+        port: 80
+        intervalSeconds: 30
+        timeoutSeconds: 5
+    gateway: public
+
+frames:
+  auth:
+    idToken:
+      # -- JWKS URL used to verify IdToken cookies forwarded to the app.
+      jwksUrl: ""
+      # -- Expected IdToken issuer. Leave empty to fall back to bearer issuer or skip issuer validation.
+      issuer: ""
+      # -- Expected IdToken audience. Leave empty to skip audience validation.
+      audience: ""
+    bearer:
+      # -- JWKS URL used to verify native-client bearer tokens.
+      jwksUrl: ""
+      # -- Expected token issuer. Leave empty to skip issuer validation.
+      issuer: ""
+      # -- Expected token audience. Leave empty to skip audience validation.
+      audience: ""
+    defaults:
+      # -- Default org id used when a verified token has no org claim.
+      orgId: ""
+      # -- Default workspace id used when a verified token has no workspace claim.
+      workspaceId: ""
+  storage:
+    # -- Frame content backend used by the API: local or s3.
+    backend: local
+    # -- Local mount path used by the API for local Frame storage.
+    mountPath: /var/frames
+    persistence:
+      enabled: false
+      existingClaim: ""
+      size: 5Gi
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+  s3:
+    bucket: ""
+    prefix: frames
+    endpointUrl: ""
+    region: ""
+    # -- Optional static credential secret for S3-compatible stores. Prefer ServiceAccount identity on EKS.
+    existingSecret: ""
+    accessKeyIdKey: AWS_ACCESS_KEY_ID
+    secretAccessKeyKey: AWS_SECRET_ACCESS_KEY
+    sessionTokenKey: AWS_SESSION_TOKEN
+  # -- Single shared Postgres URL backing the relational frames features.
+  # Setting it lights up history and groups (required features, no per-feature
+  # toggle) and is the fallback for active-state's postgres backend. When unset,
+  # the history and group endpoints return 503.
+  postgres:
+    url: ""
+    existingSecret: ""
+    databaseUrlKey: DATABASE_URL
+    autoMigrate: false
+  activeState:
+    # -- disabled, memory, or postgres. With "postgres" and no url below, falls
+    # back to the shared frames.postgres URL.
+    backend: disabled
+    postgres:
+      url: ""
+      existingSecret: ""
+      databaseUrlKey: DATABASE_URL
+      autoMigrate: false
+
+tasks:
+  # -- memory or postgres. Use postgres with tasks.postgres.url or the shared
+  # frames.postgres.url for durable scheduled task synchronization.
+  backend: memory
+  postgres:
+    url: ""
+    existingSecret: ""
+    databaseUrlKey: DATABASE_URL
+    autoMigrate: false
+
+connectors:
+  google:
+    # -- Keycloak broker token endpoint for the linked Google identity. Normal
+    # hub users must also receive the broker client role `read-token` through
+    # their default role or group; otherwise Keycloak returns 403.
+    brokerTokenUrl: ""
+    # -- Google Drive API base URL. Override for local fake Drive API smoke tests.
+    driveApiBaseUrl: https://www.googleapis.com/drive/v3
+    # -- Gmail API base URL. Override for local fake Gmail API smoke tests.
+    gmailApiBaseUrl: https://gmail.googleapis.com/gmail/v1
+    # -- Google Calendar API base URL. Override for local fake Calendar API smoke tests.
+    calendarApiBaseUrl: https://www.googleapis.com/calendar/v3
+    # -- Timeout for broker and Google API requests.
+    requestTimeoutSeconds: 10
+  slack:
+    # -- Keycloak broker token endpoint for the linked Slack identity. Normal
+    # hub users must also receive the broker client role `read-token` through
+    # their default role or group; otherwise Keycloak returns 403.
+    brokerTokenUrl: ""
+    # -- Slack Web API base URL. Override for local fake Slack API smoke tests.
+    apiBaseUrl: https://slack.com/api
+    # -- Timeout for broker and Slack API requests.
+    requestTimeoutSeconds: 10
+
+userDirectory:
+  # -- Whether to configure Collab Hub API access to the hub user directory.
+  enabled: false
+  # -- User directory provider. Only keycloak is currently supported.
+  provider: keycloak
+  keycloak:
+    # -- OIDC issuer URL for the Keycloak realm.
+    issuerUrl: ""
+    # -- OAuth token URL used for the client credentials grant.
+    tokenUrl: ""
+    # -- Base URL for the Keycloak realm admin API.
+    adminApiBaseUrl: ""
+    # -- Existing Secret containing the Keycloak service-account client credentials.
+    existingSecret: ""
+    # -- Key in existingSecret containing the Keycloak client id.
+    clientIdKey: client-id
+    # -- Key in existingSecret containing the Keycloak client secret.
+    clientSecretKey: client-secret

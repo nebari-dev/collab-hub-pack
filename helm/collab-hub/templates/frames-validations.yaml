@@ -1,0 +1,52 @@
+{{- if and (eq .Values.frames.storage.backend "local") (gt (int .Values.api.deployment.replicaCount) 1) }}
+{{- fail "frames.storage.backend=local supports only api.deployment.replicaCount=1. Use frames.storage.backend=s3 before scaling replicas." }}
+{{- end }}
+{{- if and .Values.api.autoscaling.enabled (ne .Values.frames.storage.backend "s3") }}
+{{- fail "api.autoscaling.enabled=true requires frames.storage.backend=s3 so replicas share Frame content." }}
+{{- end }}
+{{- if and .Values.api.autoscaling.enabled (ne .Values.frames.activeState.backend "postgres") }}
+{{- fail "api.autoscaling.enabled=true requires frames.activeState.backend=postgres so replicas share active Frame selections." }}
+{{- end }}
+{{- if and .Values.api.autoscaling.enabled (lt (int .Values.api.autoscaling.minReplicas) 2) }}
+{{- fail "api.autoscaling.minReplicas must be at least 2 when autoscaling is enabled." }}
+{{- end }}
+{{- if and .Values.api.autoscaling.enabled (lt (int .Values.api.autoscaling.maxReplicas) (int .Values.api.autoscaling.minReplicas)) }}
+{{- fail "api.autoscaling.maxReplicas must be greater than or equal to api.autoscaling.minReplicas." }}
+{{- end }}
+{{- if and .Values.api.autoscaling.enabled (not .Values.api.autoscaling.targetCPUUtilizationPercentage) (not .Values.api.autoscaling.targetMemoryUtilizationPercentage) }}
+{{- fail "api.autoscaling requires at least one CPU or memory target." }}
+{{- end }}
+{{- if and (eq .Values.frames.storage.backend "s3") (not .Values.frames.s3.bucket) }}
+{{- fail "frames.s3.bucket is required when frames.storage.backend=s3." }}
+{{- end }}
+{{- if and (eq .Values.frames.activeState.backend "postgres") (not .Values.frames.activeState.postgres.url) (not .Values.frames.activeState.postgres.existingSecret) (not .Values.frames.postgres.url) (not .Values.frames.postgres.existingSecret) }}
+{{- fail "frames.activeState.backend=postgres requires a URL: set frames.activeState.postgres.url/existingSecret or the shared frames.postgres.url/existingSecret." }}
+{{- end }}
+{{- if .Values.userDirectory.enabled }}
+{{- if ne .Values.userDirectory.provider "keycloak" }}
+{{- fail "userDirectory.provider must be keycloak when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.issuerUrl }}
+{{- fail "userDirectory.keycloak.issuerUrl is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.adminApiBaseUrl }}
+{{- fail "userDirectory.keycloak.adminApiBaseUrl is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.existingSecret }}
+{{- fail "userDirectory.keycloak.existingSecret is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- end }}
+{{- if .Values.userDirectory.enabled }}
+{{- if ne .Values.userDirectory.provider "keycloak" }}
+{{- fail "userDirectory.provider must be keycloak when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.issuerUrl }}
+{{- fail "userDirectory.keycloak.issuerUrl is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.adminApiBaseUrl }}
+{{- fail "userDirectory.keycloak.adminApiBaseUrl is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- if not .Values.userDirectory.keycloak.existingSecret }}
+{{- fail "userDirectory.keycloak.existingSecret is required when userDirectory.enabled=true." }}
+{{- end }}
+{{- end }}

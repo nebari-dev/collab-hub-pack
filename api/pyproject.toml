@@ -1,0 +1,52 @@
+[project]
+name = "collab-hub-api"
+version = "0.1.0"
+description = "Collab Hub API"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "OpenTeams", email = "info@openteams.com" },
+]
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "boto3>=1.35.0",
+    "fastapi>=0.136.3",
+    "httpx>=0.28.0",
+    "l2sl>=0.4.0",
+    "mcp>=1.13.0",
+    "prometheus-client>=0.23.0",
+    "psycopg[binary]>=3.2.0",
+    "pydantic-settings>=2.14.1",
+    "pyjwt[crypto]>=2.10.0",
+    "uvicorn>=0.48.0",
+    "uvloop>=0.22.1; sys_platform != 'win32'",
+]
+
+[dependency-groups]
+test = [
+    "httpx>=0.28.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"
+
+[project.urls]
+Repository = "https://github.com/nebari-dev/collab-hub-pack"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I001",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
