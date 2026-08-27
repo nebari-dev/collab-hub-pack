@@ -1,0 +1,27 @@
+name: Test
+
+# Runs the Collab Hub API test suite (pytest, in api/). Fork-safe: no secrets,
+# read-only checkout. uv provisions the pinned Python and the `test` group.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - ".github/workflows/test.yaml"
+  pull_request: {}   # runs on every PR so it can be a required status check
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run tests
+        working-directory: api
+        # Not --frozen: the rename changes the project's own package entry, so
+        # uv reconciles uv.lock's project record on sync. Deps stay pinned.
+        run: uv run --group test pytest

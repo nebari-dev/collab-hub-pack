@@ -1,0 +1,31 @@
+name: Release Chart
+
+# Releases the collab-hub chart via the shared reusable workflow in
+# nebari-dev/.github: pins the chart's image tag to the release commit's sha,
+# packages the chart, creates a GitHub Release, and opens a PR in
+# nebari-dev/helm-repository.
+#
+# Releases on a chart version bump: a push to main that changes
+# helm/collab-hub/Chart.yaml cuts the release (build-images produces the
+# matching sha-<short> image on the same commit). workflow_dispatch is kept
+# for manual re-runs. Publishing relies on the org-provided
+# NEBARI_HELM_REPO_TOKEN secret — confirm it's available to this repo before
+# the first release.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "helm/collab-hub/Chart.yaml"
+  workflow_dispatch:
+
+jobs:
+  release:
+    uses: nebari-dev/.github/.github/workflows/pack-release.yaml@v1
+    with:
+      chart-path: helm/collab-hub
+      chart-name: collab-hub
+      tag-paths: |
+        api.deployment.image.tag
+    secrets:
+      NEBARI_HELM_REPO_TOKEN: ${{ secrets.NEBARI_HELM_REPO_TOKEN }}

@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+
+import pytest
+
+from collab_hub_api.frames.models import (
+    FRAME_METADATA_SCHEMA_VERSION,
+    Frame,
+    SuggestionStatus,
+    Visibility,
+)
+from collab_hub_api.frames.store import (
+    ConcurrentFrameUpdateError,
+    LocalFsFrameStore,
+    S3FrameStore,
+    compute_token_estimate,
+)
+
+
+def _create(store, **overrides):
+    kwargs = {
+        "org_id": "org-a",
+        "workspace_id": "workspace-a",
+        "created_by": "alice",
+        "owners": ["alice"],
+        "name": "Sales Playbook",
+        "description": "",
+        "visibility": Visibility.private,
+        "tags": ["sales"],
+        "body": "hello world",
+    }
+    kwargs.update(overrides)
+    return store.create_frame(**kwargs)
+
+
+def test_local_store_crud_and_suggestion_cleanup(tmp_path):
+    store = LocalFsFrameStore(tmp_path)
+
+    frame = _create(store)
+    metadata = json.loads((tmp_path / frame.id / "metadata.json").read_text())
+    assert frame.owners == ["alice"]
+    assert frame.created_by == "alice"
+    assert frame.visibility == Visibility.private
+    assert frame.published is False
+    assert frame.readers == []
+    assert frame.name == "Sales Playbook"
+    assert frame.schema_version == FRAME_METADATA_SCHEMA_VERSION
+    assert metadata["schema_version"] == FRAME_METADATA_SCHEMA_VERSION
+    assert metadata["name"] == "Sales Playbook"
+    assert metadata["owners"] == ["alice"]
+    assert "owner" not in metadata
+    assert frame.org_id == "org-a"
+    assert frame.workspace_id == "workspace-a"
+    assert frame.token_estimate == compute_token_estimate("hello world")
+    assert (tmp_path / frame.id / "body.md").read_text() == "hello world"
+    assert store.list_frames("org-a", "workspace-a", tags=["sales"])[0].id == frame.id
+    assert store.list_frames("org-a", "workspace-a", name="play")[0].id == frame.id
+    assert store.list_frames("org-a", "workspace-a", owner="alice")[0].id == frame.id
+    assert store.list_frames("org-a", "workspace-b") == []
+
+    updated = store.update_frame(
+        frame.id,
+        "Legal Playbook",
+        "Legal guidance",
+        Visibility.internal,
+        ["sales", "legal"],
+        "updated body",
+    )
+    assert updated.name == "Legal Playbook"
+    assert updated.description == "Legal guidance"
+    assert updated.visibility == Visibility.internal
+    assert updated.body == "updated body"
+    assert updated.token_estimate == compute_token_estimate("updated body")
+
+    # update_frame preserves governance fields.
+    assert updated.owners == ["alice"]
+    assert updated.created_by == "alice"
+
+    owners_set = store.set_owners(frame.id, ["alice", "bob"])
+    assert owners_set.owners == ["alice", "bob"]
+    readers_set = store.set_readers(frame.id, ["carol"])
+    assert readers_set.readers == ["carol"]
+    published = store.set_published(frame.id, True)
+    assert published.published is True
+    # Body-preserving setters leave the body untouched.
+    assert store.get_frame(frame.id).body == "updated body"
+
+    suggestion = store.create_suggestion(frame.id, "bob", "try this")
+    assert suggestion.status == SuggestionStatus.open
+    assert store.list_suggestions(frame.id, SuggestionStatus.open)[0].id == suggestion.id
+
+    closed = store.close_suggestion(frame.id, suggestion.id)
+    assert closed.status == SuggestionStatus.closed
+    assert store.list_suggestions(frame.id, SuggestionStatus.open) == []
+    assert store.list_suggestions(frame.id, SuggestionStatus.closed)[0].id == suggestion.id
+
+    store.delete_frame(frame.id)
+    assert not (tmp_path / frame.id).exists()
+
+
+def test_local_store_reads_legacy_metadata_without_schema_version(tmp_path):
+    frame_id = "0" * 32
+    frame_dir = tmp_path / frame_id
+    frame_dir.mkdir()
+    (frame_dir / "body.md").write_text("legacy body", encoding="utf-8")
+    (frame_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "id": frame_id,
+                "owner": "legacy-user",
+                "tags": [],
+                "token_estimate": 3,
+                "suggestions": [],
+                "created_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    frame = LocalFsFrameStore(tmp_path).get_frame(frame_id)
+
+    assert frame.schema_version == FRAME_METADATA_SCHEMA_VERSION
+    assert frame.name == frame_id
+    assert frame.org_id == "dev-org"
+    assert frame.workspace_id == "default"
+    assert frame.body == "legacy body"
+    # Legacy `owner` migrates to `owners`/`created_by` and new fields default.
+    assert frame.owners == ["legacy-user"]
+    assert frame.created_by == "legacy-user"
+    assert frame.visibility == Visibility.private
+    assert frame.published is False
+    assert frame.readers == []
+    assert frame.group_ids == []
+    assert frame.description == ""
+
+
+def test_normalize_metadata_repairs_reader_visibility_invariant(tmp_path):
+    # A record persisted under the earlier "readers restrict internal" semantics
+    # (internal + non-empty readers) must be coerced to private on read, so it
+    # cannot widen to whole-tenant access once can_read ignores readers on
+    # internal/public.
+    frame_id = "1" * 32
+    frame_dir = tmp_path / frame_id
+    frame_dir.mkdir()
+    (frame_dir / "body.md").write_text("legacy body", encoding="utf-8")
+    (frame_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "id": frame_id,
+                "org_id": "org-a",
+                "workspace_id": "workspace-a",
+                "name": "Legacy Restricted",
+                "created_by": "alice",
+                "owners": ["alice"],
+                "visibility": "internal",
+                "published": True,
+                "readers": ["bob"],
+                "tags": [],
+                "token_estimate": 3,
+                "suggestions": [],
+                "created_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    frame = LocalFsFrameStore(tmp_path).get_frame(frame_id)
+
+    # Coerced to private; the reader grant is preserved.
+    assert frame.visibility == Visibility.private
+    assert frame.readers == ["bob"]
+
+
+@pytest.mark.parametrize(
+    ("body", "estimate"),
+    [
+        ("", 0),
+        ("a", 1),
+        ("abcd", 1),
+        ("abcde", 2),
+    ],
+)
+def test_token_estimate_heuristic(body, estimate):
+    assert compute_token_estimate(body) == estimate
+
+
+def test_local_store_concurrent_suggestions_are_preserved(tmp_path):
+    store = LocalFsFrameStore(tmp_path)
+    frame = _create(store, name="Team Frame", tags=["team"], body="body")
+
+    def submit(index: int):
+        return store.create_suggestion(frame.id, f"user-{index}", f"suggestion {index}")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        created = list(pool.map(submit, range(25)))
+
+    suggestions = store.list_suggestions(frame.id)
+    assert len(suggestions) == 25
+    assert {item.id for item in suggestions} == {item.id for item in created}
+
+
+class FakeS3ClientError(Exception):
+    def __init__(self, code: str, status_code: int):
+        self.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": status_code},
+        }
+
+
+def make_frame(frame_id: str = "0" * 32) -> Frame:
+    now = datetime.now(UTC)
+    return Frame(
+        schema_version=FRAME_METADATA_SCHEMA_VERSION,
+        id=frame_id,
+        org_id="org-a",
+        workspace_id="workspace-a",
+        name="Frame",
+        created_by="alice",
+        owners=["alice"],
+        tags=[],
+        body="body",
+        token_estimate=1,
+        suggestions=[],
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def test_s3_metadata_update_retries_on_etag_conflict():
+    store = S3FrameStore.__new__(S3FrameStore)
+    store.client_error = FakeS3ClientError
+    reads = [("stale", make_frame()), ("fresh", make_frame())]
+    writes = []
+    body_writes = []
+
+    def read_frame_with_etag(_frame_id):
+        etag, frame = reads.pop(0)
+        return frame, etag
+
+    def write_metadata(_frame, metadata_etag=None):
+        writes.append(metadata_etag)
+        if metadata_etag == "stale":
+            raise FakeS3ClientError("PreconditionFailed", 412)
+
+    store._read_frame_with_metadata_etag = read_frame_with_etag
+    store._write_metadata = write_metadata
+    store._write_body = lambda frame: body_writes.append(frame.body)
+
+    updated = store._retry_metadata_update(
+        "0" * 32,
+        lambda frame: frame.model_copy(update={"body": "updated"}),
+        write_body=True,
+    )
+
+    assert updated.body == "updated"
+    assert writes == ["stale", "fresh"]
+    assert body_writes == ["updated"]
+
+
+def test_s3_metadata_update_reports_exhausted_conflicts():
+    store = S3FrameStore.__new__(S3FrameStore)
+    store.client_error = FakeS3ClientError
+    store._read_frame_with_metadata_etag = lambda _frame_id: (make_frame(), "stale")
+    store._write_metadata = lambda _frame, metadata_etag=None: (_ for _ in ()).throw(
+        FakeS3ClientError("PreconditionFailed", 412)
+    )
+
+    with pytest.raises(ConcurrentFrameUpdateError):
+        store._retry_metadata_update("0" * 32, lambda frame: frame)

@@ -1,0 +1,10 @@
+title = "collab-hub-pack gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Non-secret test fixtures (example values used by unit tests)"
+paths = [
+  '''api/tests/test_web_surface\.py''',
+]

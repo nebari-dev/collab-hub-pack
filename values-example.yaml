@@ -1,0 +1,46 @@
+# Example values for a Collab Hub API install. Copy, adjust, and pass with
+# `-f`. See helm/collab-hub/values.yaml for the full reference.
+
+api:
+  deployment:
+    image:
+      # Pin a specific published tag in production (e.g. sha-<short> from a
+      # build run); "latest" tracks main.
+      tag: "latest"
+    replicaCount: 1
+  # Expose the API on the Nebari cluster (NebariApp -> HTTPRoute + TLS + OIDC).
+  nebariapp:
+    enabled: true
+    hostname: collab-hub.example.com
+
+frames:
+  auth:
+    bearer:
+      # Point at your cluster's Keycloak realm.
+      jwksUrl: https://keycloak.example.com/realms/nebari/protocol/openid-connect/certs
+      issuer: https://keycloak.example.com/realms/nebari
+      audience: apollo-desktop
+    defaults:
+      orgId: nebari
+      workspaceId: default
+  # Frame content storage. Defaults to the local filesystem (no object store
+  # needed). For durable/shared storage, use any S3-compatible endpoint:
+  storage:
+    backend: local            # or: s3
+  # s3:                       # any S3-compatible store — set endpointUrl for non-AWS
+  #   bucket: collab-hub-frames
+  #   prefix: frames
+  #   endpointUrl: ""         # e.g. https://minio.example.com (blank = AWS)
+  #   region: us-west-2
+
+  # State/history/tasks default to in-memory. For persistence, point at ANY
+  # Postgres (the history/group endpoints need this; otherwise they return 503):
+  # postgres:
+  #   existingSecret: collab-hub-postgres   # key DATABASE_URL
+  #   databaseUrlKey: DATABASE_URL
+  #   autoMigrate: true
+  # activeState:
+  #   backend: postgres
+  #   postgres:
+  #     existingSecret: collab-hub-postgres
+  #     databaseUrlKey: DATABASE_URL
