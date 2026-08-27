@@ -1,12 +1,11 @@
 name: Build Docker Images
 
-# Builds and publishes the Collab Hub API image via the shared reusable
-# workflow in nebari-dev/.github. The image is pushed to GHCR and quay.io
-# with `sha-<short>` and (on main) `latest`.
+# Builds the Collab Hub API image and publishes it to GHCR (GHCR-only; no quay,
+# no ECR). Uses the built-in GITHUB_TOKEN — no external registry creds. On PRs
+# it builds without pushing (a CI check); on main / manual dispatch it pushes.
 #
-# The Chart.yaml path is in the trigger because release.yaml pins image tags
-# to sha-<release-commit>, so the release commit (a Chart.yaml bump) must
-# produce images with that sha.
+# The Chart.yaml path is in the trigger because release.yaml pins image tags to
+# the release commit's sha, so a Chart.yaml bump must produce that image.
 
 on:
   push:
@@ -22,23 +21,47 @@ on:
 
 jobs:
   api:
-    uses: nebari-dev/.github/.github/workflows/pack-build-image.yaml@v1
-    with:
-      image: api
-      context: api
-      push: ${{ github.event_name != 'pull_request' }}
-    secrets:
-      QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
-      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
-
-  # Surfaces the tag to deploy so an operator can copy it straight from the
-  # run and bump the infra repo (see the infra repos' "Deploying an update").
-  deploy-tag:
-    needs: api
-    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/api
     steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: api
+          # The Dockerfile binds the repo-root LICENSE via this named context,
+          # so no Dockerfile change is needed for a GHCR-only custom build.
+          build-contexts: |
+            projectroot=.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+
       - name: Show deploy tag
+        if: ${{ github.event_name != 'pull_request' }}
         run: |
           short="$(echo "${GITHUB_SHA}" | cut -c1-7)"
           echo "Deploy this build by setting the infra repo image tag to: **sha-${short}**" >> "$GITHUB_STEP_SUMMARY"
