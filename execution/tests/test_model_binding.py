@@ -1,6 +1,6 @@
 import pytest
 
-from collab_hub_api.execution import (
+from collab_hub_execution import (
     BindingResolutionError,
     CapabilityRequirement,
     ContextCog,

@@ -148,23 +148,32 @@ class PostgresTrackStore:
     def __init__(self, pool: Any) -> None:
         self.pool = pool
 
+    # One statement per execute: psycopg3's extended protocol rejects multiple
+    # commands in a single execute().
+    _SCHEMA = (
+        "CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence",
+        """
+        CREATE TABLE IF NOT EXISTS collab_track_events (
+            sequence bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence'),
+            event_id text NOT NULL UNIQUE,
+            run_id text NOT NULL,
+            event_type text NOT NULL,
+            payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+            occurred_at timestamptz NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
+        # At most one submission per run: two API replicas cannot both start the
+        # same run (the losing append raises). Single-owner lease / graceful
+        # handling of the conflict lands with the DBOS backing (#1).
+        "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission "
+        "ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
+    )
+
     @staticmethod
     def ensure_schema(connection: Any) -> None:
-        connection.execute(
-            """
-            CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence;
-            CREATE TABLE IF NOT EXISTS collab_track_events (
-                sequence bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence'),
-                event_id text NOT NULL UNIQUE,
-                run_id text NOT NULL,
-                event_type text NOT NULL,
-                payload jsonb NOT NULL DEFAULT '{}'::jsonb,
-                occurred_at timestamptz NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence
-                ON collab_track_events (run_id, sequence);
-            """
-        )
+        for statement in PostgresTrackStore._SCHEMA:
+            connection.execute(statement)
 
     def append(self, event: TrackEvent) -> TrackEvent:
         if event.sequence is not None:
