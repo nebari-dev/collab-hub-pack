@@ -1,4 +1,4 @@
-from collab_hub_api.execution import (
+from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,

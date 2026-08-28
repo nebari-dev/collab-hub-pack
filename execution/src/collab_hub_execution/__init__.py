@@ -8,6 +8,7 @@ from .binding import (
     ModelBinding,
     ModelCog,
 )
+from .kubernetes import KubernetesCogExecutor, cog_slug, label_value, resource_name
 from .lifecycle import (
     BudgetExceeded,
     BudgetTracker,
@@ -56,4 +57,8 @@ __all__ = [
     "OpStep",
     "PauseRequest",
     "WorkflowEngine",
+    "KubernetesCogExecutor",
+    "cog_slug",
+    "label_value",
+    "resource_name",
 ]

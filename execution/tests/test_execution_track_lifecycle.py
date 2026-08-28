@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from collab_hub_api.execution import (
+from collab_hub_execution import (
     BudgetExceeded,
     BudgetTracker,
     CogLifecycle,
@@ -13,7 +13,7 @@ from collab_hub_api.execution import (
     TrackEvent,
     derive_run_status,
 )
-from collab_hub_api.execution.lifecycle import InvalidLifecycleTransition
+from collab_hub_execution.lifecycle import InvalidLifecycleTransition
 
 
 def test_track_replays_in_append_order_and_derives_status():
