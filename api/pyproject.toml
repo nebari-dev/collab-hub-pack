@@ -25,9 +25,11 @@ dependencies = [
 
 [dependency-groups]
 test = [
+    "diff-cover>=9.0.0",
     "httpx>=0.28.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
 ]
 
 [build-system]
@@ -50,3 +52,11 @@ select = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Measure coverage of the application package on every run and emit both a
+# terminal report and an XML report (the latter feeds the patch-coverage check
+# in CI). The global floor is applied in CI via --cov-fail-under so that a
+# deliberately-scoped local run isn't failed for not exercising everything.
+addopts = "--cov=collab_hub_api --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run]
+source = ["collab_hub_api"]
