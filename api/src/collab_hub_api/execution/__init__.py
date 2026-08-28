@@ -15,6 +15,14 @@ from .lifecycle import (
     LifecycleState,
     RunBudget,
 )
+from .orchestration import (
+    DurableWorkflowEngine,
+    InMemoryCogExecutor,
+    OpDefinition,
+    OpStep,
+    PauseRequest,
+    WorkflowEngine,
+)
 from .track import (
     InMemoryTrackStore,
     PostgresTrackStore,
@@ -42,4 +50,10 @@ __all__ = [
     "derive_run_status",
     "ModelBinding",
     "ModelCog",
+    "DurableWorkflowEngine",
+    "InMemoryCogExecutor",
+    "OpDefinition",
+    "OpStep",
+    "PauseRequest",
+    "WorkflowEngine",
 ]
