@@ -1,5 +1,13 @@
 """Execution contracts shared by the Hub's Cog and Op implementations."""
 
+from .binding import (
+    BindingResolutionError,
+    CapabilityRequirement,
+    ContextCog,
+    DeclaredCapabilityResolver,
+    ModelBinding,
+    ModelCog,
+)
 from .lifecycle import (
     BudgetExceeded,
     BudgetTracker,
@@ -17,6 +25,10 @@ from .track import (
 )
 
 __all__ = [
+    "BindingResolutionError",
+    "CapabilityRequirement",
+    "ContextCog",
+    "DeclaredCapabilityResolver",
     "BudgetExceeded",
     "BudgetTracker",
     "CogLifecycle",
@@ -28,4 +40,6 @@ __all__ = [
     "TrackEvent",
     "TrackStore",
     "derive_run_status",
+    "ModelBinding",
+    "ModelCog",
 ]
