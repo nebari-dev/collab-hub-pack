@@ -39,6 +39,26 @@ def _key_component(value: str) -> str:
     return value.replace("%", "%25").replace(":", "%3A")
 
 
+def _coerce_usage(value: Any) -> dict[str, Any] | None:
+    """Extract usage from a Cog result, coercing tokens/cost safely.
+
+    Returns None when no usage mapping is present, and never raises on a malformed
+    usage (a bad tokens/cost counts as zero) — so the post-interaction accounting
+    tail cannot turn a completed step into an uncaught engine exception.
+    """
+    raw = value.get("usage") if isinstance(value, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+
+    def _num(candidate: Any, cast: Callable[[Any], Any]) -> Any:
+        try:
+            return cast(candidate)
+        except (TypeError, ValueError):
+            return cast(0)
+
+    return {"tokens": _num(raw.get("tokens", 0), int), "cost": _num(raw.get("cost", 0.0), float)}
+
+
 @dataclass(frozen=True, slots=True)
 class OpStep:
     """One interaction with a Cog entry point."""
@@ -82,8 +102,14 @@ class CogWorker(Protocol):
 
 
 class CogExecutor(Protocol):
-    def materialize(self, cog: str, run_id: str) -> CogWorker:
-        """Materialize one Cog worker for a run."""
+    def materialize(self, cog: str, run_id: str, instance: str = "") -> CogWorker:
+        """Materialize one Cog worker for a run.
+
+        ``instance`` uniquely and recovery-stably identifies this materialization
+        within the run (the engine passes step name + attempt). An executor that
+        names cluster resources should fold it in so distinct steps and successive
+        attempts never reuse a name a prior teardown may still be terminating.
+        """
 
     def teardown(self, worker: CogWorker) -> None:
         """Release a materialized worker."""
@@ -110,7 +136,7 @@ class InMemoryCogExecutor(CogExecutor):
         self.materialized: list[tuple[str, str]] = []
         self.torn_down: list[str] = []
 
-    def materialize(self, cog: str, run_id: str) -> CogWorker:
+    def materialize(self, cog: str, run_id: str, instance: str = "") -> CogWorker:
         self.materialized.append((run_id, cog))
         return _Worker(cog, self.handlers[cog])
 
@@ -291,13 +317,17 @@ class DurableWorkflowEngine(WorkflowEngine):
                 try:
                     tracker.check()
                 except BudgetExceeded as exc:
-                    self._append(op.run_id, "budget_exceeded", step=step.name, reason=str(exc))
-                    return RunStatus.BUDGET_EXCEEDED
+                    return self._record_budget_stop(op.run_id, step.name, exc)
             # attempt = prior pauses (revisions) + explicit retries, NOT the
             # step_started count: a crash before the outcome is recorded re-runs
-            # with the SAME key (a durable worker can dedupe the replay), while an
-            # explicit retry() bumps the attempt so it re-runs under a fresh key.
+            # with the SAME instance/key (a durable worker can dedupe the replay),
+            # while an explicit retry() bumps the attempt so it re-runs under a fresh
+            # one. `instance` identifies the materialization (so distinct steps and
+            # attempts never reuse a still-terminating worker name); `key` is the
+            # same identity, run-scoped, handed to the worker for dedupe.
             attempt = self._pause_count(op.run_id, step.name) + self._retry_count(op.run_id)
+            instance = f"{_key_component(step.name)}:{attempt}"
+            key = f"{_key_component(op.run_id)}:{instance}"
             self._append(op.run_id, "step_started", step=step.name, cog=step.cog, digest=step.digest, attempt=attempt)
             lifecycle = CogLifecycle()
             worker = None
@@ -307,13 +337,12 @@ class DurableWorkflowEngine(WorkflowEngine):
             # so any infra error becomes a durable `failed` event (never a
             # non-terminal run); teardown is best-effort in `finally`.
             try:
-                worker = self.executor.materialize(step.cog, op.run_id)
+                worker = self.executor.materialize(step.cog, op.run_id, instance)
                 self._append(op.run_id, "materialized", cog=step.cog, digest=step.digest)
                 lifecycle.transition(LifecycleState.READY)
                 self._append(op.run_id, "ready", cog=step.cog)
                 lifecycle.transition(LifecycleState.INTERACTING)
                 self._append(op.run_id, "interaction_started", step=step.name, entry_point=step.entry_point)
-                key = f"{_key_component(op.run_id)}:{_key_component(step.name)}:{attempt}"
                 signal_value = self._signal_for(op.run_id, step.name)
                 arg = step.input if signal_value is _NO_SIGNAL else signal_value
                 try:
@@ -355,16 +384,26 @@ class DurableWorkflowEngine(WorkflowEngine):
             lifecycle.transition(LifecycleState.TEARING_DOWN)
             self._append(op.run_id, "teardown_started", step=step.name)
             lifecycle.transition(LifecycleState.TORN_DOWN)
-            usage = dict(value["usage"]) if isinstance(value, Mapping) and "usage" in value else None
+            # Coerce usage defensively: a Cog returning a malformed usage (not a
+            # mapping, tokens="abc") must not surface as an uncaught engine exception
+            # in this post-interaction tail — it would leave the run non-terminal.
+            usage = _coerce_usage(value)
             self._append(op.run_id, "step_completed", step=step.name, output=value, usage=usage)
             if tracker is not None and usage is not None:
                 try:
-                    tracker.consume(tokens=int(usage.get("tokens", 0)), cost=float(usage.get("cost", 0.0)))
+                    tracker.consume(tokens=usage["tokens"], cost=usage["cost"])
                 except BudgetExceeded as exc:
-                    self._append(op.run_id, "budget_exceeded", step=step.name, reason=str(exc))
-                    return RunStatus.BUDGET_EXCEEDED
+                    return self._record_budget_stop(op.run_id, step.name, exc)
         self._append(op.run_id, "completed")
         return RunStatus.COMPLETED
+
+    def _record_budget_stop(self, run_id: str, step: str, exc: "BudgetExceeded") -> RunStatus:
+        """Record a budget stop, distinguishing a duration timeout from spend."""
+        if getattr(exc, "dimension", None) == "duration":
+            self._append(run_id, "timed_out", step=step, reason=str(exc))
+            return RunStatus.TIMED_OUT
+        self._append(run_id, "budget_exceeded", step=step, reason=str(exc))
+        return RunStatus.BUDGET_EXCEEDED
 
     def signal(self, run_id: str, value: Any = None) -> RunStatus:
         if self.observe(run_id) is not RunStatus.PAUSED:

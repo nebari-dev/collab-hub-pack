@@ -171,6 +171,24 @@ def test_resource_name_is_valid_unique_per_run_and_collision_resistant():
     # a very long Cog id still yields a valid, in-bounds label with a full suffix
     long_name = resource_name("openteams/" + "a" * 300, "run-A")
     assert len(long_name) <= 63 and re.search(r"-[0-9a-f]{16}$", long_name)
+    # instance distinguishes materializations within a run (step and attempt), so a
+    # back-to-back same-Cog step or a next attempt never reuses a name
+    base = resource_name("openteams/reviewer", "run-A")
+    assert resource_name("openteams/reviewer", "run-A", "review:0") != base
+    assert resource_name("openteams/reviewer", "run-A", "review:0") != resource_name(
+        "openteams/reviewer", "run-A", "summarize:0"
+    )
+    assert resource_name("openteams/reviewer", "run-A", "review:0") != resource_name(
+        "openteams/reviewer", "run-A", "review:1"
+    )
+
+
+def test_distinct_instances_get_distinct_worker_names():
+    ex = _executor(FakeK8sApi(), FakeWorkerHttp())
+    w1 = ex.materialize("openteams/reviewer", "run-1", "review:0")
+    w2 = ex.materialize("openteams/reviewer", "run-1", "summarize:0")  # same Cog, different step
+    w3 = ex.materialize("openteams/reviewer", "run-1", "review:1")  # same step, next attempt
+    assert len({w1.name, w2.name, w3.name}) == 3
 
 
 def test_partial_materialization_is_cleaned_up_on_failure():
@@ -252,6 +270,48 @@ def test_construction_requires_an_explicit_network_security_choice():
             api=FakeK8sApi(),
             worker_http=FakeWorkerHttp(),
             allow_ingress_from={"app": "hub"},
+            insecure_skip_network_policy=True,
+        )
+
+
+def test_empty_ingress_selector_is_rejected():
+    # {} serializes to an empty podSelector, which matches ALL pods in the namespace
+    with pytest.raises(ValueError):
+        KubernetesCogExecutor(
+            runner_image="x", namespace="cogs", api=FakeK8sApi(), worker_http=FakeWorkerHttp(),
+            allow_ingress_from={},
+        )
+
+
+def test_malformed_ingress_labels_are_rejected():
+    for bad in ({"": "hub"}, {"app": ""}):
+        with pytest.raises(ValueError):
+            KubernetesCogExecutor(
+                runner_image="x", namespace="cogs", api=FakeK8sApi(), worker_http=FakeWorkerHttp(),
+                allow_ingress_from=bad,
+            )
+
+
+def test_network_policy_can_scope_the_hub_to_another_namespace():
+    ex = KubernetesCogExecutor(
+        runner_image="x",
+        namespace="cogs",
+        api=FakeK8sApi(),
+        worker_http=FakeWorkerHttp(),
+        allow_ingress_from={"app": "hub"},
+        allow_ingress_from_namespace={"kubernetes.io/metadata.name": "collab-hub"},
+    )
+    policy = ex._network_policy("openteams/reviewer", "run-ns", "cog-reviewer-x")
+    peer = policy["spec"]["ingress"][0]["from"][0]
+    assert peer["podSelector"] == {"matchLabels": {"app": "hub"}}
+    assert peer["namespaceSelector"] == {"matchLabels": {"kubernetes.io/metadata.name": "collab-hub"}}
+
+
+def test_namespace_selector_requires_a_pod_selector():
+    with pytest.raises(ValueError):
+        KubernetesCogExecutor(
+            runner_image="x", namespace="cogs", api=FakeK8sApi(), worker_http=FakeWorkerHttp(),
+            allow_ingress_from_namespace={"kubernetes.io/metadata.name": "hub-ns"},
             insecure_skip_network_policy=True,
         )
 

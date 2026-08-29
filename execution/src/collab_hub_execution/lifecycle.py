@@ -75,7 +75,15 @@ class RunBudget:
 
 
 class BudgetExceeded(RuntimeError):
-    """Raised before an interaction would exceed a run budget."""
+    """Raised before an interaction would exceed a run budget.
+
+    ``dimension`` is which limit was hit ("duration", "tokens", or "cost") so the
+    engine can distinguish a timeout from overspend.
+    """
+
+    def __init__(self, message: str, *, dimension: str) -> None:
+        super().__init__(message)
+        self.dimension = dimension
 
 
 class BudgetTracker:
@@ -94,11 +102,11 @@ class BudgetTracker:
         # pass).
         now = now or datetime.now(UTC)
         if self.budget.max_duration is not None and now >= self.started_at + self.budget.max_duration:
-            raise BudgetExceeded("run duration budget exceeded")
+            raise BudgetExceeded("run duration budget exceeded", dimension="duration")
         if self.budget.max_tokens is not None and self.tokens >= self.budget.max_tokens:
-            raise BudgetExceeded("run token budget exceeded")
+            raise BudgetExceeded("run token budget exceeded", dimension="tokens")
         if self.budget.max_cost is not None and self.cost >= self.budget.max_cost:
-            raise BudgetExceeded("run cost budget exceeded")
+            raise BudgetExceeded("run cost budget exceeded", dimension="cost")
 
     def consume(self, *, tokens: int = 0, cost: float = 0.0, now: datetime | None = None) -> None:
         self.tokens += tokens

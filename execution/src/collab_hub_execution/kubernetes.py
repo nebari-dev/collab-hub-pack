@@ -16,7 +16,9 @@ the insecure default by omission:
 
 - ``allow_ingress_from={<hub pod label selector>}`` (recommended) materializes a
   NetworkPolicy per worker that admits only the hub to the ``/invoke`` port and
-  denies all other ingress. Requires a policy-enforcing CNI.
+  denies all other ingress. The selector must be non-empty (an empty selector
+  matches every pod). Add ``allow_ingress_from_namespace={...}`` when the hub runs
+  in another namespace. Requires a policy-enforcing CNI.
 - ``insecure_skip_network_policy=True`` deliberately opts out, for a trusted,
   single-tenant namespace only.
 
@@ -57,16 +59,19 @@ def cog_slug(cog: str) -> str:
 DIGEST_HEX = 16  # 64-bit suffix: birthday collisions stay negligible at realistic run volumes
 
 
-def resource_name(cog: str, run_id: str) -> str:
-    """A valid, unique DNS-1123 label for one (Cog, run) materialization.
+def resource_name(cog: str, run_id: str, instance: str = "") -> str:
+    """A valid, unique DNS-1123 label for one Cog materialization.
 
-    Deterministic (recovery re-derives the same name), unique per run (concurrent
-    runs of the same Cog don't collide), and collision-resistant across Cogs whose
-    slugs would otherwise coincide (the digest is over the full Cog id + run id).
-    The suffix is ``DIGEST_HEX`` hex chars (64 bits), so the name stays within the
-    63-char DNS-label limit while keeping collisions negligible at realistic scale.
+    Deterministic (recovery re-derives the same name for the same instance) and
+    collision-resistant across Cogs whose slugs would otherwise coincide (the
+    digest is over the full Cog id + run id + instance). ``instance`` distinguishes
+    each materialization within a run — the engine passes step name + attempt — so
+    back-to-back steps on the same Cog, and successive revision attempts, never
+    reuse a name that a prior teardown may still be terminating. The suffix is
+    ``DIGEST_HEX`` hex chars (64 bits), keeping the name within the 63-char
+    DNS-label limit while keeping collisions negligible at realistic scale.
     """
-    digest = hashlib.sha1(f"{cog}\x00{run_id}".encode()).hexdigest()[:DIGEST_HEX]  # noqa: S324 - name uniqueness, not security
+    digest = hashlib.sha1(f"{cog}\x00{run_id}\x00{instance}".encode()).hexdigest()[:DIGEST_HEX]  # noqa: S324 - name uniqueness, not security
     return f"cog-{cog_slug(cog)}-{digest}"[:MAX_DNS_LABEL].rstrip("-")
 
 
@@ -80,6 +85,19 @@ def label_value(value: str) -> str:
     cleaned = "".join(ch if (ch.isascii() and ch.isalnum()) or ch in "-_." else "-" for ch in value)
     cleaned = cleaned.strip("-_.")[:63].strip("-_.")
     return cleaned or "unknown"
+
+
+def _require_label_selector(selector: dict[str, str], what: str) -> None:
+    """Validate a non-empty, well-formed label selector.
+
+    An empty selector is rejected because an empty pod/namespace selector matches
+    *everything* — a fail-open the worker's ingress rule must never have.
+    """
+    if not isinstance(selector, dict) or not selector:
+        raise ValueError(f"{what} must be a non-empty label selector; an empty selector matches everything")
+    for key, value in selector.items():
+        if not (isinstance(key, str) and key and isinstance(value, str) and value):
+            raise ValueError(f"{what} label {key!r}={value!r} is invalid (keys and values must be non-empty strings)")
 
 
 class K8sApi(Protocol):
@@ -129,6 +147,7 @@ class KubernetesCogExecutor:
         runner_image: str,
         namespace: str = DEFAULT_NAMESPACE,
         allow_ingress_from: dict[str, str] | None = None,
+        allow_ingress_from_namespace: dict[str, str] | None = None,
         insecure_skip_network_policy: bool = False,
         api: K8sApi | None = None,
         worker_http: WorkerHttp | None = None,
@@ -148,9 +167,18 @@ class KubernetesCogExecutor:
             )
         if allow_ingress_from is not None and insecure_skip_network_policy:
             raise ValueError("pass allow_ingress_from OR insecure_skip_network_policy, not both")
+        if allow_ingress_from is not None:
+            # An empty podSelector matches ALL pods in the namespace — the opposite
+            # of the intent — so reject it (and any malformed label) explicitly.
+            _require_label_selector(allow_ingress_from, "allow_ingress_from")
+        if allow_ingress_from_namespace is not None:
+            if allow_ingress_from is None:
+                raise ValueError("allow_ingress_from_namespace requires allow_ingress_from")
+            _require_label_selector(allow_ingress_from_namespace, "allow_ingress_from_namespace")
         self.runner_image = runner_image
         self.namespace = namespace
         self.allow_ingress_from = allow_ingress_from
+        self.allow_ingress_from_namespace = allow_ingress_from_namespace
         self._api = api
         self._worker_http = worker_http
         self.ready_timeout = ready_timeout
@@ -233,7 +261,9 @@ class KubernetesCogExecutor:
 
         Selecting the worker pod with a single ingress rule denies all other
         ingress, so an unauthenticated endpoint is not reachable cluster-wide — only
-        pods matching ``allow_ingress_from`` can call it. (Egress restriction to
+        pods matching ``allow_ingress_from`` can call it. When the hub runs in
+        another namespace, ``allow_ingress_from_namespace`` scopes the peer to that
+        namespace (both selectors AND within one peer). (Egress restriction to
         hub-mediated paths is #11.)
         """
         labels = {
@@ -242,6 +272,9 @@ class KubernetesCogExecutor:
             "collab-hub/run": label_value(run_id),
             "app.kubernetes.io/managed-by": "collab-hub-executor",
         }
+        peer = {"podSelector": {"matchLabels": self.allow_ingress_from}}
+        if self.allow_ingress_from_namespace is not None:
+            peer["namespaceSelector"] = {"matchLabels": self.allow_ingress_from_namespace}
         return {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
@@ -256,7 +289,7 @@ class KubernetesCogExecutor:
                 "policyTypes": ["Ingress"],
                 "ingress": [
                     {
-                        "from": [{"podSelector": {"matchLabels": self.allow_ingress_from}}],
+                        "from": [peer],
                         "ports": [{"protocol": "TCP", "port": RUNNER_PORT}],
                     }
                 ],
@@ -302,8 +335,8 @@ class KubernetesCogExecutor:
             paths.append(f"{self._network_policy_collection()}/{name}")
         return tuple(paths)
 
-    def materialize(self, cog: str, run_id: str) -> "_KubernetesWorker":
-        name = resource_name(cog, run_id)
+    def materialize(self, cog: str, run_id: str, instance: str = "") -> "_KubernetesWorker":
+        name = resource_name(cog, run_id, instance)
         deployment, service = self._manifests(cog, run_id, name)
         try:
             if self.allow_ingress_from is not None:

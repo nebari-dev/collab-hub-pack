@@ -58,14 +58,17 @@ def test_token_budget_survives_restart_and_stops_the_run():
     assert any(e.event_type == "budget_exceeded" for e in track.replay("run-budget"))
 
 
-def test_duration_budget_stops_run_before_any_step():
+def test_duration_budget_stops_run_before_any_step_as_timed_out():
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(
         executor=InMemoryCogExecutor({"a": lambda e, v: v}),
         track=track,
         budget=RunBudget(max_duration=timedelta(0)),
     )
-    assert engine.submit(OpDefinition("run-dur", (OpStep("s", "a", "run"),))) is RunStatus.BUDGET_EXCEEDED
+    # a duration overrun is a timeout, distinct from token/cost overspend
+    assert engine.submit(OpDefinition("run-dur", (OpStep("s", "a", "run"),))) is RunStatus.TIMED_OUT
+    assert any(e.event_type == "timed_out" for e in track.replay("run-dur"))
+    assert not any(e.event_type == "budget_exceeded" for e in track.replay("run-dur"))
 
 
 def test_bounded_revise_loop_fails_after_max_revisions():
@@ -118,7 +121,7 @@ def test_step_digest_is_recorded_and_survives_restart():
 
 
 class _FailingMaterializeExecutor:
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         raise RuntimeError("api down")
 
     def teardown(self, worker):  # never called (materialize failed)
@@ -148,7 +151,7 @@ class _CapturingExecutor:
         self.worker = worker
         self.torn = 0
 
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         return self.worker
 
     def teardown(self, worker):
@@ -179,7 +182,7 @@ class _SameWorkerExecutor:
     def __init__(self, worker):
         self.worker = worker
 
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         return self.worker
 
     def teardown(self, worker):
@@ -264,7 +267,7 @@ class _RetryProbeExecutor:
                 raise RuntimeError("first attempt fails")
             return {"ok": True}
 
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         return self._Worker(self)
 
     def teardown(self, worker):
@@ -352,8 +355,8 @@ def test_duration_budget_survives_a_crash_between_the_two_submission_events():
         budget=RunBudget(max_duration=timedelta(minutes=5)),
     )
     # recovery anchors elapsed time to op_submitted (an hour ago), not now, so the
-    # 5-minute duration budget is correctly seen as exceeded
-    assert engine.submit(op) is RunStatus.BUDGET_EXCEEDED
+    # 5-minute duration budget is correctly seen as exceeded (a timeout)
+    assert engine.submit(op) is RunStatus.TIMED_OUT
 
 
 # --- signal values are durable and recovered from the Track ---
@@ -425,7 +428,7 @@ class _KeyCapture:
     def __init__(self):
         self.keys = []
 
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         return self._Worker(self)
 
     def teardown(self, worker):
@@ -469,6 +472,34 @@ def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
     assert engine.submit(OpDefinition("run-exact", (OpStep("s", "c", "run"),))) is RunStatus.BUDGET_EXCEEDED
 
 
+# --- a malformed usage from a Cog must not become an uncaught engine exception ---
+
+
+def test_malformed_usage_is_coerced_and_does_not_crash_the_engine():
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": {"tokens": "lots", "cost": None}}}),
+        track=track,
+        budget=RunBudget(max_tokens=1000),
+    )
+    # non-numeric tokens/cost coerce to zero rather than raising in the accounting tail
+    assert engine.submit(OpDefinition("run-bad-usage", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
+    completed = [e for e in track.replay("run-bad-usage") if e.event_type == "step_completed"]
+    assert completed and completed[0].payload["usage"] == {"tokens": 0, "cost": 0.0}
+
+
+def test_non_mapping_usage_is_ignored_without_crashing():
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": "huge"}}),
+        track=track,
+        budget=RunBudget(max_tokens=1000),
+    )
+    assert engine.submit(OpDefinition("run-str-usage", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
+    completed = [e for e in track.replay("run-str-usage") if e.event_type == "step_completed"]
+    assert completed and completed[0].payload["usage"] is None
+
+
 class _TeardownFailsExecutor:
     class _Worker:
         cog = "c"
@@ -476,7 +507,7 @@ class _TeardownFailsExecutor:
         def interact(self, entry_point, input=None, idempotency_key=None):
             return {"ok": True}
 
-    def materialize(self, cog, run_id):
+    def materialize(self, cog, run_id, instance=""):
         return self._Worker()
 
     def teardown(self, worker):
