@@ -21,6 +21,23 @@ _TERMINAL_STATES = frozenset(
     {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.BUDGET_EXCEEDED}
 )
 
+# Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
+# value is genuinely None (a human resuming a Gate with an empty decision). None
+# alone is overloaded, so a paused step could not be resumed with a real None.
+_NO_SIGNAL = object()
+
+
+def _key_component(value: str) -> str:
+    """Percent-escape the key delimiter so idempotency keys are injective.
+
+    The key is ``{run_id}:{step}:{attempt}``; without escaping, ``run="a:b"
+    step="c"`` and ``run="a" step="b:c"`` collide. Escaping ``:`` (and ``%``, so
+    the escaping itself round-trips) keeps distinct (run, step) pairs distinct —
+    the contract the exactly-once claim in #1 is built on — while leaving keys
+    readable whenever the ids contain no ``:``.
+    """
+    return value.replace("%", "%25").replace(":", "%3A")
+
 
 @dataclass(frozen=True, slots=True)
 class OpStep:
@@ -179,6 +196,42 @@ class DurableWorkflowEngine(WorkflowEngine):
     def _retry_count(self, run_id: str) -> int:
         return sum(1 for e in self.track.replay(run_id) if e.event_type == "retry_requested")
 
+    def _paused_step(self, run_id: str) -> str | None:
+        """The step currently awaiting a signal (its `paused` not yet completed)."""
+        step = None
+        for e in self.track.replay(run_id):
+            if e.event_type == "paused":
+                step = e.payload.get("step")
+            elif e.event_type == "step_completed" and e.payload.get("step") == step:
+                step = None
+        return step
+
+    def _signal_for(self, run_id: str, step: str) -> Any:
+        """The latest durably-recorded signal value for a step, or ``_NO_SIGNAL``.
+
+        Recovery re-reads the decision from the Track, so a crash after a signal
+        was recorded resumes with the signal — not the step's original input.
+        """
+        value: Any = _NO_SIGNAL
+        for e in self.track.replay(run_id):
+            if e.event_type == "signal_received" and e.payload.get("step") == step:
+                value = e.payload.get("value")
+        return value
+
+    def _pending_signal(self, run_id: str) -> bool:
+        """True if a signal was recorded but its step hasn't (re)started yet.
+
+        Covers the crash window between recording a signal and advancing: the run
+        still reads as PAUSED, but the decision is durable and must resume.
+        """
+        signaled = None
+        for e in self.track.replay(run_id):
+            if e.event_type == "signal_received":
+                signaled = e.payload.get("step")
+            elif e.event_type == "step_started" and e.payload.get("step") == signaled:
+                signaled = None
+        return signaled is not None
+
     def submit(self, op: OpDefinition) -> RunStatus:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
@@ -196,11 +249,14 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # re-drive steps (and repeat side effects). Re-running a failed run
                 # is a deliberate act — call retry().
                 return status
-            if status is RunStatus.PAUSED:
+            if status is RunStatus.PAUSED and not self._pending_signal(op.run_id):
                 # A paused run is waiting for an external decision; it resumes only
                 # through signal() (which carries the value). Re-submitting must not
                 # re-invoke the gated step behind the gate's back with its original
-                # input. A genuinely mid-step run (after a crash) still resumes below.
+                # input. The exception is a signal already durably recorded but not
+                # yet consumed (a crash between recording it and advancing): that
+                # decision must resume, so it falls through. A genuinely mid-step run
+                # (after a crash) also resumes below.
                 return status
         return self._advance(op)
 
@@ -225,7 +281,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         self._append(run_id, "retry_requested", from_status=str(status))
         return self._advance(op)
 
-    def _advance(self, op: OpDefinition, signal: Any = None) -> RunStatus:
+    def _advance(self, op: OpDefinition) -> RunStatus:
         completed = self._completed_steps(op.run_id)
         tracker = self._budget_tracker(op.run_id)
         for step in op.steps:
@@ -257,8 +313,9 @@ class DurableWorkflowEngine(WorkflowEngine):
                 self._append(op.run_id, "ready", cog=step.cog)
                 lifecycle.transition(LifecycleState.INTERACTING)
                 self._append(op.run_id, "interaction_started", step=step.name, entry_point=step.entry_point)
-                key = f"{op.run_id}:{step.name}:{attempt}"
-                arg = step.input if signal is None else signal
+                key = f"{_key_component(op.run_id)}:{_key_component(step.name)}:{attempt}"
+                signal_value = self._signal_for(op.run_id, step.name)
+                arg = step.input if signal_value is _NO_SIGNAL else signal_value
                 try:
                     value = worker.interact(step.entry_point, arg, idempotency_key=key)
                     outcome = ("ok", value)
@@ -306,15 +363,18 @@ class DurableWorkflowEngine(WorkflowEngine):
                 except BudgetExceeded as exc:
                     self._append(op.run_id, "budget_exceeded", step=step.name, reason=str(exc))
                     return RunStatus.BUDGET_EXCEEDED
-            signal = None
         self._append(op.run_id, "completed")
         return RunStatus.COMPLETED
 
     def signal(self, run_id: str, value: Any = None) -> RunStatus:
-        op = self._submitted_definition(run_id)
         if self.observe(run_id) is not RunStatus.PAUSED:
             raise ValueError(f"run {run_id!r} is not paused")
-        return self._advance(op, signal=value)
+        op = self._submitted_definition(run_id)
+        # Persist the decision before advancing so a crash mid-resume recovers the
+        # signal from the Track (and replays the step with it, not its original
+        # input). The value may legitimately be None — see _NO_SIGNAL.
+        self._append(run_id, "signal_received", step=self._paused_step(run_id), value=value)
+        return self._advance(op)
 
 
 def _serialize_op(op: OpDefinition) -> dict[str, Any]:

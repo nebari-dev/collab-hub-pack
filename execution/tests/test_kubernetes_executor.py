@@ -212,3 +212,10 @@ def test_manifests_keep_the_exact_run_id_in_an_annotation():
     _deployment, service = ex._manifests("openteams/reviewer", "org/ws/run 42", "cog-reviewer-abcd1234")
     assert service["metadata"]["labels"]["collab-hub/run"] == "org-ws-run-42"  # sanitized label
     assert service["metadata"]["annotations"]["collab-hub/run-id"] == "org/ws/run 42"  # exact id preserved
+
+
+def test_worker_pod_does_not_mount_a_service_account_token():
+    ex = _executor(FakeK8sApi(), FakeWorkerHttp())
+    deployment, _service = ex._manifests("openteams/reviewer", "run-1", "cog-reviewer-x")
+    # a worker talks to the hub, not the K8s API, so it carries no SA token
+    assert deployment["spec"]["template"]["spec"]["automountServiceAccountToken"] is False

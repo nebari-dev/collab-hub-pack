@@ -19,6 +19,7 @@ from collab_hub_execution import (
     RunBudget,
     RunStatus,
     TrackEvent,
+    derive_run_status,
 )
 from collab_hub_execution.orchestration import _serialize_op
 
@@ -353,6 +354,119 @@ def test_duration_budget_survives_a_crash_between_the_two_submission_events():
     # recovery anchors elapsed time to op_submitted (an hour ago), not now, so the
     # 5-minute duration budget is correctly seen as exceeded
     assert engine.submit(op) is RunStatus.BUDGET_EXCEEDED
+
+
+# --- signal values are durable and recovered from the Track ---
+
+
+def test_signal_value_is_durable_across_a_crash_mid_resume():
+    approval = {"approved": True}
+    seen = []
+    crash = {"once": True}
+
+    def handler(entry, value):
+        if value != approval:  # the original input pauses at the gate
+            raise PauseRequest("approve")
+        seen.append(value)  # resumed with the durable signal
+        if crash["once"]:
+            crash["once"] = False
+            raise SystemExit("crash after signal consumed, before completion")
+        return {"ok": True}
+
+    track = InMemoryTrackStore()
+
+    def engine():
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
+
+    op = OpDefinition("run-sig", (OpStep("s", "c", "review", "draft-v1"),))
+    assert engine().submit(op) is RunStatus.PAUSED
+    with pytest.raises(SystemExit):  # crash while resuming with the approval
+        engine().signal("run-sig", approval)
+    # recovery must replay with the approval from the Track, never the original input
+    assert engine().submit(op) is RunStatus.COMPLETED
+    assert seen == [approval, approval]
+    assert "draft-v1" not in seen
+
+
+def test_signal_can_resume_a_step_with_an_explicit_none():
+    seen = []
+
+    def handler(entry, value):
+        if value == "GATE":  # original input pauses; a signal (even None) resumes
+            raise PauseRequest("approve")
+        seen.append(value)
+        return {"ok": True}
+
+    track = InMemoryTrackStore()
+
+    def engine():
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
+
+    op = OpDefinition("run-none", (OpStep("s", "c", "run", "GATE"),))
+    assert engine().submit(op) is RunStatus.PAUSED
+    assert engine().signal("run-none", None) is RunStatus.COMPLETED
+    assert seen == [None]  # the step saw the signal None, not its original input "GATE"
+
+
+# --- idempotency keys are injective even when ids contain the delimiter ---
+
+
+class _KeyCapture:
+    class _Worker:
+        cog = "c"
+
+        def __init__(self, outer):
+            self._outer = outer
+
+        def interact(self, entry_point, input=None, idempotency_key=None):
+            self._outer.keys.append(idempotency_key)
+            return {"ok": True}
+
+    def __init__(self):
+        self.keys = []
+
+    def materialize(self, cog, run_id):
+        return self._Worker(self)
+
+    def teardown(self, worker):
+        pass
+
+
+def test_idempotency_keys_are_injective_across_ids_containing_the_delimiter():
+    cap1 = _KeyCapture()
+    DurableWorkflowEngine(executor=cap1, track=InMemoryTrackStore()).submit(
+        OpDefinition("a:b", (OpStep("c", "c", "run"),))
+    )
+    cap2 = _KeyCapture()
+    DurableWorkflowEngine(executor=cap2, track=InMemoryTrackStore()).submit(
+        OpDefinition("a", (OpStep("b:c", "c", "run"),))
+    )
+    # ("a:b", "c") and ("a", "b:c") must not collapse to the same key
+    assert cap1.keys and cap2.keys
+    assert cap1.keys[0] != cap2.keys[0]
+
+
+# --- a mid-run poll reads RUNNING, not the terminal-sounding TEARING_DOWN ---
+
+
+def test_between_steps_status_is_running_not_tearing_down():
+    per_step = ["step_started", "materialized", "ready", "interaction_started", "idle", "teardown_started"]
+    events = [TrackEvent(run_id="r", event_type=t) for t in [*per_step, "step_completed"]]
+    assert derive_run_status(events) is RunStatus.RUNNING  # between steps, still progressing
+    events.append(TrackEvent(run_id="r", event_type="completed"))
+    assert derive_run_status(events) is RunStatus.COMPLETED  # the final event still wins
+
+
+# --- budget limits are inclusive: reaching exactly the max stops the run ---
+
+
+def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": {"tokens": 60}}}),
+        track=InMemoryTrackStore(),
+        budget=RunBudget(max_tokens=60),
+    )
+    assert engine.submit(OpDefinition("run-exact", (OpStep("s", "c", "run"),))) is RunStatus.BUDGET_EXCEEDED
 
 
 class _TeardownFailsExecutor:

@@ -33,7 +33,15 @@ _TRANSITIONS = {
 
 
 class CogLifecycle:
-    """State machine shared by one-shot and warm Cog workers."""
+    """Local, per-interaction validation that a worker's states progress legally.
+
+    This is NOT the durable state machine. It is created fresh for each step and
+    only guards transition ordering within that step; it is never rehydrated. The
+    Track is the durable record of a run — recovery derives state from Track events
+    (materialized, ready, interaction_started, idle, step_completed, failed,
+    teardown_failed), not from this object. Transitions here that the Track does
+    not mirror (e.g. TORN_DOWN) are local assertions only.
+    """
 
     def __init__(self) -> None:
         self.state = LifecycleState.MATERIALIZED
@@ -81,6 +89,9 @@ class BudgetTracker:
         # Called before a step (against elapsed time and cumulative usage so far)
         # and again after consume(). It does not bound a single interaction's spend
         # — that overshoots by design; see RunBudget for what each limit guarantees.
+        # Limits are inclusive: reaching exactly max_tokens/max_cost, or the
+        # deadline, stops the run (the limit is a hard ceiling, not a threshold to
+        # pass).
         now = now or datetime.now(UTC)
         if self.budget.max_duration is not None and now >= self.started_at + self.budget.max_duration:
             raise BudgetExceeded("run duration budget exceeded")

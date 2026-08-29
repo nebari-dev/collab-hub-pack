@@ -9,6 +9,15 @@ without a cluster; the defaults are the in-cluster SA-token client and httpx.
 Workers are reached over in-cluster service DNS (never port-forwards). Each
 materialization gets a name that is a valid DNS label and unique per (Cog, run),
 so concurrent runs never share or tear down each other's workloads.
+
+Security boundary: a worker's ``/invoke`` Service is unauthenticated, so any
+workload that can reach it can call arbitrary entry points with arbitrary input.
+This executor therefore assumes a trusted, single-tenant namespace. It reduces
+blast radius (workers carry no ServiceAccount token — automountServiceAccountToken
+is false) but does not itself authenticate callers or restrict traffic. In a
+shared or multi-tenant cluster it must be paired with a NetworkPolicy that admits
+only the hub and bounds worker egress (#11), and, longer term, request
+authentication on the worker endpoint.
 """
 
 from __future__ import annotations
@@ -161,6 +170,10 @@ class KubernetesCogExecutor:
                 "template": {
                     "metadata": {"labels": labels, "annotations": annotations},
                     "spec": {
+                        # A Cog worker talks to the hub, not the Kubernetes API, so
+                        # it should not carry a ServiceAccount token it could use
+                        # (or leak) against the API server.
+                        "automountServiceAccountToken": False,
                         "containers": [
                             {
                                 "name": "runner",

@@ -22,6 +22,7 @@ from uuid import uuid4
 class RunStatus(StrEnum):
     UNKNOWN = "unknown"
     SUBMITTED = "submitted"
+    RUNNING = "running"
     MATERIALIZED = "materialized"
     READY = "ready"
     INTERACTING = "interacting"
@@ -67,12 +68,17 @@ class TrackStore(Protocol):
 
 _STATUS_EVENTS = {
     "submitted": RunStatus.SUBMITTED,
+    "step_started": RunStatus.RUNNING,
     "materialized": RunStatus.MATERIALIZED,
     "ready": RunStatus.READY,
     "interaction_started": RunStatus.INTERACTING,
     "paused": RunStatus.PAUSED,
     "idle": RunStatus.IDLE,
     "teardown_started": RunStatus.TEARING_DOWN,
+    # A finished step returns the run to RUNNING (it's between steps / progressing),
+    # not TEARING_DOWN — that per-step teardown is done. The final `completed`
+    # overrides this on the last step.
+    "step_completed": RunStatus.RUNNING,
     "completed": RunStatus.COMPLETED,
     "failed": RunStatus.FAILED,
     "timed_out": RunStatus.TIMED_OUT,
@@ -172,6 +178,12 @@ class PostgresTrackStore:
 
     @staticmethod
     def ensure_schema(connection: Any) -> None:
+        """Create the Track table and indexes if absent (idempotent).
+
+        The adapter never calls this itself: append()/replay() assume the table
+        exists. Creating it is the application's responsibility — run this once at
+        startup or as a migration step, before the store handles traffic.
+        """
         for statement in PostgresTrackStore._SCHEMA:
             connection.execute(statement)
 
