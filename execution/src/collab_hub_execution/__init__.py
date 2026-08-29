@@ -13,10 +13,11 @@ durability is Track-based recovery, not distributed ownership:
   Kubernetes workers do not persist keys, so a replaced worker re-runs the side
   effect. Terminal runs are immutable; re-running is an explicit ``retry()``.
 
-Do not use this engine for multi-replica production execution until the DBOS
-backing supplies ownership leases and durable keyed (exactly-once) claims — see
-collab-hub-pack #1. ``WorkflowEngine`` and the Track/executor seams are stable;
-the production engine plugs in behind them without changing callers.
+Do not use this engine for multi-replica production execution until the
+crash-safe engine backing tracked in collab-hub-pack #1 supplies ownership leases
+and durable keyed (exactly-once) claims. ``WorkflowEngine`` and the Track/executor
+seams are stable; a production engine that provides those guarantees plugs in
+behind them without changing callers.
 """
 
 from .binding import (

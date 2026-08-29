@@ -171,7 +171,7 @@ class PostgresTrackStore:
         "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
         # At most one submission per run: two API replicas cannot both start the
         # same run (the losing append raises). Single-owner lease / graceful
-        # handling of the conflict lands with the DBOS backing (#1).
+        # handling of the conflict lands with the crash-safe engine backing (#1).
         "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission "
         "ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
     )

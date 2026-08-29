@@ -121,7 +121,8 @@ class CogWorker(Protocol):
         reference and Kubernetes workers here do NOT persist keys across pod
         replacement, so a replaced worker re-runs the side effect: execution is
         at-least-once across pod replacement. Crash-safe, exactly-once execution
-        (a durable keyed claim) lands with the DBOS engine backing — #1.
+        (a durable keyed claim) lands with the crash-safe engine backing tracked
+        in #1.
         """
 
 
@@ -182,9 +183,9 @@ class DurableWorkflowEngine(WorkflowEngine):
 
     Single-owner by assumption: it holds no cross-replica lease, so the same run
     must not be advanced from two API replicas concurrently. Multi-replica
-    single-owner execution (an advancement lease) is provided by the DBOS engine
-    backing (#1); the Postgres Track's one-submission-per-run index guards only a
-    duplicated *submission*, not concurrent *advancement*.
+    single-owner execution (an advancement lease) is provided by the crash-safe
+    engine backing tracked in #1; the Postgres Track's one-submission-per-run index
+    guards only a duplicated *submission*, not concurrent *advancement*.
     """
 
     def __init__(
@@ -387,7 +388,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             if teardown_error is not None:
                 # A worker we couldn't tear down may keep running/serving — that is
                 # a leak, not success. Fail the run so it is visible; durable
-                # cleanup-retry lands with the DBOS backing (#1).
+                # cleanup-retry lands with the crash-safe engine backing (#1).
                 self._append(op.run_id, "failed", step=step.name, error="TeardownFailed")
                 return RunStatus.FAILED
 
