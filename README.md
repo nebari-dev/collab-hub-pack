@@ -79,6 +79,11 @@ uv run python -m collab_hub_api   # DEV_AUTH_USER for unsafe local auth
 Setup and reference docs — connector setup, Frames, operations — live in
 [`docs/`](docs/).
 
+The basis for Cog and Op execution — vocabulary, the Op–Cog seam, the
+result envelope, the sensitivity model — is in
+[`docs/cog-execution/`](docs/cog-execution/); the decisions behind it are
+recorded in [`docs/adr/`](docs/adr/).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the
