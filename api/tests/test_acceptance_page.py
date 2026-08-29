@@ -1359,7 +1359,7 @@ def test_the_acceptance_page_itself_passes_the_seam(tmp_path, idp):
     # The check has to admit the one router that legitimately uses it, or it
     # is only proving that nothing can be public.
     surface = build_web_surface(Config.parse(web_values(tmp_path, idp)))
-    public, gated = invite_router.make_routers(memberships_enabled=True)
+    public, gated = invite_router.make_routers(memberships_enabled=True, require_verified_email=True)
     make_router(surface, page_routers=[gated], public_page_routers=[public])
     assert [route.methods for route in public.routes] == [{"GET"}]
 
@@ -1884,3 +1884,59 @@ async def test_live_an_expired_invitation_renders_its_own_state(live_app, idp, l
     assert response.status_code == 410
     assert response.json() == {"outcome": "invitation_expired"}
     assert datetime.now(tz=timezone.utc) - issued.invitation.created_at < timedelta(minutes=5)
+
+
+def test_the_not_verified_copy_does_not_promise_mail_a_relaxed_deployment_never_sends() -> None:
+    """Review finding: this change made the invitation email's copy
+    configuration-aware and left the page's alone.
+
+    On a deployment with `requireVerifiedEmail: false`, `email_not_verified` is
+    reached only when the token carries no usable address -- not because an
+    address is unverified. The strict copy tells the reader to "follow the
+    verification link that was sent to your mailbox", and no such mail exists
+    there, so the page would send people looking for something that was never
+    sent. On the surface they are actually looking at.
+    """
+
+    strict = acceptance_page(require_verified_email=True)
+    relaxed = acceptance_page(require_verified_email=False)
+
+    assert "verification link that was sent" in strict
+    assert "verification link that was sent" not in relaxed
+    assert "could not read an email address" in relaxed
+
+    # The sign-in state too. Its mention is hedged ("if you have to open an
+    # email-verification link") so it was never false, only noise about a step
+    # that does not happen -- on the page somebody reads while confused.
+    assert "email-verification link" in strict
+    assert "email-verification link" not in relaxed
+
+
+def test_no_state_mentions_verification_on_a_relaxed_deployment() -> None:
+    """The sweep, rather than a list of the two states someone remembered.
+
+    A future state whose copy mentions verification would be caught here even
+    if nobody thought to add it to `RELAXED_SECTIONS` -- which is the failure
+    mode of an override table.
+    """
+
+    relaxed = acceptance_page(require_verified_email=False)
+    assert "verification" not in relaxed.lower()
+    assert "verify" not in relaxed.lower()
+
+
+def test_both_modes_render_exactly_the_same_states() -> None:
+    """Copy varies; the wire contract does not.
+
+    If a mode ever added or dropped a state, the client script and the service's
+    outcome mapping would disagree with the page -- so this pins that the
+    override table is a copy table and nothing more.
+    """
+
+    # `rendered_states` already exists in this file and anchors on `<section`;
+    # the local copy this replaced would have counted a `data-state` on any
+    # other element the page grows later, reporting a state no section renders.
+    assert rendered_states(acceptance_page(require_verified_email=True)) == rendered_states(
+        acceptance_page(require_verified_email=False)
+    )
+    assert rendered_states(acceptance_page(require_verified_email=True)) == set(PAGE_STATES)

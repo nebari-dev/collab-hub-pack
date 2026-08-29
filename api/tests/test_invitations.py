@@ -274,6 +274,7 @@ def _carriers_of_the_secret() -> dict[str, object]:
             # app, and the renderer refuses to leave a placeholder in a message
             # nobody will proof-read.
             app_instructions="Download from https://example.test/download",
+            require_verified_email=True,
         ),
         # The wrapper itself: everything above inherits its behaviour, so it
         # is the one that actually has to hold.
@@ -1392,6 +1393,133 @@ def test_a_boolean_true_claim_with_an_address_is_accepted():
     assert verified_claim_email("someone@example.com", True) == "someone@example.com"
 
 
+# ---------------------------------------------------------------------------
+# The token as the proof of mailbox control (frames.invitations.requireVerifiedEmail)
+# ---------------------------------------------------------------------------
+
+
+def test_the_strict_check_is_the_default_everywhere_it_is_spelled():
+    """Fail closed. A caller that forgets the setting must get the strict rule,
+    and an upgrade must not weaken a deployment that never asked."""
+
+    from collab_hub_api.config import FramesInvitationsConfig
+
+    assert FramesInvitationsConfig().require_verified_email is True
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email("someone@example.com", False)  # no keyword passed
+
+
+@pytest.mark.parametrize("verified", [False, None, "true", 1, 0])
+def test_relaxed_accepts_an_unverified_address_whatever_the_claim_says(verified):
+    """The token stood in for the proof, so the flag stops being consulted --
+    including the string and integer shapes the strict path refuses."""
+
+    assert (
+        verified_claim_email("someone@example.com", verified, require_verified=False)
+        == "someone@example.com"
+    )
+
+
+@pytest.mark.parametrize("email", [None, "", 12345, [], {}])
+def test_relaxed_still_needs_an_actual_address(email):
+    """Dropping the verification requirement does not make the address optional.
+    Gate B's match has to compare something."""
+
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email(email, True, require_verified=False)
+
+
+def test_relaxing_verification_does_not_relax_the_address_match():
+    """**The property that matters.** Without this, the relaxation would turn an
+    invitation into a bearer token redeemable under any identity.
+
+    Asserted against `_evaluate_acceptance` rather than the helper, because the
+    helper cannot see the invitation -- the match is the caller's half, and the
+    question is whether the two halves are independently relaxable. They must
+    not be.
+    """
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    invitation = _invitation()
+
+    # Unverified AND the wrong address: still refused, and refused as a
+    # mismatch rather than as a verification failure -- the reader is told the
+    # true reason.
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, "someone-else@example.com", False, require_verified=False
+        )
+
+    # Unverified and the right address: accepted, which is the whole point.
+    assert (
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+        )
+        is None
+    )
+
+    # And with the strict setting the same right-address claim is refused, so
+    # the setting is what decides rather than the address.
+    with pytest.raises(EmailNotVerifiedError):
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=True
+        )
+
+
+def test_a_dead_token_is_still_dead_however_verification_is_configured():
+    """Order is load-bearing: the token's own state is decided before anything
+    about the caller, so relaxing the identity check cannot resurrect a revoked,
+    used, or expired link."""
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    cases = [
+        (_invitation(STATUS_REVOKED), invitations_module.InvitationRevokedError),
+        (_invitation(STATUS_ACCEPTED), invitations_module.InvitationAlreadyUsedError),
+        (_invitation(expires_in=-timedelta(days=1)), invitations_module.InvitationExpiredError),
+    ]
+    for invitation, expected in cases:
+        with pytest.raises(expected):
+            invitations_module._evaluate_acceptance(
+                invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+            )
+
+
+def test_the_service_builder_passes_the_setting_through():
+    """Review finding: the seam moved up a level rather than closing.
+
+    The live tests construct `PostgresInvitationService(..., require_verified_email=False)`
+    directly, so deleting the keyword in `build_invitation_service` left the suite
+    green -- and the failure is the total one: a deployment sets the flag, gets
+    the relaxed copy, and every acceptance is still refused. The sibling email
+    builder had this test; the service builder was the asymmetry.
+    """
+
+    from collab_hub_api.config import Config, build_invitation_service
+    from collab_hub_api.frames.db import PostgresPools
+
+    def service_for(flag: bool):
+        config = Config.parse(
+            {
+                "frames": {
+                    "invitations": {"require_verified_email": flag},
+                    "postgres": {"url": "postgresql://user:pw@127.0.0.1:1/db"},
+                }
+            }
+        )
+        # Pools are lazy: `database()` does not connect, so this needs no server.
+        return build_invitation_service(config, PostgresPools())
+
+    assert service_for(True)._require_verified_email is True
+    assert service_for(False)._require_verified_email is False
+
+
+def test_the_service_carries_the_setting_and_defaults_it_closed():
+    from collab_hub_api.frames.invitations import PostgresInvitationService
+
+    assert PostgresInvitationService(object())._require_verified_email is True
+    assert PostgresInvitationService(object(), require_verified_email=False)._require_verified_email is False
+
+
 def test_email_verified_reaches_the_display_identity_only_as_a_boolean():
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": True}).email_verified is True
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": "true"}).email_verified is False
@@ -2402,6 +2530,82 @@ def test_live_a_refused_acceptance_owes_nothing(service, live_db):
         _accept(service, secret=issued.raw_secret.reveal(), service_groups=["/llm"])
 
     assert _owed_rows(live_db) == []
+
+
+@live_postgres
+def test_live_a_relaxed_service_accepts_an_unverified_matching_account(live_db):
+    """The production chain, which the first version of this change never tested.
+
+    Review found that deleting **both** `require_verified` threads in
+    `_accept_once` left the suite green: the helper was tested, the private
+    attribute was read, and the path between them was not exercised at all.
+    The failure that hides behind that is total -- a deployment sets
+    `requireVerifiedEmail: false`, invitees get copy saying no verification is
+    needed, and every acceptance is still refused. Because the operator has
+    also flipped the realm by then, no account can ever verify, so every
+    invitation becomes unredeemable.
+
+    So this goes through the real service, built the way configuration builds
+    it, and asserts the membership landed.
+    """
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    outcome = relaxed.accept(
+        user_id=INVITEE,
+        display=display(INVITED_EMAIL, verified=False),
+        token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+        claim_email=INVITED_EMAIL,
+        email_verified=False,
+    )
+
+    assert outcome.org_id == ORG
+    assert _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_strict_service_refuses_the_same_unverified_account(live_db):
+    """The other half of the pair: same account, same token, strict service.
+
+    Without this, the test above would pass on a build that ignored the setting
+    entirely -- which is precisely the build review produced by deleting the
+    threads.
+    """
+
+    strict = invitations_module.PostgresInvitationService(live_db)
+    issued = strict.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(EmailNotVerifiedError):
+        strict.accept(
+            user_id=INVITEE,
+            display=display(INVITED_EMAIL, verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email=INVITED_EMAIL,
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_relaxed_service_still_refuses_a_mismatched_address(live_db):
+    """Relaxing verification must not relax the match, asserted through the
+    service rather than only through the helper."""
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        relaxed.accept(
+            user_id=INVITEE,
+            display=display("someone-else@example.com", verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email="someone-else@example.com",
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
 
 
 @live_postgres

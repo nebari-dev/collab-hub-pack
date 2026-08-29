@@ -30,3 +30,43 @@ jobs:
 
       - name: Validate rendered manifests
         run: helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
+
+      - name: Invitation acceptance renders only when relaxed
+        run: |
+          set -euo pipefail
+          # `frames.invitations.requireVerifiedEmail` renders NO environment
+          # variable at its strict default, so the variable's presence is what
+          # tells a reader the deployment took the trade. Both directions are
+          # asserted because the first version of that template block was
+          # nested inside a neighbouring conditional and rendered nothing at
+          # all -- a mistake a render check catches and a diff review does not.
+          helm template helm/collab-hub >/tmp/verify-default.yaml
+          if grep -q "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-default.yaml; then
+            echo "the strict default must render no requireVerifiedEmail env var" >&2
+            exit 1
+          fi
+
+          helm template helm/collab-hub \
+            --set frames.invitations.requireVerifiedEmail=false \
+            >/tmp/verify-relaxed.yaml
+          if [ "$(grep -c 'FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL' /tmp/verify-relaxed.yaml)" != "1" ]; then
+            echo "requireVerifiedEmail=false must render exactly one env var" >&2
+            exit 1
+          fi
+          if ! grep -A1 "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-relaxed.yaml \
+            | grep -q 'value: "false"'; then
+            echo "the rendered env var must carry \"false\"" >&2
+            exit 1
+          fi
+
+          # extraEnv renders after the chart's own env block, so a duplicate
+          # would win -- and since the strict default renders nothing, an entry
+          # there could relax the check on a deployment whose values say it is
+          # strict, with nothing in the manifest to show it.
+          if helm template helm/collab-hub \
+            --set 'api.deployment.extraEnv[0].name=COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL' \
+            --set-string 'api.deployment.extraEnv[0].value=false' \
+            >/tmp/verify-extraenv.yaml 2>/tmp/verify-extraenv.err; then
+            echo "expected extraEnv to be refused for invitation acceptance configuration" >&2
+            exit 1
+          fi

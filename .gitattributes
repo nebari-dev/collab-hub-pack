@@ -1,0 +1,5 @@
+# The onboarding copy carries conditional markers whose pattern is line-ending
+# tolerant, but pinning the file removes the drift rather than absorbing it --
+# see api/src/collab_hub_api/web/onboarding_email.py. A CRLF checkout of that
+# template used to cost a deployment all of its invitation email.
+*.txt text eol=lf

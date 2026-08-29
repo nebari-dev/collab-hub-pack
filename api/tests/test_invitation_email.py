@@ -20,6 +20,7 @@ from collab_hub_api.frames.invitation_email import (
     ConfiguredInvitationEmailDelivery,
     DisabledInvitationEmailDelivery,
     InvitationEmailMessage,
+    ProviderAcceptance,
     SesInvitationEmailProvider,
     build_setup_url,
     render_invitation_email,
@@ -63,6 +64,7 @@ def _delivery(client: RecordingSesClient) -> ConfiguredInvitationEmailDelivery:
         provider,
         accept_url="https://collab.example.test/invite/accept",
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
 
 
@@ -144,6 +146,7 @@ def test_plain_text_template_has_complete_setup_and_no_sensitive_repr():
         organization_name=" Example\nOrganization ",
         expires_at=EXPIRES_AT,
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
 
     assert message.recipient == RECIPIENT
@@ -226,6 +229,7 @@ def test_ses_request_shape_is_accepted_by_the_installed_botocore_model():
         organization_name=None,
         expires_at=EXPIRES_AT,
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
     expected = {
         "FromEmailAddress": "no-reply@collab.example.test",
@@ -507,3 +511,112 @@ def test_ses_provider_rejects_endpoint_shaping_and_invalid_configuration(field, 
 
     with pytest.raises(ValueError):
         SesInvitationEmailProvider(**kwargs)
+
+
+def test_the_delivery_copy_and_the_acceptance_rule_read_one_setting() -> None:
+    """**The coupling that must not come apart.**
+
+    Two independent switches -- one deciding what acceptance requires, one
+    deciding what the email says -- would eventually be set differently, and
+    the failure is silent: invitees told to watch for a verification email that
+    the deployment no longer sends, which is #171's defect with the sign
+    flipped. Asserted against the builder, because that is where a second
+    switch would be introduced.
+    """
+
+    from collab_hub_api.config import Config, build_invitation_email_delivery
+
+    def delivery_for(flag: bool):
+        return build_invitation_email_delivery(
+            Config.parse(
+                {
+                    "frames": {
+                        "invitations": {"require_verified_email": flag},
+                        "email": {
+                            "provider": "ses",
+                            "accept_url": "https://web.test/invite",
+                            "app_instructions": "Download it",
+                            "ses": {
+                                "sender_address": "no-reply@web.test",
+                                "region": "us-west-2",
+                                "configuration_set": "collab-invitations",
+                            },
+                        },
+                    }
+                }
+            )
+        )
+
+    assert delivery_for(True)._require_verified_email is True
+    assert delivery_for(False)._require_verified_email is False
+
+
+def test_a_relaxed_deployment_sends_copy_without_the_verification_step() -> None:
+    """Through ``deliver()``, which is the only production path that renders a
+    sent email.
+
+    The first version of this test read ``delivery._require_verified_email``
+    and passed it to the renderer itself -- asserting the value against itself
+    while never exercising the wiring. Review demonstrated the consequence:
+    deleting ``require_verified_email=self._require_verified_email`` from
+    ``deliver()`` left all 62 tests green, so a refactor could silently restore
+    the verification paragraph on every relaxed deployment.
+
+    So this captures what the provider was actually handed.
+    """
+
+    sent: list[InvitationEmailMessage] = []
+
+    class Capturing:
+        def send(self, message, *, invitation_id):
+            del invitation_id
+            sent.append(message)
+            return ProviderAcceptance(message_id="probe-message-id")
+
+    delivery = ConfiguredInvitationEmailDelivery(
+        Capturing(),
+        accept_url="https://web.test/invite",
+        app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=False,
+    )
+    delivery.deliver(
+        invitation_id="inv-1",
+        recipient=RECIPIENT,
+        invitation_secret=SECRET,
+        organization_name=None,
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+    )
+
+    (message,) = sent
+    body = message.text_body.reveal()
+    assert "verify" not in body.lower(), "a relaxed deployment must not promise verification mail"
+
+
+def test_a_strict_deployment_sends_copy_with_the_verification_step() -> None:
+    """The pair, so the test above cannot pass on a build that ignores the
+    setting entirely -- which is the build review produced."""
+
+    sent: list[InvitationEmailMessage] = []
+
+    class Capturing:
+        def send(self, message, *, invitation_id):
+            del invitation_id
+            sent.append(message)
+            return ProviderAcceptance(message_id="probe-message-id")
+
+    delivery = ConfiguredInvitationEmailDelivery(
+        Capturing(),
+        accept_url="https://web.test/invite",
+        app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
+    )
+    delivery.deliver(
+        invitation_id="inv-1",
+        recipient=RECIPIENT,
+        invitation_secret=SECRET,
+        organization_name=None,
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+    )
+
+    (message,) = sent
+    assert "verify the address" in message.text_body.reveal()

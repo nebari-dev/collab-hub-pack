@@ -301,7 +301,9 @@ def _sends_json(request: Request) -> bool:
     )
 
 
-def make_routers(*, memberships_enabled: bool) -> tuple[APIRouter, APIRouter]:
+def make_routers(
+    *, memberships_enabled: bool, require_verified_email: bool
+) -> tuple[APIRouter, APIRouter]:
     """Build the acceptance page's ``(public_router, session_gated_router)``.
 
     ``memberships_enabled`` is ``org_source_is_membership()``, resolved once
@@ -335,6 +337,11 @@ def make_routers(*, memberships_enabled: bool) -> tuple[APIRouter, APIRouter]:
                 root_path=root_path,
                 session=session,
                 claims_current=session is not None and verified_claims_are_current(session),
+                # The page's copy for `email_not_verified` describes a
+                # verification email, which a deployment that does not require
+                # verification never sends. Same value the acceptance check and
+                # the invitation email read.
+                require_verified_email=require_verified_email,
             ),
             path=ACCEPT_PAGE_PATH,
         )
