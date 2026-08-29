@@ -1,0 +1,61 @@
+name: Test execution E2E (kind)
+
+# Real-cluster end-to-end for Cog execution: build the runner image, spin up a
+# kind cluster, materialize Cog worker pods through the KubernetesCogExecutor, and
+# run a gated multi-step Op, asserting the Track. This is a separate job from
+# `Test execution` (the unit + Postgres suite) and runs concurrently with it.
+#
+# Based on the pack's local-kind CI pattern (nexus-pack-ci.yaml's
+# local-nexus-features-kind job): pinned kind + kubectl, a --wait cluster
+# bootstrap, and cluster diagnostics on failure. Path-gated because a kind run is
+# heavier than the unit job, so it only runs when the execution code or the E2E
+# harness changes.
+
+on:
+  pull_request:
+    paths:
+      - "execution/**"
+      - "scripts/cog-execution-e2e/**"
+      - ".github/workflows/test-execution-e2e.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "execution/**"
+      - "scripts/cog-execution-e2e/**"
+      - ".github/workflows/test-execution-e2e.yaml"
+
+jobs:
+  cog-execution-e2e-kind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # actions/checkout v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install kind and kubectl
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kind version
+          kubectl version --client=true
+
+      - name: Bootstrap local kind cluster
+        run: kind create cluster --name cog-e2e --wait 120s
+
+      - name: Materialize Cog pods and run a gated Op in kind
+        env:
+          KIND_CLUSTER: cog-e2e
+          KEEP: "1"   # reuse the bootstrapped cluster; keep it up for diagnostics
+        run: bash scripts/cog-execution-e2e/run.sh
+
+      - name: Dump cluster diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          kubectl --context kind-cog-e2e get pods --all-namespaces -o wide || true
+          kubectl --context kind-cog-e2e -n cogs-e2e describe pods || true
+          kubectl --context kind-cog-e2e -n cogs-e2e logs job/op-driver --tail=300 || true
