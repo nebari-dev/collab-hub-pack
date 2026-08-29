@@ -5,7 +5,7 @@ defined but never enforced in a run, and the Track lacked per-step digests and a
 bounded revise loop.
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -18,7 +18,9 @@ from collab_hub_execution import (
     PauseRequest,
     RunBudget,
     RunStatus,
+    TrackEvent,
 )
+from collab_hub_execution.orchestration import _serialize_op
 
 
 def test_token_budget_survives_restart_and_stops_the_run():
@@ -286,6 +288,71 @@ def test_retry_rejects_a_non_terminal_run():
     assert engine.submit(OpDefinition("run-paused", (OpStep("s", "c", "run"),))) is RunStatus.PAUSED
     with pytest.raises(ValueError):
         engine.retry("run-paused")
+
+
+def test_retry_rejects_a_completed_run():
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore()
+    )
+    assert engine.submit(OpDefinition("run-ok", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
+    with pytest.raises(ValueError):  # nothing to retry; re-running finished work is a new Op
+        engine.retry("run-ok")
+
+
+# --- a paused run resumes only through signal(), never a re-submit ---
+
+
+def test_re_submitting_a_paused_run_does_not_resume_it_behind_the_gate():
+    calls = {"n": 0}
+    state = {"approved": False}
+
+    def gate(entry, value):
+        calls["n"] += 1
+        if not state["approved"]:
+            raise PauseRequest("approve")
+        return value
+
+    track = InMemoryTrackStore()
+
+    def engine():
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": gate}), track=track)
+
+    op = OpDefinition("run-gate", (OpStep("s", "c", "run", "x"),))
+    assert engine().submit(op) is RunStatus.PAUSED
+    assert calls["n"] == 1
+    # a re-submit must NOT re-invoke the gated step (that would bypass the gate)
+    assert engine().submit(op) is RunStatus.PAUSED
+    assert calls["n"] == 1
+    # the gate opens only through signal(), which carries the decision value
+    state["approved"] = True
+    assert engine().signal("run-gate", "go") is RunStatus.COMPLETED
+
+
+# --- duration budget must survive a crash between the two submission events ---
+
+
+def test_duration_budget_survives_a_crash_between_the_two_submission_events():
+    track = InMemoryTrackStore()
+    op = OpDefinition("run-crash-budget", (OpStep("s", "c", "run"),))
+    # Simulate a crash after op_submitted committed but before `submitted`: only the
+    # first event exists, and it happened long ago.
+    long_ago = datetime.now(UTC) - timedelta(hours=1)
+    track.append(
+        TrackEvent(
+            run_id="run-crash-budget",
+            event_type="op_submitted",
+            payload={"op": _serialize_op(op)},
+            occurred_at=long_ago,
+        )
+    )
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v: v}),
+        track=track,
+        budget=RunBudget(max_duration=timedelta(minutes=5)),
+    )
+    # recovery anchors elapsed time to op_submitted (an hour ago), not now, so the
+    # 5-minute duration budget is correctly seen as exceeded
+    assert engine.submit(op) is RunStatus.BUDGET_EXCEEDED
 
 
 class _TeardownFailsExecutor:

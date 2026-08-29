@@ -153,7 +153,14 @@ class DurableWorkflowEngine(WorkflowEngine):
         if self.budget is None:
             return None
         events = self.track.replay(run_id)
-        started_at = next((e.occurred_at for e in events if e.event_type == "submitted"), None)
+        # Anchor the duration budget to when the run began. `submitted` is written
+        # right after `op_submitted`; if a crash landed between the two, `submitted`
+        # is missing on recovery — fall back to `op_submitted` (always the first
+        # event) so elapsed time isn't silently reset to now.
+        started_at = next(
+            (e.occurred_at for e in events if e.event_type in ("submitted", "op_submitted")),
+            None,
+        )
         tracker = BudgetTracker(self.budget, started_at=started_at)
         for event in events:
             if event.event_type == "step_completed":
@@ -187,23 +194,34 @@ class DurableWorkflowEngine(WorkflowEngine):
             if status in _TERMINAL_STATES:
                 # A finished run is immutable: re-submitting must not silently
                 # re-drive steps (and repeat side effects). Re-running a failed run
-                # is a deliberate act — call retry(). A non-terminal run (mid-step
-                # after a crash, or paused) still resumes here.
+                # is a deliberate act — call retry().
+                return status
+            if status is RunStatus.PAUSED:
+                # A paused run is waiting for an external decision; it resumes only
+                # through signal() (which carries the value). Re-submitting must not
+                # re-invoke the gated step behind the gate's back with its original
+                # input. A genuinely mid-step run (after a crash) still resumes below.
                 return status
         return self._advance(op)
 
     def retry(self, run_id: str) -> RunStatus:
-        """Re-drive a terminal run from its first incomplete step, as a new attempt.
+        """Re-drive an unsuccessfully-ended run from its first incomplete step.
 
-        Unlike a crash-recovery resume (which reuses the same idempotency key so a
-        durable worker can dedupe), an explicit retry records a ``retry_requested``
-        marker that advances the per-step attempt, so each step gets a fresh key —
-        the caller is asking for the work to run again.
+        Retry is for a run that stopped short — failed, timed out, or hit its
+        budget. A completed run has no incomplete steps, so retrying it would do
+        nothing but append a spurious `completed`; that is rejected (re-running
+        finished work is a new Op, with its own run id). Unlike a crash-recovery
+        resume (which reuses the same idempotency key so a durable worker can
+        dedupe), an explicit retry records a ``retry_requested`` marker that
+        advances the per-step attempt, so each step gets a fresh key — the caller
+        is asking for the work to run again.
         """
-        op = self._submitted_definition(run_id)
         status = self.observe(run_id)
+        if status is RunStatus.COMPLETED:
+            raise ValueError(f"run {run_id!r} completed; nothing to retry (start a new run instead)")
         if status not in _TERMINAL_STATES:
             raise ValueError(f"run {run_id!r} is not terminal (status={status}); nothing to retry")
+        op = self._submitted_definition(run_id)
         self._append(run_id, "retry_requested", from_status=str(status))
         return self._advance(op)
 
