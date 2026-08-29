@@ -47,7 +47,19 @@ class CogLifecycle:
 
 @dataclass(frozen=True, slots=True)
 class RunBudget:
-    """Hard per-run limits; ``None`` means that dimension is unbounded."""
+    """Per-run limits; ``None`` means that dimension is unbounded.
+
+    Enforcement differs by dimension because of what is knowable before a step:
+
+    - ``max_duration`` is a hard pre-check — elapsed time is known, so a step is
+      not started once the deadline has passed.
+    - ``max_tokens`` / ``max_cost`` are post-interaction accounting limits, not
+      hard per-interaction caps. Usage is only known after the Cog runs, so a step
+      started under budget can overshoot, and the run stops at the *next* boundary
+      once cumulative usage crosses the limit. A hard per-request token cap is the
+      model gateway's job (its ``max_tokens``); wiring that enforcement into the
+      executor rollout is tracked in collab-hub-pack #1.
+    """
 
     max_duration: timedelta | None = None
     max_tokens: int | None = None
@@ -66,6 +78,9 @@ class BudgetTracker:
         self.cost = 0.0
 
     def check(self, *, now: datetime | None = None) -> None:
+        # Called before a step (against elapsed time and cumulative usage so far)
+        # and again after consume(). It does not bound a single interaction's spend
+        # — that overshoots by design; see RunBudget for what each limit guarantees.
         now = now or datetime.now(UTC)
         if self.budget.max_duration is not None and now >= self.started_at + self.budget.max_duration:
             raise BudgetExceeded("run duration budget exceeded")

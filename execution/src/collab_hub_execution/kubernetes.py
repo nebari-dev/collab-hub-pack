@@ -14,9 +14,12 @@ so concurrent runs never share or tear down each other's workloads.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from typing import Any, Protocol
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "collab-hub"
 RUNNER_PORT = 8080
@@ -245,12 +248,22 @@ class KubernetesCogExecutor:
         return _KubernetesWorker(cog, name, self._service_url(name), self.worker_http)
 
     def _cleanup(self, name: str) -> None:
-        """Best-effort delete of a (possibly partial) materialization by name."""
+        """Best-effort delete of a (possibly partial) materialization by name.
+
+        Runs while a materialize() failure is already propagating, so it never
+        raises (that would mask the original cause). It still validates each delete
+        the way teardown() does — an HTTP error response does not raise on its own —
+        and logs any resource it could not remove, so an orphan is visible for
+        remediation instead of being silently swallowed.
+        """
         for path in self._resource_paths(name):
             try:
-                self.api.delete(path)
-            except Exception:  # noqa: BLE001,S110 - cleanup runs during failure handling
-                pass
+                response = self.api.delete(path)
+                status = getattr(response, "status_code", None)
+                if status is not None and status not in (200, 202, 404):
+                    _log.warning("cleanup of %s returned HTTP %s; resource may be orphaned", path, status)
+            except Exception as exc:  # noqa: BLE001 - cleanup runs during failure handling
+                _log.warning("cleanup of %s failed: %r; resource may be orphaned", path, exc)
 
     def teardown(self, worker: "_KubernetesWorker") -> None:
         for path in self._resource_paths(worker.name):

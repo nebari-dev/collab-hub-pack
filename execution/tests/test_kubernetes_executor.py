@@ -1,5 +1,6 @@
 """KubernetesCogExecutor unit tests — no cluster; the API + worker HTTP are faked."""
 
+import logging
 import re
 
 import pytest
@@ -29,11 +30,14 @@ class FakeResponse:
 class FakeK8sApi:
     """Records calls; returns created responses and a ready deployment."""
 
-    def __init__(self, *, conflict_on_deployment: bool = False, ready_after: int = 0) -> None:
+    def __init__(
+        self, *, conflict_on_deployment: bool = False, ready_after: int = 0, fail_delete: bool = False
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.conflict_on_deployment = conflict_on_deployment
         self._gets = 0
         self._ready_after = ready_after
+        self.fail_delete = fail_delete
 
     def post(self, path: str, *, json: dict) -> FakeResponse:
         self.calls.append(("POST", path))
@@ -47,7 +51,9 @@ class FakeK8sApi:
 
     def delete(self, path: str) -> FakeResponse:
         self.calls.append(("DELETE", path))
-        return FakeResponse(200)
+        # httpx does not raise on 4xx/5xx; a real failed delete returns an error
+        # response the caller must inspect.
+        return FakeResponse(500 if self.fail_delete else 200)
 
     def get(self, path: str) -> FakeResponse:
         self.calls.append(("GET", path))
@@ -172,6 +178,25 @@ def test_partial_materialization_is_cleaned_up_on_failure():
     name = resource_name("openteams/reviewer", "run-x")
     assert ("DELETE", f"/apis/apps/v1/namespaces/cogs/deployments/{name}") in api.calls
     assert ("DELETE", f"/api/v1/namespaces/cogs/services/{name}") in api.calls
+
+
+def test_partial_cleanup_surfaces_a_failed_delete_instead_of_swallowing_it(caplog):
+    # A delete that returns an HTTP error (httpx would not raise) must not be
+    # silently ignored — the orphaned resource is logged for remediation, and the
+    # original materialize failure still propagates.
+    api = FakeK8sApi(ready_after=99, fail_delete=True)
+    ex = KubernetesCogExecutor(
+        runner_image="collab-hub/cog-runner:test",
+        namespace="cogs",
+        api=api,
+        worker_http=FakeWorkerHttp(),
+        poll_interval=0,
+        ready_timeout=0,
+    )
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(TimeoutError):  # original cause, not masked by cleanup
+            ex.materialize("openteams/reviewer", "run-x")
+    assert any("orphaned" in record.getMessage() for record in caplog.records)
 
 
 def test_label_value_is_a_safe_kubernetes_label(monkeypatch):
