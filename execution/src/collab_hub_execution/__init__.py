@@ -1,4 +1,23 @@
-"""Execution contracts shared by the Hub's Cog and Op implementations."""
+"""Execution contracts shared by the Hub's Cog and Op implementations.
+
+Guarantees and non-goals
+------------------------
+``DurableWorkflowEngine`` is a single-owner, at-least-once reference engine. Its
+durability is Track-based recovery, not distributed ownership:
+
+- **Single-owner.** It holds no cross-replica lease, so one run must be advanced
+  by one owner at a time. The Postgres Track's one-submission-per-run index guards
+  a duplicate *submission*, not two callers concurrently *advancing* the same run.
+- **At-least-once.** The engine keeps a stable idempotency key across a
+  crash-recovery resume and passes it to the worker, but the reference and
+  Kubernetes workers do not persist keys, so a replaced worker re-runs the side
+  effect. Terminal runs are immutable; re-running is an explicit ``retry()``.
+
+Do not use this engine for multi-replica production execution until the DBOS
+backing supplies ownership leases and durable keyed (exactly-once) claims — see
+collab-hub-pack #1. ``WorkflowEngine`` and the Track/executor seams are stable;
+the production engine plugs in behind them without changing callers.
+"""
 
 from .binding import (
     BindingResolutionError,
