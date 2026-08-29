@@ -62,8 +62,8 @@ def _coerce_usage(value: Any) -> dict[str, Any] | None:
 def _nonneg_int(candidate: Any) -> int:
     try:
         number = int(candidate)
-    except (TypeError, ValueError):
-        _log.warning("usage tokens %r is not an integer; counting as 0", candidate)
+    except (TypeError, ValueError, OverflowError):  # OverflowError: int(float("inf"))
+        _log.warning("usage tokens %r is not a usable integer; counting as 0", candidate)
         return 0
     if number < 0:
         _log.warning("usage tokens %r is negative; counting as 0", number)

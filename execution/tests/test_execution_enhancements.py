@@ -504,8 +504,13 @@ def test_non_mapping_usage_is_ignored_without_crashing():
 def test_negative_or_nonfinite_usage_is_clamped_to_zero():
     handlers = {
         "neg": lambda e, v: {"usage": {"tokens": -100, "cost": -5.0}},
-        "nan": lambda e, v: {"usage": {"cost": float("nan")}},
-        "inf": lambda e, v: {"usage": {"cost": float("inf")}},
+        "cost_nan": lambda e, v: {"usage": {"cost": float("nan")}},
+        "cost_inf": lambda e, v: {"usage": {"cost": float("inf")}},
+        # tokens must be covered symmetrically: int(float("inf")) raises
+        # OverflowError, int(float("nan")) raises ValueError — both must clamp, not crash
+        "tokens_inf": lambda e, v: {"usage": {"tokens": float("inf")}},
+        "tokens_ninf": lambda e, v: {"usage": {"tokens": float("-inf")}},
+        "tokens_nan": lambda e, v: {"usage": {"tokens": float("nan")}},
     }
     for cog, handler in handlers.items():
         track = InMemoryTrackStore()
