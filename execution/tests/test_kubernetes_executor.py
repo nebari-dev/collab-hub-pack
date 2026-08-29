@@ -78,6 +78,18 @@ def _executor(api, worker_http):
         api=api,
         worker_http=worker_http,
         poll_interval=0,
+        insecure_skip_network_policy=True,
+    )
+
+
+def _secure_executor(api, worker_http, allow_ingress_from=None):
+    return KubernetesCogExecutor(
+        runner_image="collab-hub/cog-runner:test",
+        namespace="cogs",
+        api=api,
+        worker_http=worker_http,
+        poll_interval=0,
+        allow_ingress_from=allow_ingress_from or {"app": "hub"},
     )
 
 
@@ -172,6 +184,7 @@ def test_partial_materialization_is_cleaned_up_on_failure():
         worker_http=FakeWorkerHttp(),
         poll_interval=0,
         ready_timeout=0,
+        insecure_skip_network_policy=True,
     )
     with pytest.raises(TimeoutError):
         ex.materialize("openteams/reviewer", "run-x")
@@ -192,6 +205,7 @@ def test_partial_cleanup_surfaces_a_failed_delete_instead_of_swallowing_it(caplo
         worker_http=FakeWorkerHttp(),
         poll_interval=0,
         ready_timeout=0,
+        insecure_skip_network_policy=True,
     )
     with caplog.at_level(logging.WARNING):
         with pytest.raises(TimeoutError):  # original cause, not masked by cleanup
@@ -219,3 +233,54 @@ def test_worker_pod_does_not_mount_a_service_account_token():
     deployment, _service = ex._manifests("openteams/reviewer", "run-1", "cog-reviewer-x")
     # a worker talks to the hub, not the K8s API, so it carries no SA token
     assert deployment["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+
+
+# --- worker network boundary is enforced, not just documented ---
+
+
+def test_construction_requires_an_explicit_network_security_choice():
+    # the insecure default cannot be reached by omission
+    with pytest.raises(ValueError):
+        KubernetesCogExecutor(
+            runner_image="x", namespace="cogs", api=FakeK8sApi(), worker_http=FakeWorkerHttp()
+        )
+    # and the two choices are mutually exclusive
+    with pytest.raises(ValueError):
+        KubernetesCogExecutor(
+            runner_image="x",
+            namespace="cogs",
+            api=FakeK8sApi(),
+            worker_http=FakeWorkerHttp(),
+            allow_ingress_from={"app": "hub"},
+            insecure_skip_network_policy=True,
+        )
+
+
+def test_network_policy_admits_only_the_hub_and_is_applied_before_the_pod():
+    api, http = FakeK8sApi(), FakeWorkerHttp()
+    ex = _secure_executor(api, http, allow_ingress_from={"app": "collab-hub-api"})
+    worker = ex.materialize("openteams/reviewer", "run-np")
+
+    np_post = ("POST", "/apis/networking.k8s.io/v1/namespaces/cogs/networkpolicies")
+    dep_post = ("POST", "/apis/apps/v1/namespaces/cogs/deployments")
+    assert np_post in api.calls and dep_post in api.calls
+    assert api.calls.index(np_post) < api.calls.index(dep_post)  # policy in place before the pod
+
+    policy = ex._network_policy("openteams/reviewer", "run-np", worker.name)
+    assert policy["spec"]["podSelector"]["matchLabels"] == {"app": worker.name}
+    assert policy["spec"]["policyTypes"] == ["Ingress"]
+    assert policy["spec"]["ingress"][0]["from"] == [{"podSelector": {"matchLabels": {"app": "collab-hub-api"}}}]
+    assert policy["spec"]["ingress"][0]["ports"] == [{"protocol": "TCP", "port": 8080}]
+
+
+def test_teardown_deletes_the_network_policy_too():
+    api, http = FakeK8sApi(), FakeWorkerHttp()
+    worker = (ex := _secure_executor(api, http)).materialize("openteams/reviewer", "run-np2")
+    ex.teardown(worker)
+    assert ("DELETE", f"/apis/networking.k8s.io/v1/namespaces/cogs/networkpolicies/{worker.name}") in api.calls
+
+
+def test_insecure_skip_creates_no_network_policy():
+    api, http = FakeK8sApi(), FakeWorkerHttp()
+    _executor(api, http).materialize("openteams/reviewer", "run-x")
+    assert not any("networkpolicies" in path for _method, path in api.calls)

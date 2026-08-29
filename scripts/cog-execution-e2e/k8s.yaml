@@ -10,7 +10,7 @@ metadata:
   namespace: cogs-e2e
 ---
 # Least-privilege: the executor may manage exactly the workloads it materializes,
-# scoped to its namespace (issue #7).
+# scoped to its namespace (issue #6).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -23,6 +23,9 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get", "list", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

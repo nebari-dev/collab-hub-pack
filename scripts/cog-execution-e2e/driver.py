@@ -26,7 +26,14 @@ def main() -> int:
     runner_image = os.environ["E2E_RUNNER_IMAGE"]
 
     executor = KubernetesCogExecutor(
-        runner_image=runner_image, namespace=namespace, ready_timeout=120, poll_interval=2
+        runner_image=runner_image,
+        namespace=namespace,
+        # Materialize a NetworkPolicy admitting only this driver (the stand-in hub)
+        # to each worker. kind's default CNI does not enforce NetworkPolicy, so this
+        # exercises the secure code path; a policy-enforcing CNI enforces it.
+        allow_ingress_from={"app": "op-driver"},
+        ready_timeout=120,
+        poll_interval=2,
     )
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=executor, track=track)

@@ -10,14 +10,19 @@ Workers are reached over in-cluster service DNS (never port-forwards). Each
 materialization gets a name that is a valid DNS label and unique per (Cog, run),
 so concurrent runs never share or tear down each other's workloads.
 
-Security boundary: a worker's ``/invoke`` Service is unauthenticated, so any
-workload that can reach it can call arbitrary entry points with arbitrary input.
-This executor therefore assumes a trusted, single-tenant namespace. It reduces
-blast radius (workers carry no ServiceAccount token — automountServiceAccountToken
-is false) but does not itself authenticate callers or restrict traffic. In a
-shared or multi-tenant cluster it must be paired with a NetworkPolicy that admits
-only the hub and bounds worker egress (#11), and, longer term, request
-authentication on the worker endpoint.
+Security boundary: a worker's ``/invoke`` Service is unauthenticated, so the
+network is the control. Construction requires an explicit choice — you cannot get
+the insecure default by omission:
+
+- ``allow_ingress_from={<hub pod label selector>}`` (recommended) materializes a
+  NetworkPolicy per worker that admits only the hub to the ``/invoke`` port and
+  denies all other ingress. Requires a policy-enforcing CNI.
+- ``insecure_skip_network_policy=True`` deliberately opts out, for a trusted,
+  single-tenant namespace only.
+
+Blast radius is reduced regardless — workers carry no ServiceAccount token
+(``automountServiceAccountToken: false``). Egress restriction to hub-mediated
+paths, and request authentication on the endpoint, are tracked in #11.
 """
 
 from __future__ import annotations
@@ -123,13 +128,29 @@ class KubernetesCogExecutor:
         *,
         runner_image: str,
         namespace: str = DEFAULT_NAMESPACE,
+        allow_ingress_from: dict[str, str] | None = None,
+        insecure_skip_network_policy: bool = False,
         api: K8sApi | None = None,
         worker_http: WorkerHttp | None = None,
         ready_timeout: float = 60.0,
         poll_interval: float = 1.0,
     ) -> None:
+        # A worker's /invoke endpoint is unauthenticated, so the network boundary is
+        # the control. Force an explicit choice at construction — the secure path
+        # (a NetworkPolicy admitting only the hub) or a deliberate, named opt-out —
+        # so the insecure single-tenant assumption cannot be deployed by omission.
+        if allow_ingress_from is None and not insecure_skip_network_policy:
+            raise ValueError(
+                "KubernetesCogExecutor exposes an unauthenticated worker endpoint. Pass "
+                "allow_ingress_from={<pod label selector for the hub>} to materialize a "
+                "NetworkPolicy that admits only the hub, or set insecure_skip_network_policy=True "
+                "to deliberately run without one in a trusted, single-tenant namespace."
+            )
+        if allow_ingress_from is not None and insecure_skip_network_policy:
+            raise ValueError("pass allow_ingress_from OR insecure_skip_network_policy, not both")
         self.runner_image = runner_image
         self.namespace = namespace
+        self.allow_ingress_from = allow_ingress_from
         self._api = api
         self._worker_http = worker_http
         self.ready_timeout = ready_timeout
@@ -207,6 +228,41 @@ class KubernetesCogExecutor:
         }
         return deployment, service
 
+    def _network_policy(self, cog: str, run_id: str, name: str) -> dict:
+        """A NetworkPolicy that admits only the hub to this worker's /invoke port.
+
+        Selecting the worker pod with a single ingress rule denies all other
+        ingress, so an unauthenticated endpoint is not reachable cluster-wide — only
+        pods matching ``allow_ingress_from`` can call it. (Egress restriction to
+        hub-mediated paths is #11.)
+        """
+        labels = {
+            "app": name,
+            "collab-hub/cog": cog_slug(cog),
+            "collab-hub/run": label_value(run_id),
+            "app.kubernetes.io/managed-by": "collab-hub-executor",
+        }
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {
+                "name": name,
+                "namespace": self.namespace,
+                "labels": labels,
+                "annotations": {"collab-hub/run-id": run_id},
+            },
+            "spec": {
+                "podSelector": {"matchLabels": {"app": name}},
+                "policyTypes": ["Ingress"],
+                "ingress": [
+                    {
+                        "from": [{"podSelector": {"matchLabels": self.allow_ingress_from}}],
+                        "ports": [{"protocol": "TCP", "port": RUNNER_PORT}],
+                    }
+                ],
+            },
+        }
+
     def _apply(self, collection_path: str, name: str, body: dict, *, replaceable: bool) -> None:
         response = self.api.post(collection_path, json=body)
         if response.status_code == 409:  # already exists
@@ -234,16 +290,27 @@ class KubernetesCogExecutor:
                 raise TimeoutError(f"deployment {name} not ready within {self.ready_timeout}s")
             time.sleep(self.poll_interval)
 
-    def _resource_paths(self, name: str) -> tuple[str, str]:
-        return (
+    def _network_policy_collection(self) -> str:
+        return f"/apis/networking.k8s.io/v1/namespaces/{self.namespace}/networkpolicies"
+
+    def _resource_paths(self, name: str) -> tuple[str, ...]:
+        paths = [
             f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}",
             f"/api/v1/namespaces/{self.namespace}/services/{name}",
-        )
+        ]
+        if self.allow_ingress_from is not None:
+            paths.append(f"{self._network_policy_collection()}/{name}")
+        return tuple(paths)
 
     def materialize(self, cog: str, run_id: str) -> "_KubernetesWorker":
         name = resource_name(cog, run_id)
         deployment, service = self._manifests(cog, run_id, name)
         try:
+            if self.allow_ingress_from is not None:
+                # Put the ingress restriction in place before the pod can serve.
+                self._apply(
+                    self._network_policy_collection(), name, self._network_policy(cog, run_id, name), replaceable=True
+                )
             self._apply(
                 f"/apis/apps/v1/namespaces/{self.namespace}/deployments", name, deployment, replaceable=True
             )
