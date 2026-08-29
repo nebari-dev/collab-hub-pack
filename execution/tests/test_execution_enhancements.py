@@ -185,7 +185,14 @@ class _SameWorkerExecutor:
 
 class _KeyHonoringWorker:
     """Durable-store stand-in: a replayed key returns the prior result and does
-    not repeat the side effect; the first call crashes after its side effect."""
+    not repeat the side effect. The first call performs its side effect and then
+    the process dies (SystemExit) before the step outcome is recorded — so the run
+    is left mid-step (non-terminal), which is what a genuine crash looks like.
+
+    This proves the *engine's* key-stability contract on resume; a real worker
+    that does not persist keys across pod replacement is at-least-once (see the
+    CogWorker.interact docstring and #1).
+    """
 
     def __init__(self):
         self.side_effects = []
@@ -199,17 +206,86 @@ class _KeyHonoringWorker:
         self._seen[idempotency_key] = {"done": idempotency_key}
         if self._crash_once:
             self._crash_once = False
-            raise RuntimeError("crash after side effect, before completion")
+            raise SystemExit("process died after side effect, before completion")
         return self._seen[idempotency_key]
 
 
-def test_idempotency_key_is_stable_across_recovery_so_side_effect_runs_once():
+def test_crash_recovery_resumes_with_the_same_key_so_the_side_effect_runs_once():
     worker = _KeyHonoringWorker()
     engine = DurableWorkflowEngine(executor=_SameWorkerExecutor(worker), track=InMemoryTrackStore())
     op = OpDefinition("run-idem", (OpStep("s", "c", "run"),))
-    assert engine.submit(op) is RunStatus.FAILED  # crashed after its side effect
-    assert engine.submit(op) is RunStatus.COMPLETED  # recovery re-drives with the SAME key
+    with pytest.raises(SystemExit):  # process dies mid-step; run left non-terminal
+        engine.submit(op)
+    assert engine.observe("run-idem") not in (RunStatus.COMPLETED, RunStatus.FAILED)
+    assert engine.submit(op) is RunStatus.COMPLETED  # resume re-drives with the SAME key
     assert worker.side_effects == ["run-idem:s:0"]  # performed exactly once
+
+
+# --- terminal runs are immutable; re-running takes an explicit retry() (#3) ---
+
+
+def test_re_submitting_a_failed_run_is_a_no_op_not_a_silent_re_execution():
+    calls = {"n": 0}
+
+    def fail(entry, value):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": fail}), track=track)
+    op = OpDefinition("run-term", (OpStep("s", "c", "run"),))
+    assert engine.submit(op) is RunStatus.FAILED
+    before = len(track.replay("run-term"))
+    assert engine.submit(op) is RunStatus.FAILED  # immutable: no re-drive
+    assert calls["n"] == 1                          # the step did NOT run again
+    assert len(track.replay("run-term")) == before  # no new events appended
+
+
+class _RetryProbeExecutor:
+    """Records the idempotency key of each interaction; first attempt fails."""
+
+    def __init__(self):
+        self.keys = []
+        self.attempts = 0
+
+    class _Worker:
+        cog = "c"
+
+        def __init__(self, outer):
+            self._outer = outer
+
+        def interact(self, entry_point, input=None, idempotency_key=None):
+            self._outer.keys.append(idempotency_key)
+            self._outer.attempts += 1
+            if self._outer.attempts == 1:
+                raise RuntimeError("first attempt fails")
+            return {"ok": True}
+
+    def materialize(self, cog, run_id):
+        return self._Worker(self)
+
+    def teardown(self, worker):
+        pass
+
+
+def test_retry_re_drives_a_failed_run_under_a_fresh_key():
+    ex = _RetryProbeExecutor()
+    engine = DurableWorkflowEngine(executor=ex, track=InMemoryTrackStore())
+    op = OpDefinition("run-retry", (OpStep("s", "c", "run"),))
+    assert engine.submit(op) is RunStatus.FAILED
+    assert engine.retry("run-retry") is RunStatus.COMPLETED
+    # explicit retry is a new attempt -> fresh key, so the work genuinely re-runs
+    assert ex.keys == ["run-retry:s:0", "run-retry:s:1"]
+
+
+def test_retry_rejects_a_non_terminal_run():
+    def gate(entry, value):
+        raise PauseRequest("hold")
+
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": gate}), track=InMemoryTrackStore())
+    assert engine.submit(OpDefinition("run-paused", (OpStep("s", "c", "run"),))) is RunStatus.PAUSED
+    with pytest.raises(ValueError):
+        engine.retry("run-paused")
 
 
 class _TeardownFailsExecutor:

@@ -146,8 +146,32 @@ def test_resource_name_is_valid_unique_per_run_and_collision_resistant():
     assert n_a == resource_name("openteams/reviewer", "run-A")  # deterministic (recovery-safe)
     assert len(n_a) <= 63
     assert re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", n_a)  # valid DNS-1123 label
+    # 64-bit digest suffix (16 hex): wide enough that collisions stay negligible
+    assert re.search(r"-[0-9a-f]{16}$", n_a)
     # slug-colliding Cogs still get distinct names (digest is over the full id)
     assert resource_name("a/reviewer", "r") != resource_name("b/reviewer", "r")
+    # a very long Cog id still yields a valid, in-bounds label with a full suffix
+    long_name = resource_name("openteams/" + "a" * 300, "run-A")
+    assert len(long_name) <= 63 and re.search(r"-[0-9a-f]{16}$", long_name)
+
+
+def test_partial_materialization_is_cleaned_up_on_failure():
+    # Deployment is created, then readiness never arrives: materialize must not
+    # leak the Deployment (the engine gets no worker handle to tear down).
+    api = FakeK8sApi(ready_after=99)  # never ready
+    ex = KubernetesCogExecutor(
+        runner_image="collab-hub/cog-runner:test",
+        namespace="cogs",
+        api=api,
+        worker_http=FakeWorkerHttp(),
+        poll_interval=0,
+        ready_timeout=0,
+    )
+    with pytest.raises(TimeoutError):
+        ex.materialize("openteams/reviewer", "run-x")
+    name = resource_name("openteams/reviewer", "run-x")
+    assert ("DELETE", f"/apis/apps/v1/namespaces/cogs/deployments/{name}") in api.calls
+    assert ("DELETE", f"/api/v1/namespaces/cogs/services/{name}") in api.calls
 
 
 def test_label_value_is_a_safe_kubernetes_label(monkeypatch):

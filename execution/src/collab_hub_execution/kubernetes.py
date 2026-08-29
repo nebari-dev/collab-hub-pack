@@ -37,14 +37,19 @@ def cog_slug(cog: str) -> str:
     return cleaned[:40] or "cog"
 
 
+DIGEST_HEX = 16  # 64-bit suffix: birthday collisions stay negligible at realistic run volumes
+
+
 def resource_name(cog: str, run_id: str) -> str:
     """A valid, unique DNS-1123 label for one (Cog, run) materialization.
 
     Deterministic (recovery re-derives the same name), unique per run (concurrent
     runs of the same Cog don't collide), and collision-resistant across Cogs whose
     slugs would otherwise coincide (the digest is over the full Cog id + run id).
+    The suffix is ``DIGEST_HEX`` hex chars (64 bits), so the name stays within the
+    63-char DNS-label limit while keeping collisions negligible at realistic scale.
     """
-    digest = hashlib.sha1(f"{cog}\x00{run_id}".encode()).hexdigest()[:8]  # noqa: S324 - name uniqueness, not security
+    digest = hashlib.sha1(f"{cog}\x00{run_id}".encode()).hexdigest()[:DIGEST_HEX]  # noqa: S324 - name uniqueness, not security
     return f"cog-{cog_slug(cog)}-{digest}"[:MAX_DNS_LABEL].rstrip("-")
 
 
@@ -213,23 +218,42 @@ class KubernetesCogExecutor:
                 raise TimeoutError(f"deployment {name} not ready within {self.ready_timeout}s")
             time.sleep(self.poll_interval)
 
+    def _resource_paths(self, name: str) -> tuple[str, str]:
+        return (
+            f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{name}",
+            f"/api/v1/namespaces/{self.namespace}/services/{name}",
+        )
+
     def materialize(self, cog: str, run_id: str) -> "_KubernetesWorker":
         name = resource_name(cog, run_id)
         deployment, service = self._manifests(cog, run_id, name)
-        self._apply(
-            f"/apis/apps/v1/namespaces/{self.namespace}/deployments", name, deployment, replaceable=True
-        )
-        self._apply(
-            f"/api/v1/namespaces/{self.namespace}/services", name, service, replaceable=False
-        )
-        self._wait_ready(name)
+        try:
+            self._apply(
+                f"/apis/apps/v1/namespaces/{self.namespace}/deployments", name, deployment, replaceable=True
+            )
+            self._apply(
+                f"/api/v1/namespaces/{self.namespace}/services", name, service, replaceable=False
+            )
+            self._wait_ready(name)
+        except Exception:
+            # A partial materialization (e.g. Deployment created, then Service or
+            # readiness failed) would leak a workload the engine can't tear down —
+            # it never got a worker handle. Delete by the deterministic name,
+            # best-effort, then re-raise the original failure.
+            self._cleanup(name)
+            raise
         return _KubernetesWorker(cog, name, self._service_url(name), self.worker_http)
 
+    def _cleanup(self, name: str) -> None:
+        """Best-effort delete of a (possibly partial) materialization by name."""
+        for path in self._resource_paths(name):
+            try:
+                self.api.delete(path)
+            except Exception:  # noqa: BLE001,S110 - cleanup runs during failure handling
+                pass
+
     def teardown(self, worker: "_KubernetesWorker") -> None:
-        for path in (
-            f"/apis/apps/v1/namespaces/{self.namespace}/deployments/{worker.name}",
-            f"/api/v1/namespaces/{self.namespace}/services/{worker.name}",
-        ):
+        for path in self._resource_paths(worker.name):
             response = self.api.delete(path)
             if response.status_code not in (200, 202, 404):
                 response.raise_for_status()

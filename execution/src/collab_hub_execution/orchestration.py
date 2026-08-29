@@ -15,6 +15,12 @@ from .lifecycle import (
 )
 from .track import RunStatus, TrackEvent, TrackStore, derive_run_status
 
+# A run in one of these states is finished; its Track is immutable. Resuming it
+# takes an explicit retry(), never a re-submit (which would silently re-run steps).
+_TERMINAL_STATES = frozenset(
+    {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.BUDGET_EXCEEDED}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class OpStep:
@@ -47,9 +53,14 @@ class CogWorker(Protocol):
     def interact(self, entry_point: str, input: Any = None, idempotency_key: str | None = None) -> Any:
         """Interact through a declared entry point.
 
-        ``idempotency_key`` is stable per (run, step, attempt) so a Cog can dedupe
-        a retried interaction after a crash-recovery. (A durable claim that makes
-        the crash window fully safe lands with the DBOS engine backing — #1.)
+        ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
+        re-drives the same incomplete step with the *same* key, and an explicit
+        retry uses a *new* key. A worker that persists results by key can turn the
+        replay into a no-op — but that durability is the worker's to provide. The
+        reference and Kubernetes workers here do NOT persist keys across pod
+        replacement, so a replaced worker re-runs the side effect: execution is
+        at-least-once across pod replacement. Crash-safe, exactly-once execution
+        (a durable keyed claim) lands with the DBOS engine backing — #1.
         """
 
 
@@ -158,6 +169,9 @@ class DurableWorkflowEngine(WorkflowEngine):
             if e.event_type == "paused" and e.payload.get("step") == step
         )
 
+    def _retry_count(self, run_id: str) -> int:
+        return sum(1 for e in self.track.replay(run_id) if e.event_type == "retry_requested")
+
     def submit(self, op: OpDefinition) -> RunStatus:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
@@ -166,8 +180,31 @@ class DurableWorkflowEngine(WorkflowEngine):
         if not existing:
             self._append(op.run_id, "op_submitted", op=_serialize_op(op))
             self._append(op.run_id, "submitted")
-        elif self._submitted_definition(op.run_id) != op:
-            raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
+        else:
+            if self._submitted_definition(op.run_id) != op:
+                raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
+            status = derive_run_status(existing)
+            if status in _TERMINAL_STATES:
+                # A finished run is immutable: re-submitting must not silently
+                # re-drive steps (and repeat side effects). Re-running a failed run
+                # is a deliberate act — call retry(). A non-terminal run (mid-step
+                # after a crash, or paused) still resumes here.
+                return status
+        return self._advance(op)
+
+    def retry(self, run_id: str) -> RunStatus:
+        """Re-drive a terminal run from its first incomplete step, as a new attempt.
+
+        Unlike a crash-recovery resume (which reuses the same idempotency key so a
+        durable worker can dedupe), an explicit retry records a ``retry_requested``
+        marker that advances the per-step attempt, so each step gets a fresh key —
+        the caller is asking for the work to run again.
+        """
+        op = self._submitted_definition(run_id)
+        status = self.observe(run_id)
+        if status not in _TERMINAL_STATES:
+            raise ValueError(f"run {run_id!r} is not terminal (status={status}); nothing to retry")
+        self._append(run_id, "retry_requested", from_status=str(status))
         return self._advance(op)
 
     def _advance(self, op: OpDefinition, signal: Any = None) -> RunStatus:
@@ -182,10 +219,11 @@ class DurableWorkflowEngine(WorkflowEngine):
                 except BudgetExceeded as exc:
                     self._append(op.run_id, "budget_exceeded", step=step.name, reason=str(exc))
                     return RunStatus.BUDGET_EXCEEDED
-            # attempt = prior pauses (real revisions), NOT the step_started count:
-            # a crash before the outcome is recorded re-runs with the SAME key, so
-            # a worker can deduplicate the replay.
-            attempt = self._pause_count(op.run_id, step.name)
+            # attempt = prior pauses (revisions) + explicit retries, NOT the
+            # step_started count: a crash before the outcome is recorded re-runs
+            # with the SAME key (a durable worker can dedupe the replay), while an
+            # explicit retry() bumps the attempt so it re-runs under a fresh key.
+            attempt = self._pause_count(op.run_id, step.name) + self._retry_count(op.run_id)
             self._append(op.run_id, "step_started", step=step.name, cog=step.cog, digest=step.digest, attempt=attempt)
             lifecycle = CogLifecycle()
             worker = None
