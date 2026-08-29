@@ -5,6 +5,7 @@ defined but never enforced in a run, and the Track lacked per-step digests and a
 bounded revise loop.
 """
 
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -498,6 +499,46 @@ def test_non_mapping_usage_is_ignored_without_crashing():
     assert engine.submit(OpDefinition("run-str-usage", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
     completed = [e for e in track.replay("run-str-usage") if e.event_type == "step_completed"]
     assert completed and completed[0].payload["usage"] is None
+
+
+def test_negative_or_nonfinite_usage_is_clamped_to_zero():
+    handlers = {
+        "neg": lambda e, v: {"usage": {"tokens": -100, "cost": -5.0}},
+        "nan": lambda e, v: {"usage": {"cost": float("nan")}},
+        "inf": lambda e, v: {"usage": {"cost": float("inf")}},
+    }
+    for cog, handler in handlers.items():
+        track = InMemoryTrackStore()
+        engine = DurableWorkflowEngine(
+            executor=InMemoryCogExecutor({cog: handler}),
+            track=track,
+            budget=RunBudget(max_tokens=1000, max_cost=1000.0),
+        )
+        assert engine.submit(OpDefinition(f"run-{cog}", (OpStep("s", cog, "run"),))) is RunStatus.COMPLETED
+        usage = [e for e in track.replay(f"run-{cog}") if e.event_type == "step_completed"][0].payload["usage"]
+        assert usage["tokens"] >= 0
+        assert math.isfinite(usage["cost"]) and usage["cost"] >= 0
+
+
+def test_negative_tokens_cannot_lower_cumulative_usage_below_the_budget():
+    # s1 legitimately uses 900; s2 reports -1000 (clamped to 0, not subtracted);
+    # s3 uses 900 -> 900 + 0 + 900 >= max 1000, so the budget still stops the run.
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor(
+            {
+                "big": lambda e, v: {"usage": {"tokens": 900}},
+                "cheat": lambda e, v: {"usage": {"tokens": -1000}},
+            }
+        ),
+        track=track,
+        budget=RunBudget(max_tokens=1000),
+    )
+    op = OpDefinition(
+        "run-cheat",
+        (OpStep("a", "big", "run"), OpStep("b", "cheat", "run"), OpStep("c", "big", "run")),
+    )
+    assert engine.submit(op) is RunStatus.BUDGET_EXCEEDED
 
 
 class _TeardownFailsExecutor:

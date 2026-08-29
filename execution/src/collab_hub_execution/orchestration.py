@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -14,6 +16,8 @@ from .lifecycle import (
     RunBudget,
 )
 from .track import RunStatus, TrackEvent, TrackStore, derive_run_status
+
+_log = logging.getLogger(__name__)
 
 # A run in one of these states is finished; its Track is immutable. Resuming it
 # takes an explicit retry(), never a re-submit (which would silently re-run steps).
@@ -40,23 +44,43 @@ def _key_component(value: str) -> str:
 
 
 def _coerce_usage(value: Any) -> dict[str, Any] | None:
-    """Extract usage from a Cog result, coercing tokens/cost safely.
+    """Extract usage from a Cog result as finite, non-negative tokens/cost.
 
-    Returns None when no usage mapping is present, and never raises on a malformed
-    usage (a bad tokens/cost counts as zero) — so the post-interaction accounting
-    tail cannot turn a completed step into an uncaught engine exception.
+    Returns None when no usage mapping is present. Never raises on a malformed usage
+    — so the post-interaction accounting tail cannot turn a completed step into an
+    uncaught engine exception — and never trusts a value that could subvert a budget:
+    a non-numeric, negative, NaN, or infinite tokens/cost is clamped to zero (a
+    negative would *reduce* cumulative usage; a NaN makes every limit comparison
+    false; both bypass budgets). Clamped values are logged.
     """
     raw = value.get("usage") if isinstance(value, Mapping) else None
     if not isinstance(raw, Mapping):
         return None
+    return {"tokens": _nonneg_int(raw.get("tokens", 0)), "cost": _nonneg_float(raw.get("cost", 0.0))}
 
-    def _num(candidate: Any, cast: Callable[[Any], Any]) -> Any:
-        try:
-            return cast(candidate)
-        except (TypeError, ValueError):
-            return cast(0)
 
-    return {"tokens": _num(raw.get("tokens", 0), int), "cost": _num(raw.get("cost", 0.0), float)}
+def _nonneg_int(candidate: Any) -> int:
+    try:
+        number = int(candidate)
+    except (TypeError, ValueError):
+        _log.warning("usage tokens %r is not an integer; counting as 0", candidate)
+        return 0
+    if number < 0:
+        _log.warning("usage tokens %r is negative; counting as 0", number)
+        return 0
+    return number
+
+
+def _nonneg_float(candidate: Any) -> float:
+    try:
+        number = float(candidate)
+    except (TypeError, ValueError):
+        _log.warning("usage cost %r is not a number; counting as 0", candidate)
+        return 0.0
+    if not math.isfinite(number) or number < 0:
+        _log.warning("usage cost %r is not finite and non-negative; counting as 0", candidate)
+        return 0.0
+    return number
 
 
 @dataclass(frozen=True, slots=True)
