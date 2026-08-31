@@ -1196,7 +1196,10 @@ async def test_github_read_project_authoritative_counts(tmp_path, monkeypatch):
     assert counts["authoritative"] is True
     assert counts["total"] == 2
     assert counts["archived_policy"] == "excluded"
-    # The authoritative total agrees with the legacy total_count (same board scalar).
+    # The authoritative total agrees with the legacy total_count (same board scalar) —
+    # only true because both exclude archived items by default. If archived_policy
+    # ever changes to include archived items, this assertion will start failing on
+    # boards that actually have archived items.
     assert counts["total"] == body["total_count"]
     assert counts["by_status"] == [
         {"name": "Backlog", "count": 1},
@@ -1247,6 +1250,63 @@ async def test_github_project_status_count_escapes_filter_values(tmp_path, monke
     assert response.status_code == 200
     assert captured_variables["q0"] == r'status:"Ready \"for QA\""'
     assert captured_variables["q1"] == r'status:"Needs \\ review"'
+
+
+async def test_github_status_counts_null_project_falls_back_instead_of_zeroing(tmp_path, monkeypatch):
+    # A1 (aggregates) succeeds, but A2 (per-status counts) comes back with
+    # projectV2: null -- exactly what GraphQL non-null bubbling produces when a
+    # single s{i} alias errors. This must drop the whole count attempt to the
+    # sampled fallback, not report every status column as 0 while still claiming
+    # authoritative: true.
+    # totalCount raised well above what's actually enumerated so a fallback to
+    # sampling is unambiguously non-authoritative (mirrors the truncated-board
+    # fallback test below), isolating this test to the null-projectV2 defect.
+    node = _read_node_states()
+    node["projectV2"]["items"]["totalCount"] = 91
+
+    def handler(request: httpx.Request) -> Response:
+        if not request.url.path.endswith("/graphql"):
+            return Response(404, json={"message": "Not Found"})
+        payload = json.loads(request.content.decode("utf-8"))
+        query = payload["query"]
+        if "statusField:" in query:
+            agg_node = {
+                "projectV2": {
+                    "statusField": {"options": [{"name": "Todo"}, {"name": "Done"}]},
+                    "total": {"totalCount": 91},
+                    "issue": {"totalCount": 91},
+                    "pull_request": {"totalCount": 0},
+                    "draft": {"totalCount": 0},
+                    "opened": {"totalCount": 4},
+                    "closed": {"totalCount": 6},
+                    "no_status": {"totalCount": 0},
+                }
+            }
+            return Response(200, json={"data": {"organization": agg_node, "user": None}})
+        if "s0: items" in query:
+            return Response(
+                200,
+                json={
+                    "data": {"organization": {"projectV2": None}, "user": None},
+                    "errors": [{"message": "something went wrong resolving Query.organization.projectV2"}],
+                },
+            )
+        return Response(200, json={"data": {"organization": node, "user": None}})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False
+    assert counts["by_status"] != [
+        {"name": "Todo", "count": 0},
+        {"name": "Done", "count": 0},
+    ]
 
 
 async def test_github_read_project_counts_fall_back_to_sample(tmp_path, monkeypatch):

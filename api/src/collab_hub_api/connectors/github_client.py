@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
@@ -40,6 +41,8 @@ MAX_ITEM_COMMENTS = 30
 # keep the newest tail so a later APPROVED isn't hidden by an early CHANGES_REQUESTED.
 _PR_REVIEW_PAGE_SIZE = 100
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec"
+
+logger = logging.getLogger("frames_server.connectors")
 
 # Projects V2 are GraphQL-only. Query the org and user owners in one request and
 # use whichever resolves, so one tool handles org and personal boards.
@@ -162,6 +165,12 @@ def _project_filter_value(value: str) -> str:
     variable itself is interpreted by GitHub's Projects filter DSL. Escape its
     string delimiters so a board-controlled Status option cannot change the
     query that is counted.
+
+    Unverified upstream: live testing shows a quoted value with these escapes
+    returns `totalCount: 0` with no error, so whether the Projects filter DSL
+    actually honors backslash escapes (vs. silently never matching) could not
+    be confirmed. A status option containing `"` in its name may therefore
+    silently count as 0 rather than raising.
     """
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -481,6 +490,7 @@ class GitHubClient:
             # response (parse/shape error) must still fall back to sampling rather
             # than propagate. asyncio.CancelledError is a BaseException and is not
             # caught here, so cancellation still surfaces.
+            logger.warning("github_project_counts_fallback", exc_info=True)
             return _sampled_counts(total=total, items=items)
 
     async def _authoritative_counts(self, *, login: str, number: int) -> GitHubProjectCounts:
@@ -534,8 +544,12 @@ class GitHubClient:
         data = await self._graphql(
             _status_counts_query(len(options)), variables, operation="project status counts"
         )
-        node = _owner_node(data) or {}
-        project = node.get("projectV2") or {}
+        node = _owner_node(data)
+        project = node.get("projectV2") if node else None
+        if not isinstance(project, dict):
+            raise GitHubUpstreamError(
+                operation="project status counts", status_code=404, message="project not found"
+            )
         return [
             GitHubStatusCount(
                 name=sanitize_connector_text(option),

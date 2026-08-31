@@ -100,7 +100,10 @@ The two `projects` endpoints read **Projects V2** boards via GitHub's **GraphQL*
 API (`read:project` scope). `projects/list` takes an `owner` (org *or* user
 login) and returns each board's number/title/description/item count.
 `projects/{number}/read` returns the board's items, each with its status column,
-`state` (open/closed of the linked issue/PR), an `is_archived` flag, and — when
+`state` (open/closed of the linked issue/PR), an `is_archived` flag (always
+`false` today — the item read excludes archived items by default, matching
+`archived_policy: "excluded"` on `counts`; the field is forward-compatible for
+if the read is ever widened to include archived items), and — when
 the item is a linked issue or PR — the `repo` (owner/name), `number`,
 `assignees`, and `labels`, so a caller can triage by person or label and chain
 `items/{number}/read` to read that issue/PR.
