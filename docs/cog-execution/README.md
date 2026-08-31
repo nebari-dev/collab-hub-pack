@@ -73,6 +73,15 @@ pinned model, which endpoint, which harness, which evidence — the identity
 that every result and every Track entry carries. Credentials appear in a
 binding only by reference, never as values.
 
+**Locality.** Where a satisfier runs and where data goes when it is used —
+in-cluster, on-prem, or an external provider. A bind-time constraint that
+resolution enforces so data stays where policy allows; the model
+[sensitivity](sensitivity.md) generalizes.
+
+**Nebi.** The package manager for Cogs (ADR-0001 D6): `nebi pull` installs a
+Cog's files, `nebi run` executes one of its entry points, and publishing
+goes through Nebi to an OCI registry the hub indexes.
+
 **Capability list.** What a hosting environment publishes: the satisfiers it
 offers and the requirements it places on Cogs that run there (envelope
 shape, io values, entry-point forms). Environment-owned; needs no
