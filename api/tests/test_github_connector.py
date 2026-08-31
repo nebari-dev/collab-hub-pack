@@ -1441,6 +1441,23 @@ async def test_api_get_204_empty_body(monkeypatch):
     assert result.truncated is False
 
 
+async def test_api_get_empty_200_body_is_not_a_size_cap_error(monkeypatch):
+    # A literal empty 200 body (Content-Length: 0, Content-Type: json) must not
+    # be reported as "exceeded the size cap before it could be parsed" -- that
+    # message is for a body that overflowed max_chars mid-parse, and would send
+    # someone debugging a legitimately-empty response looking at the wrong
+    # knob entirely. Nothing here was truncated: byte_truncated is False.
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=b"")
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/some/empty/json/endpoint")
+    assert result.status == 200
+    assert result.body is None
+    assert result.body_text == ""
+    assert result.truncated is False
+
+
 async def test_api_get_has_more_from_link_header(monkeypatch):
     def handler(request: httpx.Request) -> Response:
         return _json_response([{"n": 1}], links='<https://github.test/api/x?page=2>; rel="next"')

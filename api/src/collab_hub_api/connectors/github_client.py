@@ -704,6 +704,15 @@ class GitHubClient:
         status: int,
         max_chars: int,
     ) -> GitHubApiResult:
+        if not raw:
+            # A literal empty 200 body (e.g. Content-Length: 0) is a valid empty
+            # result, not a truncation failure -- distinguish it from the
+            # size-cap error below, which would otherwise send a caller looking
+            # at max_chars for a body that was simply never there.
+            return GitHubApiResult(
+                body=None, body_text="", truncated=False, has_more=has_more,
+                content_type=content_type, status=status,
+            )
         text = raw.decode("utf-8", errors="replace")
         try:
             parsed = json.loads(text)
