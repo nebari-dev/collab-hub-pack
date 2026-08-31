@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -14,6 +15,7 @@ from collab_hub_api.connectors.calendar_client import (
 )
 from collab_hub_api.connectors.drive_client import DriveUpstreamError, GoogleDriveClient, UnsupportedDriveFileType
 from collab_hub_api.connectors.github_client import (
+    GitHubApiRequestError,
     GitHubClient,
     GitHubSearchError,
     GitHubUpstreamError,
@@ -40,6 +42,8 @@ from collab_hub_api.connectors.models import (
     DriveReadResponse,
     DriveSearchRequest,
     DriveSearchResponse,
+    GitHubApiGetRequest,
+    GitHubApiGetResponse,
     GitHubFileReadRequest,
     GitHubFileReadResponse,
     GitHubItemReadRequest,
@@ -485,6 +489,82 @@ async def search_github(
     except httpx.HTTPError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub search failed") from exc
     return GitHubSearchResponse(hits=hits, next_page_token=next_page_token, incomplete_results=incomplete)
+
+
+def _api_get_semaphore(request: Request, config: ConnectorsConfig) -> asyncio.Semaphore:
+    """Process-wide bound on concurrent generic reads, created once, lazily.
+
+    getattr/create/setattr run with no await between them, so concurrent requests
+    cannot race to install two semaphores.
+    """
+    semaphore = getattr(request.app.state, "github_api_get_semaphore", None)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(config.github.api_get_max_concurrency)
+        request.app.state.github_api_get_semaphore = semaphore
+    return semaphore
+
+
+@router.post("/github/api/get", response_model=GitHubApiGetResponse)
+async def github_api_get(
+    body: GitHubApiGetRequest,
+    request: Request,
+    auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> GitHubApiGetResponse:
+    if not config.github.api_get_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "generic API read is disabled on this hub")
+    # The generic read has a wider aperture than the curated tools, so its
+    # request/refusal/truncation/upstream events are the alertable surface for
+    # abuse (per-user via auth.user + the validated path).
+    logger.info(
+        "github_api_get_request",
+        extra={"user": auth.user, "path": body.path, "media_type": body.media_type},
+    )
+    # Bound concurrent generic reads so an injected agent can't exhaust the hub's
+    # sockets/memory by fanning out api_get calls (each opens its own client plus
+    # a token-broker fetch). Released before the response is built.
+    async with _api_get_semaphore(request, config):
+        client = await _github_client(request, config)
+        try:
+            result = await client.api_get(
+                path=body.path,
+                params=body.params,
+                media_type=body.media_type,
+                max_chars=body.max_chars,
+            )
+        except GitHubApiRequestError as exc:
+            logger.info(
+                "github_api_get_refusal",
+                extra={"reason": str(exc), "path": body.path, "media_type": body.media_type},
+            )
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        except GitHubUpstreamError as exc:
+            logger.info(
+                "github_api_get_upstream_error",
+                extra={"operation": exc.operation, "status_code": exc.status_code, "path": body.path},
+            )
+            # A GitHub 422 on the generic read is model-correctable (bad params, or
+            # paging a search-backed endpoint past its 1000-result cap), not a gateway
+            # failure — surface it as 422 so the model fixes the request rather than
+            # blindly retrying a 502. str(exc) carries only GitHub's structured message.
+            if exc.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+            _raise_github_upstream(exc, not_found_detail=_GITHUB_NOT_FOUND_DETAIL)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API read failed") from exc
+    if result.truncated:
+        logger.info(
+            "github_api_get_truncation",
+            extra={"path": body.path, "media_type": body.media_type, "content_type": result.content_type},
+        )
+    return GitHubApiGetResponse(
+        body=result.body,
+        body_text=result.body_text,
+        truncated=result.truncated,
+        has_more=result.has_more,
+        content_type=result.content_type,
+        status=result.status,
+    )
 
 
 @router.post("/github/items/{number}/read", response_model=GitHubItemReadResponse)

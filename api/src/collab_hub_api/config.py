@@ -554,6 +554,14 @@ class GitHubConnectorConfig(BaseModel):
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
     request_timeout_seconds: float = 10.0
+    # Kill switch for the generic /api/get read, distinct from blanking
+    # broker_token_url (which would also kill the curated reads). Flip to False
+    # to disable the long-tail tool while leaving the curated tools working.
+    api_get_enabled: bool = True
+    # Bound concurrent generic reads per hub process so an injected agent can't
+    # fan out unbounded outbound requests (each api_get opens its own client plus
+    # a token-broker fetch). Curated tools are unaffected.
+    api_get_max_concurrency: int = Field(default=8, ge=1)
 
 
 class ConnectorsConfig(BaseModel):
