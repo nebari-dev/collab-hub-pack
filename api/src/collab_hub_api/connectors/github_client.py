@@ -12,10 +12,12 @@ from .connector_text import sanitize_connector_text
 from .models import (
     GitHubItem,
     GitHubProject,
+    GitHubProjectCounts,
     GitHubProjectItem,
     GitHubRepo,
     GitHubReview,
     GitHubSearchHit,
+    GitHubStatusCount,
 )
 
 # GitHub search returns at most 1000 results across all pages, regardless of
@@ -25,6 +27,10 @@ GITHUB_MAX_PER_PAGE = 100
 # Cap the body text carried in a search hit; a full issue/PR body belongs to a
 # dedicated read, not a search snippet.
 SEARCH_TEXT_SNIPPET_CHARS = 500
+# Cap each review body separately from the item's max_chars budget: a PR keeps
+# the newest MAX_ITEM_COMMENTS reviews, so this bounds the review text at
+# MAX_ITEM_COMMENTS * REVIEW_BODY_SNIPPET_CHARS regardless of body length.
+REVIEW_BODY_SNIPPET_CHARS = 500
 # The contents API only returns files up to 1 MB; larger ones come back with
 # encoding "none" and no content, and must be fetched via the git blobs API.
 CONTENTS_MAX_BYTES = 1_000_000
@@ -42,10 +48,19 @@ _PROJECT_ITEM_FIELDS = """
         pageInfo { hasNextPage endCursor }
         nodes {
           type
+          isArchived
           content {
             __typename
-            ... on Issue { number title repository { nameWithOwner } }
-            ... on PullRequest { number title repository { nameWithOwner } }
+            ... on Issue {
+              number title state repository { nameWithOwner }
+              assignees(first: 10) { nodes { login } }
+              labels(first: 20) { nodes { name } }
+            }
+            ... on PullRequest {
+              number title state repository { nameWithOwner }
+              assignees(first: 10) { nodes { login } }
+              labels(first: 20) { nodes { name } }
+            }
             ... on DraftIssue { title }
           }
           fieldValues(first: 8) {
@@ -87,6 +102,68 @@ query($login: String!, $number: Int!, $first: Int!, $after: String) {{
 _PROJECT_PAGE_SIZE = 100
 _MAX_PROJECT_ITEMS = 500
 _MAX_PROJECT_PAGES = _MAX_PROJECT_ITEMS // _PROJECT_PAGE_SIZE
+
+# --- Project board counts ---------------------------------------------------
+# Projects V2 GraphQL has NO group-by aggregate; the only server-side counter is
+# totalCount on the items connection. But items() accepts a board-filter `query`
+# and an `archivedStates` argument, so one totalCount-only query per bucket gives
+# an EXACT count regardless of the item-enumeration cap above. Every count query
+# pins archivedStates:[NOT_ARCHIVED] so the buckets share one policy and the
+# status columns provably reconcile to the total (archived_policy="excluded").
+_COUNTS_ARCHIVED = "archivedStates: [NOT_ARCHIVED]"
+# A1: options + total + by-type + by-state + blank-status, all in one request.
+# The by_type/by_state aliases lean on the `query` filter DSL, so a rejection of
+# that DSL surfaces here and drops the whole count path to the sampled fallback.
+_PROJECT_COUNTS_BODY = f"""projectV2(number: $number) {{
+      statusField: field(name: "Status") {{ ... on ProjectV2SingleSelectField {{ options {{ name }} }} }}
+      total: items(first: 0, {_COUNTS_ARCHIVED}) {{ totalCount }}
+      issue: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:issue") {{ totalCount }}
+      pull_request: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:pr") {{ totalCount }}
+      draft: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:draft") {{ totalCount }}
+      opened: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:open") {{ totalCount }}
+      closed: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:closed") {{ totalCount }}
+      no_status: items(first: 0, {_COUNTS_ARCHIVED}, query: "no:status") {{ totalCount }}
+    }}"""
+
+_PROJECT_COUNTS_QUERY = f"""
+query($login: String!, $number: Int!) {{
+  organization(login: $login) {{ {_PROJECT_COUNTS_BODY} }}
+  user(login: $login) {{ {_PROJECT_COUNTS_BODY} }}
+}}
+"""
+
+# Board single-selects other than "Status" are rare, but a column named "Status"
+# is GitHub's default and what "which column" means to a user.
+_COUNTS_TYPE_ALIASES = ("issue", "pull_request", "draft")
+
+
+def _status_counts_query(option_count: int) -> str:
+    """Build one aliased query that counts every Status column in a single
+    request. Column names are passed as GraphQL variables ($q0..$qN), never
+    interpolated, so an option name cannot inject query text."""
+    var_decls = "".join(f", $q{i}: String!" for i in range(option_count))
+    aliases = "\n      ".join(
+        f"s{i}: items(first: 0, {_COUNTS_ARCHIVED}, query: $q{i}) {{ totalCount }}"
+        for i in range(option_count)
+    )
+    body = f"projectV2(number: $number) {{\n      {aliases}\n    }}"
+    return (
+        f"query($login: String!, $number: Int!{var_decls}) {{\n"
+        f"  organization(login: $login) {{ {body} }}\n"
+        f"  user(login: $login) {{ {body} }}\n"
+        f"}}\n"
+    )
+
+
+def _project_filter_value(value: str) -> str:
+    """Escape a value embedded in a quoted Projects filter expression.
+
+    GraphQL variables keep option names out of the GraphQL document, but the
+    variable itself is interpreted by GitHub's Projects filter DSL. Escape its
+    string delimiters so a board-controlled Status option cannot change the
+    query that is counted.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass
@@ -252,6 +329,9 @@ class GitHubClient:
             pull = await self._get(f"/repos/{owner_repo}/pulls/{number}", operation="pull read")
             if isinstance(pull, dict):
                 item.requested_reviewers = _logins(pull.get("requested_reviewers"))
+                item.requested_teams = _team_names(pull.get("requested_teams"))
+                item.is_draft = bool(pull.get("draft"))
+                item.merge_state = _merge_state(pull)
             pull_reviews = await self._get(
                 f"/repos/{owner_repo}/pulls/{number}/reviews",
                 params={"per_page": str(_PR_REVIEW_PAGE_SIZE)},
@@ -384,6 +464,85 @@ class GitHubClient:
             else:
                 break
         return _project(project or {}), collected[:cap]
+
+    async def project_counts(
+        self, *, owner: str, number: int, total: int, items: list[GitHubProjectItem]
+    ) -> GitHubProjectCounts:
+        """Aggregate counts for a board. Tries exact server-side count queries;
+        if the board-filter DSL is unavailable (or any count query fails) falls
+        back to bucketing the enumerated items, flagged non-authoritative. Never
+        raises — a count failure must not break the item read."""
+        login = owner.strip()
+        try:
+            return await self._authoritative_counts(login=login, number=number)
+        except Exception:
+            # Best-effort: honor the "must not break the item read" contract for
+            # any failure, not just upstream/HTTP errors — a malformed count
+            # response (parse/shape error) must still fall back to sampling rather
+            # than propagate. asyncio.CancelledError is a BaseException and is not
+            # caught here, so cancellation still surfaces.
+            return _sampled_counts(total=total, items=items)
+
+    async def _authoritative_counts(self, *, login: str, number: int) -> GitHubProjectCounts:
+        data = await self._graphql(
+            _PROJECT_COUNTS_QUERY, {"login": login, "number": number}, operation="project counts"
+        )
+        node = _owner_node(data)
+        project = node.get("projectV2") if node else None
+        if not isinstance(project, dict):
+            raise GitHubUpstreamError(operation="project counts", status_code=404, message="project not found")
+
+        def _tc(key: str) -> int:
+            return int((project.get(key) or {}).get("totalCount", 0) or 0)
+
+        total = _tc("total")
+        issue, pull_request, draft = _tc("issue"), _tc("pull_request"), _tc("draft")
+        status_field = project.get("statusField") or {}
+        options = [
+            str((o or {}).get("name", "") or "")
+            for o in (status_field.get("options") or [])
+            if isinstance(o, dict)
+        ]
+        options = [o for o in options if o]
+        by_status = await self._status_column_counts(login=login, number=number, options=options)
+        return GitHubProjectCounts(
+            total=total,
+            archived_policy="excluded",
+            by_status=by_status,
+            no_status=_tc("no_status"),
+            by_type={
+                "issue": issue,
+                "pull_request": pull_request,
+                "draft": draft,
+                # Derived: redacted items carry no accessible content to filter on.
+                "redacted": max(total - (issue + pull_request + draft), 0),
+            },
+            by_state={"open": _tc("opened"), "closed": _tc("closed")},
+            authoritative=True,
+            counted_items=total,
+            total_items=total,
+        )
+
+    async def _status_column_counts(
+        self, *, login: str, number: int, options: list[str]
+    ) -> list[GitHubStatusCount]:
+        if not options:
+            return []
+        variables: dict[str, str | int] = {"login": login, "number": number}
+        for index, option in enumerate(options):
+            variables[f"q{index}"] = f'status:"{_project_filter_value(option)}"'
+        data = await self._graphql(
+            _status_counts_query(len(options)), variables, operation="project status counts"
+        )
+        node = _owner_node(data) or {}
+        project = node.get("projectV2") or {}
+        return [
+            GitHubStatusCount(
+                name=sanitize_connector_text(option),
+                count=int((project.get(f"s{index}") or {}).get("totalCount", 0) or 0),
+            )
+            for index, option in enumerate(options)
+        ]
 
     async def list_repos(self, *, owner: str, first: int = 30) -> list[GitHubRepo]:
         """List repos for an org or user (whichever the owner is), most recently
@@ -604,9 +763,62 @@ def _project_item(node: dict) -> GitHubProjectItem:
         title=sanitize_connector_text(str(content.get("title", "") or "")),
         type=str(node.get("type", "") or ""),
         status=status,
+        state=str(content.get("state", "") or "").lower(),
+        is_archived=bool(node.get("isArchived", False)),
         repo=repo,
         number=int(content.get("number", 0) or 0),
+        assignees=_logins((content.get("assignees") or {}).get("nodes")),
+        labels=_label_names((content.get("labels") or {}).get("nodes")),
         fields=fields,
+    )
+
+
+_PROJECT_TYPE_BUCKETS = {
+    "ISSUE": "issue",
+    "PULL_REQUEST": "pull_request",
+    "DRAFT_ISSUE": "draft",
+    "REDACTED": "redacted",
+}
+
+
+def _sampled_counts(*, total: int, items: list[GitHubProjectItem]) -> GitHubProjectCounts:
+    """Bucket the already-enumerated items when server-side counts are
+    unavailable. Exact only when the whole board was enumerated
+    (counted == total); otherwise flagged non-authoritative so a caller never
+    reads a truncated sample as a full count."""
+    by_status: dict[str, int] = {}
+    order: list[str] = []
+    no_status = 0
+    by_type = {"issue": 0, "pull_request": 0, "draft": 0, "redacted": 0}
+    by_state = {"open": 0, "closed": 0}
+    for item in items:
+        bucket = _PROJECT_TYPE_BUCKETS.get(item.type)
+        if bucket:
+            by_type[bucket] += 1
+        if item.status:
+            if item.status not in by_status:
+                by_status[item.status] = 0
+                order.append(item.status)
+            by_status[item.status] += 1
+        else:
+            no_status += 1
+        if item.state == "merged":
+            # A merged PR is closed; the authoritative path counts it under
+            # is:closed, so sample the same way rather than dropping it.
+            by_state["closed"] += 1
+        elif item.state in ("open", "closed"):
+            by_state[item.state] += 1
+    counted = len(items)
+    return GitHubProjectCounts(
+        total=total,
+        archived_policy="excluded",
+        by_status=[GitHubStatusCount(name=name, count=by_status[name]) for name in order],
+        no_status=no_status,
+        by_type=by_type,
+        by_state=by_state,
+        authoritative=counted == total,
+        counted_items=counted,
+        total_items=total,
     )
 
 
@@ -631,6 +843,28 @@ def _label_names(values: Any) -> list[str]:
     return result
 
 
+def _team_names(values: Any) -> list[str]:
+    result: list[str] = []
+    if isinstance(values, list):
+        for entry in values:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "") or entry.get("slug", "") or "")
+            if name:
+                result.append(sanitize_connector_text(name))
+    return result
+
+
+def _merge_state(pull: dict) -> str:
+    """Collapse a PR's outcome to merged | closed_unmerged | open, so a closed
+    PR is never ambiguous about whether it actually landed."""
+    if pull.get("merged"):
+        return "merged"
+    if str(pull.get("state", "") or "").lower() == "closed":
+        return "closed_unmerged"
+    return "open"
+
+
 def _reviews(values: Any) -> list[GitHubReview]:
     result: list[GitHubReview] = []
     if isinstance(values, list):
@@ -640,8 +874,11 @@ def _reviews(values: Any) -> list[GitHubReview]:
             user = entry.get("user") or {}
             login = str(user.get("login", "") or "") if isinstance(user, dict) else ""
             state = str(entry.get("state", "") or "")
-            if login or state:
-                result.append(GitHubReview(user=sanitize_connector_text(login), state=state))
+            body = sanitize_connector_text(str(entry.get("body", "") or ""))
+            if len(body) > REVIEW_BODY_SNIPPET_CHARS:
+                body = body[:REVIEW_BODY_SNIPPET_CHARS].rstrip() + "…"
+            if login or state or body:
+                result.append(GitHubReview(user=sanitize_connector_text(login), state=state, body=body))
     return result
 
 

@@ -614,11 +614,15 @@ async def read_github_project(
     # project.items_count is the board's full size; flag when we returned fewer
     # so the caller doesn't reason over a partial board as if it were complete.
     total = project.items_count
+    # Aggregate counts are computed independently (server-side when possible), so
+    # they stay accurate even when the item list above is truncated.
+    counts = await client.project_counts(owner=body.owner, number=number, total=total, items=items)
     return GitHubProjectReadResponse(
         project=project,
         items=items,
         total_count=total,
         truncated=total > len(items),
+        counts=counts,
     )
 
 
