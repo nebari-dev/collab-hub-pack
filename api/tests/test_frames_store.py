@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
@@ -272,3 +274,88 @@ def test_s3_metadata_update_reports_exhausted_conflicts():
 
     with pytest.raises(ConcurrentFrameUpdateError):
         store._retry_metadata_update("0" * 32, lambda frame: frame)
+
+
+class RecordingFakeS3:
+    """Minimal S3 client that records every key a caller fetches."""
+
+    def __init__(self, metadata_by_id: dict, missing: set[str] | None = None):
+        self.metadata_by_id = metadata_by_id
+        self.missing = missing or set()
+        self.requested: list[str] = []
+        self._lock = threading.Lock()
+
+    def get_paginator(self, operation: str):
+        assert operation == "list_objects_v2"
+        keys = []
+        for frame_id in self.metadata_by_id:
+            keys.append(f"frames/{frame_id}/metadata.json")
+            keys.append(f"frames/{frame_id}/body.md")
+
+        class _Paginator:
+            def paginate(self, **_kwargs):
+                return [{"Contents": [{"Key": key} for key in keys]}]
+
+        return _Paginator()
+
+    def get_object(self, Bucket: str, Key: str):  # noqa: N803 - boto3 casing
+        del Bucket
+        with self._lock:
+            self.requested.append(Key)
+        frame_id = Key.split("/")[-2]
+        if frame_id in self.missing:
+            raise FakeS3ClientError("NoSuchKey", 404)
+        payload = json.dumps(self.metadata_by_id[frame_id]).encode("utf-8")
+        return {"Body": io.BytesIO(payload), "ETag": '"etag"'}
+
+
+def _metadata_payload(frame_id: str) -> dict:
+    return make_frame(frame_id).model_dump(mode="json", exclude={"body"})
+
+
+def _s3_store_with(fake: RecordingFakeS3) -> S3FrameStore:
+    store = S3FrameStore.__new__(S3FrameStore)
+    store.bucket = "bucket"
+    store.prefix = "frames"
+    store.client_error = FakeS3ClientError
+    store.s3 = fake
+    return store
+
+
+def test_s3_list_frames_does_not_read_bodies():
+    """Listing is latency-bound on round trips; bodies are never needed."""
+
+    ids = [f"{index:032x}" for index in range(5)]
+    fake = RecordingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
+    store = _s3_store_with(fake)
+
+    listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == sorted(ids)
+    assert all(key.endswith("/metadata.json") for key in fake.requested)
+    assert len(fake.requested) == len(ids)
+
+
+def test_s3_list_frames_skips_a_frame_deleted_mid_list():
+    """A delete between the LIST and a GET must not fail the whole page."""
+
+    ids = [f"{index:032x}" for index in range(4)]
+    gone = ids[2]
+    fake = RecordingFakeS3(
+        {frame_id: _metadata_payload(frame_id) for frame_id in ids},
+        missing={gone},
+    )
+    store = _s3_store_with(fake)
+
+    listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == sorted(set(ids) - {gone})
+
+
+def test_s3_list_frames_still_applies_filters():
+    ids = [f"{index:032x}" for index in range(3)]
+    fake = RecordingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
+    store = _s3_store_with(fake)
+
+    assert store.list_frames("org-a", "workspace-a", owner="alice")
+    assert store.list_frames("other-org", "workspace-a") == []
