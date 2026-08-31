@@ -24,43 +24,6 @@ _BARE_DOMAIN = re.compile(
     r"(?<![@\w.-])(?:[A-Z0-9-]+\.)+[A-Z]{2,}(?:/[A-Z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?",
     re.IGNORECASE,
 )
-# A bare domain and a dotted code token are syntactically indistinguishable in
-# general (``config.py`` could be a host). Keep the small exception set limited
-# to common source/config file suffixes, which are frequent in diffs and useful
-# to preserve. Everything else remains link-free for the Apollo renderer.
-_GITHUB_CODE_FILE_SUFFIXES = frozenset(
-    {
-        "c",
-        "cc",
-        "cpp",
-        "cs",
-        "css",
-        "go",
-        "h",
-        "hpp",
-        "html",
-        "java",
-        "js",
-        "json",
-        "jsx",
-        "kt",
-        "md",
-        "mjs",
-        "php",
-        "py",
-        "rb",
-        "rs",
-        "sh",
-        "sql",
-        "swift",
-        "toml",
-        "ts",
-        "tsx",
-        "xml",
-        "yaml",
-        "yml",
-    }
-)
 
 
 def _render_markdown_link(match: re.Match[str]) -> str:
@@ -84,14 +47,6 @@ def _render_email(match: re.Match[str]) -> str:
     return f"{local} [at] {domain}"
 
 
-def _render_github_bare_domain(match: re.Match[str]) -> str:
-    """Preserve common filename tokens, but mask all other bare domains."""
-    token = match.group(0)
-    if "/" not in token and token.rsplit(".", 1)[-1].lower() in _GITHUB_CODE_FILE_SUFFIXES:
-        return token
-    return _render_plain_url(match)
-
-
 def sanitize_connector_text(text: str) -> str:
     """Replace Markdown, URI, email, and bare-domain targets with safe text."""
     if not text:
@@ -106,12 +61,15 @@ def sanitize_github_api_text(text: str) -> str:
     """Neutralize link-shaped text while preserving code-shaped text.
 
     The generic GitHub read tool returns diffs, file contents, and dotted
-    identifiers (``config.py``, SHAs, refs) where the shared
-    :func:`sanitize_connector_text`'s bare-domain masking is destructive
-    (``config.py`` -> ``[link]``). Bare domains are still masked because they can
-    crash Apollo's renderer; only a bounded set of common filename suffixes is
-    preserved. This variant otherwise runs the same Markdown / URI / email
-    masking.
+    identifiers (``config.py``, ``os.path``, SHAs, refs) where the shared
+    :func:`sanitize_connector_text`'s bare-domain masking is destructive: every
+    dotted attribute access reads as a bare domain, so a code diff comes back
+    riddled with ``[link]``. Bare-domain masking is dropped entirely for this
+    variant — the renderer-crash premise it existed for (apollo-desktop#365) has
+    expired, and reading code diffs is this tool's headline use case. Scheme
+    (``https://``, ``mailto:``, ...), ``www.``, Markdown-link, and email masking
+    still apply, since those shapes are unambiguous and injection-relevant
+    regardless of code context.
 
     This is additive: :func:`sanitize_connector_text` and all its callers
     (Gmail/Calendar/Drive/Slack + the curated GitHub tools) are unchanged.
@@ -120,5 +78,4 @@ def sanitize_github_api_text(text: str) -> str:
         return text
     without_markdown_targets = _MARKDOWN_LINK.sub(_render_markdown_link, text)
     without_urls = _PLAIN_URL.sub(_render_plain_url, without_markdown_targets)
-    without_emails = _EMAIL_ADDRESS.sub(_render_email, without_urls)
-    return _BARE_DOMAIN.sub(_render_github_bare_domain, without_emails)
+    return _EMAIL_ADDRESS.sub(_render_email, without_urls)

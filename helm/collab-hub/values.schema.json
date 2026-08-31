@@ -855,6 +855,9 @@
             "requestTimeoutSeconds": {
               "type": "number",
               "minimum": 1
+            },
+            "apiGetEnabled": {
+              "type": "boolean"
             }
           },
           "additionalProperties": false

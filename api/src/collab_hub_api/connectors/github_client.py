@@ -654,12 +654,15 @@ class GitHubClient:
                 raise GitHubApiRequestError(_API_GET_406_MESSAGE)
             _raise_for_github_status(response, operation="api get")
 
-        if status_code == 202:
-            # Repo-statistics endpoints return 202 + empty body while GitHub
-            # computes; that is a retry signal, not an error.
+        if status_code in (202, 204):
+            # 202: repo-statistics endpoints return empty body while GitHub
+            # computes; that is a retry signal, not an error. 204: several GETs
+            # answer no-body-means-yes (e.g. collaborator/following membership
+            # checks, vulnerability-alerts) with no Content-Type at all, which
+            # would otherwise fall through to the binary-refusal branch below.
             return GitHubApiResult(
                 body=None, body_text="", truncated=False, has_more=has_more,
-                content_type=content_type, status=202,
+                content_type=content_type, status=status_code,
             )
 
         raw, byte_truncated = await self._read_capped(response, max_chars * 4 + 1)

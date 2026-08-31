@@ -191,9 +191,10 @@ nexus-pack has no in-repo alerting framework — wiring these into alerts is an
 infra follow-up (see "Open items" below), not shippable in this change.
 
 **Response runbook.**
-1. Flip `connectors.github.api_get_enabled: false` and **redeploy/restart** the
-   hub — the flag is read at startup, so this is NOT a live reload; new calls then
-   `403`, and the curated reads are unaffected throughout.
+1. Flip `connectors.github.apiGetEnabled: false` in the Helm values and
+   **redeploy/restart** the hub — the flag is read at startup, so this is NOT a
+   live reload; new calls then `403`, and the curated reads are unaffected
+   throughout.
 2. Grep the structured events for the offending user/agent's `path` history to
    scope what was read.
 3. If warranted, revoke the user's GitHub OAuth grant (invalidates the broker's

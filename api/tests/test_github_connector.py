@@ -322,9 +322,11 @@ async def test_github_search_sanitizes_link_text(tmp_path, monkeypatch):
 
 def test_github_api_text_sanitizer_preserves_code_shapes():
     # The generic read returns diffs, file contents, and refs where the shared
-    # sanitizer's bare-domain masking is destructive (config.py -> [link]). The
-    # GitHub-local variant preserves common filenames while keeping bare web
-    # domains, scheme/www./markdown/email links neutralized.
+    # sanitizer's bare-domain masking is destructive (config.py -> [link], and
+    # every dotted attribute access -- os.path, self.timeout_seconds -- reads as
+    # a bare domain too). The GitHub-local variant drops bare-domain masking
+    # entirely (the renderer-crash premise, apollo-desktop#365, has expired)
+    # while keeping scheme/www./markdown/email links neutralized.
     for value in (
         "config.py",
         "src/components/App.tsx",
@@ -333,6 +335,12 @@ def test_github_api_text_sanitizer_preserves_code_shapes():
         "a3f5b9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7",
         "refs/heads/main",
         "v1.2.3",
+        "os.path.join(base, x)",
+        "self.timeout_seconds = timeout_seconds",
+        "np.linalg.norm(x)",
+        "see foo.com for details",
+        "example.io test.dev foo.ai",
+        "numpy.linalg",
     ):
         assert sanitize_github_api_text(value) == value
 
@@ -342,9 +350,6 @@ def test_github_api_text_sanitizer_preserves_code_shapes():
     assert sanitize_github_api_text("Email person@example.com") == "Email person [at] example [dot] com"
     assert sanitize_github_api_text("mailto:bob@x.test") == "[link]"
     assert sanitize_github_api_text("Meet at www.example.com/x") == "Meet at [link]"
-    assert sanitize_github_api_text("see foo.com for details") == "see [link] for details"
-    assert sanitize_github_api_text("example.io test.dev foo.ai") == "[link] [link] [link]"
-    assert sanitize_github_api_text("numpy.linalg") == "[link]"
     assert sanitize_github_api_text("") == ""
 
     # Idempotent across code-shaped and link-shaped inputs.
@@ -1412,6 +1417,22 @@ async def test_api_get_202_empty_body(monkeypatch):
     _install_mock_client(monkeypatch, handler)
     result = await _api_client().api_get(path="/repos/a/b/stats/contributors")
     assert result.status == 202
+    assert result.body is None
+    assert result.body_text == ""
+    assert result.truncated is False
+
+
+async def test_api_get_204_empty_body(monkeypatch):
+    # Several GETs answer no-body-means-yes with a bare 204 and no Content-Type
+    # at all (e.g. /repos/{o}/{r}/collaborators/{user}, /user/following/{user},
+    # /repos/{o}/{r}/vulnerability-alerts). Must not fall through to the
+    # binary/unknown-content-type refusal.
+    def handler(request: httpx.Request) -> Response:
+        return Response(204)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/collaborators/carol")
+    assert result.status == 204
     assert result.body is None
     assert result.body_text == ""
     assert result.truncated is False

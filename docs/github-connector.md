@@ -135,7 +135,9 @@ control characters) before they are ever placed in an upstream URL.
 `api/get` is the generic long-tail read: a single **GET** against an arbitrary
 GitHub REST `path` (query args via `params`) for the endpoints the curated tools
 don't cover — e.g. `/repos/{o}/{r}/pulls/{n}/files`, `/commits`, `/releases`, or
-`/commits/{ref}/check-runs`. Prefer the curated tools for triage. The verb is
+`/commits/{ref}/check-runs`. Prefer the curated tools for triage. `path` rejects
+`%`, so a contents path with a space or other percent-encoded character is
+unreachable via `api/get` — use `files/read` for those. The verb is
 always GET and `media_type` (`json`|`diff`|`patch`) selects a fixed `Accept`
 header, so GraphQL (POST-only) and writes are excluded **by construction**, not
 by a denylist. Pages via `params` `per_page`/`page`; `has_more` echoes the
@@ -143,7 +145,9 @@ upstream `Link rel="next"`. `media_type: "diff"`/`"patch"` works only on
 pulls/commits/compare — issues silently return JSON, so check the echoed
 `content_type`. Bodies are size-capped (`max_chars`, default 20k for json / 50k
 for diff, 50k ceiling) with `truncated` set when cut; a `202` with an empty body
-means GitHub is still computing the result — retry. The read is origin-locked
+means GitHub is still computing the result — retry. A `204` with an empty body
+is an affirmative result with nothing to return (e.g. a collaborator/following
+membership check). The read is origin-locked
 (GET stays on the API host; archive/binary redirects are refused) and can be
 turned off per hub with `api_get_enabled: false` without affecting the curated
 reads.

@@ -532,6 +532,10 @@ connectors:
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
     requestTimeoutSeconds: 10
+    # -- Enable the generic GitHub read (api/get). The containment path for an
+    # incident: set to false and redeploy/restart to disable it (read once at
+    # startup, so this is not a live toggle).
+    apiGetEnabled: true
 
 userDirectory:
   # -- Whether to configure Collab Hub API access to the hub user directory.
