@@ -500,7 +500,13 @@ class GitHubClient:
         node = _owner_node(data)
         project = node.get("projectV2") if node else None
         if not isinstance(project, dict):
-            raise GitHubUpstreamError(operation="project counts", status_code=404, message="project not found")
+            # Existence was already confirmed by read_project moments earlier in
+            # the same request, so a null projectV2 here is a partial GraphQL
+            # error on this specific query (rate limit, transient upstream
+            # issue, ...), not evidence the project doesn't exist -- no
+            # status_code, matching the "invalid response" convention used
+            # elsewhere for an unexpected shape rather than a real HTTP error.
+            raise GitHubUpstreamError(operation="project counts", message="project data missing from response")
 
         def _tc(key: str) -> int:
             return int((project.get(key) or {}).get("totalCount", 0) or 0)
@@ -547,8 +553,13 @@ class GitHubClient:
         node = _owner_node(data)
         project = node.get("projectV2") if node else None
         if not isinstance(project, dict):
+            # Same reasoning as _authoritative_counts above: existence was
+            # already confirmed by read_project, so this is a partial GraphQL
+            # error on this specific query, not a real not-found -- no
+            # status_code, so the fallback's logged exception doesn't read as
+            # "HTTP 404" during, say, a rate-limit incident.
             raise GitHubUpstreamError(
-                operation="project status counts", status_code=404, message="project not found"
+                operation="project status counts", message="project data missing from response"
             )
         return [
             GitHubStatusCount(
