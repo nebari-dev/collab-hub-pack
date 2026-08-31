@@ -163,6 +163,11 @@ own review).
   404-vs-403→502 mapping is a finer existence/permission **oracle** over arbitrary
   paths than the curated shapes — accepted as `curl`-equivalent, but named here as
   an intentional info-disclosure the signer ratifies.
+  **Not api_get-scoped:** this normalization lives in the shared
+  `_raise_for_github_status`, called by the curated reads too — every curated
+  GitHub tool gets the same 403-with-Retry-After → 429 treatment, not just
+  `api_get`. Called out here because the rest of this PR's changes are
+  additive/isolated to the new endpoint; this one is not.
 
 ## Post-ship blast radius, detection & response
 
