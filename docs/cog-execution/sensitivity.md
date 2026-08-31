@@ -18,11 +18,13 @@ and only two:
   level, and match it as the process moves along: a downstream step may
   consume a label only if its own resolution is rated for it.
 
-This is **locality generalized**. Locality already enforces sovereignty at
-bind time; sensitivity is a second axis through exactly the same machinery
-— one more predicate in the resolve step. Capability negotiation stays the
-only glue (ADR-0001 invariant 4); constraints are never special-cased into
-the spec.
+This is **locality generalized**. Locality — where a satisfier runs and
+where data goes when it is used: in-cluster, on-prem, or an external
+provider — is already a bind-time constraint that resolution enforces so an
+organization's data stays where its policy says it may go. Sensitivity is a
+second axis through exactly the same machinery — one more predicate in the
+resolve step. Capability negotiation stays the only glue (ADR-0001
+invariant 4); constraints are never special-cased into the spec.
 
 ## Labels originate in the data catalog, not in Cogs
 
@@ -81,7 +83,10 @@ Only what the environment cannot infer. Three items, additive:
   not run time, is when you learn step 3 routes confidential output to a
   public-rated satisfier.
 - **Result envelope:** carries the *effective* label of this run's output,
-  beside the binding identity already in every result.
+  beside the binding identity already in every result. The v1 envelope
+  defines no label field yet; it arrives as an additive optional field with
+  the flow-time work (#13), which the envelope's versioning rule allows
+  without a version bump.
 - **Propagation (the Op orchestrator's rule):** a step's output label is at
   least the strictest of its input labels on each axis, absent a declared,
   Guard-verified, Gate-signed downgrade; a step may consume a label only if
