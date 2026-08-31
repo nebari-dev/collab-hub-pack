@@ -176,6 +176,26 @@ class ConfiguredInvitationEmailDelivery:
                 "app_instructions is required when invitation email is enabled"
             )
         self._app_instructions = app_instructions
+        # Resolve the copy now, for the same reason the check above happens
+        # here: a deployment that enables invitation email and cannot render it
+        # should fail where somebody is watching.
+        #
+        # This is what makes the module's "resolved at import" property real.
+        # Its only other importer is function-local inside
+        # `render_invitation_email`, so without this line the resolution happens
+        # on the *first send* -- and an unresolvable template then raises into
+        # `deliver`'s `except (TypeError, ValueError)` below, which drops the
+        # message by design and records `invalid_invitation_email`. Every
+        # subsequent send repeats it, because a failed import is evicted from
+        # `sys.modules`. The result would be total, silent loss of invitation
+        # email under an error code that points at recipient validation.
+        #
+        # Imported locally rather than at module scope to keep the reason the
+        # other import is local: nothing of the browser surface should reach the
+        # mail path at import time.
+        from ..web.onboarding_email import BODIES
+
+        del BODIES
 
     def deliver(
         self,

@@ -251,8 +251,15 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__EMAIL__SES__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.frames.email.ses.requestTimeoutSeconds | quote }}
             {{- end }}
-            {{- if not .Values.frames.invitations.requireVerifiedEmail }}
-            {{/*
+            {{- /* `eq ... "false"` and not `if not`: a nil value is falsy, and
+                   Helm strips null-valued keys during coalescing rather than
+                   falling back to the chart default -- so `requireVerifiedEmail:`
+                   left empty while reflowing a values file rendered "false" and
+                   relaxed Gate B on a deployment that never asked. The schema
+                   cannot catch it either, because the key is gone before
+                   validation. Only an explicit false renders now. */}}
+            {{- if eq (.Values.frames.invitations.requireVerifiedEmail | toString) "false" }}
+            {{- /*
               Rendered only when turned OFF, so the strict default needs no env
               var and cannot be weakened by an empty or malformed value. A
               deployment that wants the relaxation says so explicitly, and the
@@ -284,7 +291,7 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__SERVICE_ACCESS__KEYCLOAK__ADMIN_API_BASE_URL
               value: {{ .Values.frames.serviceAccess.keycloak.adminApiBaseUrl | quote }}
             {{- if .Values.frames.serviceAccess.keycloak.groupIds }}
-            {{/*
+            {{- /*
               Rendered only when set: an empty mapping means "look every path
               up", and an env var holding `{}` would be indistinguishable from
               that while still occupying it -- the same reasoning as the group

@@ -1484,20 +1484,22 @@ def test_a_dead_token_is_still_dead_however_verification_is_configured():
             )
 
 
-def test_accept_threads_the_setting_without_needing_a_database():
-    """The threading guard that runs **in CI**, where the live tests do not.
+def test_accept_threads_the_setting_to_both_decisions_without_a_database(monkeypatch):
+    """Both threads, and it has to be both.
 
-    The three live tests below cover this against real Postgres, and locally
-    they are the better check. But `test.yaml` provisions no database and sets
-    no `COLLAB_HUB_TEST_POSTGRES_URL`, so `skipif` drops them -- which leaves
-    deleting either thread in `_accept_once` green on CI, the same state that
-    prompted writing them. This one has no such gate.
+    `_accept_once` consults the setting twice -- once through
+    `_evaluate_acceptance` and again through `verified_claim_email`, whose result
+    becomes the persisted membership address. An earlier version of this test
+    replaced the first with a spy that raised immediately, so execution never
+    reached the second: deleting *that* keyword left it green, and on a relaxed
+    deployment it would refuse every acceptance permanently, since the provider
+    has stopped verifying and no account can satisfy the strict check. The live
+    tests that would catch it are the ones CI skips, which is the gap this test
+    exists to close.
 
-    A fake connection stands in for the one read `_accept_once` performs before
-    the evaluation, and `_evaluate_acceptance` is replaced by a spy that records
-    what it was asked and stops there. Nothing about the audited transaction is
-    exercised; the question is only whether the deployment's choice reaches the
-    decision.
+    So the first spy returns a passing verdict and the second records and stops.
+    `monkeypatch` rather than hand-restoring: a raise before a `try` would
+    otherwise leak a spy into the next test.
     """
 
     import contextlib
@@ -1535,30 +1537,34 @@ def test_accept_threads_the_setting_without_needing_a_database():
         pass
 
     for flag in (True, False):
-        seen: list[bool] = []
+        evaluated: list[bool] = []
+        claimed: list[bool] = []
 
-        def spy(*_args, require_verified: bool, **_kwargs):
-            seen.append(require_verified)
+        def evaluate(*_args, require_verified: bool, **_kwargs):
+            evaluated.append(require_verified)
+            return None  # a passing verdict, so execution continues
+
+        def claim(email, _verified, *, require_verified: bool = True):
+            claimed.append(require_verified)
             raise Stop
 
-        original = invitations_module._evaluate_acceptance
-        invitations_module._evaluate_acceptance = spy
-        try:
-            service = invitations_module.PostgresInvitationService(
-                FakeDb(), require_verified_email=flag
-            )
-            with pytest.raises(Stop):
-                service.accept(
-                    user_id=INVITEE,
-                    display=display(INVITED_EMAIL, verified=False),
-                    token_hash="h" * 64,
-                    claim_email=INVITED_EMAIL,
-                    email_verified=False,
-                )
-        finally:
-            invitations_module._evaluate_acceptance = original
+        monkeypatch.setattr(invitations_module, "_evaluate_acceptance", evaluate)
+        monkeypatch.setattr(invitations_module, "verified_claim_email", claim)
 
-        assert seen == [flag], f"the deployment setting did not reach the decision for {flag}"
+        service = invitations_module.PostgresInvitationService(
+            FakeDb(), require_verified_email=flag
+        )
+        with pytest.raises(Stop):
+            service.accept(
+                user_id=INVITEE,
+                display=display(INVITED_EMAIL, verified=False),
+                token_hash="h" * 64,
+                claim_email=INVITED_EMAIL,
+                email_verified=False,
+            )
+
+        assert evaluated == [flag], f"the evaluation thread lost the setting for {flag}"
+        assert claimed == [flag], f"the claim thread lost the setting for {flag}"
 
 
 def test_the_service_builder_passes_the_setting_through():

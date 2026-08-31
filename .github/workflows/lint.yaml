@@ -46,6 +46,22 @@ jobs:
             exit 1
           fi
 
+          # A null value must fall strict, not open. Helm strips null-valued
+          # keys during coalescing rather than restoring the chart default, so
+          # `requireVerifiedEmail:` left empty while reflowing a values file
+          # used to render "false" -- relaxing Gate B on a deployment that never
+          # asked, with values that still read `true`. Neither the untouched
+          # default nor an explicit false covers that shape.
+          for null_form in "--set frames.invitations.requireVerifiedEmail=null" "-f /tmp/null-value.yaml"; do
+            printf 'frames:\n  invitations:\n    requireVerifiedEmail:\n' >/tmp/null-value.yaml
+            # shellcheck disable=SC2086
+            helm template helm/collab-hub ${null_form} >/tmp/verify-null.yaml
+            if grep -q "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-null.yaml; then
+              echo "a null requireVerifiedEmail must not render the env var (${null_form})" >&2
+              exit 1
+            fi
+          done
+
           helm template helm/collab-hub \
             --set frames.invitations.requireVerifiedEmail=false \
             >/tmp/verify-relaxed.yaml

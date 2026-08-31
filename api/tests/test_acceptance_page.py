@@ -1916,7 +1916,7 @@ def test_no_state_mentions_verification_on_a_relaxed_deployment() -> None:
     """The sweep, rather than a list of the two states someone remembered.
 
     A future state whose copy mentions verification would be caught here even
-    if nobody thought to add it to `RELAXED_SECTIONS` -- which is the failure
+    if nobody thought to add it to `RELAXED_PARAGRAPHS` -- which is the failure
     mode of an override table.
     """
 
@@ -1968,14 +1968,26 @@ def test_copy_that_does_not_vary_is_stored_once() -> None:
     restating something unchanged.
     """
 
-    from collab_hub_api.web.acceptance import _SECTIONS, RELAXED_PARAGRAPHS
+    from collab_hub_api.web.acceptance import (
+        _SECTIONS,
+        RELAXED_HEADINGS,
+        RELAXED_PARAGRAPHS,
+    )
 
-    strict = {name: paragraphs for name, _, paragraphs in _SECTIONS}
+    strict_paragraphs = {name: paragraphs for name, _, paragraphs in _SECTIONS}
+    strict_headings = {name: heading for name, heading, _ in _SECTIONS}
+
     for state, overrides in RELAXED_PARAGRAPHS.items():
         for index, text in overrides.items():
-            assert text != strict[state][index], (
+            assert text != strict_paragraphs[state][index], (
                 f"{state}[{index}] overrides with the same text it replaces"
             )
+    # Headings too: a byte-identical entry would pass every other test and
+    # freeze relaxed deployments on wording a later edit moved past.
+    for state, heading in RELAXED_HEADINGS.items():
+        assert heading != strict_headings[state], (
+            f"{state} overrides its heading with the same text"
+        )
 
 
 @pytest.mark.asyncio
@@ -1987,7 +1999,7 @@ async def test_the_app_renders_the_page_copy_the_configuration_asks_for(tmp_path
     path is the same shape and was missed: changing `core.py`'s
     `require_verified_email=` to a literal `True` passes all ~1440 tests, while
     every relaxed deployment's page tells invitees to follow a verification
-    link for mail it never sends -- the defect `RELAXED_SECTIONS` exists to fix.
+    link for mail it never sends -- the defect `RELAXED_PARAGRAPHS` exists to fix.
 
     So this goes through `make_app` and fetches the page over HTTP, which is
     the only way the value's whole path is exercised: config -> make_routers ->
@@ -1997,12 +2009,17 @@ async def test_the_app_renders_the_page_copy_the_configuration_asks_for(tmp_path
     from collab_hub_api.web.acceptance import ACCEPT_PAGE_PATH
 
     for flag, expect_verification_copy in ((True, True), (False, False)):
-        # Membership-sourced with a shared Postgres URL, because the invite
-        # routers mount only there. Nothing connects: the page is static HTML
-        # and the lifespan is not entered, so the URL is never dialled.
+        # The invite routers mount for any `web.enabled` build, so nothing here
+        # is needed to reach the page; what makes membership mode apply is the
+        # autouse `membership_env` fixture above, which sets the environment
+        # variable `org_source_is_membership()` reads. A `frames.auth` key would
+        # be inert -- `FramesConfig` has no such field and does not forbid
+        # extras, so it is silently dropped.
+        #
+        # The Postgres URL is here only so the invitation service builds rather
+        # than resolving to the unavailable one. Nothing connects: the page is
+        # static HTML and the lifespan is never entered.
         values = web_values(tmp_path, idp, web={"public_base_url": PUBLIC_BASE_URL})
-        values["frames"]["auth"] = {"identity_claim": "sub", "org_source": "membership"}
-        values["frames"]["orgs"] = {"backend": "postgres"}
         values["frames"]["postgres"] = {"url": "postgresql://u:p@127.0.0.1:1/db"}
         values["frames"]["invitations"] = {"require_verified_email": flag}
         app = make_app(Config.parse(values))

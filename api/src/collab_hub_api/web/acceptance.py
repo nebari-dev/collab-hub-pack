@@ -169,13 +169,13 @@ force them to dig the original link out of their email for a problem they
 had just been told how to fix.
 
 On a deployment with ``frames.invitations.require_verified_email`` off, the
-"unverified email" outcome above means something else -- the token carried no
-usable address -- and is **not** fixable by the person, since that deployment
+"unverified email" outcome above means something else -- the signed-in account
+carried no usable address -- and is **not** fixable by the person, since that deployment
 sends no verification mail. It stays out of this set either way, which is the
 right side of the line for a different reason than the one listed: the browser
 keeps the token not because a retry will work, but because throwing it away
 would cost the invitee their only copy of it while somebody helps them.
-:data:`RELAXED_SECTIONS` is what makes the words match.
+:data:`RELAXED_PARAGRAPHS` is what makes the words match.
 """
 
 # --- The page's script ------------------------------------------------------
@@ -549,7 +549,8 @@ the same duplication back.
 
 **Why this exists.** With ``requireVerifiedEmail`` false,
 ``email_not_verified`` is no longer reached because an address is unverified --
-it is reached only when the token carries no usable address at all. The strict
+it is reached only when the **sign-in** carries no usable address -- the
+invitation row's own address is always populated. The strict
 copy tells the reader to "follow the verification link that was sent to your
 mailbox", and on such a deployment no such mail is ever sent. The sign-in
 state's mention is hedged and so was never false, only noise about a step that
@@ -560,8 +561,43 @@ does not happen.
 RELAXED_HEADINGS: dict[str, str] = {
     OUTCOME_EMAIL_NOT_VERIFIED: "We could not read an email address for this account",
 }
-"""The one heading that changes. Separate from the paragraphs so the shared
-sections cannot acquire a duplicated heading by accident."""
+"""The one heading that changes, and the only one that should.
+
+``email_not_verified`` is the only state whose *name* is wrong where
+verification is not required: it is reached there because no address was
+readable, not because one was unverified. Every other heading is true either
+way.
+
+Separate from :data:`RELAXED_PARAGRAPHS` so overriding a heading is a
+deliberate act with its own name rather than something a paragraph entry can do
+by accident -- and held to the same no-duplication rule by the tests, so an
+entry restating the strict heading fails instead of freezing relaxed
+deployments on wording a later edit moved past."""
+
+
+def _validate_overrides() -> None:
+    """Refuse a table entry that names no state or no paragraph, at import.
+
+    :func:`_with_overrides` also refuses a bad index, but it runs per request
+    and only on a relaxed deployment -- so a stale index would be a 500 on the
+    invitation page for somebody with no other copy of their link. The same
+    argument :data:`BODIES` makes for the email copy: unrenderable copy should
+    stop the pod, not wait for the first reader.
+    """
+
+    states = {name: paragraphs for name, _, paragraphs in _SECTIONS}
+    for table in (RELAXED_PARAGRAPHS, RELAXED_HEADINGS):
+        unknown = sorted(set(table) - set(states))
+        if unknown:
+            raise ValueError(f"relaxed copy names states that do not exist: {unknown}")
+    for state, overrides in RELAXED_PARAGRAPHS.items():
+        limit = len(states[state])
+        bad = sorted(i for i in overrides if not 0 <= i < limit)
+        if bad:
+            raise ValueError(f"relaxed copy for {state!r} names paragraphs out of range: {bad}")
+
+
+_validate_overrides()
 
 
 PAGE_STATES: tuple[str, ...] = tuple(name for name, _, _ in _SECTIONS)

@@ -670,8 +670,8 @@ afterwards so they carry the new copy.
 
 **If somebody is stuck with this relaxed, do not tell them to verify.** On a
 deployment with the setting off, the `email_not_verified` outcome no longer
-means "unverified" — it is reachable only when the token carried **no usable
-email address**, and no verification mail exists to complete. Setting
+means "unverified" — it is reachable only when the **signed-in account**
+carried no usable email address, and no verification mail exists to complete. Setting
 `emailVerified` on the account fixes nothing either. Check the account's email
 address at the identity provider and the client's `email` scope instead. The
 API's message distinguishes the two cases; the wire code does not.

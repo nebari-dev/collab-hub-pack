@@ -85,7 +85,7 @@ leaves room for a couple of levels of quoting."""
 
 SUBJECT_PREFIX = "Subject: "
 
-CONDITIONAL_MARKER = re.compile(r"\[(?:IF [A-Z ]+|END IF)\]")
+CONDITIONAL_MARKER = re.compile(r"\[(?:IF [A-Z_0-9 ]+|END IF)\]")
 """Any conditional marker, for the post-resolution assertion.
 
 Separate from :data:`CONDITIONAL_BLOCK` because it has to match a marker the
@@ -136,7 +136,7 @@ did not come across, which is worth reconciling separately.
 """
 
 
-UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z /]*\]")
+UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z_0-9 /]*\]")
 """Matches any ``[UPPER CASE]`` slot still present in a rendered body.
 
 Used by :func:`render_for_automated_delivery` as a **runtime** check, not only
@@ -180,7 +180,7 @@ def _load_template() -> tuple[str, str]:
 
 
 def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
-    """Keep or drop each conditional span, leaving no markers behind.
+    r"""Keep or drop each conditional span, leaving no markers behind.
 
     The kept form is the block's own content, which carries its leading blank
     line, so a paragraph that stays is separated from the one above it and a
@@ -227,17 +227,25 @@ def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
 
 SUBJECT, _BODY_TEMPLATE = _load_template()
 
-_BODIES: dict[bool, str] = {
+BODIES: dict[bool, str] = {
     True: _resolve_conditionals(_BODY_TEMPLATE, require_verified_email=True),
     False: _resolve_conditionals(_BODY_TEMPLATE, require_verified_email=False),
 }
-"""Both variants, resolved once at import.
+"""Both variants, resolved once when this module is first imported.
 
 Resolved here rather than per message for the reason :func:`_load_template`
 already establishes for the template itself: unrenderable copy should stop the
 pod from starting, not start cleanly, pass health checks, and then fail every
-invitation with a message ``deliver`` deliberately drops. A damaged template is
-now an import-time ``ValueError`` that somebody reads in the logs.
+invitation with a message ``deliver`` deliberately drops.
+
+**That property depends on somebody importing this module at startup, and for a
+while nothing did.** The only importer was function-local inside
+``render_invitation_email``, so the resolution actually happened on the first
+send. ``ConfiguredInvitationEmailDelivery.__init__`` now touches this name
+during startup validation, beside the check that refuses a missing
+``app_instructions`` -- which is where "a deployment that enables invitation
+email and cannot render it fails loudly" already lived. Public rather than
+underscored because that dependency is real and should be visible.
 
 It also removes a per-send ``DOTALL`` regex over the whole body, which the
 result never depended on: one boolean and a module constant fully determine it.
@@ -315,7 +323,7 @@ def render_onboarding_email(
     if app_instructions is not None:
         substitutions.append((APP_INSTRUCTIONS_PLACEHOLDER, app_instructions))
 
-    body = _BODIES[bool(require_verified_email)]
+    body = BODIES[bool(require_verified_email)]
     for placeholder, value in substitutions:
         body = body.replace(placeholder, value)
     return body

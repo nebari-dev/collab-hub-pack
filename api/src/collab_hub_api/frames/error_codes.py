@@ -93,7 +93,8 @@ Covers ``email_verified`` absent, false, or non-boolean and ``email`` absent
 or unusable, deliberately as one state: the differences are IdP configuration,
 not something the invitee can act on differently.
 
-Since #190 this code also covers "the token carried no usable email address",
+Since #190 this code also covers "the signed-in account carried no usable email
+address",
 which is the only way it is reachable on a deployment with
 ``frames.invitations.require_verified_email`` off. The code is unchanged so the
 desktop app and the acceptance page keep one state to handle; the *message*

@@ -210,12 +210,12 @@ def test_automated_delivery_refuses_a_placeholder_added_to_the_copy_later() -> N
 
     import collab_hub_api.web.onboarding_email as module
 
-    # `_BODIES`, not `_BODY_TEMPLATE`: conditionals resolve at import now, so
+    # `BODIES`, not `_BODY_TEMPLATE`: conditionals resolve at import now, so
     # the rendered body comes from there. That is the cost of the import-time
     # resolution -- one less patchable seam -- paid for by a damaged template
     # failing at startup instead of per send with a swallowed message.
-    original = dict(module._BODIES)
-    module._BODIES = {
+    original = dict(module.BODIES)
+    module.BODIES = {
         flag: body.replace("Thanks,", "Sent on behalf of [ORGANIZATION].\n\nThanks,", 1)
         for flag, body in original.items()
     }
@@ -223,7 +223,7 @@ def test_automated_delivery_refuses_a_placeholder_added_to_the_copy_later() -> N
         with pytest.raises(ValueError, match=r"\[ORGANIZATION\]"):
             render_for_automated_delivery(**DELIVERY_KWARGS)
     finally:
-        module._BODIES = original
+        module.BODIES = original
 
 
 # ---------------------------------------------------------------------------
@@ -390,17 +390,50 @@ def test_an_unresolvable_template_names_what_actually_survived(label, damage, ex
     assert "unclosed" not in str(raised.value), "the message must not guess at a cause"
 
 
-def test_both_variants_are_resolved_at_import() -> None:
-    """Damage becomes a startup failure rather than a swallowed per-send one.
-
-    `_load_template` already sets this precedent for the template itself: copy
-    that cannot be rendered should stop the pod from starting, not let it start
-    cleanly, pass health checks, and fail every invitation with a message
-    `deliver` deliberately drops.
-    """
-
+def test_both_variants_are_resolved_once() -> None:
     import collab_hub_api.web.onboarding_email as module
 
-    assert set(module._BODIES) == {True, False}
-    assert "verify the address" in module._BODIES[True]
-    assert "verify" not in module._BODIES[False].lower()
+    assert set(module.BODIES) == {True, False}
+    assert "verify the address" in module.BODIES[True]
+    assert "verify" not in module.BODIES[False].lower()
+
+
+def test_configuring_invitation_email_resolves_the_copy_at_startup() -> None:
+    """The property the docstring claims, asserted where it can actually fail.
+
+    `set(BODIES) == {True, False}` is true whenever the *test* imports the
+    module, so it could never see the real defect: nothing imported this module
+    at app startup, because its only importer was function-local inside
+    `render_invitation_email`. The resolution therefore happened on the first
+    send, where an unresolvable template raises into `deliver`'s
+    `except (TypeError, ValueError)`, is recorded as `invalid_invitation_email`,
+    and repeats for every subsequent send.
+
+    So the assertion is that *constructing the delivery* is what touches it --
+    beside the `app_instructions` check, which is where startup validation for
+    invitation email already lives.
+    """
+
+    import sys
+
+    from collab_hub_api.frames.invitation_email import ConfiguredInvitationEmailDelivery
+
+    module_name = "collab_hub_api.web.onboarding_email"
+
+    class _Provider:
+        def send(self, message, *, invitation_id):  # pragma: no cover - never called
+            raise AssertionError("construction must not send")
+
+    # Drop the module so the import has to happen for real, then construct the
+    # delivery the way configuration does at startup.
+    sys.modules.pop(module_name, None)
+    assert module_name not in sys.modules
+    ConfiguredInvitationEmailDelivery(
+        _Provider(),
+        accept_url="https://web.test/invite",
+        app_instructions="Download it",
+    )
+    assert module_name in sys.modules, (
+        "constructing the delivery must resolve the copy; otherwise the "
+        "resolution happens on the first send, where deliver() swallows the error"
+    )

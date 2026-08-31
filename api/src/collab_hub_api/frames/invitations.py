@@ -650,7 +650,7 @@ def verified_claim_email(email: object, email_verified: object, *, require_verif
         )
     if not isinstance(email, str) or not email:
         # A DIFFERENT condition, and the only one reachable when verification is
-        # not required: the token carried no usable address at all. It shares
+        # not required: the signed-in account carried no usable address. It shares
         # the exception and the wire code -- widening either is a contract
         # change -- but not the sentence, because `routers/invitations.py`
         # returns `str(exc)` verbatim and this is the one string every

@@ -601,3 +601,10 @@ def test_the_sent_copy_follows_the_delivery_setting(
     (message,) = provider.sent
     body = message.text_body.reveal()
     assert ("verify the address" in body) is expect_verification_copy
+    # And the broad sweep, at this seam rather than only at the renderer:
+    # rewording the conditional paragraph to "confirm your address by following
+    # the verification link" would otherwise slip through the one test that goes
+    # via deliver().
+    if not expect_verification_copy:
+        assert "verify" not in body.lower()
+        assert "verification" not in body.lower()
