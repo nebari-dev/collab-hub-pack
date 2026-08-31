@@ -586,9 +586,11 @@ account grants nothing, and neither does being invited.
 Gate B is **two** checks: the accepter's address is verified by the identity
 provider, *and* it equals the invited address. `frames.invitations.requireVerifiedEmail`
 (default `true`) controls the first. The second is not configurable and never
-becomes conditional — a test asserts that relaxing one does not relax the other,
-because an invitation that skipped the match would be a bearer token redeemable
-under any identity.
+becomes conditional, and a test asserts that relaxing one does not relax the
+other. In strict mode that keeps the invitation from being a bearer token
+redeemable under any identity; in relaxed mode it keeps the recorded address
+honest, which is a smaller claim — see what the match does and does not buy,
+below.
 
 **The argument for `false`.** The invitation token is already proof of mailbox
 control: a 256-bit secret delivered only to the invited address, which is
@@ -596,13 +598,30 @@ exactly what a verification link proves. Requiring both is defence in depth
 rather than one necessary check, and the second round trip is real friction —
 Keycloak's verification link does not return the reader to the invitation.
 
-**What it costs, stated so the choice is informed.** A forwarded or
-shared-mailbox invitation becomes usable by whoever received it. Today they
-cannot accept — they cannot verify an address they do not control — and the
-invitation simply goes unused until the real invitee asks again. With this
-`false` they can accept, and the account they end up with carries the invited
-person's address **permanently**, which is an identity-confusion problem in the
-member list rather than only an access one.
+**What it costs, stated so the choice is informed.** Turning this off means also
+turning off verification at the identity provider (below), and at that point the
+`email` claim is **self-asserted** — whoever holds the link can register an
+account typing the invited address, or point an existing account at it, and
+redeem. So the invitation becomes usable by **anyone who obtains the link**;
+forwarding and shared mailboxes are the mundane cases, not the boundary.
+
+What a link-holder receives is the organization membership and role the
+invitation grants, **plus whatever `frames.serviceAccess.grantOnAcceptance`
+grants at acceptance** — identity-provider group membership included, which on
+most deployments is the access that actually matters. And the account carries
+the invited person's address permanently, so the member list is misleading
+afterwards too.
+
+**What the retained address match does and does not buy.** With verification
+required it is an access control: the accepter proved control of the invited
+address, and the match ties that proof to this invitation. Without it the match
+is a *labelling* property — the address recorded on the membership row is the
+invited one — and not a barrier, because the claim it compares is unverified.
+Keeping it unconditional is still right, and it is not what stands between a
+link-holder and the grant.
+
+What the token still handles regardless: a revoked, expired or already-used
+invitation is refused, and it is single-use.
 
 **Turning it off takes two changes, not one.** The realm must also stop forcing
 verification:

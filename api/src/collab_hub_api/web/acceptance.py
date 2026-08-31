@@ -169,10 +169,12 @@ force them to dig the original link out of their email for a problem they
 had just been told how to fix.
 
 On a deployment with ``frames.invitations.require_verified_email`` off, the
-"unverified email" member of this set means something else -- the token carried
-no address -- and *is not* fixable by the person: there is no mailbox to verify,
-because that deployment sends no verification mail. It stays in this set because
-what the page does with it is unchanged (offer sign-out and a retry), and
+"unverified email" outcome above means something else -- the token carried no
+usable address -- and is **not** fixable by the person, since that deployment
+sends no verification mail. It stays out of this set either way, which is the
+right side of the line for a different reason than the one listed: the browser
+keeps the token not because a retry will work, but because throwing it away
+would cost the invitee their only copy of it while somebody helps them.
 :data:`RELAXED_SECTIONS` is what makes the words match.
 """
 
@@ -510,50 +512,56 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
 )
 
-RELAXED_SECTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
-    CLIENT_STATE_SIGNIN: (
-        "Create your account to accept your invitation",
-        (
-            "Your invitation is ready. Create your account with the exact email"
-            " address the invitation was sent to — or sign in with it, if you"
-            " already have an account here.",
+RELAXED_PARAGRAPHS: dict[str, dict[int, str]] = {
+    CLIENT_STATE_SIGNIN: {
+        1: (
             "Your invitation is held in this browser tab while you do that, so"
             " finish in this tab. If you lose it, simply open your invitation"
-            " link again.",
+            " link again."
         ),
-    ),
-    OUTCOME_EMAIL_NOT_VERIFIED: (
-        "We could not read an email address for this account",
-        (
+    },
+    OUTCOME_EMAIL_NOT_VERIFIED: {
+        0: (
             "An invitation can only be accepted for the address it names, so we"
             " have to be able to read an address from the account you signed in"
-            " with — and this sign-in did not carry one.",
-            "That usually means the account has no email address set. Ask"
-            " whoever invited you for help. Your invitation has not been used.",
+            " with — and this sign-in did not carry one."
         ),
-    ),
+        1: (
+            "That usually means the account has no email address set. Ask"
+            " whoever invited you for help. Your invitation has not been used."
+        ),
+    },
 }
-"""Copy that differs on a deployment which does not require a verified address.
+"""Individual paragraphs that differ where a verified address is not required.
 
-Only the wording changes: the state names, and therefore the wire contract and
-:data:`PAGE_STATES`, are identical in both modes. That is what keeps this a
-copy table rather than a second page.
+**Per paragraph, not per section, and that is the point.** The first version
+overrode whole sections, which meant the sign-in state's heading and its first
+paragraph were duplicated byte-for-byte from :data:`_SECTIONS`. Rewording the
+shared text there would have left relaxed deployments on the old wording
+forever, with nothing asserting the shared parts stayed shared -- exactly the
+failure :data:`CONDITIONAL_BLOCK`'s docstring argues against for the email copy
+("90% shared text and no mechanism keeping the shared part shared"). Indexing
+into the paragraph tuple keeps one copy of everything that does not vary.
 
-**Why this exists.** With ``requireVerifiedEmail`` false, ``email_not_verified``
-is no longer reached because an address is unverified — it is reached only when
-the token carries no usable address at all. The strict copy tells the reader to
-"follow the verification link that was sent to your mailbox", and on such a
-deployment no such mail is ever sent, so the page would be sending people to
-look for something that does not exist. Review caught that this change made the
-*invitation email* configuration-aware and left the page — the surface the
-invitee is actually looking at — asserting the old flow.
-The sign-in state is here for a weaker reason than the not-verified one: its
-sentence about an "email-verification link" is hedged ("if you have to"), so it
-is not false on a relaxed deployment, only noise about a step that never
-happens — on the page somebody reads at their most confused moment. Included
-because the whole point of keying copy to configuration is that the reader is
-told about the flow they are in.
+Headings are not overridable for the same reason: the only heading that needed
+to change is the not-verified one, and a table that can change headings invites
+the same duplication back.
+
+**Why this exists.** With ``requireVerifiedEmail`` false,
+``email_not_verified`` is no longer reached because an address is unverified --
+it is reached only when the token carries no usable address at all. The strict
+copy tells the reader to "follow the verification link that was sent to your
+mailbox", and on such a deployment no such mail is ever sent. The sign-in
+state's mention is hedged and so was never false, only noise about a step that
+does not happen.
 """
+
+
+RELAXED_HEADINGS: dict[str, str] = {
+    OUTCOME_EMAIL_NOT_VERIFIED: "We could not read an email address for this account",
+}
+"""The one heading that changes. Separate from the paragraphs so the shared
+sections cannot acquire a duplicated heading by accident."""
 
 
 PAGE_STATES: tuple[str, ...] = tuple(name for name, _, _ in _SECTIONS)
@@ -563,6 +571,22 @@ Enumerated so the tests can assert the two directions that matter: every
 terminal state the invitation service can produce has copy here, and every
 state named by the script exists as a section.
 """
+
+
+def _with_overrides(paragraphs: tuple[str, ...], overrides: dict[int, str] | None) -> tuple[str, ...]:
+    """One section's paragraphs, with individual ones replaced.
+
+    An index outside the tuple is a programming error rather than something to
+    absorb: it would mean a table entry that renders nothing, which is the
+    silent-inertness this table shape exists to avoid.
+    """
+
+    if not overrides:
+        return paragraphs
+    unknown = sorted(i for i in overrides if not 0 <= i < len(paragraphs))
+    if unknown:
+        raise ValueError(f"paragraph override index out of range: {unknown}")
+    return tuple(overrides.get(i, text) for i, text in enumerate(paragraphs))
 
 
 def _section(name: str, heading: str, paragraphs: tuple[str, ...], extra: str = "") -> str:
@@ -679,11 +703,17 @@ def acceptance_page(
         CLIENT_STATE_READY: statement + button,
         OUTCOME_REAUTHENTICATION_REQUIRED: renew,
     }
-    # Copy only: `RELAXED_SECTIONS` never adds or removes a state, so the wire
-    # contract and PAGE_STATES are the same either way.
-    overrides = {} if require_verified_email else RELAXED_SECTIONS
+    # Copy only: neither table adds or removes a state, so the wire contract and
+    # PAGE_STATES are identical either way -- asserted in the tests.
+    para_overrides = {} if require_verified_email else RELAXED_PARAGRAPHS
+    head_overrides = {} if require_verified_email else RELAXED_HEADINGS
     sections = "".join(
-        _section(name, *overrides.get(name, (heading, paragraphs)), extras.get(name, ""))
+        _section(
+            name,
+            head_overrides.get(name, heading),
+            _with_overrides(paragraphs, para_overrides.get(name)),
+            extras.get(name, ""),
+        )
         for name, heading, paragraphs in _SECTIONS
     )
     noscript = (

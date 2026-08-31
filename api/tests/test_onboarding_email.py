@@ -313,7 +313,9 @@ def test_the_strict_variant_is_what_a_caller_gets_by_default() -> None:
 @pytest.mark.parametrize(
     ("label", "damage"),
     [
-        ("CRLF checkout", lambda body: body.replace("\n", "\r\n")),
+        # No CRLF case: the loader translates universal newlines, so the
+        # resolver never sees `\r\n`. The earlier version built one by hand and
+        # so asserted tolerance of an input that cannot occur.
         ("trailing spaces after a marker", lambda body: body.replace("[END IF]\n", "[END IF]   \n")),
         (
             "trailing tab after a marker",
@@ -323,18 +325,14 @@ def test_the_strict_variant_is_what_a_caller_gets_by_default() -> None:
 )
 @pytest.mark.parametrize("require_verified_email", [True, False])
 def test_line_ending_and_whitespace_drift_is_tolerated(label, damage, require_verified_email) -> None:
-    """The regression review caught, asserted in the direction it should hold.
+    """Reachable drift is absorbed rather than refused.
 
-    The first version required an exact ``\n`` after each marker and raised a
-    well-worded error otherwise. That was worse than not having the conditional
-    at all: on a CRLF checkout the raise fired for **both** settings including
-    the strict default, `deliver` swallowed the message into
-    `invalid_invitation_email`, and a deployment that never opted into this
-    feature lost all invitation email over a line ending -- where before it sent
-    correctly, because `_load_template` is CRLF tolerant.
+    A space or tab left after a marker by someone reflowing the copy is a real
+    edit somebody can commit, and an exact-newline requirement would turn it
+    into a refusal to send every invitation.
 
-    So drift is absorbed now. `.gitattributes` pins the file so it should not
-    arise at all, and this is what holds when it does anyway.
+    What this no longer asserts is tolerance of a CRLF template: the loader
+    performs universal-newline translation, so that input cannot reach here.
     """
 
     del label
@@ -347,20 +345,49 @@ def test_line_ending_and_whitespace_drift_is_tolerated(label, damage, require_ve
     assert ("verify the address" in resolved) is require_verified_email
 
 
-def test_an_unclosed_marker_still_raises_because_nothing_can_absorb_it() -> None:
-    """What the raise is actually for, now that drift is tolerated.
+@pytest.mark.parametrize(
+    ("label", "damage", "expect_named"),
+    [
+        (
+            "an unclosed [IF ...]",
+            lambda body: body.replace("[END IF]\n", ""),
+            "[IF VERIFIED EMAIL REQUIRED]",
+        ),
+        (
+            "a second condition the resolver does not know",
+            lambda body: body.replace("[END IF]\n", "[END IF]\n\n[IF SOMETHING ELSE]\nx\n[END IF]\n", 1),
+            "[IF SOMETHING ELSE]",
+        ),
+        (
+            "a marker that does not begin its line",
+            lambda body: body.replace("[IF VERIFIED EMAIL REQUIRED]\n", "text [IF VERIFIED EMAIL REQUIRED]\n", 1),
+            "[IF VERIFIED EMAIL REQUIRED]",
+        ),
+    ],
+)
+def test_an_unresolvable_template_names_what_actually_survived(label, damage, expect_named) -> None:
+    """What the raise is for, and it must not guess at the cause.
 
-    An `[IF ...]` with no `[END IF]` is not whitespace drift -- there is no
-    correct resolution -- so it stays a failure, at import, which is where the
-    message reaches somebody.
+    An earlier message said "most likely an unclosed [IF ...]", which is wrong
+    for the likelier case: a *second* condition added to the copy, whose marker
+    the generic pattern matches and the block pattern -- keyed to one literal
+    name -- does not. So the message reports the surviving markers and lets the
+    reader see which it was.
+
+    The line-start anchoring is here too: before it, a marker with text in front
+    of it resolved and silently left that text behind, while the message claimed
+    markers must sit alone on their own lines.
     """
 
+    del label
     import collab_hub_api.web.onboarding_email as module
 
-    with pytest.raises(ValueError, match="unclosed"):
+    with pytest.raises(ValueError) as raised:
         module._resolve_conditionals(
-            module._BODY_TEMPLATE.replace("[END IF]\n", ""), require_verified_email=True
+            damage(module._BODY_TEMPLATE), require_verified_email=True
         )
+    assert expect_named in str(raised.value)
+    assert "unclosed" not in str(raised.value), "the message must not guess at a cause"
 
 
 def test_both_variants_are_resolved_at_import() -> None:

@@ -1484,6 +1484,83 @@ def test_a_dead_token_is_still_dead_however_verification_is_configured():
             )
 
 
+def test_accept_threads_the_setting_without_needing_a_database():
+    """The threading guard that runs **in CI**, where the live tests do not.
+
+    The three live tests below cover this against real Postgres, and locally
+    they are the better check. But `test.yaml` provisions no database and sets
+    no `COLLAB_HUB_TEST_POSTGRES_URL`, so `skipif` drops them -- which leaves
+    deleting either thread in `_accept_once` green on CI, the same state that
+    prompted writing them. This one has no such gate.
+
+    A fake connection stands in for the one read `_accept_once` performs before
+    the evaluation, and `_evaluate_acceptance` is replaced by a spy that records
+    what it was asked and stops there. Nothing about the audited transaction is
+    exercised; the question is only whether the deployment's choice reaches the
+    decision.
+    """
+
+    import contextlib
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    row = {
+        "id": "inv-1",
+        "org_id": ORG,
+        "email": INVITED_EMAIL,
+        "status": STATUS_PENDING,
+        "created_at": now,
+        "created_by": OPERATOR,
+        "expires_at": now + timedelta(days=7),
+        "accepted_at": None,
+        "accepted_by": None,
+        "accepted_org_id": None,
+        "revoked_at": None,
+        "revoked_by": None,
+        "server_now": now,
+    }
+
+    class FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchone(self):
+            return row
+
+    class FakeDb:
+        @contextlib.contextmanager
+        def connection(self):
+            yield FakeConn()
+
+    class Stop(Exception):
+        pass
+
+    for flag in (True, False):
+        seen: list[bool] = []
+
+        def spy(*_args, require_verified: bool, **_kwargs):
+            seen.append(require_verified)
+            raise Stop
+
+        original = invitations_module._evaluate_acceptance
+        invitations_module._evaluate_acceptance = spy
+        try:
+            service = invitations_module.PostgresInvitationService(
+                FakeDb(), require_verified_email=flag
+            )
+            with pytest.raises(Stop):
+                service.accept(
+                    user_id=INVITEE,
+                    display=display(INVITED_EMAIL, verified=False),
+                    token_hash="h" * 64,
+                    claim_email=INVITED_EMAIL,
+                    email_verified=False,
+                )
+        finally:
+            invitations_module._evaluate_acceptance = original
+
+        assert seen == [flag], f"the deployment setting did not reach the decision for {flag}"
+
+
 def test_the_service_builder_passes_the_setting_through():
     """Review finding: the seam moved up a level rather than closing.
 

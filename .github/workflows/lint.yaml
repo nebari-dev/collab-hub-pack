@@ -63,10 +63,27 @@ jobs:
           # would win -- and since the strict default renders nothing, an entry
           # there could relax the check on a deployment whose values say it is
           # strict, with nothing in the manifest to show it.
-          if helm template helm/collab-hub \
-            --set 'api.deployment.extraEnv[0].name=COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL' \
-            --set-string 'api.deployment.extraEnv[0].value=false' \
-            >/tmp/verify-extraenv.yaml 2>/tmp/verify-extraenv.err; then
-            echo "expected extraEnv to be refused for invitation acceptance configuration" >&2
-            exit 1
-          fi
+          #
+          # Both cases spelled out: pydantic-settings matches environment
+          # variables case-insensitively, so the lowercase name is honoured by
+          # the app just as much and was walking through an uppercase-only
+          # guard. Asserting only the uppercase form is what let that through.
+          for spelling in \
+            COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL \
+            collab_hub_api__frames__invitations__require_verified_email; do
+            if helm template helm/collab-hub \
+              --set "api.deployment.extraEnv[0].name=${spelling}" \
+              --set-string 'api.deployment.extraEnv[0].value=false' \
+              >/tmp/verify-extraenv.yaml 2>/tmp/verify-extraenv.err; then
+              echo "expected extraEnv ${spelling} to be refused" >&2
+              exit 1
+            fi
+            # Assert WHY it failed. Without this the check passes on any Helm
+            # error at all -- a renamed values path, a tightened schema, a typo
+            # in the --set key -- while proving nothing about the guard.
+            if ! grep -q "invitation acceptance configuration" /tmp/verify-extraenv.err; then
+              echo "extraEnv ${spelling} failed for the wrong reason:" >&2
+              cat /tmp/verify-extraenv.err >&2
+              exit 1
+            fi
+          done

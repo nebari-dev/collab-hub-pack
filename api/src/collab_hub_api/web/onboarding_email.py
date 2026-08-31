@@ -94,8 +94,8 @@ block pattern *failed* to match -- which is the whole failure mode.
 
 
 CONDITIONAL_BLOCK = re.compile(
-    r"\[IF VERIFIED EMAIL REQUIRED\][ \t]*\r?\n(.*?)\[END IF\][ \t]*\r?\n",
-    re.DOTALL,
+    r"^\[IF VERIFIED EMAIL REQUIRED\][ \t]*\r?\n(.*?)^\[END IF\][ \t]*\r?\n",
+    re.DOTALL | re.MULTILINE,
 )
 """A span of copy that belongs in the message only under one configuration.
 
@@ -188,29 +188,39 @@ def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
     on the rendered body rather than reasoned about here -- whitespace is
     exactly the kind of thing that reads correct and renders wrong.
 
-    **Line endings and trailing whitespace are tolerated, not diagnosed.** The
-    first version of this required an exact ``\n`` after each marker and raised
-    a well-worded error when it did not match. Review found that made things
-    *worse* than before the conditional existed: on a CRLF checkout the
-    substitution became a no-op, the raise fired for **both** settings
-    including the strict default, and ``deliver`` swallowed the message into
-    ``error_code="invalid_invitation_email"`` -- so a deployment that never
-    opted into this feature lost all invitation email over a line ending, where
-    previously it sent correctly because :func:`_load_template` is CRLF
-    tolerant. Narrowing an existing tolerance to add a diagnostic is the wrong
-    trade; the pattern now accepts what the drift produces, and
-    ``.gitattributes`` pins the file so it does not drift in the first place.
+    **Trailing whitespace after a marker is tolerated rather than diagnosed.**
+    Someone reflowing this copy can leave a space or tab behind, and an exact
+    ``\n`` requirement would turn that into a refusal to send.
 
-    The raise is kept for what it is actually good for: a marker that survives
-    for a reason the pattern cannot absorb, such as an unclosed ``[IF ...]``.
+    Line endings need no tolerance and never did. An earlier review reported
+    that a CRLF checkout would make the substitution a no-op and fire the guard
+    for both settings; **that mechanism does not exist.** ``Path.read_text``
+    and ``importlib.resources``' text mode both perform universal-newline
+    translation, so this function only ever sees ``\n`` however the file was
+    checked out. The ``\r?`` is harmless and kept for cheapness, not as
+    protection against anything reachable. Recorded because the previous
+    version of this docstring asserted that history as fact, and it was
+    verified by constructing a CRLF string by hand rather than by asking
+    whether one could arrive.
+
+    The raise is kept for a marker that survives for a reason the pattern
+    cannot absorb, such as an unclosed ``[IF ...]``.
     """
 
     resolved = CONDITIONAL_BLOCK.sub(r"\1" if require_verified_email else "", body)
     if CONDITIONAL_MARKER.search(resolved):
+        # The message names what is observable and stops there. An earlier
+        # version guessed "unclosed [IF ...]", which is wrong for the likelier
+        # cause: a *second* condition added to the copy, whose marker
+        # CONDITIONAL_MARKER matches and CONDITIONAL_BLOCK -- keyed to one
+        # literal name -- does not. Reporting the surviving markers lets the
+        # reader see which it was.
+        surviving = ", ".join(sorted(set(CONDITIONAL_MARKER.findall(resolved))))
         raise ValueError(
-            f"{TEMPLATE_FILENAME}: a conditional marker survived resolution -- most likely an"
-            " unclosed [IF ...] with no matching [END IF]. Markers must sit alone on their own"
-            " lines."
+            f"{TEMPLATE_FILENAME}: conditional markers survived resolution ({surviving}). Each"
+            " must begin its own line and be paired, and only [IF VERIFIED EMAIL REQUIRED] is"
+            " understood -- a new condition needs teaching to CONDITIONAL_BLOCK, not just"
+            " adding to the copy."
         )
     return resolved
 

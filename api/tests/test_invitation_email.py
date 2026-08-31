@@ -551,33 +551,44 @@ def test_the_delivery_copy_and_the_acceptance_rule_read_one_setting() -> None:
     assert delivery_for(False)._require_verified_email is False
 
 
-def test_a_relaxed_deployment_sends_copy_without_the_verification_step() -> None:
+class _Capturing:
+    """A provider that keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.sent: list[InvitationEmailMessage] = []
+
+    def send(self, message, *, invitation_id):
+        del invitation_id
+        self.sent.append(message)
+        return ProviderAcceptance(message_id="probe-message-id")
+
+
+@pytest.mark.parametrize(
+    ("require_verified_email", "expect_verification_copy"),
+    [(True, True), (False, False)],
+)
+def test_the_sent_copy_follows_the_delivery_setting(
+    require_verified_email, expect_verification_copy
+) -> None:
     """Through ``deliver()``, which is the only production path that renders a
     sent email.
 
-    The first version of this test read ``delivery._require_verified_email``
-    and passed it to the renderer itself -- asserting the value against itself
-    while never exercising the wiring. Review demonstrated the consequence:
-    deleting ``require_verified_email=self._require_verified_email`` from
-    ``deliver()`` left all 62 tests green, so a refactor could silently restore
-    the verification paragraph on every relaxed deployment.
+    An earlier version of this read ``delivery._require_verified_email`` and
+    passed it to the renderer itself -- asserting the value against itself while
+    never exercising the wiring, so deleting the real thread left every test
+    green. So this captures what the provider was actually handed.
 
-    So this captures what the provider was actually handed.
+    Parametrized rather than written twice: the two directions were near-identical
+    functions each declaring their own provider class, which is how a pair meant
+    to pin one seam drifts into asserting different things about it.
     """
 
-    sent: list[InvitationEmailMessage] = []
-
-    class Capturing:
-        def send(self, message, *, invitation_id):
-            del invitation_id
-            sent.append(message)
-            return ProviderAcceptance(message_id="probe-message-id")
-
+    provider = _Capturing()
     delivery = ConfiguredInvitationEmailDelivery(
-        Capturing(),
+        provider,
         accept_url="https://web.test/invite",
         app_instructions=APP_INSTRUCTIONS,
-        require_verified_email=False,
+        require_verified_email=require_verified_email,
     )
     delivery.deliver(
         invitation_id="inv-1",
@@ -587,36 +598,6 @@ def test_a_relaxed_deployment_sends_copy_without_the_verification_step() -> None
         expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
     )
 
-    (message,) = sent
+    (message,) = provider.sent
     body = message.text_body.reveal()
-    assert "verify" not in body.lower(), "a relaxed deployment must not promise verification mail"
-
-
-def test_a_strict_deployment_sends_copy_with_the_verification_step() -> None:
-    """The pair, so the test above cannot pass on a build that ignores the
-    setting entirely -- which is the build review produced."""
-
-    sent: list[InvitationEmailMessage] = []
-
-    class Capturing:
-        def send(self, message, *, invitation_id):
-            del invitation_id
-            sent.append(message)
-            return ProviderAcceptance(message_id="probe-message-id")
-
-    delivery = ConfiguredInvitationEmailDelivery(
-        Capturing(),
-        accept_url="https://web.test/invite",
-        app_instructions=APP_INSTRUCTIONS,
-        require_verified_email=True,
-    )
-    delivery.deliver(
-        invitation_id="inv-1",
-        recipient=RECIPIENT,
-        invitation_secret=SECRET,
-        organization_name=None,
-        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
-    )
-
-    (message,) = sent
-    assert "verify the address" in message.text_body.reveal()
+    assert ("verify the address" in body) is expect_verification_copy

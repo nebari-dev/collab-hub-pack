@@ -301,7 +301,7 @@ class EmailNotVerifiedError(InvitationError):
     the login's IdP configuration, not something the invitee can act on
     differently, and enumerating them would describe another account's claims
     to whoever holds the link.
-    
+
     **Two conditions share this one state, and only one of them is always
     reachable.** With ``frames.invitations.require_verified_email`` on -- the
     default -- it is raised for an unverified or non-boolean claim *and* for a
@@ -1728,12 +1728,18 @@ def _evaluate_acceptance(
         raise InvitationAlreadyUsedError("This invitation has already been used.")
     if status == STATUS_EXPIRED:
         raise InvitationExpiredError("This invitation has expired. Ask for a new one.")
-    # The match is NOT conditional on `require_verified`. Relaxing the
-    # verification requirement means the token stands in for the proof that the
-    # accepter receives mail at the invited address; it does not mean any
-    # address will do. A deployment that dropped both would have an invitation
-    # that grants access to whoever holds the link under any identity, which is
-    # a different feature and not one anything here offers.
+    # The match is NOT conditional on `require_verified`, and it is worth being
+    # exact about why, because the reason differs by mode.
+    #
+    # Strict: the match is an access control. The accepter has proved control of
+    # a verified address, and this is what ties that proof to *this* invitation.
+    #
+    # Relaxed: the claim is self-asserted, so the match is not a barrier -- a
+    # link-holder can type the invited address. What it still buys is that the
+    # address recorded on the membership row is the invited one, which is worth
+    # keeping unconditional: an invitation that recorded any address would make
+    # the member list unreliable as well as the access. What it does not buy is
+    # protection against whoever holds the link.
     matched_email = verified_claim_email(claim_email, email_verified, require_verified=require_verified)
     if not emails_match(invitation.email, matched_email):
         raise InvitationEmailMismatchError(

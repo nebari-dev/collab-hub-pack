@@ -524,7 +524,7 @@ class FramesInvitationsConfig(BaseModel):
 
     require_verified_email: bool = True
     """Whether Gate B additionally requires the identity provider to have
-    verified the address (#67).
+    verified the address (#190).
 
     **True is the default and must stay the default.** Turning it off is a
     deliberate deployment trade, and a default that silently weakened an
@@ -537,13 +537,28 @@ class FramesInvitationsConfig(BaseModel):
     address, which is exactly what a verification link proves. Requiring both
     is defence in depth rather than one necessary check.
 
-    **What is given up, stated so a deployment chooses it knowingly.** A
-    forwarded or shared-mailbox invitation becomes usable by whoever received
-    it: today they cannot accept, because they cannot verify an address they
-    do not control, and the invitation simply goes unused. With this false they
-    can, and the account they end up with carries the invited person's address
-    permanently -- an identity-confusion problem in the member list, not only
-    an access one.
+    **What is given up, stated so a deployment chooses it knowingly.** Once the
+    identity provider stops verifying addresses, the ``email`` claim is
+    *self-asserted*: whoever holds the invitation link can register an account
+    typing the invited address, or point an existing account at it, and redeem.
+    So the invitation becomes usable by **anyone who obtains the link by any
+    means** -- forwarding and shared mailboxes are the mundane cases, not the
+    boundary.
+
+    What they receive is the organization membership and role the invitation
+    grants, plus anything ``frames.service_access.grant_on_acceptance`` grants
+    at acceptance -- identity-provider group membership included. And the
+    account they end up with carries the invited person's address permanently,
+    which is an identity-confusion problem in the member list on top of the
+    access one.
+
+    **What the retained address match does and does not buy.** With verification
+    required it is an access control: an accepter must prove control of the
+    invited address. Without it, the match is a *labelling* property -- the
+    address recorded on the membership row is the invited one -- and not a
+    barrier, because the claim it compares is unverified. Keeping it
+    unconditional is still right; it is simply not the thing standing between a
+    link-holder and the grant.
 
     **When to leave it true.** Any deployment whose invitees arrive through an
     identity provider with ``trustEmail``: those accounts are already verified

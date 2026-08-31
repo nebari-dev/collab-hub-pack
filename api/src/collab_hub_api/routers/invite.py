@@ -23,7 +23,13 @@ Freshness of the verified address
 Holding a session is not enough to redeem. The session's ``email`` and
 ``email_verified`` are one half of #89's authority pair, and unlike the
 subject they are facts about the account *at the IdP* that the IdP can
-withdraw. A session lasts eight hours; a membership lasts forever (one
+withdraw.
+
+Where ``frames.invitations.require_verified_email`` is off (#190) the pair is
+the ``email`` claim alone, and the freshness rule below still applies to it for
+the surviving half of this reasoning: an address can be reassigned at the IdP
+just as a verification can be revoked, and the match against it is not
+configurable. A session lasts eight hours; a membership lasts forever (one
 organization per login, no change afterwards). Acting on an assertion up to a
 whole session old could therefore bind a permanent membership on a
 verification that had already been revoked.
@@ -357,10 +363,18 @@ def make_routers(
         """Redeem the token the page is holding, for this browser's session.
 
         Authority is the pair #89 defined and nothing else: holding the
-        secret, and controlling the verified mailbox it was issued to. The
-        session supplies the second half — ``email`` and ``email_verified``
-        as the IdP asserted them, recently (see the module note on freshness)
-        — and the lifecycle service checks both inside its transaction.
+        secret, and controlling the mailbox it was issued to. The session
+        supplies the second half — ``email`` and ``email_verified`` as the IdP
+        asserted them, recently (see the module note on freshness) — and the
+        lifecycle service checks it inside its transaction.
+
+        **How much of that second half is checked is a deployment setting.**
+        With ``frames.invitations.require_verified_email`` on, the default, the
+        service requires both the verified flag and the address match. With it
+        off it requires the match alone, on the argument that the one-time
+        secret is itself evidence of mailbox control (#190). Written out because
+        this is the docstring a reader consults to learn what stands in for a
+        role on this route.
 
         ``require_csrf`` is called here instead of being declared as a
         dependency, and the reason has changed once. Originally the ordering

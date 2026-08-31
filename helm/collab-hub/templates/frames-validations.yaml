@@ -142,10 +142,15 @@ and scheme this app records. */}}
 {{- end }}
 {{- range .Values.api.deployment.extraEnv }}
 {{- $name := default "" .name }}
+{{- /* Compared case-insensitively from here on. pydantic-settings matches
+       environment variables without regard to case, so a lowercase spelling of
+       a refused name is honoured by the app and was walking straight through a
+       guard that only knew the uppercase one. */}}
+{{- $upper := upper $name }}
 {{- if and (hasKey . "value") (or (eq $name "AWS_ACCESS_KEY_ID") (eq $name "AWS_SECRET_ACCESS_KEY") (eq $name "AWS_SESSION_TOKEN") (eq $name "AWS_SECURITY_TOKEN")) }}
 {{- fail (printf "api.deployment.extraEnv may not render AWS credential %s as plaintext; use workload identity or a Secret reference." $name) }}
 {{- end }}
-{{- if or (eq $name "COLLAB_HUB_API__FRAMES") (eq $name "COLLAB_HUB_API__FRAMES__EMAIL") (hasPrefix "COLLAB_HUB_API__FRAMES__EMAIL__" $name) }}
+{{- if or (eq $upper "COLLAB_HUB_API__FRAMES") (eq $upper "COLLAB_HUB_API__FRAMES__EMAIL") (hasPrefix "COLLAB_HUB_API__FRAMES__EMAIL__" $upper) }}
 {{- fail (printf "api.deployment.extraEnv may not set or override invitation email configuration (%s); use frames.email and its existingSecret fields." $name) }}
 {{- end }}
 {{- /* Gate B's verification requirement, for the same reason and one more.
@@ -155,7 +160,7 @@ and scheme this app records. */}}
        `requireVerifiedEmail: true`, with nothing in the rendered values to show
        it. That defeats the point of rendering it only when relaxed, which is
        that a security trade should be visible in the manifest. */}}
-{{- if or (eq $name "COLLAB_HUB_API__FRAMES__INVITATIONS") (hasPrefix "COLLAB_HUB_API__FRAMES__INVITATIONS__" $name) }}
+{{- if or (eq $upper "COLLAB_HUB_API__FRAMES__INVITATIONS") (hasPrefix "COLLAB_HUB_API__FRAMES__INVITATIONS__" $upper) }}
 {{- fail (printf "api.deployment.extraEnv may not set or override invitation acceptance configuration (%s); use frames.invitations.requireVerifiedEmail so the choice is visible in the values." $name) }}
 {{- end }}
 {{- end }}
