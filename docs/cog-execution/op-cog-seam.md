@@ -30,15 +30,16 @@ fine.
 
 ## Bundled ops
 
-The tasks a Cog ships with — `ask`, `chat`, build-a-bundle-and-ask — are
-**bundled ops**: single-Cog, zero-gate ops included in the package. Two
-kinds, with different audiences:
+A Cog's entry points have two audiences:
 
-- **Usage ops** (`ask`, `chat`, bundle-and-ask): what end users and the Op
-  layer invoke. These appear in the catalog card.
-- **Lifecycle ops** (`resolve`, `serve`, `check`, `eval`): how a hosting
-  environment installs, binds, starts, and verifies the Cog. The Op layer
-  never sees these.
+- **Usage entry points** (`ask`, `chat`, build-a-bundle-and-ask): what end
+  users and the Op layer invoke. These are the Cog's **bundled ops** —
+  single-Cog, zero-gate ops shipped in the package — and they appear in the
+  catalog card.
+- **Lifecycle entry points** (`resolve`, `serve`, `check`, `eval`): how a
+  hosting environment installs, binds, starts, and verifies the Cog. These
+  are not ops — nothing a person kicks off or composes into steps — and the
+  Op layer never sees them.
 
 This makes the Op factory's job precise: **compose bundled ops into steps,
 and wrap Frames, Guards, Gates, and Tracks around them.** `nebi run cog`
@@ -50,14 +51,14 @@ scales.
 Everything an Op step needs from a Cog:
 
 1. **An invokable task entry point** — POST a task bundle (context in), get
-   a result. This is the usage op.
+   a result. This is the usage entry point, the bundled op.
 2. **A result envelope** — a checkable payload plus a problems list. Guards
    check the payload; Gates read the problems; "passed with integrity
    problems" is rendered for the human, not swallowed. See
    [the envelope](result-envelope.md).
 3. **A health probe** — is this Cog able to take work right now.
-4. **A catalog card** — name, function, io, and its usage ops, derivable
-   from the manifest. This is how Cogs appear in the Op builder's picker.
+4. **A catalog card** — name, function, io, and its usage entry points,
+   derivable from the manifest. This is how Cogs appear in the Op builder's picker.
 
 Nothing else crosses the seam. Harness, model, weights, pixi environments,
 binding machinery — all stay inside the Cog, and all remain swappable
@@ -95,8 +96,8 @@ identity.
   surfaces. Integrates with Cogs only through the seam.
 - **Cogs:** provide the four items. The remaining work is packaging so Cogs
   are installable where the orchestrator can reach them.
-- **The hosting environment:** owns lifecycle ops and publishes its
-  capability list — the shape a Cog must have to be runnable *there*.
+- **The hosting environment:** owns the lifecycle entry points and publishes
+  its capability list — the shape a Cog must have to be runnable *there*.
   Environment-owned, so it needs no universal ratification.
 - **The registry/catalog:** distribution and discovery; its catalog feeds
   the Op builder's picker.
@@ -113,10 +114,10 @@ possible for free as long as the orchestrator only ever touches the seam.
 
 - The Op orchestrator integrates with Cogs exclusively via their declared
   task entry points; it never executes Cog internals and never manages a
-  Cog's environment beyond invoking its lifecycle ops.
-- Cogs run themselves: the hub *hosts* Cogs (lifecycle ops) and *invokes*
-  them (usage ops). "Run a Cog" in orchestrator code should always mean one
-  of those two verbs.
+  Cog's environment beyond invoking its lifecycle entry points.
+- Cogs run themselves: the hub *hosts* Cogs (lifecycle entry points) and
+  *invokes* them (usage entry points). "Run a Cog" in orchestrator code
+  should always mean one of those two verbs.
 - A step's gate consumes the Cog's result envelope (payload + problems);
   Guard failures and integrity problems are surfaced to the gate, never
   retried silently. The gate is declared on the step; the Cog does not
