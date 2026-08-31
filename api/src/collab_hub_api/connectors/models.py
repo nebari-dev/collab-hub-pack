@@ -560,10 +560,6 @@ class GitHubProjectItem(BaseModel):
     # state of the linked issue/PR: "open"/"closed" for issues, plus "merged"
     # for PRs. Empty for draft/redacted items (no accessible content).
     state: str = ""
-    # Always False today: the item read excludes archived items by default
-    # (archived_policy="excluded" on GitHubProjectCounts). Forward-compatible
-    # for if the read is ever widened to include archived items.
-    is_archived: bool = False
     repo: str = ""  # owner/name, when the item is a linked issue/PR
     number: int = 0  # issue/PR number, when linked
     # Assignees/labels of the linked issue/PR (bounded), so a board can be triaged

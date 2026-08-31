@@ -1014,8 +1014,8 @@ async def test_github_projects_reject_bad_owner(tmp_path, monkeypatch):
 
 
 def _read_node_states():
-    """A board whose items exercise state (open/closed), the archived flag, and a
-    REDACTED node (content the viewer cannot access)."""
+    """A board whose items exercise state (open/closed) and a REDACTED node
+    (content the viewer cannot access)."""
     return {
         "projectV2": {
             "number": 1,
@@ -1027,7 +1027,6 @@ def _read_node_states():
                 "nodes": [
                     {
                         "type": "ISSUE",
-                        "isArchived": False,
                         "content": {
                             "__typename": "Issue",
                             "number": 7,
@@ -1039,11 +1038,10 @@ def _read_node_states():
                     },
                     {
                         "type": "ISSUE",
-                        "isArchived": True,
                         "content": {
                             "__typename": "Issue",
                             "number": 8,
-                            "title": "Shelved",
+                            "title": "Another bug",
                             "state": "OPEN",
                             "repository": {"nameWithOwner": "acme/widgets"},
                         },
@@ -1051,7 +1049,6 @@ def _read_node_states():
                     },
                     {
                         "type": "REDACTED",
-                        "isArchived": False,
                         "content": None,
                         "fieldValues": {"nodes": []},
                     },
@@ -1061,7 +1058,7 @@ def _read_node_states():
     }
 
 
-async def test_github_read_project_item_state_archived_redacted(tmp_path, monkeypatch):
+async def test_github_read_project_item_state_and_redacted(tmp_path, monkeypatch):
     _install_mock_client(monkeypatch, _graphql_handler(org=_read_node_states(), user=None))
     app = make_app(_config(tmp_path))
     async with _client(app) as client:
@@ -1072,11 +1069,9 @@ async def test_github_read_project_item_state_archived_redacted(tmp_path, monkey
         )
     assert response.status_code == 200
     items = response.json()["items"]
-    # A linked issue carries its open/closed state and archived flag.
+    # A linked issue carries its open/closed state.
     assert items[0]["state"] == "closed"
-    assert items[0]["is_archived"] is False
     assert items[1]["state"] == "open"
-    assert items[1]["is_archived"] is True
     # A redacted item is marked as such and leaks no content.
     assert items[2]["type"] == "REDACTED"
     assert items[2]["repo"] == "" and items[2]["number"] == 0
@@ -1097,7 +1092,6 @@ async def test_github_read_project_item_assignees_and_labels(tmp_path, monkeypat
                 "nodes": [
                     {
                         "type": "ISSUE",
-                        "isArchived": False,
                         "content": {
                             "__typename": "Issue",
                             "number": 7,
@@ -1111,7 +1105,6 @@ async def test_github_read_project_item_assignees_and_labels(tmp_path, monkeypat
                     },
                     {
                         "type": "DRAFT_ISSUE",
-                        "isArchived": False,
                         "content": {"__typename": "DraftIssue", "title": "An idea"},
                         "fieldValues": {"nodes": []},
                     },

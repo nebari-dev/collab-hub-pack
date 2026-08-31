@@ -51,7 +51,6 @@ _PROJECT_ITEM_FIELDS = """
         pageInfo { hasNextPage endCursor }
         nodes {
           type
-          isArchived
           content {
             __typename
             ... on Issue {
@@ -789,7 +788,6 @@ def _project_item(node: dict) -> GitHubProjectItem:
         type=str(node.get("type", "") or ""),
         status=status,
         state=str(content.get("state", "") or "").lower(),
-        is_archived=bool(node.get("isArchived", False)),
         repo=repo,
         number=int(content.get("number", 0) or 0),
         assignees=_logins((content.get("assignees") or {}).get("nodes")),
