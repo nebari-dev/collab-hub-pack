@@ -341,6 +341,9 @@ def test_github_api_text_sanitizer_preserves_code_shapes():
         "see foo.com for details",
         "example.io test.dev foo.ai",
         "numpy.linalg",
+        # The reviewer's own repro case for the old behavior: a domain:tag
+        # shape (colon before the tag, not a scheme prefix) must survive too.
+        "image: ghcr.io/openteams/collab:8da6475",
     ):
         assert sanitize_github_api_text(value) == value
 
