@@ -94,14 +94,12 @@ or unusable, deliberately as one state: the differences are IdP configuration,
 not something the invitee can act on differently.
 
 Since #190 this code also covers "the signed-in account carried no usable email
-address" -- reachable on a **strict** deployment too, when a client's scopes
-omit `email`, not only where verification is not required. The message
-distinguishes the two; the code does not, and the page copy offers a remedy for
-each.
-which is the only way it is reachable on a deployment with
-``frames.invitations.require_verified_email`` off. The code is unchanged so the
-desktop app and the acceptance page keep one state to handle; the *message*
-distinguishes them.
+address". That is the *only* way it is reachable where
+``frames.invitations.require_verified_email`` is off -- and it is reachable on a
+**strict** deployment too, when a client's scopes omit ``email``. The code stays
+one value so the desktop app and the acceptance page keep one state to handle;
+the message distinguishes the two conditions, and the page copy offers a remedy
+for each.
 """
 
 INVITATION_EMAIL_MISMATCH = "invitation_email_mismatch"
