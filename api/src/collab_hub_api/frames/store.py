@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
@@ -77,6 +78,9 @@ def readers_after_visibility(visibility: Visibility, current_readers: list[str])
     """
 
     return current_readers if visibility == Visibility.private else []
+
+
+logger = logging.getLogger("frames_server.store")
 
 
 def normalize_metadata(metadata: dict) -> dict:
@@ -583,6 +587,12 @@ class S3FrameStore(FrameStore):
             except FrameNotFoundError:
                 # Deleted between the LIST and this GET. Skipping matches the
                 # local backend; raising would fail a whole page for one race.
+                # Logged so the rate is measurable: a steady stream means
+                # something other than ordinary deletes is removing objects.
+                logger.warning(
+                    "Frame %s listed but not readable; omitted from this page",
+                    frame_id,
+                )
                 return None
 
         ordered = sorted(frame_ids)

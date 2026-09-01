@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -350,6 +351,25 @@ def test_s3_list_frames_skips_a_frame_deleted_mid_list():
     listed = store.list_frames("org-a", "workspace-a")
 
     assert [item.id for item in listed] == sorted(set(ids) - {gone})
+
+
+def test_s3_list_frames_warns_when_it_skips(caplog):
+    """The skip is logged, so its rate is measurable rather than invisible."""
+
+    ids = [f"{index:032x}" for index in range(3)]
+    gone = ids[1]
+    fake = RecordingFakeS3(
+        {frame_id: _metadata_payload(frame_id) for frame_id in ids},
+        missing={gone},
+    )
+    store = _s3_store_with(fake)
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.store"):
+        store.list_frames("org-a", "workspace-a")
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert gone in warnings[0].getMessage()
 
 
 def test_s3_list_frames_still_applies_filters():
