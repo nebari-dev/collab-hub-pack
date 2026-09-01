@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 
@@ -81,6 +80,7 @@ from collab_hub_api.connectors.slack_client import (
     SlackUpstreamError,
 )
 from collab_hub_api.connectors.slack_tokens import SlackTokenProvider
+from collab_hub_api.connectors.validation import has_control_or_nonprintable
 from collab_hub_api.frames.auth import get_auth_context
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
@@ -491,19 +491,6 @@ async def search_github(
     return GitHubSearchResponse(hits=hits, next_page_token=next_page_token, incomplete_results=incomplete)
 
 
-def _api_get_semaphore(request: Request, config: ConnectorsConfig) -> asyncio.Semaphore:
-    """Process-wide bound on concurrent generic reads, created once, lazily.
-
-    getattr/create/setattr run with no await between them, so concurrent requests
-    cannot race to install two semaphores.
-    """
-    semaphore = getattr(request.app.state, "github_api_get_semaphore", None)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(config.github.api_get_max_concurrency)
-        request.app.state.github_api_get_semaphore = semaphore
-    return semaphore
-
-
 @router.post("/github/api/get", response_model=GitHubApiGetResponse)
 async def github_api_get(
     body: GitHubApiGetRequest,
@@ -522,8 +509,8 @@ async def github_api_get(
     )
     # Bound concurrent generic reads so an injected agent can't exhaust the hub's
     # sockets/memory by fanning out api_get calls (each opens its own client plus
-    # a token-broker fetch). Released before the response is built.
-    async with _api_get_semaphore(request, config):
+    # a token-broker fetch). The semaphore is sized once at app startup (lifespan).
+    async with request.app.state.github_api_get_semaphore:
         client = await _github_client(request, config)
         try:
             result = await client.api_get(
@@ -557,14 +544,9 @@ async def github_api_get(
             "github_api_get_truncation",
             extra={"path": body.path, "media_type": body.media_type, "content_type": result.content_type},
         )
-    return GitHubApiGetResponse(
-        body=result.body,
-        body_text=result.body_text,
-        truncated=result.truncated,
-        has_more=result.has_more,
-        content_type=result.content_type,
-        status=result.status,
-    )
+    # api_get already returns the response model (sanitized + capped), so no
+    # field-by-field copy is needed.
+    return result
 
 
 @router.post("/github/items/{number}/read", response_model=GitHubItemReadResponse)
@@ -787,13 +769,14 @@ def _validate_github_repo(repo: str) -> None:
 def _validate_github_path(path: str) -> None:
     candidate = path.strip()
     # Reject traversal, absolute paths, backslashes, and control characters
-    # before the value is ever placed into an upstream URL.
+    # before the value is ever placed into an upstream URL. Spaces are legal in a
+    # file path, so only the shared control/DEL/zero-width class is rejected here.
     if (
         not candidate
         or candidate.startswith("/")
         or "\\" in candidate
         or ".." in candidate.split("/")
-        or any(ord(ch) < 0x20 for ch in candidate)
+        or has_control_or_nonprintable(candidate)
     ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid GitHub file path")
 
@@ -807,7 +790,8 @@ def _validate_github_ref(ref: str) -> None:
         or candidate.startswith("-")
         or "\\" in candidate
         or ".." in candidate
-        or any(ord(ch) < 0x20 or ch.isspace() for ch in candidate)
+        or any(ch.isspace() for ch in candidate)
+        or has_control_or_nonprintable(candidate)
     ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid GitHub ref")
 

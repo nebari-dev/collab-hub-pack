@@ -17,6 +17,7 @@ from collab_hub_api.connectors.github_client import (
     GitHubApiRequestError,
     GitHubClient,
     GitHubUpstreamError,
+    _raise_for_github_status,
 )
 from collab_hub_api.connectors.models import (
     GITHUB_READONLY_SCOPES,
@@ -1330,6 +1331,18 @@ async def test_api_get_refuses_userinfo_spoof_redirect(monkeypatch):
         await _api_client().api_get(path="/repos/a/b")
 
 
+async def test_api_get_refuses_malformed_redirect_location(monkeypatch):
+    # A malformed upstream Location (unterminated IPv6 bracket) raises
+    # httpx.InvalidURL, which is NOT an httpx.HTTPError — it must degrade to the
+    # 422 refusal, not surface as an uncaught raw 500.
+    def handler(request: httpx.Request) -> Response:
+        return Response(301, headers={"Location": "https://[bad"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b")
+
+
 async def test_api_get_aborts_oversized_body(monkeypatch):
     pulled = {"chunks": 0}
 
@@ -1400,6 +1413,45 @@ async def test_api_get_forbidden_without_rate_signal_is_upstream(monkeypatch):
     with pytest.raises(GitHubUpstreamError) as excinfo:
         await _api_client().api_get(path="/repos/a/b")
     assert excinfo.value.status_code == 403
+
+
+# _raise_for_github_status is the SHARED classifier (every curated GitHub tool
+# routes 4xx/5xx through it), so pin its 403->429 behavior directly, not only via
+# api_get, which can be feature-flagged off.
+def test_raise_for_github_status_403_retry_after_keeps_upstream_detail():
+    # A 403 carrying Retry-After can be a permanent WAF/abuse block, not a rate
+    # limit: normalize to 429 (keep the backoff hint) WITHOUT discarding GitHub's
+    # own structured reason behind the generic message.
+    response = httpx.Response(
+        403,
+        headers={"retry-after": "45", "x-ratelimit-remaining": "99"},
+        json={"message": "Access blocked by our WAF"},
+    )
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        _raise_for_github_status(response, operation="curated read")
+    exc = excinfo.value
+    assert exc.status_code == 429
+    assert exc.retry_after == "45"
+    assert "retry after 45 seconds" in str(exc)
+    assert "Access blocked by our WAF" in str(exc)  # upstream detail not dropped
+
+
+def test_raise_for_github_status_http_date_retry_after_not_labeled_seconds():
+    # Retry-After is legally an HTTP-date (RFC 9110), not just delta-seconds. It
+    # must NOT be interpolated as "<date> seconds" into the model-visible detail,
+    # though the raw value still rides the retry_after field for the header.
+    response = httpx.Response(
+        403,
+        headers={"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT", "x-ratelimit-remaining": "0"},
+        json={"message": "API rate limit exceeded"},
+    )
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        _raise_for_github_status(response, operation="curated read")
+    exc = excinfo.value
+    assert exc.status_code == 429
+    assert "seconds" not in str(exc)  # a date was never mislabeled as seconds
+    assert exc.retry_after == "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert "API rate limit exceeded" in str(exc)
 
 
 async def test_api_get_diff_406_friendly_message(monkeypatch):

@@ -536,6 +536,9 @@ connectors:
     # incident: set to false and redeploy/restart to disable it (read once at
     # startup, so this is not a live toggle).
     apiGetEnabled: true
+    # -- Max concurrent generic GitHub reads per API process. The throttle short
+    # of the full kill switch during an abuse incident (read once at startup).
+    apiGetMaxConcurrency: 8
 
 userDirectory:
   # -- Whether to configure Collab Hub API access to the hub user directory.

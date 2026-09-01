@@ -152,10 +152,12 @@ membership check). The read is origin-locked
 turned off per hub with `api_get_enabled: false` without affecting the curated
 reads.
 
-The curated endpoints return no GitHub URL of any kind: the Collab chat renderer
-crashes on link-shaped text anywhere in tool output (apollo-desktop#365), so all
-provider text is link-sanitized and `repo`/`number` (not URLs) are what a
-follow-up read needs. `api/get` uses a **code-aware** variant of that sanitizer:
+The curated endpoints return no GitHub URL of any kind: all provider text is
+link-sanitized (bare domains included) and `repo`/`number` (not URLs) are what a
+follow-up read needs. This began as a workaround for a chat renderer that crashed
+on link-shaped text (apollo-desktop#365, now fixed) and is retained as
+defense-in-depth against link/markup injection through tool output. `api/get`
+uses a **code-aware** variant of that sanitizer:
 it still masks scheme-, `www.`-, markdown-, and `mailto`-shaped links, but
 preserves code-shaped text (dotted identifiers like `config.py`, SHAs, refs) so
 diffs and file contents come back intact.

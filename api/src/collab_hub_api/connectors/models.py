@@ -596,6 +596,19 @@ class GitHubReposListResponse(UntrustedConnectorResponse):
     repos: list[GitHubRepo]
 
 
+def coerce_github_param_value(value: str | int | bool) -> str:
+    """Single authority for the GitHub query-param wire format.
+
+    ``bool`` -> ``"true"``/``"false"`` (httpx's lowercase casing, not ``str(True)``
+    -> ``"True"``); every other scalar -> ``str``. Both ``GitHubApiGetRequest``'s
+    validator and ``GitHubClient.api_get`` call this so the route and direct-client
+    callers can never disagree on how a value is serialized.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 class GitHubApiGetRequest(BaseModel):
     """A GET against an arbitrary GitHub REST path — the generic long-tail read.
 
@@ -616,15 +629,17 @@ class GitHubApiGetRequest(BaseModel):
     @classmethod
     def _coerce_params(cls, value: dict[str, str | int | bool]) -> dict[str, str]:
         # pydantic 2.13 does not coerce int->str, so accept scalars and normalize
-        # here (bool -> lowercase, matching httpx). Bounds keep a single request
-        # from smuggling an oversized query.
+        # to the wire form here. The bool/str rule is the single authority in
+        # coerce_github_param_value (the client re-applies it), so a future param
+        # widening can't let route traffic diverge from direct-client callers.
+        # Bounds keep a single request from smuggling an oversized query.
         if len(value) > 20:
             raise ValueError("params accepts at most 20 entries")
         coerced: dict[str, str] = {}
         for key, raw in value.items():
             if len(key) > 64:
                 raise ValueError("each params key must be at most 64 characters")
-            text = "true" if raw is True else "false" if raw is False else str(raw)
+            text = coerce_github_param_value(raw)
             if len(text) > 256:
                 raise ValueError("each params value must be at most 256 characters")
             coerced[key] = text
