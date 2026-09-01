@@ -346,7 +346,8 @@ def make_routers(
                 # The page's copy for `email_not_verified` describes a
                 # verification email, which a deployment that does not require
                 # verification never sends. Same value the acceptance check and
-                # the invitation email read.
+                # the invitation email read, fixed for the process's life --
+                # which is why the copy it selects is built once, above.
                 require_verified_email=require_verified_email,
             ),
             path=ACCEPT_PAGE_PATH,

@@ -136,7 +136,7 @@ did not come across, which is worth reconciling separately.
 """
 
 
-UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z_0-9 /]*\]")
+UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z /]*\]")
 """Matches any ``[UPPER CASE]`` slot still present in a rendered body.
 
 Used by :func:`render_for_automated_delivery` as a **runtime** check, not only
@@ -144,6 +144,14 @@ a test one. An operator pasting the message can see and fill a leftover
 placeholder; a server sending it cannot, and the invitee would read
 ``[DESKTOP APP DOWNLOAD / INSTALL INSTRUCTIONS]`` verbatim. So the automated
 path refuses to produce a body that still contains one.
+
+**Deliberately narrower than :data:`CONDITIONAL_MARKER`, which is wide enough
+for underscores.** This pattern is applied to a body that already contains
+operator-supplied ``app_instructions``, so widening it to ``[A-Z_0-9 ]``
+made it match bracketed tokens in *their* copy -- ``Download [MACOS_ARM64]
+build`` began failing every send with ``invalid_invitation_email``, and the
+message is dropped so nobody saw why. The underscore case that widening was
+for belongs to the marker pattern, which only ever sees the template.
 """
 
 AUTOMATED_GREETING_NAME = "there"

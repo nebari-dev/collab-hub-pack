@@ -398,42 +398,55 @@ def test_both_variants_are_resolved_once() -> None:
     assert "verify" not in module.BODIES[False].lower()
 
 
-def test_configuring_invitation_email_resolves_the_copy_at_startup() -> None:
-    """The property the docstring claims, asserted where it can actually fail.
+@pytest.mark.parametrize(
+    ("app_instructions", "raises"),
+    [
+        ("Download from https://example.test/collab", False),
+        # An operator's own bracketed token. Legitimate copy: the placeholder net
+        # is scoped narrowly enough not to claim it, and a widening that did
+        # claim it failed every send silently.
+        ("Download the [MACOS_ARM64] build", False),
+        # A genuinely unresolvable placeholder. This must stop the deployment.
+        ("Download [SOME PLACEHOLDER] build", True),
+    ],
+)
+def test_configuring_invitation_email_renders_a_probe_at_startup(
+    app_instructions, raises
+) -> None:
+    """Construction renders the message the send path renders.
 
-    `set(BODIES) == {True, False}` is true whenever the *test* imports the
-    module, so it could never see the real defect: nothing imported this module
-    at app startup, because its only importer was function-local inside
-    `render_invitation_email`. The resolution therefore happened on the first
-    send, where an unresolvable template raises into `deliver`'s
-    `except (TypeError, ValueError)`, is recorded as `invalid_invitation_email`,
-    and repeats for every subsequent send.
+    Resolving the template alone was not enough, and the reason is the shape of
+    three consecutive defects rather than any one of them: the placeholder
+    refusal runs inside `render_for_automated_delivery`, whose caller sits inside
+    `deliver`'s `except (TypeError, ValueError)`, where the message is dropped by
+    design. So each fix moved the failure to a different input reaching the same
+    swallow -- an unresolvable marker, then a widened pattern matching an
+    operator's own brackets.
 
-    So the assertion is that *constructing the delivery* is what touches it --
-    beside the `app_instructions` check, which is where startup validation for
-    invitation email already lives.
+    A probe render at construction closes that class, and **the raising case is
+    the proof**: if construction did not render, a body it cannot render would
+    not raise. An earlier version of this test asserted the same thing by
+    dropping the module from `sys.modules` and watching it come back, which left
+    two live copies of the module behind -- disarming the placeholder test later
+    in this file, because its top-level import was bound to the first copy while
+    the reimport produced a second.
     """
 
-    import sys
-
     from collab_hub_api.frames.invitation_email import ConfiguredInvitationEmailDelivery
-
-    module_name = "collab_hub_api.web.onboarding_email"
 
     class _Provider:
         def send(self, message, *, invitation_id):  # pragma: no cover - never called
             raise AssertionError("construction must not send")
 
-    # Drop the module so the import has to happen for real, then construct the
-    # delivery the way configuration does at startup.
-    sys.modules.pop(module_name, None)
-    assert module_name not in sys.modules
-    ConfiguredInvitationEmailDelivery(
-        _Provider(),
-        accept_url="https://web.test/invite",
-        app_instructions="Download it",
-    )
-    assert module_name in sys.modules, (
-        "constructing the delivery must resolve the copy; otherwise the "
-        "resolution happens on the first send, where deliver() swallows the error"
-    )
+    def construct():
+        return ConfiguredInvitationEmailDelivery(
+            _Provider(),
+            accept_url="https://web.test/invite",
+            app_instructions=app_instructions,
+        )
+
+    if raises:
+        with pytest.raises(ValueError, match="cannot be rendered"):
+            construct()
+    else:
+        assert construct() is not None

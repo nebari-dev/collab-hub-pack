@@ -459,11 +459,12 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "Confirm your email address first",
         (
             "We can only accept an invitation for an email address your identity"
-            " provider has confirmed, and this account's address is not confirmed"
-            " yet.",
-            "Follow the verification link that was sent to your mailbox, then"
-            " come back to this tab — or open your invitation link again. Your"
-            " invitation has not been used.",
+            " provider has confirmed. Either this account's address is not"
+            " confirmed yet, or the sign-in did not carry an address at all.",
+            "If a confirmation email was sent to you, follow its link and come"
+            " back to this tab — or open your invitation link again. If you were"
+            " never asked to confirm an address, ask whoever invited you for"
+            " help. Your invitation has not been used.",
         ),
     ),
     (
@@ -595,9 +596,10 @@ def _validate_overrides() -> None:
         bad = sorted(i for i in overrides if not 0 <= i < limit)
         if bad:
             raise ValueError(f"relaxed copy for {state!r} names paragraphs out of range: {bad}")
+        # Run the substitution itself, so this is the only place the indices are
+        # checked and the code path a request takes is the one startup proved.
+        _with_overrides(states[state], overrides)
 
-
-_validate_overrides()
 
 
 PAGE_STATES: tuple[str, ...] = tuple(name for name, _, _ in _SECTIONS)
@@ -612,17 +614,21 @@ state named by the script exists as a section.
 def _with_overrides(paragraphs: tuple[str, ...], overrides: dict[int, str] | None) -> tuple[str, ...]:
     """One section's paragraphs, with individual ones replaced.
 
-    An index outside the tuple is a programming error rather than something to
-    absorb: it would mean a table entry that renders nothing, which is the
-    silent-inertness this table shape exists to avoid.
+    No range check here. :func:`_validate_overrides` runs this function over
+    every section at import, so by the time a request reaches it the indices are
+    known good -- and a second check would be unreachable code that also happens
+    to be the uncovered line. One implementation, exercised at startup.
     """
 
     if not overrides:
         return paragraphs
-    unknown = sorted(i for i in overrides if not 0 <= i < len(paragraphs))
-    if unknown:
-        raise ValueError(f"paragraph override index out of range: {unknown}")
     return tuple(overrides.get(i, text) for i, text in enumerate(paragraphs))
+
+
+# Called here rather than beside its definition: it exercises `_with_overrides`,
+# which is defined just above, so this is the earliest point at which the check
+# can run the code path a request takes.
+_validate_overrides()
 
 
 def _section(name: str, heading: str, paragraphs: tuple[str, ...], extra: str = "") -> str:
@@ -741,6 +747,14 @@ def acceptance_page(
     }
     # Copy only: neither table adds or removes a state, so the wire contract and
     # PAGE_STATES are identical either way -- asserted in the tests.
+    #
+    # **Built per request, and it has to be.** Review suggested memoizing this on
+    # the deployment boolean, on the reading that the sections depend on no
+    # per-request input. They do: `extras` carries `link`, `statement` and
+    # `renew`, each of which interpolates `root_path` -- read from
+    # `request.scope` precisely because a prefixed deployment changes it. Caching
+    # on the boolean alone would serve one request's prefix to another's page,
+    # which is a correctness bug traded for a string join.
     para_overrides = {} if require_verified_email else RELAXED_PARAGRAPHS
     head_overrides = {} if require_verified_email else RELAXED_HEADINGS
     sections = "".join(

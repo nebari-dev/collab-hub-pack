@@ -682,7 +682,6 @@ reassigned at the IdP just as a verification can be revoked. So the window
 keeps its value with half of its original justification unused, rather than
 being loosened because one reason weakened.
 
-
 Holding a session is not enough to redeem. Identity in the cookie is stable —
 a subject does not stop being that subject — which is what makes an eight-hour
 session acceptable for it. The verified-address pair is different in kind: it

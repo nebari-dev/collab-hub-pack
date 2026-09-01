@@ -17,7 +17,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from typing import Any, Protocol
@@ -176,26 +176,52 @@ class ConfiguredInvitationEmailDelivery:
                 "app_instructions is required when invitation email is enabled"
             )
         self._app_instructions = app_instructions
-        # Resolve the copy now, for the same reason the check above happens
-        # here: a deployment that enables invitation email and cannot render it
-        # should fail where somebody is watching.
+        # Render one probe message now, for the same reason the check above
+        # happens here: a deployment that enables invitation email and cannot
+        # produce a message should fail where somebody is watching.
         #
-        # This is what makes the module's "resolved at import" property real.
-        # Its only other importer is function-local inside
-        # `render_invitation_email`, so without this line the resolution happens
-        # on the *first send* -- and an unresolvable template then raises into
-        # `deliver`'s `except (TypeError, ValueError)` below, which drops the
-        # message by design and records `invalid_invitation_email`. Every
-        # subsequent send repeats it, because a failed import is evicted from
-        # `sys.modules`. The result would be total, silent loss of invitation
-        # email under an error code that points at recipient validation.
+        # **A probe render rather than a template check, and that distinction is
+        # the whole point.** Resolving the copy alone proved the *template* was
+        # sound and left `render_for_automated_delivery`'s placeholder refusal
+        # running per send -- into the `except (TypeError, ValueError)` below,
+        # which drops the message by design. Three review rounds running, a
+        # change in this module traded one failure for a sharper one inside that
+        # same swallow: first an unresolvable marker, then a widened pattern
+        # that matched brackets in an operator's own `app_instructions`
+        # ("Download [MACOS_ARM64] build" failed every send, silently). Each
+        # instance was fixed and the class stayed open.
         #
-        # Imported locally rather than at module scope to keep the reason the
-        # other import is local: nothing of the browser surface should reach the
-        # mail path at import time.
-        from ..web.onboarding_email import BODIES
+        # Rendering the message the send path renders, with this deployment's
+        # actual `app_instructions`, closes the class: anything that would make
+        # a real send unrenderable makes construction raise instead.
+        self._probe_render()
 
-        del BODIES
+    def _probe_render(self) -> None:
+        """Render a throwaway message, to fail at startup rather than per send.
+
+        Imported locally to keep the reason the send path's import is local:
+        nothing of the browser surface should reach the mail path at import
+        time.
+
+        The probe values are deliberately unroutable -- nothing is sent, and a
+        reader who finds one of these strings in a log knows it came from here.
+        """
+
+        from ..web.onboarding_email import render_for_automated_delivery
+
+        try:
+            render_for_automated_delivery(
+                link="https://startup-probe.invalid/invite#token=probe",
+                recipient="startup-probe@invalid",
+                expires_at=datetime(2000, 1, 1, tzinfo=UTC),
+                app_instructions=self._app_instructions,
+                require_verified_email=self._require_verified_email,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "invitation email is enabled but a message cannot be rendered, so no"
+                f" invitation could be sent: {exc}"
+            ) from exc
 
     def deliver(
         self,
@@ -402,7 +428,7 @@ def render_invitation_email(
     organization_name: str | None,
     expires_at: datetime,
     app_instructions: str,
-    require_verified_email: bool,
+    require_verified_email: bool = True,
 ) -> InvitationEmailMessage:
     """Render the **approved onboarding copy** for one invitation (#93).
 
@@ -427,6 +453,16 @@ def render_invitation_email(
     the failure above. Importing it costs nothing but strings —
     :mod:`..web.data_statement` defers its page import for exactly this reason —
     so no browser-surface machinery reaches the mail path.
+
+    ``require_verified_email`` **does** default here, unlike the other
+    pass-throughs. The fail-loud argument for requiring it is that a dropped
+    keyword should be a ``TypeError`` at the first call -- but this function's
+    only caller is inside :meth:`ConfiguredInvitationEmailDelivery.deliver`'s
+    ``try``, whose ``except (TypeError, ValueError)`` turns that into a dropped
+    email with the message never logged. So requiring it buys a silent outage
+    where defaulting it buys copy that over-explains. The seam is still covered:
+    the delivery threads the value and a test captures what the provider was
+    handed.
 
     ``organization_name`` is accepted and deliberately unused: the approved copy
     is org-neutral, because operator invitations may *create* an organization

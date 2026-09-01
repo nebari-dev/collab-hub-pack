@@ -2508,6 +2508,10 @@ def test_live_accepting_an_org_creating_invitation_makes_exactly_one_neutral_org
         "invitation_id": issued.invitation.id,
         "role": ROLE_OWNER,
         "org_created": True,
+        # #190: which acceptances took the relaxed path has to be answerable
+        # after the fact. The membership row cannot say -- it stores the matched
+        # address either way.
+        "verified_email_required": True,
     }
 
 

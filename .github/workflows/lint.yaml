@@ -52,8 +52,16 @@ jobs:
           # used to render "false" -- relaxing Gate B on a deployment that never
           # asked, with values that still read `true`. Neither the untouched
           # default nor an explicit false covers that shape.
-          for null_form in "--set frames.invitations.requireVerifiedEmail=null" "-f /tmp/null-value.yaml"; do
-            printf 'frames:\n  invitations:\n    requireVerifiedEmail:\n' >/tmp/null-value.yaml
+          # Both depths of the same reflowing mistake: the leaf emptied, and the
+          # key removed with its `invitations:` header left behind. The second
+          # used to be a template error rather than a fallback.
+          printf 'frames:\n  invitations:\n    requireVerifiedEmail:\n' >/tmp/null-value.yaml
+          printf 'frames:\n  invitations:\n' >/tmp/null-parent.yaml
+          for null_form in \
+            "--set frames.invitations.requireVerifiedEmail=null" \
+            "--set frames.invitations=null" \
+            "-f /tmp/null-value.yaml" \
+            "-f /tmp/null-parent.yaml"; do
             # shellcheck disable=SC2086
             helm template helm/collab-hub ${null_form} >/tmp/verify-null.yaml
             if grep -q "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-null.yaml; then

@@ -1901,8 +1901,13 @@ def test_the_not_verified_copy_does_not_promise_mail_a_relaxed_deployment_never_
     strict = acceptance_page(require_verified_email=True)
     relaxed = acceptance_page(require_verified_email=False)
 
-    assert "verification link that was sent" in strict
-    assert "verification link that was sent" not in relaxed
+    # The strict copy now covers both conditions this state can mean -- an
+    # unconfirmed address, and a sign-in that carried none -- because the second
+    # is reachable on a strict deployment too when a client's scopes omit
+    # `email`, and "follow the verification link" is no remedy for it.
+    assert "follow its link" in strict
+    assert "confirmation email" in strict
+    assert "confirmation email" not in relaxed
     assert "could not read an email address" in relaxed
 
     # The sign-in state too. Its mention is hedged ("if you have to open an
@@ -1958,6 +1963,30 @@ def test_every_override_names_a_state_that_exists() -> None:
         assert set(table) <= set(PAGE_STATES), sorted(set(table) - set(PAGE_STATES))
 
 
+@pytest.mark.parametrize(
+    ("table", "entry", "message"),
+    [
+        ("RELAXED_PARAGRAPHS", {"no_such_state": {0: "x"}}, "states that do not exist"),
+        ("RELAXED_HEADINGS", {"no_such_state": "x"}, "states that do not exist"),
+        ("RELAXED_PARAGRAPHS", {"email_not_verified": {99: "x"}}, "out of range"),
+    ],
+)
+def test_the_import_time_validator_refuses_a_bad_table(monkeypatch, table, entry, message) -> None:
+    """The validator's raise branches, which nothing exercised.
+
+    `test_every_override_names_a_state_that_exists` re-asserts the same set
+    relation from outside rather than constructing a bad table, so the branches
+    that make the assertion enforceable were the file's uncovered lines --
+    93% patch coverage against a 90 floor, so CI had nothing to say either.
+    """
+
+    from collab_hub_api.web import acceptance
+
+    monkeypatch.setattr(acceptance, table, entry)
+    with pytest.raises(ValueError, match=message):
+        acceptance._validate_overrides()
+
+
 def test_copy_that_does_not_vary_is_stored_once() -> None:
     """The override table must not duplicate text it does not change.
 
@@ -2009,18 +2038,13 @@ async def test_the_app_renders_the_page_copy_the_configuration_asks_for(tmp_path
     from collab_hub_api.web.acceptance import ACCEPT_PAGE_PATH
 
     for flag, expect_verification_copy in ((True, True), (False, False)):
-        # The invite routers mount for any `web.enabled` build, so nothing here
-        # is needed to reach the page; what makes membership mode apply is the
-        # autouse `membership_env` fixture above, which sets the environment
-        # variable `org_source_is_membership()` reads. A `frames.auth` key would
-        # be inert -- `FramesConfig` has no such field and does not forbid
-        # extras, so it is silently dropped.
-        #
-        # The Postgres URL is here only so the invitation service builds rather
-        # than resolving to the unavailable one. Nothing connects: the page is
-        # static HTML and the lifespan is never entered.
+        # No Postgres URL. The page route mounts on `config.web.enabled` alone,
+        # never on invitation-service availability, so the URL bought nothing --
+        # and it was not free: `make_app`'s schema-version check dialled it,
+        # taking the test from 0.17s to 10.2s in repeated connection failures,
+        # with one run ending in a `PythonFinalizationError` from the pool's
+        # `__del__`. The comment that used to sit here claimed nothing connects.
         values = web_values(tmp_path, idp, web={"public_base_url": PUBLIC_BASE_URL})
-        values["frames"]["postgres"] = {"url": "postgresql://u:p@127.0.0.1:1/db"}
         values["frames"]["invitations"] = {"require_verified_email": flag}
         app = make_app(Config.parse(values))
         async with web_client(app) as client:

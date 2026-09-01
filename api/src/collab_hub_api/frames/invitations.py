@@ -1380,6 +1380,15 @@ class PostgresInvitationService:
                     "invitation_id": invitation.id,
                     "role": invitation.granted_role,
                     "org_created": invitation.creates_organization,
+                    # Whether this acceptance required a verified address (#190).
+                    # The docs describe the relaxed trade honestly -- "usable by
+                    # anyone who obtains the link" -- but without this there is
+                    # no way to answer "which memberships were granted without a
+                    # verified address" during an incident, and the membership
+                    # row cannot say: it stores the matched address either way.
+                    # One boolean makes the documented trade reviewable after
+                    # the fact.
+                    "verified_email_required": self._require_verified_email,
                 },
             ) as event:
                 acceptance = self._redeem(
