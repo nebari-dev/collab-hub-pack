@@ -372,6 +372,57 @@ def test_s3_list_frames_warns_when_it_skips(caplog):
     assert gone in warnings[0].getMessage()
 
 
+def test_s3_list_frames_returns_empty_without_reading_anything():
+    """An empty store short-circuits before the thread pool."""
+
+    fake = RecordingFakeS3({})
+    store = _s3_store_with(fake)
+
+    assert store.list_frames("org-a", "workspace-a") == []
+    assert fake.requested == []
+
+
+def test_s3_read_metadata_reraises_errors_that_are_not_missing_objects():
+    """A permissions failure must not masquerade as a deleted Frame.
+
+    ``list_frames`` skips FrameNotFoundError. If anything else were folded into
+    it, an AccessDenied would silently shorten every page instead of failing.
+    """
+
+    frame_id = "0" * 32
+
+    class DeniedS3(RecordingFakeS3):
+        def get_object(self, Bucket: str, Key: str):  # noqa: N803 - boto3 casing
+            raise FakeS3ClientError("AccessDenied", 403)
+
+    store = _s3_store_with(DeniedS3({frame_id: _metadata_payload(frame_id)}))
+
+    with pytest.raises(FakeS3ClientError):
+        store._read_metadata(frame_id)
+    with pytest.raises(FakeS3ClientError):
+        store.list_frames("org-a", "workspace-a")
+
+
+def test_s3_store_sizes_the_connection_pool_to_the_read_fan_out():
+    """Botocore's default pool of 10 would serialise the surplus list workers."""
+
+    store = S3FrameStore(bucket="bucket", region_name="us-east-1")
+
+    assert store.s3.meta.config.max_pool_connections == S3FrameStore.LIST_WORKERS
+    assert getattr(store.s3.meta.config, "s3", None) in (None, {})
+
+
+def test_s3_store_keeps_path_addressing_for_s3_compatible_endpoints():
+    store = S3FrameStore(
+        bucket="bucket",
+        endpoint_url="http://localhost:9000",
+        region_name="us-east-1",
+    )
+
+    assert store.s3.meta.config.s3["addressing_style"] == "path"
+    assert store.s3.meta.config.max_pool_connections == S3FrameStore.LIST_WORKERS
+
+
 def test_s3_list_frames_still_applies_filters():
     ids = [f"{index:032x}" for index in range(3)]
     fake = RecordingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
