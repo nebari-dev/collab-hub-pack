@@ -9,8 +9,10 @@ and the seam the ADR assumes.
 
 Contents:
 
-- **This page** — vocabulary, the seam in one paragraph, what stays inside a
-  Cog, a review checklist, and how the open issues map to the ADR.
+- **This page** — the seam in one paragraph, what stays inside a Cog, a
+  review checklist, and how the open issues map to the ADR.
+- [The glossary](../GLOSSARY.md) — every term used in the issues, the ADR,
+  and these docs, defined in one place with citations.
 - [The Op–Cog seam](op-cog-seam.md) — the four things an Op step needs from
   a Cog, and why nothing else crosses.
 - [The result envelope](result-envelope.md) — the shape a Cog's entry point
@@ -21,98 +23,12 @@ Contents:
 ## Vocabulary
 
 These terms are used precisely throughout the issues, the ADR, and the
-code. When a word here has a narrower meaning than its everyday one, the
-narrower meaning is the one intended.
-
-**Cog.** A packaged, installable AI worker. A *complete* Cog is the model,
-the weights, the model runtime (including any harness), and the context. A
-Cog is described by its manifest (`cog.yaml`, following the shared Cog
-specification as a profile) and runs itself: it carries its own pinned
-environment and its own entry points. The hub never supplies a Cog's
-runtime.
-
-**Cog classes.** Declared in the manifest, not separate code paths:
-*model* Cogs serve a model (or describe one the environment serves — a
-*descriptor* Cog); *harness* Cogs supply interaction machinery; *context*
-Cogs carry prompts, schemas, and frames and point at a model rather than
-carrying one; *complete* Cogs carry all three. Classes compose through
-`provides`/`requires` (ADR-0001 D3).
-
-**Entry point.** A declared, invokable interface of a Cog. Two audiences:
-*usage* entry points (`ask`, `chat`, …) face end users and the Op layer;
-*lifecycle* entry points (`resolve`, `serve`, `check`, `eval`, …) face the
-hosting environment. A Cog's usage entry points are its **bundled ops** —
-single-Cog, zero-gate operations shipped in the package.
-
-**Op.** A supervised, multi-step workflow that a person kicks off. Ops
-compose Cogs' usage entry points into steps and wrap Frames, Guards,
-Gates, and Tracks around them. "Run a Cog once" and "a five-step proposal
-with human sign-off" are the same concept at two scales.
-
-**Hosts / invokes.** The hub *hosts* a Cog by invoking its lifecycle entry
-points (install, resolve, serve, check) and *invokes* a Cog by calling its
-usage entry points. "Run a Cog" in orchestrator code should always mean one
-of those two verbs — never "execute the Cog's internals."
-
-**Materialize / worker.** To materialize a Cog is to bring up a running
-instance of its `serve` entry point where the hub can reach it — on
-Kubernetes, a pod behind a Service. That running instance is a **worker**.
-Materialization happens behind the executor interface (ADR-0001 D5,
-invariant 2); teardown reclaims it. *Install* is earlier and separate:
-fetching the package, provisioning its environment, running its checks,
-resolving its requirements, recording the binding, and deriving its
-catalog card. Installing makes a Cog *invokable*; the first invocation
-materializes a worker.
-
-**Satisfier / resolution / binding record.** A Cog declares what it
-`requires` (a model capability, a harness, a connector). A *satisfier* is
-something in the environment that `provides` it. *Resolution* is the Cog's
-own `resolve` lifecycle entry point selecting satisfiers from the inventory
-the hosting environment offers. The result is the **binding record**: which
-pinned model, which endpoint, which harness, which evidence — the identity
-that every result and every Track entry carries. Credentials appear in a
-binding only by reference, never as values.
-
-**Locality.** Where a satisfier runs and where data goes when it is used —
-in-cluster, on-prem, or an external provider. A bind-time constraint that
-resolution enforces so data stays where policy allows; the model
-[sensitivity](sensitivity.md) generalizes.
-
-**Nebi.** The package manager for Cogs (ADR-0001 D6): `nebi pull` installs a
-Cog's files, `nebi run` executes one of its entry points, and publishing
-goes through Nebi to an OCI registry the hub indexes.
-
-**Capability list.** What a hosting environment publishes: the satisfiers it
-offers and the requirements it places on Cogs that run there (envelope
-shape, io values, entry-point forms). Environment-owned; needs no
-ratification in the Cog spec.
-
-**Frame.** Organizational context supplied to a step — saved Markdown
-context, org policy, the material a Cog is asked to work from.
-
-**Contract check.** A Cog's own in-package validation of its declared
-contract (schema, grounding, citation, identity). Self-reported in the
-envelope's `problems` list. *Never* call these Guards.
-
-**Guard.** An independent, system-side verifier of the *system's*
-requirements, run by the Op layer on a step's result envelope. A Guard
-produces findings; it does not decide.
-
-**Gate.** The decision point on a step: ok / ok-with-problems / escalate to
-a human. Gates consume the envelope (payload and problems) and Guard
-findings. Gates decide; Cogs never do. A gate is declared on the Op step,
-not implemented inside the Cog.
-
-**Track.** The durable, append-only record of a run: which Cogs ran under
-which bindings, which Guards and Gates fired, who approved, what came out.
-Status is derived from the Track, never held only in memory. The Track is
-the accountability record — a Gate signature is only meaningful because
-the Track can say *which* model, *which* weights, *which* evidence produced
-the thing that was signed.
-
-**Result envelope.** The structured return of a usage entry point: `ok`,
-`payload`, `problems`, `binding`, plus usage and timing. See
-[the envelope](result-envelope.md).
+code, and they all live in **[the glossary](../GLOSSARY.md)** — one page,
+every term, each entry citing the whitepaper section or ADR decision that
+defines it. When a word there has a narrower meaning than its everyday
+one, the narrower meaning is the one intended. Read the glossary before
+the rest of this directory; the notes below assume its vocabulary
+(seam, envelope, worker, binding record, Guard vs contract check).
 
 ## The seam in one paragraph
 
