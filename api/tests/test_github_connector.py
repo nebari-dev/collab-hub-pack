@@ -1128,17 +1128,23 @@ async def test_github_read_project_item_assignees_and_labels(tmp_path, monkeypat
 
 
 def _counts_handler(*, read_node, options, aggregates, status_counts, fail_dsl=False, captured_variables=None):
-    """Route POST /graphql three ways: the enumeration read, the aggregate count
-    query (A1, marked by 'statusField:'), and the per-status column query (A2,
-    marked by 's0: items'). fail_dsl simulates the board-filter DSL being rejected
-    by the API, so the count path falls back to sampling the enumerated items."""
+    """Route POST /graphql three ways by GraphQL operation name: the enumeration
+    read (ProjectRead), the aggregate count query (ProjectCounts), and the
+    per-status column query (ProjectStatusCounts). fail_dsl simulates the
+    board-filter DSL being rejected by the API, so the count path falls back to
+    sampling the enumerated items."""
 
     def handler(request: httpx.Request) -> Response:
         if not request.url.path.endswith("/graphql"):
             return Response(404, json={"message": "Not Found"})
         payload = json.loads(request.content.decode("utf-8"))
         query = payload["query"]
-        if "statusField:" in query:
+        if "ProjectStatusCounts" in query:
+            if captured_variables is not None:
+                captured_variables.update(payload["variables"])
+            node = {"projectV2": {f"s{i}": {"totalCount": c} for i, c in enumerate(status_counts)}}
+            return Response(200, json={"data": {"organization": node, "user": None}})
+        if "ProjectCounts" in query:
             if fail_dsl:
                 return Response(200, json={"errors": [{"message": "unknown query filter"}]})
             node = {
@@ -1147,11 +1153,6 @@ def _counts_handler(*, read_node, options, aggregates, status_counts, fail_dsl=F
                     **{alias: {"totalCount": n} for alias, n in aggregates.items()},
                 }
             }
-            return Response(200, json={"data": {"organization": node, "user": None}})
-        if "s0: items" in query:
-            if captured_variables is not None:
-                captured_variables.update(payload["variables"])
-            node = {"projectV2": {f"s{i}": {"totalCount": c} for i, c in enumerate(status_counts)}}
             return Response(200, json={"data": {"organization": node, "user": None}})
         return Response(200, json={"data": {"organization": read_node, "user": None}})
 
@@ -1164,11 +1165,14 @@ async def test_github_read_project_authoritative_counts(tmp_path, monkeypatch):
     handler = _counts_handler(
         read_node=_read_node(),  # totalCount 2 -> matches the authoritative total
         options=["Backlog", "In progress", "Done"],
+        # A board draft matches is:issue too, so is:issue counts the draft (1) and
+        # board_draft (is:draft is:issue) isolates it; issue = 1 - 1 = 0 real
+        # issues, the draft lands in the draft bucket, and the PR under is:pr.
         aggregates={
             "total": 2,
-            "issue": 0,
+            "issue": 1,
             "pull_request": 1,
-            "draft": 1,
+            "board_draft": 1,
             "opened": 1,
             "closed": 1,
             "no_status": 0,
@@ -1208,6 +1212,72 @@ async def test_github_read_project_authoritative_counts(tmp_path, monkeypatch):
     assert counts["by_state"] == {"open": 1, "closed": 1}
 
 
+async def test_github_authoritative_by_type_partitions_despite_draft_overlap(tmp_path, monkeypatch):
+    # A board of {board draft, draft PR, issue, merged PR}: is:issue counts the
+    # real issue AND the board draft (2), is:pr counts both PRs (2), is:draft
+    # counts the board draft AND the draft PR. Naively summing is:issue + is:pr +
+    # is:draft overcounts (6 > total 4). board_draft (is:draft is:issue) isolates
+    # the board draft so the buckets partition the total exactly.
+    handler = _counts_handler(
+        read_node=_read_node(),
+        options=["Todo", "Done"],
+        aggregates={
+            "total": 4,
+            "issue": 2,  # real issue + board draft (a board draft matches is:issue)
+            "pull_request": 2,  # merged PR + draft PR
+            "board_draft": 1,  # is:draft is:issue -> just the board draft
+            "opened": 2,
+            "closed": 2,
+            "no_status": 0,
+        },
+        status_counts=[3, 1],
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is True
+    # issue = is:issue(2) - board_draft(1); pr = is:pr(2); draft = board_draft(1).
+    assert counts["by_type"] == {"issue": 1, "pull_request": 2, "draft": 1, "redacted": 0}
+    assert sum(counts["by_type"].values()) == counts["total"] == 4
+
+
+async def test_github_authoritative_counts_downgrade_when_status_does_not_reconcile(tmp_path, monkeypatch):
+    # Both count queries "succeed", but the status columns + no_status (2) don't
+    # reconcile to the total (91) -- exactly what a non-"Status" single-select or
+    # a `"`-in-name option can silently produce. The self-check must refuse the
+    # authoritative stamp and degrade to the sampled fallback rather than ship
+    # wrong numbers with full authority.
+    node = _read_node_states()
+    node["projectV2"]["items"]["totalCount"] = 91
+    handler = _counts_handler(
+        read_node=node,
+        options=["Todo", "Done"],
+        aggregates={
+            "total": 91,
+            "issue": 91,
+            "pull_request": 0,
+            "board_draft": 0,
+            "opened": 4,
+            "closed": 6,
+            "no_status": 0,
+        },
+        status_counts=[1, 1],  # 1 + 1 + no_status(0) = 2, not 91
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False
+    assert counts["counted_items"] == 3  # bucketed from the enumerated sample, not the bogus server counts
+
+
 def test_project_filter_value_escapes_status_option_delimiters():
     # Status names are board-controlled. They are GraphQL variables, but their
     # contents are parsed by GitHub's Projects filter DSL before being counted.
@@ -1224,7 +1294,7 @@ async def test_github_project_status_count_escapes_filter_values(tmp_path, monke
             "total": 2,
             "issue": 1,
             "pull_request": 1,
-            "draft": 0,
+            "board_draft": 0,
             "opened": 2,
             "closed": 0,
             "no_status": 0,
@@ -1262,21 +1332,7 @@ async def test_github_status_counts_null_project_falls_back_instead_of_zeroing(t
             return Response(404, json={"message": "Not Found"})
         payload = json.loads(request.content.decode("utf-8"))
         query = payload["query"]
-        if "statusField:" in query:
-            agg_node = {
-                "projectV2": {
-                    "statusField": {"options": [{"name": "Todo"}, {"name": "Done"}]},
-                    "total": {"totalCount": 91},
-                    "issue": {"totalCount": 91},
-                    "pull_request": {"totalCount": 0},
-                    "draft": {"totalCount": 0},
-                    "opened": {"totalCount": 4},
-                    "closed": {"totalCount": 6},
-                    "no_status": {"totalCount": 0},
-                }
-            }
-            return Response(200, json={"data": {"organization": agg_node, "user": None}})
-        if "s0: items" in query:
+        if "ProjectStatusCounts" in query:
             return Response(
                 200,
                 json={
@@ -1284,6 +1340,20 @@ async def test_github_status_counts_null_project_falls_back_instead_of_zeroing(t
                     "errors": [{"message": "something went wrong resolving Query.organization.projectV2"}],
                 },
             )
+        if "ProjectCounts" in query:
+            agg_node = {
+                "projectV2": {
+                    "statusField": {"options": [{"name": "Todo"}, {"name": "Done"}]},
+                    "total": {"totalCount": 91},
+                    "issue": {"totalCount": 91},
+                    "pull_request": {"totalCount": 0},
+                    "board_draft": {"totalCount": 0},
+                    "opened": {"totalCount": 4},
+                    "closed": {"totalCount": 6},
+                    "no_status": {"totalCount": 0},
+                }
+            }
+            return Response(200, json={"data": {"organization": agg_node, "user": None}})
         return Response(200, json={"data": {"organization": node, "user": None}})
 
     _install_mock_client(monkeypatch, handler)
@@ -1323,7 +1393,6 @@ async def test_github_read_project_counts_fall_back_to_sample(tmp_path, monkeypa
     assert counts["authoritative"] is False
     assert counts["total"] == 91
     assert counts["counted_items"] == 3
-    assert counts["total_items"] == 91
     # Bucketed from the 3 enumerated items: issue(closed), issue(open), redacted.
     assert counts["by_state"] == {"open": 1, "closed": 1}
     assert counts["by_type"]["issue"] == 2

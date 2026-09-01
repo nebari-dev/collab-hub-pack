@@ -580,8 +580,10 @@ class GitHubProjectCounts(BaseModel):
     # default that matches the live board a human sees).
     total: int = 0
     archived_policy: str = "excluded"
-    # Per Status-column counts in board-column order; no_status is the blank
-    # column. by_status + no_status reconcile to total.
+    # Per Status-column counts; no_status is the blank column. When authoritative,
+    # columns are in board-column order and by_status + no_status reconcile to
+    # total. On the sampled fallback the buckets cover only counted_items, in
+    # first-seen order (zero-count columns omitted).
     by_status: list[GitHubStatusCount] = Field(default_factory=list)
     no_status: int = 0
     # Two independent partitions of total — do NOT cross-add. by_type keys:
@@ -591,11 +593,10 @@ class GitHubProjectCounts(BaseModel):
     by_type: dict[str, int] = Field(default_factory=dict)
     by_state: dict[str, int] = Field(default_factory=dict)
     # True when produced by server-side count queries, OR when the whole board
-    # was enumerated (counted_items == total_items) so the buckets are exact.
-    # False marks a truncated sample: breakdowns cover only counted_items.
+    # was enumerated (counted_items == total) so the buckets are exact. False
+    # marks a truncated sample: breakdowns cover only counted_items.
     authoritative: bool = False
     counted_items: int = 0
-    total_items: int = 0
 
 
 class GitHubProjectsListRequest(BaseModel):

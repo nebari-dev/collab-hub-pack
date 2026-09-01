@@ -602,7 +602,11 @@ async def read_github_project(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A positive GitHub project number is required")
     client = await _github_client(request, config)
     try:
-        project, items = await client.read_project(owner=body.owner, number=number, max_items=body.max_items)
+        # Counts run concurrently with the enumeration and never raise; only the
+        # board read's own failure surfaces here to be mapped.
+        project, items, counts = await client.read_project_with_counts(
+            owner=body.owner, number=number, max_items=body.max_items
+        )
     except GitHubUpstreamError as exc:
         logger.info(
             "github_project_read_upstream_error",
@@ -614,9 +618,6 @@ async def read_github_project(
     # project.items_count is the board's full size; flag when we returned fewer
     # so the caller doesn't reason over a partial board as if it were complete.
     total = project.items_count
-    # Aggregate counts are computed independently (server-side when possible), so
-    # they stay accurate even when the item list above is truncated.
-    counts = await client.project_counts(owner=body.owner, number=number, total=total, items=items)
     return GitHubProjectReadResponse(
         project=project,
         items=items,
