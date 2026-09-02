@@ -1700,6 +1700,7 @@ def test_the_unavailable_service_refuses_every_operation():
             email_verified=False,
         ),
         lambda: service.organization_name(ORG),
+        lambda: service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets"),
         lambda: service.server_now(),
     ):
         with pytest.raises(InvitationsUnavailableError):
@@ -3639,6 +3640,8 @@ def test_the_placeholder_predicate_agrees_with_the_schema_constant():
         "---",  # punctuation alone
         "Unnamed\u00a0organization",  # the placeholder with a no-break space
         "Unnamed   organization",  # the placeholder with a run of spaces
+        None,  # not a string at all
+        42,  # nor is a number
     ],
 )
 def test_an_unusable_organization_name_is_refused(bad):
@@ -3653,6 +3656,73 @@ def test_a_usable_organization_name_has_its_spacing_normalized_and_is_otherwise_
     assert validate_organization_name("Ünïcode & Co.") == "Ünïcode & Co."
     assert validate_organization_name("株式会社テスト") == "株式会社テスト"
     assert validate_organization_name("42") == "42"
+
+
+def test_naming_is_one_audited_read_then_write_and_refuses_without_writing(monkeypatch):
+    """Non-live pin of the one-shot transaction body (the live tests own the
+    real ``FOR UPDATE`` semantics): a missing organization refuses, a named
+    one refuses **without writing**, and the placeholder case writes exactly
+    one UPDATE, with the normalized name, on the audited connection it was
+    handed — never a second checkout."""
+
+    missing = object()
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self, current_name):
+            self._current = current_name
+            self.updates = []
+
+        def execute(self, sql, params=()):
+            if sql.lstrip().startswith("SELECT"):
+                assert "FOR UPDATE" in sql
+                return _Result(None if self._current is missing else {"name": self._current})
+            self.updates.append(params)
+            return _Result(None)
+
+    class _Event:
+        def __init__(self, conn):
+            self.conn = conn
+
+    audits = []
+
+    class _Audited:
+        def __init__(self, db, ctx, action, **kwargs):
+            audits.append((action, kwargs))
+
+        def __enter__(self):
+            return _Event(conn)
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(invitations_module, "audited", _Audited)
+    service = PostgresInvitationService(object())
+
+    conn = _Conn(missing)
+    with pytest.raises(invitations_module.OrgNotFoundError):
+        service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets")
+    assert conn.updates == []
+
+    conn = _Conn("Already Chosen")
+    with pytest.raises(invitations_module.OrganizationAlreadyNamedError):
+        service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets")
+    assert conn.updates == []
+
+    conn = _Conn("Unnamed organization")
+    named = service.name_organization(OPERATOR_CTX, org_id=ORG, name="  Acme  Widgets ")
+    assert named == "Acme Widgets"
+    assert conn.updates == [("Acme Widgets", ORG)]
+    action, kwargs = audits[-1]
+    assert action == invitations_module.AUDIT_ACTION_ORG_RENAME
+    assert kwargs["target_label"] == "Acme Widgets"
+    assert kwargs["org_id"] == ORG
 
 
 @live_postgres
