@@ -1,9 +1,8 @@
 # Threat model — generic GitHub read (`github_api_get`)
 
 Security sign-off doc for the generic GitHub REST read (`github_api_get`), added
-in this PR and its desktop counterpart openteams-ai/apollo-desktop#726. Live-ship
-is gated on this sign-off **and** the nexus read-live deploy sync
-(nebari-dev/nebari-nexus-pack#151).
+in this PR and its desktop-client counterpart change. Live-ship
+is gated on this sign-off **and** the hub deploy carrying this change.
 
 The feature adds ONE new capability: a single GET against an arbitrary GitHub
 REST path, exposed to the model through both apollo tool paths (Hermes plugin +
@@ -20,7 +19,7 @@ Collab Hub (`collab-hub-pack/api`):
   `api_get_enabled` config, structured logging, docs (routers/connectors.py,
   connectors/models.py, config.py, docs/github-connector.md)
 
-Apollo (`apollo-desktop`, openteams-ai/apollo-desktop#726):
+Apollo (`apollo-desktop`):
 - `c352846` — proxy allow-list (internal/hubauth/proxy_policy.go)
 - `1984ec5` — Hermes plugin tool (internal/hermesagent/plugins/apollo_github/)
 - `98ec29a` — ravnar ChatAgent tool (internal/intelligencehub/ravnar_apollo/agents.py)
@@ -207,8 +206,8 @@ Wiring the plugin harness into CI (`55237f1`) surfaced that **apollo_slack**
 enforces DM/mpim exclusion on list/search but NOT on read-by-id — a pre-existing
 gap that stayed red unnoticed because the harness ran in no workflow. It is NOT
 part of this feature; the failing assertion is a strict xfail so the harness can
-land and guard everything else, and the fix is routed to the slack owner, filed
-as openteams-ai/apollo-desktop#720.
+land and guard everything else, and the fix is filed with the desktop
+client's Slack-connector owner.
 
 ## Open items for sign-off
 
