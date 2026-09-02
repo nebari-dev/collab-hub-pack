@@ -554,6 +554,10 @@ class GitHubConnectorConfig(BaseModel):
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
     request_timeout_seconds: float = 10.0
+    # Restrict search to these GitHub org logins. Empty = the token's full
+    # visibility (personal repos + every approved org). Set this in real
+    # deploys so agent searches do not interleave personal and work results.
+    allowed_orgs: list[str] = Field(default_factory=list)
 
 
 class ConnectorsConfig(BaseModel):

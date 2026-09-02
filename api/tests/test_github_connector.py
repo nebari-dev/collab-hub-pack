@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config
+from collab_hub_api.connectors.github_client import GitHubClient
 from collab_hub_api.connectors.models import GITHUB_READONLY_SCOPES, GitHubSearchRequest
 from collab_hub_api.core import make_app
 
@@ -958,6 +959,74 @@ async def test_github_search_bad_repo_qualifier_maps_to_422(tmp_path, monkeypatc
         )
     assert response.status_code == 422
     assert "repo" in response.json()["detail"].lower()
+
+
+# --- query building: allowed_orgs -----------------------------------------
+
+
+def _client_with_orgs(*orgs: str) -> GitHubClient:
+    return GitHubClient(access_token="t", api_base_url="https://github.test/api", allowed_orgs=list(orgs))
+
+
+def test_build_query_empty_allowlist_adds_no_org_qualifiers():
+    client = GitHubClient(access_token="t", api_base_url="https://github.test/api")
+    assert client._build_query("is:open bug", "") == "is:open bug"
+
+
+def test_build_query_applies_allowed_orgs_when_no_repo_qualifier():
+    client = _client_with_orgs("acme", "other-co")
+    assert client._build_query("is:open bug", "") == "is:open bug org:acme org:other-co"
+
+
+def test_build_query_explicit_repo_qualifier_wins_over_allowed_orgs():
+    # A caller-supplied repo: is a narrower scope than the allowlist and is
+    # meant to override it, not stack with it.
+    client = _client_with_orgs("acme")
+    assert client._build_query("is:open bug", "acme/widgets") == "is:open bug repo:acme/widgets"
+
+
+async def test_github_search_applies_org_allowlist_when_no_repo_given(tmp_path, monkeypatch):
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/issues"):
+            seen["q"] = request.url.params.get("q", "")
+            return Response(200, json={"total_count": 0, "incomplete_results": False, "items": []})
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, allowed_orgs=["acme", "other-co"]))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/search",
+            headers=_auth_header(),
+            json={"query": "login", "limit": 10},
+        )
+    assert response.status_code == 200
+    assert "org:acme" in seen["q"]
+    assert "org:other-co" in seen["q"]
+
+
+async def test_github_search_repo_qualifier_overrides_org_allowlist(tmp_path, monkeypatch):
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/issues"):
+            seen["q"] = request.url.params.get("q", "")
+            return Response(200, json={"total_count": 0, "incomplete_results": False, "items": []})
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, allowed_orgs=["acme"]))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/search",
+            headers=_auth_header(),
+            json={"query": "login", "limit": 10, "repo": "acme/widgets"},
+        )
+    assert response.status_code == 200
+    assert "repo:acme/widgets" in seen["q"]
+    assert "org:" not in seen["q"]
 
 
 # --- repo discovery: list_github_repos -----------------------------------

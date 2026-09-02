@@ -145,10 +145,12 @@ class GitHubClient:
         access_token: str,
         api_base_url: str,
         timeout_seconds: float = 10.0,
+        allowed_orgs: list[str] | None = None,
     ):
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout_seconds)
+        self.allowed_orgs = allowed_orgs or []
 
     async def verify_access(self) -> GitHubAccessCheck:
         """Confirm the token can read, and resolve the connected login.
@@ -436,6 +438,10 @@ class GitHubClient:
         parts = [query.strip()]
         if repo.strip():
             parts.append(f"repo:{repo.strip()}")
+        elif self.allowed_orgs:
+            # Repeating ``org:`` qualifiers ORs them in GitHub issue search, so
+            # results stay confined to the configured org allowlist.
+            parts.extend(f"org:{org}" for org in self.allowed_orgs)
         return " ".join(part for part in parts if part)
 
     async def _get_response(

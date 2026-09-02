@@ -855,6 +855,13 @@
             "requestTimeoutSeconds": {
               "type": "number",
               "minimum": 1
+            },
+            "allowedOrgs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           },
           "additionalProperties": false
