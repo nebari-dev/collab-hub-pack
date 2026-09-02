@@ -670,3 +670,22 @@ def test_first_fetch_failure_has_no_set_to_fall_back_to(jwks):
     # a failed first fetch caches nothing.
     jwks.keys = [KEY_1_JWK]
     assert _decode(_token(KEY_1_PEM, "key-1"), jwks.url)["preferred_username"] == "signed-user"
+
+
+def test_a_dedicated_id_token_verifier_is_used_when_configured(jwks, monkeypatch):
+    # The dedicated-verifier path is unchanged by the fallback work: with
+    # FRAMES_IDTOKEN_JWKS_URL set, cookie verification uses the dedicated
+    # verifier and its own audience — the bearer audience plays no part, so a
+    # token minted for the bearer client is refused even though the bearer
+    # config would have accepted it.
+    monkeypatch.setenv("FRAMES_IDTOKEN_JWKS_URL", jwks.url)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.delenv("FRAMES_BEARER_JWKS_URL", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
