@@ -1,11 +1,28 @@
 """The owner invitation routes (issue #142) — the first owner action.
 
-Three routes on the browser surface, all under ``/web/org``, all requiring a
+Four routes on the browser surface, all under ``/web/org``, all requiring a
 web session *and* an active ``role = 'owner'`` membership:
 
 ``GET  /web/org/invitations``           the page and the listing
 ``POST /web/org/invitations``           issue one invitation into the caller's org
 ``POST /web/org/invitations/revoke``    revoke one of the caller's org's
+``POST /web/org/invitations/name``      give a placeholder-named org its name (#44)
+
+The naming route is the first-invite naming flow #92 specified and #142 did
+not ship: every organization starts with the neutral placeholder name, so an
+owner reaching this page for the first time owns "Unnamed organization", and
+the page identifies the destination of every invitation they issue only as
+that (observed live, #44). The invitation email is organization-neutral by
+decision and unaffected; this is the owner's side — knowing what they are
+inviting people into. While the placeholder stands the page renders the
+naming form instead of the issue form, and ``POST /web/org/invitations``
+refuses to issue: a submission that passes the page's ordinary request checks
+(bounded body, CSRF, a valid address) is answered **409** before the issue
+action and before delivery, and a submission that fails those checks is
+answered as it always was — so no body shape reaches issuance. The refusal
+is the server's; the hidden form is just its honest rendering. Naming is
+one-shot and audited as ``org.rename``; see
+:meth:`~..frames.invitations.PostgresInvitationService.name_organization`.
 
 The pattern is issue #91's, instantiated for the org axis — see
 :mod:`..web.owner` for what carries over and what the axis changes.
@@ -14,7 +31,7 @@ Concretely, in this file:
 * the router carries ``Depends(require_org_owner)``, so **every** route on it
   refuses a signed-in non-owner with the surface's own 403 page rather than a
   404, a blank page, or an API error envelope;
-* the two things this page can *do* are plain functions carrying #87's
+* the three things this page can *do* are plain functions carrying #87's
   ``@requires_org_role(ROLE_OWNER, org_arg="org_id")`` guard, so the
   authority check lives on the action, is pinned to the organization the call
   names, and holds wherever the function is called from;
@@ -68,6 +85,7 @@ from ..frames.invitation_email import (
     InvitationEmailDelivery,
 )
 from ..frames.invitations import (
+    MAX_ORGANIZATION_NAME_LENGTH,
     Invitation,
     InvitationAlreadyUsedError,
     InvitationNotFoundError,
@@ -75,7 +93,10 @@ from ..frames.invitations import (
     InvitationsUnavailableError,
     IssuedInvitation,
     LiveInvitationExists,
+    OrganizationAlreadyNamedError,
+    is_placeholder_organization_name,
     validate_invited_email,
+    validate_organization_name,
 )
 from ..frames.orgs import ROLE_OWNER
 from ..web.admin import (
@@ -94,14 +115,19 @@ from ..web.forms import (
 )
 from ..web.org_invitations import (
     NOTICE_ALREADY_LIVE,
+    NOTICE_ALREADY_NAMED,
     NOTICE_INVALID_EMAIL,
+    NOTICE_INVALID_ORGANIZATION_NAME,
     NOTICE_ISSUED_SEND_FAILED,
     NOTICE_ISSUED_SEND_UNKNOWN,
     NOTICE_ISSUED_SENT,
+    NOTICE_NAMED,
     NOTICE_NOT_FOUND,
+    NOTICE_ORGANIZATION_UNNAMED,
     NOTICE_REVOKE_REFUSED,
     NOTICE_REVOKED,
     NOTICE_UNAVAILABLE,
+    ORGANIZATION_NAME_FIELD,
     Notice,
     invitations_page,
     request_refused_page,
@@ -111,6 +137,7 @@ from ..web.pages import forbidden_page, page_response
 from ..web.request_limits import connection_close_headers
 from ..web.session import WebSession
 from ..web.surface import (
+    ORG_INVITATIONS_NAME_PATH,
     ORG_INVITATIONS_PATH,
     ORG_INVITATIONS_REVOKE_PATH,
 )
@@ -173,6 +200,21 @@ def revoke_invitation(
     """
 
     return service.revoke(auth, invitation_id, expect_org_id=org_id)
+
+
+@requires_org_role(ROLE_OWNER, org_arg="org_id")
+def name_organization(auth: AuthContext, service: InvitationService, *, org_id: str, name: str) -> str:
+    """Give *org_id* its first name, recorded as ``org.rename``.
+
+    Same pin as the other two actions: ``org_id`` is the caller's own
+    organization from :func:`~..web.owner.owner_context`, compared by the
+    wrapper against the same resolution's ``home_org_id``. The service reads
+    the current name ``FOR UPDATE`` and refuses with
+    :class:`~..frames.invitations.OrganizationAlreadyNamedError` unless it is
+    still the placeholder, so this is the first naming and only that.
+    """
+
+    return service.name_organization(auth, org_id=org_id, name=name)
 
 
 # --- Request helpers ---------------------------------------------------------
@@ -257,13 +299,17 @@ def make_router() -> APIRouter:
         org_id = auth.org_id
         try:
             organization_name = service.organization_name(org_id)
+            organization_named = not is_placeholder_organization_name(organization_name)
             page = service.list_for_org(org_id, limit=LISTING_LIMIT, offset=0)
             now = service.server_now()
         except InvitationsUnavailableError:
             # No listing to show. `now` is unused with no rows; a real value
             # rather than a placeholder so nothing downstream has to special
-            # case it.
+            # case it. `organization_named` is True: with no store to answer,
+            # the page has no verdict to render, and every form on it fails
+            # into the same unavailable notice anyway.
             organization_name, page, now = "your organization", None, datetime.now(tz=timezone.utc)
+            organization_named = True
             notice = notice if notice is not None else Notice(NOTICE_UNAVAILABLE)
             if status_code == status.HTTP_200_OK:
                 status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -273,6 +319,7 @@ def make_router() -> APIRouter:
                 root_path=_root_path(request),
                 session=session,
                 organization_name=organization_name,
+                organization_named=organization_named,
                 email_configured=_email_configured(delivery),
                 invitations=page.invitations if page is not None else (),
                 has_more=page.has_more if page is not None else False,
@@ -339,8 +386,28 @@ def make_router() -> APIRouter:
 
         # Before the audited transaction, same as the API route: it is only
         # used to word the email, and it must not run between commit and send.
-        organization_name = service.organization_name(auth.org_id)
+        # It is also the first-invite gate (#44): an organization still
+        # carrying the placeholder name issues nothing from this page. The
+        # checks above (body bound, CSRF, address) answer a malformed
+        # submission first, as they always did; anything that passes them is
+        # refused here, before the audited action and before delivery — the
+        # form the page hides is a rendering of this refusal, not the refusal
+        # itself. A rename racing this read can only make the name handed to
+        # the delivery adapter better, never worse (and the shipped renderer
+        # is organization-neutral and discards it), so the gate is read here
+        # rather than locked into the send.
         try:
+            organization_name = service.organization_name(auth.org_id)
+            if is_placeholder_organization_name(organization_name):
+                return _render(
+                    request,
+                    session,
+                    auth,
+                    service,
+                    delivery,
+                    notice=Notice(NOTICE_ORGANIZATION_UNNAMED, address),
+                    status_code=status.HTTP_409_CONFLICT,
+                )
             outcome = issue_invitation(auth, service, org_id=auth.org_id, email=address)
         except InvitationsUnavailableError:
             return _render(
@@ -471,6 +538,67 @@ def make_router() -> APIRouter:
             request, session, auth, service, delivery, notice=Notice(NOTICE_REVOKED, invitation.email)
         )
 
+    @router.post(ORG_INVITATIONS_NAME_PATH)
+    async def name(
+        request: Request,
+        session: WebSession = Depends(require_org_owner),
+        auth: AuthContext = Depends(owner_context),
+        service: InvitationService = Depends(get_invitation_service),
+        delivery: InvitationEmailDelivery = Depends(get_invitation_email_delivery),
+    ) -> Response:
+        """Name the caller's organization, once, so invitations can be issued."""
+
+        try:
+            fields = await form_fields(request, max_bytes=MAX_FORM_BYTES)
+        except FormRefused as refusal:
+            return _refused(request, refusal)
+        if not csrf_ok(request, fields, session, page="/web/org"):
+            return _forbidden(request)
+
+        # Same shape as the address: validated here, before the action, so an
+        # internal ValueError is never worded as the owner's typo. An
+        # over-long field comes back from form_field as "" and fails the same
+        # way a blank one does.
+        submitted = form_field(fields, ORGANIZATION_NAME_FIELD, max_length=MAX_ORGANIZATION_NAME_LENGTH)
+        try:
+            chosen = validate_organization_name(submitted)
+        except ValueError:
+            return _render(
+                request,
+                session,
+                auth,
+                service,
+                delivery,
+                notice=Notice(NOTICE_INVALID_ORGANIZATION_NAME),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            named = name_organization(auth, service, org_id=auth.org_id, name=chosen)
+        except OrganizationAlreadyNamedError:
+            return _render(
+                request,
+                session,
+                auth,
+                service,
+                delivery,
+                notice=Notice(NOTICE_ALREADY_NAMED),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        except InvitationsUnavailableError:
+            return _render(
+                request,
+                session,
+                auth,
+                service,
+                delivery,
+                notice=Notice(NOTICE_UNAVAILABLE),
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        # The organization id and the actor, not the name: the name is on the
+        # audit row, and a log line is not where display text belongs.
+        logger.info("web_organization_named", extra={"user": session.user, "org_id": auth.org_id})
+        return _render(request, session, auth, service, delivery, notice=Notice(NOTICE_NAMED, named))
+
     return router
 
 
@@ -478,5 +606,6 @@ __all__ = [
     "LISTING_LIMIT",
     "issue_invitation",
     "make_router",
+    "name_organization",
     "revoke_invitation",
 ]

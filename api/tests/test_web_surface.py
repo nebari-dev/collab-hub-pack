@@ -2943,6 +2943,8 @@ def test_the_shipped_csrf_exemptions_are_exactly_the_reviewed_one():
             # for the same page-shaped-refusal reason.
             "/web/org/invitations",
             "/web/org/invitations/revoke",
+            # #44's first-invite naming POST: same page, same predicate.
+            "/web/org/invitations/name",
         }
     )
     # Spelled literally above and compared against the constant here: #90's
@@ -3470,6 +3472,7 @@ def test_the_shipped_admin_entries_lead_their_routes_without_failing(tmp_path, i
         # a claims-sourced deployment serves neither route.
         "/web/org/invitations",
         "/web/org/invitations/revoke",
+        "/web/org/invitations/name",
     }
     # Neither the registry check nor the route lint objects to them.
     assert stale_csrf_exemptions(app.routes) == []
