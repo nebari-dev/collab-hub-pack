@@ -67,12 +67,26 @@ flowchart LR
 
 ## Local development
 
+API only, with the unsafe dev-auth shortcut and everything in-memory:
+
 ```sh
 cd api
-uv sync
+uv sync --python 3.14
 uv run pytest
-uv run python -m collab_hub_api   # DEV_AUTH_USER for unsafe local auth
+FRAMES_UNSAFE_AUTH_ENABLED=true DEV_AUTH_ENABLED=true DEV_AUTH_USER=dev \
+  COLLAB_HUB_API__STORAGE__FRAMES_PATH=/tmp/collab-hub-frames \
+  uv run python -m collab_hub_api
 ```
+
+The full local stack (Keycloak, Postgres, SES stand-in, mail catcher) for the
+browser web surface, invitations and registration:
+
+```sh
+make -C dev up
+make -C dev api
+```
+
+See [`dev/README.md`](dev/README.md).
 
 ## Documentation
 

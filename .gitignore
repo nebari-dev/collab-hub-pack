@@ -32,3 +32,6 @@ Thumbs.db
 
 # Claude
 CLAUDE.md
+
+# Local compose stack state (frames written by a host-run API)
+dev/.data/
