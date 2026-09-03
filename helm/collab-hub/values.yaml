@@ -332,11 +332,17 @@ observability:
 frames:
   auth:
     idToken:
-      # -- JWKS URL used to verify IdToken cookies forwarded to the app.
+      # -- JWKS URL used to verify IdToken cookies forwarded to the app. Leave
+      # empty to verify cookies against the bearer verifier instead — jwks,
+      # issuer, and audience are all inherited from frames.auth.bearer.* as a
+      # whole (a dedicated idToken.issuer or idToken.audience below still wins
+      # over the inherited bearer value when set).
       jwksUrl: ""
       # -- Expected IdToken issuer. Leave empty to fall back to bearer issuer or skip issuer validation.
       issuer: ""
-      # -- Expected IdToken audience. Leave empty to skip audience validation.
+      # -- Expected IdToken audience. Leave empty: on a bearer-only deployment
+      # (idToken.jwksUrl unset) the bearer audience is inherited and enforced;
+      # otherwise audience validation is skipped.
       audience: ""
     bearer:
       # -- JWKS URL used to verify native-client bearer tokens.
