@@ -145,10 +145,12 @@ class GitHubClient:
         access_token: str,
         api_base_url: str,
         timeout_seconds: float = 10.0,
+        allowed_orgs: list[str] | None = None,
     ):
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout_seconds)
+        self.allowed_orgs = allowed_orgs or []
 
     async def verify_access(self) -> GitHubAccessCheck:
         """Confirm the token can read, and resolve the connected login.
@@ -434,8 +436,22 @@ class GitHubClient:
 
     def _build_query(self, query: str, repo: str) -> str:
         parts = [query.strip()]
-        if repo.strip():
-            parts.append(f"repo:{repo.strip()}")
+        repo = repo.strip()
+        if repo:
+            # An explicit repo: is a narrower scope than the allowlist, but it is
+            # still caller-supplied, so it must itself live inside the allowlist
+            # -- otherwise a caller could bypass the allowlist entirely by naming
+            # a repo in an org the deployment never approved.
+            if self.allowed_orgs and not _repo_owner_allowed(repo, self.allowed_orgs):
+                raise GitHubSearchError(
+                    f"repo {repo!r} is outside the configured GitHub org allowlist "
+                    f"({', '.join(self.allowed_orgs)})"
+                )
+            parts.append(f"repo:{repo}")
+        elif self.allowed_orgs:
+            # Repeating ``org:`` qualifiers ORs them in GitHub issue search, so
+            # results stay confined to the configured org allowlist.
+            parts.extend(f"org:{org}" for org in self.allowed_orgs)
         return " ".join(part for part in parts if part)
 
     async def _get_response(
@@ -534,6 +550,18 @@ def _decode_page_token(page_token: str, fingerprint: str) -> int:
     if page < 1:
         raise GitHubSearchError("page_token is malformed")
     return page
+
+
+def _repo_owner_allowed(repo: str, allowed_orgs: list[str]) -> bool:
+    """Whether ``repo``'s ``owner/name`` owner segment is in the allowlist.
+
+    GitHub logins are case-insensitive, so both sides are lowercased. A
+    malformed ``repo`` with no ``/`` is treated as its own (never-matching)
+    owner rather than raising here -- GitHub's own 422 on an invalid
+    qualifier is the existing, already-handled error path for that.
+    """
+    owner = repo.split("/", 1)[0].strip().lower()
+    return owner in {org.strip().lower() for org in allowed_orgs}
 
 
 def _repo_from_repository_url(repository_url: str) -> str:

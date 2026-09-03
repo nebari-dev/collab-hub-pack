@@ -1,3 +1,4 @@
+import re
 import sys
 from typing import Any, Literal, Self
 
@@ -549,11 +550,41 @@ class SlackConnectorConfig(BaseModel):
     request_timeout_seconds: float = 10.0
 
 
+# GitHub login: alphanumeric characters with single hyphens between them, no
+# leading/trailing/doubled hyphen (GitHub's own login rule). Deliberately
+# stricter than routers/connectors.py's ``_GITHUB_OWNER_PATTERN`` -- that one
+# only has to bound *request-time* free text, but an allowed_orgs entry is
+# deploy config that gets spliced directly into GitHub search-query syntax as
+# ``org:{org}``, so a value like "acme OR repo:other/private" would silently
+# widen the search instead of narrowing it. No lookahead, so the same pattern
+# also works as-is for the chart's values.schema.json (JSON Schema regexes
+# run through Go's RE2, which does not support it); the length half of
+# GitHub's rule is checked separately, mirroring the schema's ``maxLength``.
+_GITHUB_LOGIN_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+_GITHUB_LOGIN_MAX_LENGTH = 39
+
+
 class GitHubConnectorConfig(BaseModel):
     broker_token_url: str = ""
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
     request_timeout_seconds: float = 10.0
+    # Restrict search to these GitHub org logins. Empty = the token's full
+    # visibility (personal repos + every approved org). Set this in real
+    # deploys so agent searches do not interleave personal and work results.
+    allowed_orgs: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_orgs")
+    @classmethod
+    def _check_allowed_orgs(cls, value: list[str]) -> list[str]:
+        for org in value:
+            if len(org) > _GITHUB_LOGIN_MAX_LENGTH or not _GITHUB_LOGIN_PATTERN.fullmatch(org):
+                raise ValueError(
+                    f"connectors.github.allowed_orgs entry {org!r} is not a valid GitHub org login: "
+                    "alphanumeric characters and single hyphens only, no leading/trailing hyphen, "
+                    f"max {_GITHUB_LOGIN_MAX_LENGTH} characters"
+                )
+        return value
 
 
 class ConnectorsConfig(BaseModel):
