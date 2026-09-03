@@ -31,6 +31,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .db import locked_schema_connection
 from .models import (
     DESCRIPTION_MAX_LENGTH,
     FRAME_NAME_MAX_LENGTH,
@@ -692,7 +693,9 @@ class PostgresFrameGroupStore(FrameGroupStore):
         )
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        # Advisory-locked (issue #42): bare CREATE TABLE IF NOT EXISTS races
+        # under concurrent replica startup.
+        with locked_schema_connection(self.db) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS frames_server_groups (
