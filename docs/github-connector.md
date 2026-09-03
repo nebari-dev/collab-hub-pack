@@ -99,10 +99,26 @@ kcadm.sh add-roles -r <realm> --rname default-roles-<realm> \
 The two `projects` endpoints read **Projects V2** boards via GitHub's **GraphQL**
 API (`read:project` scope). `projects/list` takes an `owner` (org *or* user
 login) and returns each board's number/title/description/item count.
-`projects/{number}/read` returns the board's items, each with its status column
-and — when the item is a linked issue or PR — the `repo` (owner/name),
-`number`, `assignees`, and `labels`, so a caller can triage by person or label
-and chain `items/{number}/read` to read that issue/PR.
+`projects/{number}/read` returns the board's items, each with its status column,
+`state` (open/closed of the linked issue/PR), and — when the item is a linked
+issue or PR — the `repo` (owner/name), `number`, `assignees`, and `labels`, so a
+caller can triage by person or label and chain `items/{number}/read` to read
+that issue/PR. The item read excludes archived items (`archived_policy:
+"excluded"` on `counts`).
+
+The read also returns a `counts` object with the board's aggregate breakdowns: an
+exact non-archived `total` (scope recorded in `archived_policy`), per-status-column
+counts (`by_status` plus `no_status` for the blank column, which reconcile to the
+total), `by_type` (issue / pull_request / draft / redacted), and `by_state`
+(open / closed of linked issues/PRs). Projects V2 has **no** group-by aggregate,
+so each bucket is a `totalCount`-only count query under one `archivedStates`
+policy — which makes the counts accurate **even when the returned item list is
+truncated**. If those count queries are unavailable the breakdowns fall back to
+sampling the returned items and set `authoritative: false` with
+`counted_items`/`total_items`, so a partial sample is never mistaken for a full
+count. `by_status` + `no_status` and `by_type` are each independent partitions of
+`total` and should not be cross-added; `by_state` covers only linked issues/PRs
+so it need not sum to `total`.
 
 `search` runs against GitHub's issue-and-PR search (`/search/issues`, which
 returns both issues and pull requests) and is **page/`per_page`-paginated with a
@@ -116,9 +132,13 @@ for code search, which this connector does not use) is normalized to `429` with
 
 `items/{number}/read` reads one issue or pull request (body plus recent comments,
 capped at `max_chars`). Both issues and PRs carry their `assignees` and `labels`;
-pull requests additionally carry `requested_reviewers` and submitted `reviews`
-(user + review state), fetched from the pulls endpoint. Changed files and diffs
-are out of scope. `files/read` reads a repository file by `repo`, `path`,
+pull requests additionally carry `requested_reviewers`, `requested_teams`,
+`is_draft`, a `merge_state` (`merged` / `closed_unmerged` / `open`, so a closed PR
+is never ambiguous about whether it landed), and submitted `reviews` (user, review
+state, and the reviewer's sanitized, length-capped `body`), fetched from the pulls
+endpoint. A requested reviewer who has already submitted a review moves from
+`requested_reviewers` into `reviews`, so read both to see everyone involved. Changed
+files and diffs are out of scope. `files/read` reads a repository file by `repo`, `path`,
 and optional `ref` (branch/tag/SHA; default branch when omitted). The contents
 API only returns files up to 1 MB, so larger files come back with `too_large`;
 non-UTF-8 files come back with `binary`; git-lfs pointers and directories come

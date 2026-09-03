@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
@@ -12,19 +15,23 @@ from .connector_text import sanitize_connector_text
 from .models import (
     GitHubItem,
     GitHubProject,
+    GitHubProjectCounts,
     GitHubProjectItem,
     GitHubRepo,
     GitHubReview,
     GitHubSearchHit,
+    GitHubStatusCount,
 )
 
 # GitHub search returns at most 1000 results across all pages, regardless of
 # total_count, and caps per_page at 100. We never page past the 1000th result.
 GITHUB_SEARCH_RESULT_CAP = 1000
 GITHUB_MAX_PER_PAGE = 100
-# Cap the body text carried in a search hit; a full issue/PR body belongs to a
-# dedicated read, not a search snippet.
-SEARCH_TEXT_SNIPPET_CHARS = 500
+# Cap the free-text snippet carried in a search hit or a PR review body; a full
+# issue/PR/review body belongs to a dedicated read, not a summary snippet. A PR
+# keeps the newest MAX_ITEM_COMMENTS reviews, so this also bounds a PR's review
+# text at MAX_ITEM_COMMENTS * TEXT_SNIPPET_CHARS regardless of body length.
+TEXT_SNIPPET_CHARS = 500
 # The contents API only returns files up to 1 MB; larger ones come back with
 # encoding "none" and no content, and must be fetched via the git blobs API.
 CONTENTS_MAX_BYTES = 1_000_000
@@ -35,6 +42,8 @@ MAX_ITEM_COMMENTS = 30
 _PR_REVIEW_PAGE_SIZE = 100
 _LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec"
 
+logger = logging.getLogger("frames_server.connectors")
+
 # Projects V2 are GraphQL-only. Query the org and user owners in one request and
 # use whichever resolves, so one tool handles org and personal boards.
 _PROJECT_ITEM_FIELDS = """
@@ -44,8 +53,16 @@ _PROJECT_ITEM_FIELDS = """
           type
           content {
             __typename
-            ... on Issue { number title repository { nameWithOwner } }
-            ... on PullRequest { number title repository { nameWithOwner } }
+            ... on Issue {
+              number title state repository { nameWithOwner }
+              assignees(first: 10) { nodes { login } }
+              labels(first: 20) { nodes { name } }
+            }
+            ... on PullRequest {
+              number title state repository { nameWithOwner }
+              assignees(first: 10) { nodes { login } }
+              labels(first: 20) { nodes { name } }
+            }
             ... on DraftIssue { title }
           }
           fieldValues(first: 8) {
@@ -63,7 +80,7 @@ _PROJECT_ITEM_FIELDS = """
 _PROJECT_SUMMARY = "number title shortDescription closed items { totalCount }"
 
 _PROJECTS_LIST_QUERY = f"""
-query($login: String!, $first: Int!) {{
+query ProjectsList($login: String!, $first: Int!) {{
   organization(login: $login) {{ projectsV2(first: $first) {{ nodes {{ {_PROJECT_SUMMARY} }} }} }}
   user(login: $login) {{ projectsV2(first: $first) {{ nodes {{ {_PROJECT_SUMMARY} }} }} }}
 }}
@@ -75,7 +92,7 @@ _PROJECT_READ_BODY = f"""projectV2(number: $number) {{
     }}"""
 
 _PROJECT_READ_QUERY = f"""
-query($login: String!, $number: Int!, $first: Int!, $after: String) {{
+query ProjectRead($login: String!, $number: Int!, $first: Int!, $after: String) {{
   organization(login: $login) {{ {_PROJECT_READ_BODY} }}
   user(login: $login) {{ {_PROJECT_READ_BODY} }}
 }}
@@ -87,6 +104,75 @@ query($login: String!, $number: Int!, $first: Int!, $after: String) {{
 _PROJECT_PAGE_SIZE = 100
 _MAX_PROJECT_ITEMS = 500
 _MAX_PROJECT_PAGES = _MAX_PROJECT_ITEMS // _PROJECT_PAGE_SIZE
+
+# --- Project board counts ---------------------------------------------------
+# Projects V2 GraphQL has NO group-by aggregate; the only server-side counter is
+# totalCount on the items connection. But items() accepts a board-filter `query`
+# and an `archivedStates` argument, so one totalCount-only query per bucket gives
+# an EXACT count regardless of the item-enumeration cap above. Every count query
+# pins archivedStates:[NOT_ARCHIVED] so the buckets share one policy and the
+# status columns provably reconcile to the total (archived_policy="excluded").
+_COUNTS_ARCHIVED = "archivedStates: [NOT_ARCHIVED]"
+# A1: options + total + by-type + by-state + blank-status, all in one request.
+# The by_type/by_state aliases lean on the `query` filter DSL, so a rejection of
+# that DSL surfaces here and drops the whole count path to the sampled fallback.
+# `is:draft` matches BOTH board drafts (DraftIssue) and draft PRs, and a board
+# draft ALSO matches `is:issue` -- so the type partition is built from the raw
+# buckets, not by summing overlapping filters (see _authoritative_counts):
+# `board_draft` (is:draft is:issue) isolates board drafts, letting issue/pr/draft
+# form an exact, non-overlapping partition of the total.
+_PROJECT_COUNTS_BODY = f"""projectV2(number: $number) {{
+      statusField: field(name: "Status") {{ ... on ProjectV2SingleSelectField {{ options {{ name }} }} }}
+      total: items(first: 0, {_COUNTS_ARCHIVED}) {{ totalCount }}
+      issue: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:issue") {{ totalCount }}
+      pull_request: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:pr") {{ totalCount }}
+      board_draft: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:draft is:issue") {{ totalCount }}
+      opened: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:open") {{ totalCount }}
+      closed: items(first: 0, {_COUNTS_ARCHIVED}, query: "is:closed") {{ totalCount }}
+      no_status: items(first: 0, {_COUNTS_ARCHIVED}, query: "no:status") {{ totalCount }}
+    }}"""
+
+_PROJECT_COUNTS_QUERY = f"""
+query ProjectCounts($login: String!, $number: Int!) {{
+  organization(login: $login) {{ {_PROJECT_COUNTS_BODY} }}
+  user(login: $login) {{ {_PROJECT_COUNTS_BODY} }}
+}}
+"""
+
+
+def _status_counts_query(option_count: int) -> str:
+    """Build one aliased query that counts every Status column in a single
+    request. Column names are passed as GraphQL variables ($q0..$qN), never
+    interpolated, so an option name cannot inject query text."""
+    var_decls = "".join(f", $q{i}: String!" for i in range(option_count))
+    aliases = "\n      ".join(
+        f"s{i}: items(first: 0, {_COUNTS_ARCHIVED}, query: $q{i}) {{ totalCount }}"
+        for i in range(option_count)
+    )
+    body = f"projectV2(number: $number) {{\n      {aliases}\n    }}"
+    return (
+        f"query ProjectStatusCounts($login: String!, $number: Int!{var_decls}) {{\n"
+        f"  organization(login: $login) {{ {body} }}\n"
+        f"  user(login: $login) {{ {body} }}\n"
+        f"}}\n"
+    )
+
+
+def _project_filter_value(value: str) -> str:
+    """Escape a value embedded in a quoted Projects filter expression.
+
+    GraphQL variables keep option names out of the GraphQL document, but the
+    variable itself is interpreted by GitHub's Projects filter DSL. Escape its
+    string delimiters so a board-controlled Status option cannot change the
+    query that is counted.
+
+    Unverified upstream: live testing shows a quoted value with these escapes
+    returns `totalCount: 0` with no error, so whether the Projects filter DSL
+    actually honors backslash escapes (vs. silently never matching) could not
+    be confirmed. A status option containing `"` in its name may therefore
+    silently count as 0 rather than raising.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 @dataclass
@@ -252,6 +338,11 @@ class GitHubClient:
             pull = await self._get(f"/repos/{owner_repo}/pulls/{number}", operation="pull read")
             if isinstance(pull, dict):
                 item.requested_reviewers = _logins(pull.get("requested_reviewers"))
+                # requested_teams entries always carry a "name", so the label
+                # extractor (name-or-str) handles them without a slug fallback.
+                item.requested_teams = _label_names(pull.get("requested_teams"))
+                item.is_draft = bool(pull.get("draft"))
+                item.merge_state = _merge_state(pull)
             pull_reviews = await self._get(
                 f"/repos/{owner_repo}/pulls/{number}/reviews",
                 params={"per_page": str(_PR_REVIEW_PAGE_SIZE)},
@@ -286,9 +377,7 @@ class GitHubClient:
 
         full = "\n\n".join(segment for segment in segments if segment)
         truncated = len(full) > max_chars
-        if truncated:
-            full = full[:max_chars].rstrip() + "…"
-        return item, full, truncated
+        return item, _snippet(full, max_chars), truncated
 
     async def read_file(
         self,
@@ -332,9 +421,7 @@ class GitHubClient:
 
         text = sanitize_connector_text(text)
         truncated = len(text) > max_chars
-        if truncated:
-            text = text[:max_chars].rstrip() + "…"
-        return GitHubFileContent(content=text, truncated=truncated)
+        return GitHubFileContent(content=_snippet(text, max_chars), truncated=truncated)
 
     async def list_projects(self, *, owner: str, first: int = 20) -> list[GitHubProject]:
         data = await self._graphql(
@@ -368,10 +455,9 @@ class GitHubClient:
                 {"login": login, "number": number, "first": _PROJECT_PAGE_SIZE, "after": cursor},
                 operation="project read",
             )
-            node = _owner_node(data)
-            project = node.get("projectV2") if node else None
-            if not isinstance(project, dict):
-                raise GitHubUpstreamError(operation="project read", status_code=404, message="project not found")
+            project = _owner_project(
+                data, operation="project read", status_code=404, message="project not found"
+            )
             items_field = project.get("items") or {}
             for item in (items_field.get("nodes") or []):
                 if isinstance(item, dict):
@@ -384,6 +470,146 @@ class GitHubClient:
             else:
                 break
         return _project(project or {}), collected[:cap]
+
+    async def read_project_with_counts(
+        self, *, owner: str, number: int, max_items: int
+    ) -> tuple[GitHubProject, list[GitHubProjectItem], GitHubProjectCounts]:
+        """Read a board and compute its aggregate counts concurrently.
+
+        The exact server-side count queries don't depend on the item
+        enumeration, so they run alongside read_project instead of strictly
+        after it -- overlapping the two count round-trips with the 1-5
+        enumeration pages rather than paying them in series.
+
+        Counts never break the read: on any count failure (rejected filter DSL,
+        non-reconciling self-check, upstream/network error, or a coding bug) we
+        fall back to bucketing the enumerated items, flagged non-authoritative.
+        A read_project failure, by contrast, propagates -- it's the caller's
+        error to map -- after the counts task is cancelled so it can't leak."""
+        counts_task = asyncio.ensure_future(
+            self._authoritative_counts(login=owner.strip(), number=number)
+        )
+        try:
+            project, items = await self.read_project(owner=owner, number=number, max_items=max_items)
+        except BaseException:
+            counts_task.cancel()
+            with contextlib.suppress(BaseException):
+                await counts_task
+            raise
+        total = project.items_count
+        try:
+            counts = await counts_task
+        except (GitHubUpstreamError, httpx.HTTPError):
+            # Expected degrade: upstream/network failure, a rejected filter DSL,
+            # or a self-check that refused to stamp non-reconciling counts
+            # authoritative (see _authoritative_counts). Sample at WARNING.
+            logger.warning("github_project_counts_fallback", exc_info=True)
+            counts = _sampled_counts(total=total, items=items)
+        except Exception:
+            # Unexpected: a coding bug (bad query edit, upstream shape change,
+            # TypeError in parsing) would otherwise become permanent silent
+            # degradation -- and a small fully-enumerated board still returns
+            # authoritative=True from the fallback, masking it. Log at ERROR so a
+            # shipped regression is loud, but still honor "must not break the
+            # read" (asyncio.CancelledError is a BaseException and still surfaces).
+            logger.error("github_project_counts_unexpected_error", exc_info=True)
+            counts = _sampled_counts(total=total, items=items)
+        return project, items, counts
+
+    async def _authoritative_counts(self, *, login: str, number: int) -> GitHubProjectCounts:
+        data = await self._graphql(
+            _PROJECT_COUNTS_QUERY, {"login": login, "number": number}, operation="project counts"
+        )
+        # Existence was already confirmed by read_project moments earlier in the
+        # same request, so a null projectV2 here is a partial GraphQL error on
+        # this specific query (rate limit, transient upstream issue, ...), not
+        # evidence the project doesn't exist -- no status_code, matching the
+        # "invalid response" convention for an unexpected shape (vs. a real HTTP
+        # error). project_counts turns this into the sampled fallback.
+        project = _owner_project(
+            data, operation="project counts", status_code=None, message="project data missing from response"
+        )
+
+        def _tc(key: str) -> int:
+            return int((project.get(key) or {}).get("totalCount", 0) or 0)
+
+        total = _tc("total")
+        # is:draft matches BOTH board drafts and draft PRs, and a board draft also
+        # matches is:issue, so the raw filters overlap. board_draft (is:draft
+        # is:issue) isolates board drafts; subtracting it from is:issue leaves
+        # real issues, draft PRs stay under is:pr, and the three buckets then
+        # partition the total exactly -- redacted absorbs items matching none.
+        board_draft = _tc("board_draft")
+        issue = _tc("issue") - board_draft
+        pull_request = _tc("pull_request")
+        redacted = total - (issue + pull_request + board_draft)
+        status_field = project.get("statusField") or {}
+        options = [
+            str((o or {}).get("name", "") or "")
+            for o in (status_field.get("options") or [])
+            if isinstance(o, dict)
+        ]
+        options = [o for o in options if o]
+        by_status = await self._status_column_counts(login=login, number=number, options=options)
+        no_status = _tc("no_status")
+        # Verify the invariant before advertising authoritative=True. Two disclosed
+        # edges can silently miscount while the query still "succeeds": a Status
+        # option whose name contains `"` (see _project_filter_value), and a board
+        # whose single-select isn't named "Status" (statusField -> null, so
+        # by_status is empty while no:status counts something unrelated). If the
+        # buckets don't reconcile to the total, refuse the authoritative stamp --
+        # raise so project_counts degrades to the honest sampled fallback.
+        if sum(c.count for c in by_status) + no_status != total or issue < 0 or redacted < 0:
+            raise GitHubUpstreamError(
+                operation="project counts",
+                message="server-side counts did not reconcile to the board total",
+            )
+        return GitHubProjectCounts(
+            total=total,
+            archived_policy="excluded",
+            by_status=by_status,
+            no_status=no_status,
+            by_type={
+                "issue": issue,
+                "pull_request": pull_request,
+                "draft": board_draft,
+                # Derived: items matching none of the type filters (redacted content).
+                "redacted": redacted,
+            },
+            by_state={"open": _tc("opened"), "closed": _tc("closed")},
+            authoritative=True,
+            counted_items=total,
+        )
+
+    async def _status_column_counts(
+        self, *, login: str, number: int, options: list[str]
+    ) -> list[GitHubStatusCount]:
+        if not options:
+            return []
+        variables: dict[str, str | int] = {"login": login, "number": number}
+        for index, option in enumerate(options):
+            variables[f"q{index}"] = f'status:"{_project_filter_value(option)}"'
+        data = await self._graphql(
+            _status_counts_query(len(options)), variables, operation="project status counts"
+        )
+        # Same reasoning as _authoritative_counts: existence was already confirmed
+        # by read_project, so a null projectV2 here is a partial GraphQL error on
+        # this specific query, not a real not-found -- no status_code, so the
+        # fallback's logged exception doesn't read as "HTTP 404" during, say, a
+        # rate-limit incident.
+        project = _owner_project(
+            data,
+            operation="project status counts",
+            status_code=None,
+            message="project data missing from response",
+        )
+        return [
+            GitHubStatusCount(
+                name=sanitize_connector_text(option),
+                count=int((project.get(f"s{index}") or {}).get("totalCount", 0) or 0),
+            )
+            for index, option in enumerate(options)
+        ]
 
     async def list_repos(self, *, owner: str, first: int = 30) -> list[GitHubRepo]:
         """List repos for an org or user (whichever the owner is), most recently
@@ -462,6 +688,14 @@ class GitHubClient:
             raise GitHubUpstreamError(
                 operation=operation, status_code=response.status_code, message="invalid JSON"
             ) from exc
+
+
+def _snippet(text: str, limit: int) -> str:
+    """Truncate to `limit` chars on an overflow, trimming trailing space and
+    marking the cut with an ellipsis; return the text unchanged when it fits."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
 
 
 def _parse_oauth_scopes(header: str) -> list[str]:
@@ -553,6 +787,16 @@ def _owner_node(data: dict) -> dict | None:
     return None
 
 
+def _owner_project(data: dict, *, operation: str, status_code: int | None, message: str) -> dict:
+    """Resolve the projectV2 node from an org-or-user GraphQL response, raising a
+    GitHubUpstreamError with the caller's message/status when it is absent."""
+    node = _owner_node(data)
+    project = node.get("projectV2") if node else None
+    if not isinstance(project, dict):
+        raise GitHubUpstreamError(operation=operation, status_code=status_code, message=message)
+    return project
+
+
 def _repo(node: dict) -> GitHubRepo:
     return GitHubRepo(
         full_name=str(node.get("full_name", "") or ""),
@@ -604,9 +848,60 @@ def _project_item(node: dict) -> GitHubProjectItem:
         title=sanitize_connector_text(str(content.get("title", "") or "")),
         type=str(node.get("type", "") or ""),
         status=status,
+        state=str(content.get("state", "") or "").lower(),
         repo=repo,
         number=int(content.get("number", 0) or 0),
+        assignees=_logins((content.get("assignees") or {}).get("nodes")),
+        labels=_label_names((content.get("labels") or {}).get("nodes")),
         fields=fields,
+    )
+
+
+_PROJECT_TYPE_BUCKETS = {
+    "ISSUE": "issue",
+    "PULL_REQUEST": "pull_request",
+    "DRAFT_ISSUE": "draft",
+    "REDACTED": "redacted",
+}
+
+
+def _sampled_counts(*, total: int, items: list[GitHubProjectItem]) -> GitHubProjectCounts:
+    """Bucket the already-enumerated items when server-side counts are
+    unavailable. Exact only when the whole board was enumerated
+    (counted == total); otherwise flagged non-authoritative so a caller never
+    reads a truncated sample as a full count."""
+    by_status: dict[str, int] = {}
+    order: list[str] = []
+    no_status = 0
+    by_type = {"issue": 0, "pull_request": 0, "draft": 0, "redacted": 0}
+    by_state = {"open": 0, "closed": 0}
+    for item in items:
+        bucket = _PROJECT_TYPE_BUCKETS.get(item.type)
+        if bucket:
+            by_type[bucket] += 1
+        if item.status:
+            if item.status not in by_status:
+                by_status[item.status] = 0
+                order.append(item.status)
+            by_status[item.status] += 1
+        else:
+            no_status += 1
+        if item.state == "merged":
+            # A merged PR is closed; the authoritative path counts it under
+            # is:closed, so sample the same way rather than dropping it.
+            by_state["closed"] += 1
+        elif item.state in ("open", "closed"):
+            by_state[item.state] += 1
+    counted = len(items)
+    return GitHubProjectCounts(
+        total=total,
+        archived_policy="excluded",
+        by_status=[GitHubStatusCount(name=name, count=by_status[name]) for name in order],
+        no_status=no_status,
+        by_type=by_type,
+        by_state=by_state,
+        authoritative=counted == total,
+        counted_items=counted,
     )
 
 
@@ -631,6 +926,16 @@ def _label_names(values: Any) -> list[str]:
     return result
 
 
+def _merge_state(pull: dict) -> str:
+    """Collapse a PR's outcome to merged | closed_unmerged | open, so a closed
+    PR is never ambiguous about whether it actually landed."""
+    if pull.get("merged"):
+        return "merged"
+    if str(pull.get("state", "") or "").lower() == "closed":
+        return "closed_unmerged"
+    return "open"
+
+
 def _reviews(values: Any) -> list[GitHubReview]:
     result: list[GitHubReview] = []
     if isinstance(values, list):
@@ -640,15 +945,14 @@ def _reviews(values: Any) -> list[GitHubReview]:
             user = entry.get("user") or {}
             login = str(user.get("login", "") or "") if isinstance(user, dict) else ""
             state = str(entry.get("state", "") or "")
-            if login or state:
-                result.append(GitHubReview(user=sanitize_connector_text(login), state=state))
+            body = _snippet(sanitize_connector_text(str(entry.get("body", "") or "")), TEXT_SNIPPET_CHARS)
+            if login or state or body:
+                result.append(GitHubReview(user=sanitize_connector_text(login), state=state, body=body))
     return result
 
 
 def _search_hit(item: dict) -> GitHubSearchHit:
-    body = sanitize_connector_text(str(item.get("body", "") or ""))
-    if len(body) > SEARCH_TEXT_SNIPPET_CHARS:
-        body = body[:SEARCH_TEXT_SNIPPET_CHARS].rstrip() + "…"
+    body = _snippet(sanitize_connector_text(str(item.get("body", "") or "")), TEXT_SNIPPET_CHARS)
     user = item.get("user") or {}
     return GitHubSearchHit(
         repo=_repo_from_repository_url(str(item.get("repository_url", "") or "")),
