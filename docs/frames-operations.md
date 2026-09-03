@@ -581,15 +581,133 @@ owner naming an organization they do not own is a plain 403.
 Acceptance is the *only* thing that creates a membership row. Registering an
 account grants nothing, and neither does being invited.
 
+#### Whether a verified address is also required
+
+Gate B is **two** checks: the accepter's address is verified by the identity
+provider, *and* it equals the invited address. `frames.invitations.requireVerifiedEmail`
+(default `true`) controls the first. The second is not configurable and never
+becomes conditional, and a test asserts that relaxing one does not relax the
+other. In strict mode that keeps the invitation from being a bearer token
+redeemable under any identity; in relaxed mode it keeps the recorded address
+honest, which is a smaller claim — see what the match does and does not buy,
+below.
+
+**The argument for `false`.** The invitation token is already proof of mailbox
+control: a 256-bit secret delivered only to the invited address, which is
+exactly what a verification link proves. Requiring both is defence in depth
+rather than one necessary check, and the second round trip is real friction —
+Keycloak's verification link does not return the reader to the invitation.
+
+**What it costs, stated so the choice is informed.** Turning this off means also
+turning off verification at the identity provider (below), and at that point the
+`email` claim is **self-asserted** — whoever holds the link can register an
+account typing the invited address, or point an existing account at it, and
+redeem. So the invitation becomes usable by **anyone who obtains the link**;
+forwarding and shared mailboxes are the mundane cases, not the boundary.
+
+What a link-holder receives is the organization membership and role the
+invitation grants, **plus whatever `frames.serviceAccess.grantOnAcceptance`
+grants at acceptance** — identity-provider group membership included, which on
+most deployments is the access that actually matters. And the account carries
+the invited person's address permanently, so the member list is misleading
+afterwards too.
+
+**What the retained address match does and does not buy.** With verification
+required it is an access control: the accepter proved control of the invited
+address, and the match ties that proof to this invitation. Without it the match
+is a *labelling* property — the address recorded on the membership row is the
+invited one — and not a barrier, because the claim it compares is unverified.
+Keeping it unconditional is still right, and it is not what stands between a
+link-holder and the grant.
+
+What the token still handles regardless: a revoked, expired or already-used
+invitation is refused, and it is single-use.
+
+**Turning it off takes two changes, not one.** The realm must also stop forcing
+verification:
+
+```sh
+kubectl exec -i -n keycloak keycloak-keycloakx-0 -- bash -s <<'REMOTE'
+/opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 \
+  --realm master --user admin --password "$KEYCLOAK_ADMIN_PASSWORD" >/dev/null 2>&1
+/opt/keycloak/bin/kcadm.sh update realms/nebari -s verifyEmail=false
+/opt/keycloak/bin/kcadm.sh get realms/nebari --fields verifyEmail
+REMOTE
+```
+
+The `config credentials` line is not optional: each `exec` is a fresh session
+with no `~/.keycloak/kcadm.config`, so a bare `kcadm.sh update` exits with "No
+server or realm configured" and **changes nothing**. Since the server setting
+ships first, an operator who missed that would believe both halves were done
+while Keycloak still refuses tokens to unverified accounts — which presents
+exactly as "nothing appears to happen". Read the last line back rather than
+trusting the exit status.
+
+Without that, Keycloak will not issue a token to an unverified account at all,
+so the acceptance check is never reached.
+
+**There is no ordering with a harmless middle, so keep the window short.** The
+setting drives the invitation copy as well as the check, which means both
+intermediate states are wrong — in opposite directions and to very different
+degrees:
+
+| Middle state | What an invitee hits |
+| --- | --- |
+| **server relaxed, realm still verifying** (ship server first) | The email omits the verification step, but Keycloak still sends the mail and still shows its own "verify your email" screen. They can finish unaided; the email simply did not warn them. |
+| **realm flipped first, server still strict** | The email tells them to look for verification mail the realm no longer sends, *and* acceptance then refuses them. Nothing they can do. |
+
+So **ship the server setting first** — not because that window is harmless, but
+because the invitee can get themselves out of it and the other way they cannot.
+Then flip the realm promptly, and prefer not issuing invitations in between.
+
+**Invitations already in flight carry the copy for the previous setting.**
+Anything sent in the preceding 48 hours (the TTL) tells its reader to expect a
+verification email, and after the realm flip that mail is no longer sent — so
+those invitees register, wait, and stop. That is the stranding this change
+exists to prevent, arriving through the transition itself. Either wait out the
+TTL before flipping the realm, or revoke and reissue the live invitations
+afterwards so they carry the new copy.
+
+**If somebody is stuck with this relaxed, do not tell them to verify.** On a
+deployment with the setting off, the `email_not_verified` outcome no longer
+means "unverified" — it is reachable only when the **signed-in account**
+carried no usable email address, and no verification mail exists to complete. Setting
+`emailVerified` on the account fixes nothing either. Check the account's email
+address at the identity provider and the client's `email` scope instead. The
+API's message distinguishes the two cases; the wire code does not.
+
+**When to leave it `true`.** Any deployment whose invitees arrive through an
+identity provider with `trustEmail` — those accounts are verified on creation,
+the check costs nothing, and the invitee never sees a verification step.
+Relaxing it there buys nothing and gives up the forwarded-mail protection for
+free.
+
+**The invitation email follows this setting.** The onboarding copy's
+verification instruction is conditional on the same value, so a deployment that
+relaxes the check stops telling invitees to watch for a verification email. That
+is one setting rather than two on purpose: two switches would eventually be set
+differently, and the failure is silent — people waiting for mail that is no
+longer sent, which is the defect
+[nebari-nexus-pack#171](https://github.com/nebari-dev/nebari-nexus-pack/pull/171)
+fixed, with the sign flipped. A test asserts the copy and the rule read one
+value.
+
 #### The invited address must match exactly
 
-The invitee has to sign in with the **exact** address the invitation was sent
-to — same spelling, same case — and their IdP must assert `email_verified`
-as a boolean `true`. There is no canonicalization: `Alice@example.com` and
-`alice@example.com` are different invitations to this server (Gate B,
-ratified 2026-08-03). Type the address the way the IdP will report it. A
+The invitee has to sign in with the address the invitation was sent to. The
+comparison folds **ASCII case and nothing else** (the amendment on
+[#157](https://github.com/nebari-dev/nebari-nexus-pack/issues/157)), so
+`Alice@example.com` and `alice@example.com` are the same invitation, while
+plus-tags and dots are **not** folded: `a+tag@example.com` is a different
+address from `a@example.com`. There is no provider ruleset beyond that. A
 mismatch does **not** consume the invitation, so the fix is for the right
 mailbox to accept, or for you to revoke and reissue.
+
+Whether the IdP must also assert `email_verified` as a boolean `true` depends
+on `frames.invitations.requireVerifiedEmail` — see
+[Whether a verified address is also required](#whether-a-verified-address-is-also-required)
+above. The address match described here applies either way and is not
+configurable.
 
 The match is against the claim presented *at acceptance time*. If someone
 changes their verified address after being invited, the old invitation stops

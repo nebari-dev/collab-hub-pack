@@ -85,6 +85,57 @@ leaves room for a couple of levels of quoting."""
 
 SUBJECT_PREFIX = "Subject: "
 
+CONDITIONAL_MARKER = re.compile(r"\[(?:IF [A-Z_0-9 ]+|END IF)\]")
+"""Any conditional marker, for the post-resolution assertion.
+
+Separate from :data:`CONDITIONAL_BLOCK` because it has to match a marker the
+block pattern *failed* to match -- which is the whole failure mode.
+"""
+
+
+CONDITIONAL_BLOCK = re.compile(
+    r"^\[IF VERIFIED EMAIL REQUIRED\][ \t]*\r?\n(.*?)^\[END IF\][ \t]*\r?\n",
+    re.DOTALL | re.MULTILINE,
+)
+"""A span of copy that belongs in the message only under one configuration.
+
+**Why markers in the template rather than a second template file.** The
+divergence this module's history records -- two versions of the copy drifting
+apart -- came from composing a second version elsewhere. Two files would
+reintroduce exactly that, with 90% shared text and no mechanism keeping the
+shared part shared. So the variants live together, and what varies is marked.
+
+**Why not variant strings in Python.** The subject line is read out of the
+template file specifically so *all* of the copy lives in one reviewable place.
+Moving a paragraph into a Python literal would undo that for the one paragraph
+whose wording is most likely to be argued about.
+
+The marker spellings deliberately match the ``[UPPER CASE IN BRACKETS]``
+placeholder convention, which means :data:`UNRESOLVED_PLACEHOLDER` matches them
+too. That is the safety net rather than a coincidence: a body that reached the
+sending path with a marker still in it is refused, so forgetting to resolve a
+conditional fails the same way forgetting to substitute ``[NAME]`` does.
+"""
+
+
+CONDITIONAL_MARKERS_ARE_NOT_PLACEHOLDERS = """\
+[IF VERIFIED EMAIL REQUIRED] and [END IF] are **selection markers**, not slots.
+
+They mark a span the renderer keeps or drops according to
+``frames.invitations.require_verified_email``; nothing substitutes them. They
+are spelled like placeholders deliberately, so the same net that refuses an
+unsubstituted [NAME] also refuses a marker that survived resolution.
+
+If you reflow step 2, leave those two lines alone. Whitespace and line endings
+around them are tolerated -- see :func:`_resolve_conditionals` -- but the
+markers themselves must stay on their own lines.
+
+Recorded here rather than in a copy-editing guide because this package no
+longer ships one; the module docstring above still refers to a document that
+did not come across, which is worth reconciling separately.
+"""
+
+
 UNRESOLVED_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z /]*\]")
 """Matches any ``[UPPER CASE]`` slot still present in a rendered body.
 
@@ -93,6 +144,14 @@ a test one. An operator pasting the message can see and fill a leftover
 placeholder; a server sending it cannot, and the invitee would read
 ``[DESKTOP APP DOWNLOAD / INSTALL INSTRUCTIONS]`` verbatim. So the automated
 path refuses to produce a body that still contains one.
+
+**Deliberately narrower than :data:`CONDITIONAL_MARKER`, which is wide enough
+for underscores.** This pattern is applied to a body that already contains
+operator-supplied ``app_instructions``, so widening it to ``[A-Z_0-9 ]``
+made it match bracketed tokens in *their* copy -- ``Download [MACOS_ARM64]
+build`` began failing every send with ``invalid_invitation_email``, and the
+message is dropped so nobody saw why. The underscore case that widening was
+for belongs to the marker pattern, which only ever sees the template.
 """
 
 AUTOMATED_GREETING_NAME = "there"
@@ -128,7 +187,77 @@ def _load_template() -> tuple[str, str]:
     return first[len(SUBJECT_PREFIX) :].strip(), body.lstrip("\n")
 
 
+def _resolve_conditionals(body: str, *, require_verified_email: bool) -> str:
+    r"""Keep or drop each conditional span, leaving no markers behind.
+
+    The kept form is the block's own content, which carries its leading blank
+    line, so a paragraph that stays is separated from the one above it and a
+    paragraph that goes leaves no double blank behind. Both shapes are asserted
+    on the rendered body rather than reasoned about here -- whitespace is
+    exactly the kind of thing that reads correct and renders wrong.
+
+    **Trailing whitespace after a marker is tolerated rather than diagnosed.**
+    Someone reflowing this copy can leave a space or tab behind, and an exact
+    ``\n`` requirement would turn that into a refusal to send.
+
+    Line endings need no tolerance and never did. An earlier review reported
+    that a CRLF checkout would make the substitution a no-op and fire the guard
+    for both settings; **that mechanism does not exist.** ``Path.read_text``
+    and ``importlib.resources``' text mode both perform universal-newline
+    translation, so this function only ever sees ``\n`` however the file was
+    checked out. The ``\r?`` is harmless and kept for cheapness, not as
+    protection against anything reachable. Recorded because the previous
+    version of this docstring asserted that history as fact, and it was
+    verified by constructing a CRLF string by hand rather than by asking
+    whether one could arrive.
+
+    The raise is kept for a marker that survives for a reason the pattern
+    cannot absorb, such as an unclosed ``[IF ...]``.
+    """
+
+    resolved = CONDITIONAL_BLOCK.sub(r"\1" if require_verified_email else "", body)
+    if CONDITIONAL_MARKER.search(resolved):
+        # The message names what is observable and stops there. An earlier
+        # version guessed "unclosed [IF ...]", which is wrong for the likelier
+        # cause: a *second* condition added to the copy, whose marker
+        # CONDITIONAL_MARKER matches and CONDITIONAL_BLOCK -- keyed to one
+        # literal name -- does not. Reporting the surviving markers lets the
+        # reader see which it was.
+        surviving = ", ".join(sorted(set(CONDITIONAL_MARKER.findall(resolved))))
+        raise ValueError(
+            f"{TEMPLATE_FILENAME}: conditional markers survived resolution ({surviving}). Each"
+            " must begin its own line and be paired, and only [IF VERIFIED EMAIL REQUIRED] is"
+            " understood -- a new condition needs teaching to CONDITIONAL_BLOCK, not just"
+            " adding to the copy."
+        )
+    return resolved
+
+
 SUBJECT, _BODY_TEMPLATE = _load_template()
+
+BODIES: dict[bool, str] = {
+    True: _resolve_conditionals(_BODY_TEMPLATE, require_verified_email=True),
+    False: _resolve_conditionals(_BODY_TEMPLATE, require_verified_email=False),
+}
+"""Both variants, resolved once when this module is first imported.
+
+Resolved here rather than per message for the reason :func:`_load_template`
+already establishes for the template itself: unrenderable copy should stop the
+pod from starting, not start cleanly, pass health checks, and then fail every
+invitation with a message ``deliver`` deliberately drops.
+
+**That property depends on somebody importing this module at startup, and for a
+while nothing did.** The only importer was function-local inside
+``render_invitation_email``, so the resolution actually happened on the first
+send. ``ConfiguredInvitationEmailDelivery.__init__`` now touches this name
+during startup validation, beside the check that refuses a missing
+``app_instructions`` -- which is where "a deployment that enables invitation
+email and cannot render it fails loudly" already lived. Public rather than
+underscored because that dependency is real and should be visible.
+
+It also removes a per-send ``DOTALL`` regex over the whole body, which the
+result never depended on: one boolean and a module constant fully determine it.
+"""
 
 
 def format_expiry(expires_at: datetime) -> str:
@@ -157,6 +286,7 @@ def render_onboarding_email(
     expires_at: datetime,
     name: str | None = None,
     app_instructions: str | None = None,
+    require_verified_email: bool = True,
 ) -> str:
     """The complete message body, personalised for one invitation.
 
@@ -201,7 +331,7 @@ def render_onboarding_email(
     if app_instructions is not None:
         substitutions.append((APP_INSTRUCTIONS_PLACEHOLDER, app_instructions))
 
-    body = _BODY_TEMPLATE
+    body = BODIES[bool(require_verified_email)]
     for placeholder, value in substitutions:
         body = body.replace(placeholder, value)
     return body
@@ -214,6 +344,7 @@ def render_for_automated_delivery(
     expires_at: datetime,
     app_instructions: str,
     name: str = AUTOMATED_GREETING_NAME,
+    require_verified_email: bool = True,
 ) -> str:
     """The body to **send**, with nothing left for a human to fill in (#93).
 
@@ -227,6 +358,13 @@ def render_for_automated_delivery(
     for **any** unresolved slot, not only the two known ones — a placeholder
     added to the copy later is caught by the same check, which is the whole
     reason it is a pattern rather than a list.
+
+    That net covers the conditional markers too, since they are spelled like
+    placeholders: a body that reached here with ``[IF VERIFIED EMAIL
+    REQUIRED]`` still in it is refused rather than sent. ``require_verified_email``
+    defaults to the strict value, matching the server-side check it describes,
+    so a caller that forgets to thread it produces copy that over-explains
+    rather than copy that lies.
     """
 
     if not app_instructions.strip():
@@ -241,6 +379,7 @@ def render_for_automated_delivery(
         expires_at=expires_at,
         name=name,
         app_instructions=app_instructions,
+        require_verified_email=require_verified_email,
     )
     unresolved = sorted(set(UNRESOLVED_PLACEHOLDER.findall(body)))
     if unresolved:

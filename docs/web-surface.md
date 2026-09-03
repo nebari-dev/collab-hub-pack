@@ -668,11 +668,22 @@ POST body by design, so a body-logging proxy will capture it. That half is
   endpoint answers `invitations_unavailable` instead of reporting a success
   that granted nothing.
 - **The session carries `email_verified`**, recorded from the ID token at
-  sign-in, because acceptance matches the invited address against a *verified*
-  claim and the browser never holds the token afterwards. A session minted
-  before that field existed decodes as unverified — fail-closed.
+  sign-in, because the browser never holds that token afterwards and acceptance
+  may need it. A session minted before that field existed decodes as
+  unverified — fail-closed. Whether acceptance *requires* it is
+  `frames.invitations.requireVerifiedEmail` (default on); the address match it
+  is paired with is not configurable.
 
 ### The verified address has to be current
+
+Where `frames.invitations.requireVerifiedEmail` is off, the revocation argument
+below no longer applies — acceptance does not read `email_verified` as an
+authorization input at all — and **the bound is unchanged anyway.** What still
+matters there is the `email` claim's currency: it is an authorization input in
+both modes, since the address match is not configurable, and an address can be
+reassigned at the IdP just as a verification can be revoked. So the window
+keeps its value with half of its original justification unused, rather than
+being loosened because one reason weakened.
 
 Holding a session is not enough to redeem. Identity in the cookie is stable —
 a subject does not stop being that subject — which is what makes an eight-hour

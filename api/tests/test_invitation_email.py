@@ -20,6 +20,7 @@ from collab_hub_api.frames.invitation_email import (
     ConfiguredInvitationEmailDelivery,
     DisabledInvitationEmailDelivery,
     InvitationEmailMessage,
+    ProviderAcceptance,
     SesInvitationEmailProvider,
     build_setup_url,
     render_invitation_email,
@@ -63,6 +64,7 @@ def _delivery(client: RecordingSesClient) -> ConfiguredInvitationEmailDelivery:
         provider,
         accept_url="https://collab.example.test/invite/accept",
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
 
 
@@ -144,6 +146,7 @@ def test_plain_text_template_has_complete_setup_and_no_sensitive_repr():
         organization_name=" Example\nOrganization ",
         expires_at=EXPIRES_AT,
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
 
     assert message.recipient == RECIPIENT
@@ -226,6 +229,7 @@ def test_ses_request_shape_is_accepted_by_the_installed_botocore_model():
         organization_name=None,
         expires_at=EXPIRES_AT,
         app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=True,
     )
     expected = {
         "FromEmailAddress": "no-reply@collab.example.test",
@@ -507,3 +511,100 @@ def test_ses_provider_rejects_endpoint_shaping_and_invalid_configuration(field, 
 
     with pytest.raises(ValueError):
         SesInvitationEmailProvider(**kwargs)
+
+
+def test_the_delivery_copy_and_the_acceptance_rule_read_one_setting() -> None:
+    """**The coupling that must not come apart.**
+
+    Two independent switches -- one deciding what acceptance requires, one
+    deciding what the email says -- would eventually be set differently, and
+    the failure is silent: invitees told to watch for a verification email that
+    the deployment no longer sends, which is #171's defect with the sign
+    flipped. Asserted against the builder, because that is where a second
+    switch would be introduced.
+    """
+
+    from collab_hub_api.config import Config, build_invitation_email_delivery
+
+    def delivery_for(flag: bool):
+        return build_invitation_email_delivery(
+            Config.parse(
+                {
+                    "frames": {
+                        "invitations": {"require_verified_email": flag},
+                        "email": {
+                            "provider": "ses",
+                            "accept_url": "https://web.test/invite",
+                            "app_instructions": "Download it",
+                            "ses": {
+                                "sender_address": "no-reply@web.test",
+                                "region": "us-west-2",
+                                "configuration_set": "collab-invitations",
+                            },
+                        },
+                    }
+                }
+            )
+        )
+
+    assert delivery_for(True)._require_verified_email is True
+    assert delivery_for(False)._require_verified_email is False
+
+
+class _Capturing:
+    """A provider that keeps what it was handed."""
+
+    def __init__(self) -> None:
+        self.sent: list[InvitationEmailMessage] = []
+
+    def send(self, message, *, invitation_id):
+        del invitation_id
+        self.sent.append(message)
+        return ProviderAcceptance(message_id="probe-message-id")
+
+
+@pytest.mark.parametrize(
+    ("require_verified_email", "expect_verification_copy"),
+    [(True, True), (False, False)],
+)
+def test_the_sent_copy_follows_the_delivery_setting(
+    require_verified_email, expect_verification_copy
+) -> None:
+    """Through ``deliver()``, which is the only production path that renders a
+    sent email.
+
+    An earlier version of this read ``delivery._require_verified_email`` and
+    passed it to the renderer itself -- asserting the value against itself while
+    never exercising the wiring, so deleting the real thread left every test
+    green. So this captures what the provider was actually handed.
+
+    Parametrized rather than written twice: the two directions were near-identical
+    functions each declaring their own provider class, which is how a pair meant
+    to pin one seam drifts into asserting different things about it.
+    """
+
+    provider = _Capturing()
+    delivery = ConfiguredInvitationEmailDelivery(
+        provider,
+        accept_url="https://web.test/invite",
+        app_instructions=APP_INSTRUCTIONS,
+        require_verified_email=require_verified_email,
+    )
+    delivery.deliver(
+        invitation_id="inv-1",
+        recipient=RECIPIENT,
+        invitation_secret=SECRET,
+        organization_name=None,
+        expires_at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+    )
+
+    (message,) = provider.sent
+    body = message.text_body.reveal()
+    assert ("verify the address" in body) is expect_verification_copy
+    # And the broad sweep, at this seam rather than only at the renderer:
+    # rewording the conditional paragraph to "confirm your address by following
+    # the verification link" would otherwise slip through the one test that goes
+    # via deliver().
+    if not expect_verification_copy:
+        assert "verify" not in body.lower()
+        assert "verification" not in body.lower()

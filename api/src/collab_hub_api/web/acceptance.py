@@ -167,6 +167,15 @@ in as the invited address, verify the mailbox, use a separate login, wait),
 so the browser keeps the token and a reload retries. Dropping it there would
 force them to dig the original link out of their email for a problem they
 had just been told how to fix.
+
+On a deployment with ``frames.invitations.require_verified_email`` off, the
+"unverified email" outcome above means something else -- the signed-in account
+carried no usable address -- and is **not** fixable by the person, since that deployment
+sends no verification mail. It stays out of this set either way, which is the
+right side of the line for a different reason than the one listed: the browser
+keeps the token not because a retry will work, but because throwing it away
+would cost the invitee their only copy of it while somebody helps them.
+:data:`RELAXED_PARAGRAPHS` is what makes the words match.
 """
 
 # --- The page's script ------------------------------------------------------
@@ -450,11 +459,12 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "Confirm your email address first",
         (
             "We can only accept an invitation for an email address your identity"
-            " provider has confirmed, and this account's address is not confirmed"
-            " yet.",
-            "Follow the verification link that was sent to your mailbox, then"
-            " come back to this tab — or open your invitation link again. Your"
-            " invitation has not been used.",
+            " provider has confirmed. Either this account's address is not"
+            " confirmed yet, or the sign-in did not carry an address at all.",
+            "If a confirmation email was sent to you, follow its link and come"
+            " back to this tab — or open your invitation link again. If you were"
+            " never asked to confirm an address, ask whoever invited you for"
+            " help. Your invitation has not been used.",
         ),
     ),
     (
@@ -503,6 +513,95 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
 )
 
+RELAXED_PARAGRAPHS: dict[str, dict[int, str]] = {
+    CLIENT_STATE_SIGNIN: {
+        1: (
+            "Your invitation is held in this browser tab while you do that, so"
+            " finish in this tab. If you lose it, simply open your invitation"
+            " link again."
+        ),
+    },
+    OUTCOME_EMAIL_NOT_VERIFIED: {
+        0: (
+            "An invitation can only be accepted for the address it names, so we"
+            " have to be able to read an address from the account you signed in"
+            " with — and this sign-in did not carry one."
+        ),
+        1: (
+            "That usually means the account has no email address set. Ask"
+            " whoever invited you for help. Your invitation has not been used."
+        ),
+    },
+}
+"""Individual paragraphs that differ where a verified address is not required.
+
+**Per paragraph, not per section, and that is the point.** The first version
+overrode whole sections, which meant the sign-in state's heading and its first
+paragraph were duplicated byte-for-byte from :data:`_SECTIONS`. Rewording the
+shared text there would have left relaxed deployments on the old wording
+forever, with nothing asserting the shared parts stayed shared -- exactly the
+failure :data:`CONDITIONAL_BLOCK`'s docstring argues against for the email copy
+("90% shared text and no mechanism keeping the shared part shared"). Indexing
+into the paragraph tuple keeps one copy of everything that does not vary.
+
+Headings are not overridable for the same reason: the only heading that needed
+to change is the not-verified one, and a table that can change headings invites
+the same duplication back.
+
+**Why this exists.** With ``requireVerifiedEmail`` false,
+``email_not_verified`` is no longer reached because an address is unverified --
+it is reached only when the **sign-in** carries no usable address -- the
+invitation row's own address is always populated. The strict
+copy tells the reader to "follow the verification link that was sent to your
+mailbox", and on such a deployment no such mail is ever sent. The sign-in
+state's mention is hedged and so was never false, only noise about a step that
+does not happen.
+"""
+
+
+RELAXED_HEADINGS: dict[str, str] = {
+    OUTCOME_EMAIL_NOT_VERIFIED: "We could not read an email address for this account",
+}
+"""The one heading that changes, and the only one that should.
+
+``email_not_verified`` is the only state whose *name* is wrong where
+verification is not required: it is reached there because no address was
+readable, not because one was unverified. Every other heading is true either
+way.
+
+Separate from :data:`RELAXED_PARAGRAPHS` so overriding a heading is a
+deliberate act with its own name rather than something a paragraph entry can do
+by accident -- and held to the same no-duplication rule by the tests, so an
+entry restating the strict heading fails instead of freezing relaxed
+deployments on wording a later edit moved past."""
+
+
+def _validate_overrides() -> None:
+    """Refuse a table entry that names no state or no paragraph, at import.
+
+    :func:`_with_overrides` also refuses a bad index, but it runs per request
+    and only on a relaxed deployment -- so a stale index would be a 500 on the
+    invitation page for somebody with no other copy of their link. The same
+    argument :data:`BODIES` makes for the email copy: unrenderable copy should
+    stop the pod, not wait for the first reader.
+    """
+
+    states = {name: paragraphs for name, _, paragraphs in _SECTIONS}
+    for table in (RELAXED_PARAGRAPHS, RELAXED_HEADINGS):
+        unknown = sorted(set(table) - set(states))
+        if unknown:
+            raise ValueError(f"relaxed copy names states that do not exist: {unknown}")
+    for state, overrides in RELAXED_PARAGRAPHS.items():
+        limit = len(states[state])
+        bad = sorted(i for i in overrides if not 0 <= i < limit)
+        if bad:
+            raise ValueError(f"relaxed copy for {state!r} names paragraphs out of range: {bad}")
+        # Run the substitution itself, so this is the only place the indices are
+        # checked and the code path a request takes is the one startup proved.
+        _with_overrides(states[state], overrides)
+
+
+
 PAGE_STATES: tuple[str, ...] = tuple(name for name, _, _ in _SECTIONS)
 """Every state the page can render, in document order.
 
@@ -510,6 +609,26 @@ Enumerated so the tests can assert the two directions that matter: every
 terminal state the invitation service can produce has copy here, and every
 state named by the script exists as a section.
 """
+
+
+def _with_overrides(paragraphs: tuple[str, ...], overrides: dict[int, str] | None) -> tuple[str, ...]:
+    """One section's paragraphs, with individual ones replaced.
+
+    No range check here. :func:`_validate_overrides` runs this function over
+    every section at import, so by the time a request reaches it the indices are
+    known good -- and a second check would be unreachable code that also happens
+    to be the uncovered line. One implementation, exercised at startup.
+    """
+
+    if not overrides:
+        return paragraphs
+    return tuple(overrides.get(i, text) for i, text in enumerate(paragraphs))
+
+
+# Called here rather than beside its definition: it exercises `_with_overrides`,
+# which is defined just above, so this is the earliest point at which the check
+# can run the code path a request takes.
+_validate_overrides()
 
 
 def _section(name: str, heading: str, paragraphs: tuple[str, ...], extra: str = "") -> str:
@@ -559,7 +678,13 @@ def signin_link(root_path: str, *, renew: bool = False, register: bool = False) 
     return f"{root_path}/web/signin?{urlencode(params)}"
 
 
-def acceptance_page(*, root_path: str = "", session=None, claims_current: bool = False) -> str:
+def acceptance_page(
+    *,
+    root_path: str = "",
+    session=None,
+    claims_current: bool = False,
+    require_verified_email: bool = True,
+) -> str:
     """Render the acceptance page for this request.
 
     The server knows two things the script does not: whether this browser
@@ -620,8 +745,25 @@ def acceptance_page(*, root_path: str = "", session=None, claims_current: bool =
         CLIENT_STATE_READY: statement + button,
         OUTCOME_REAUTHENTICATION_REQUIRED: renew,
     }
+    # Copy only: neither table adds or removes a state, so the wire contract and
+    # PAGE_STATES are identical either way -- asserted in the tests.
+    #
+    # **Built per request, and it has to be.** Review suggested memoizing this on
+    # the deployment boolean, on the reading that the sections depend on no
+    # per-request input. They do: `extras` carries `link`, `statement` and
+    # `renew`, each of which interpolates `root_path` -- read from
+    # `request.scope` precisely because a prefixed deployment changes it. Caching
+    # on the boolean alone would serve one request's prefix to another's page,
+    # which is a correctness bug traded for a string join.
+    para_overrides = {} if require_verified_email else RELAXED_PARAGRAPHS
+    head_overrides = {} if require_verified_email else RELAXED_HEADINGS
     sections = "".join(
-        _section(name, heading, paragraphs, extras.get(name, ""))
+        _section(
+            name,
+            head_overrides.get(name, heading),
+            _with_overrides(paragraphs, para_overrides.get(name)),
+            extras.get(name, ""),
+        )
         for name, heading, paragraphs in _SECTIONS
     )
     noscript = (

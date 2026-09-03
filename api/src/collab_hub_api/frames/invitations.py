@@ -83,11 +83,20 @@ action alone.
 
 Address matching (Gate B, ratified 2026-08-03; amended on #157)
 ---------------------------------------------------------------
-Acceptance requires the caller's OIDC ``email_verified`` claim to be boolean
-``true`` and their ``email`` claim to equal the invited address **but for
-ASCII case**. Gate B chose exact match over canonicalization, and that still
-holds for everything except case: there is no plus-tag stripping, no
+Acceptance requires the caller's ``email`` claim to equal the invited address
+**but for ASCII case**. Gate B chose exact match over canonicalization, and that
+still holds for everything except case: there is no plus-tag stripping, no
 dot-folding, no provider-specific rule, and no canonical column.
+
+Gate B's *other* half — that the caller's OIDC ``email_verified`` claim is
+boolean ``true`` — is a deployment setting since #190:
+``frames.invitations.require_verified_email``, default on. Where it is off, the
+invitation token stands in for the proof of mailbox control and **the address
+match above still applies unchanged**. This paragraph exists because the
+unconditional version of it was the canonical description of Gate B, and a
+reader reasoning from it would conclude a claim with ``email_verified: false``
+can never reach :func:`emails_match` — and might remove the ``require_verified``
+plumbing as dead code.
 
 The original rule was byte-exact, and it was wrong for one specific reason.
 **Keycloak lowercases the email on every account it holds**, so the claim it
@@ -306,6 +315,18 @@ class EmailNotVerifiedError(InvitationError):
     the login's IdP configuration, not something the invitee can act on
     differently, and enumerating them would describe another account's claims
     to whoever holds the link.
+
+    **Two conditions share this one state, and only one of them is always
+    reachable.** With ``frames.invitations.require_verified_email`` on -- the
+    default -- it is raised for an unverified or non-boolean claim *and* for a
+    missing address. With it off, only the missing address can raise it, and
+    the message says so, because ``routers/invitations.py`` returns
+    ``str(exc)`` verbatim to every non-browser client.
+
+    They share the exception and the wire code deliberately: widening either is
+    a contract change for the desktop app and the acceptance page, and the
+    remedy a caller has is the same in both cases -- sign in with an account
+    that carries the invited address.
     """
 
 
@@ -728,23 +749,45 @@ ordinary spaces — is a name's business.
 """
 
 
-def verified_claim_email(email: object, email_verified: object) -> str:
-    """The caller's verified email, or raise :class:`EmailNotVerifiedError`.
+def verified_claim_email(email: object, email_verified: object, *, require_verified: bool = True) -> str:
+    """The caller's usable email, or raise :class:`EmailNotVerifiedError`.
 
     ``email_verified`` must be the boolean ``True``. The string ``"true"``
     is rejected: some IdPs render claims as strings, and accepting the string
     would mean accepting ``"false"``-shaped truthiness from any IdP that ever
     emits a non-empty value here. This deployment's IdP contract (see
     ``docs/frames-operations.md``) is a boolean claim.
+
+    **``require_verified=False`` drops the verification requirement and nothing
+    else.** The address must still be a non-empty string, and the caller still
+    compares it to the invited address with :func:`emails_match` — dropping the
+    flag must never be mistaken for dropping the match, which is the check that
+    makes an invitation an invitation. See
+    :class:`~...config.FramesInvitationsConfig` for what the deployment is
+    trading: the token is a 256-bit secret delivered only to the invited
+    address, so holding it is itself proof of mailbox control, and the cost is
+    that a forwarded invitation becomes usable by whoever received it.
+
+    The default is ``True`` here as well as in configuration, so a caller that
+    forgets to thread the setting fails closed.
     """
 
-    if email_verified is not True:
+    if require_verified and email_verified is not True:
         raise EmailNotVerifiedError(
             "Accepting an invitation requires a verified email address on your account."
         )
     if not isinstance(email, str) or not email:
+        # A DIFFERENT condition, and the only one reachable when verification is
+        # not required: the signed-in account carried no usable address. It shares
+        # the exception and the wire code -- widening either is a contract
+        # change -- but not the sentence, because `routers/invitations.py`
+        # returns `str(exc)` verbatim and this is the one string every
+        # non-browser client sees. Telling an API caller on a relaxed
+        # deployment to "verify an address" points them at mail that deployment
+        # never sends.
         raise EmailNotVerifiedError(
-            "Accepting an invitation requires a verified email address on your account."
+            "Accepting an invitation requires an email address on your account, and the"
+            " account you signed in with did not provide one."
         )
     return email
 
@@ -958,8 +1001,13 @@ class PostgresInvitationService:
 
     available = True
 
-    def __init__(self, db):
+    def __init__(self, db, *, require_verified_email: bool = True):
         self._db = db
+        # A deployment property, so it is read once here rather than per
+        # request: nothing about a single acceptance should be able to change
+        # what the deployment requires of an identity. Defaults to the strict
+        # value so a construction that forgets it fails closed.
+        self._require_verified_email = require_verified_email
 
     # --- Reads --------------------------------------------------------------
 
@@ -1448,13 +1496,31 @@ class PostgresInvitationService:
         if row is None:
             raise InvitationNotFoundError("Invitation not found")
         invitation = _invitation(row)
-        replay = _evaluate_acceptance(invitation, row["server_now"], user_id, claim_email, email_verified)
+        replay = _evaluate_acceptance(
+            invitation,
+            row["server_now"],
+            user_id,
+            claim_email,
+            email_verified,
+            require_verified=self._require_verified_email,
+        )
         if replay is not None:
             return replay
-        # Cannot raise: the evaluation above returned, so the claim is
-        # verified and matches. Re-derived rather than threaded through, so
-        # there is one function that decides what a usable claim is.
-        verified_email = verified_claim_email(claim_email, email_verified)
+        # Cannot raise: the evaluation above returned, so the claim is usable
+        # and matches. Re-derived rather than threaded through, so there is one
+        # function that decides what a usable claim is -- and it is asked the
+        # same question, with the same setting, both times.
+        #
+        # `matched_email`, not `verified_email`. On a relaxed deployment this
+        # value is not verified by anyone, and it is *persisted* -- it becomes
+        # `collab_org_members.email`. A name asserting a property the code no
+        # longer establishes is the exact reading this change has to avoid,
+        # since a reader who trusts it might treat the column as evidence of
+        # verification. What is always true of it is that it matched the
+        # invited address.
+        matched_email = verified_claim_email(
+            claim_email, email_verified, require_verified=self._require_verified_email
+        )
 
         # Minted before the transaction so the audit scope can be declared;
         # discarded with the transaction if the body does not commit. Org ids
@@ -1500,6 +1566,15 @@ class PostgresInvitationService:
                     "invitation_id": invitation.id,
                     "role": invitation.granted_role,
                     "org_created": invitation.creates_organization,
+                    # Whether this acceptance required a verified address (#190).
+                    # The docs describe the relaxed trade honestly -- "usable by
+                    # anyone who obtains the link" -- but without this there is
+                    # no way to answer "which memberships were granted without a
+                    # verified address" during an incident, and the membership
+                    # row cannot say: it stores the matched address either way.
+                    # One boolean makes the documented trade reviewable after
+                    # the fact.
+                    "verified_email_required": self._require_verified_email,
                 },
             ) as event:
                 acceptance = self._redeem(
@@ -1507,7 +1582,7 @@ class PostgresInvitationService:
                     token_hash=token_hash,
                     user_id=user_id,
                     display=display,
-                    verified_email=verified_email,
+                    matched_email=matched_email,
                     expect_invitation_id=invitation.id,
                     new_org_id=new_org_id,
                     service_groups=service_groups,
@@ -1523,7 +1598,7 @@ class PostgresInvitationService:
         token_hash: str,
         user_id: str,
         display: DisplayIdentity,
-        verified_email: str,
+        matched_email: str,
         expect_invitation_id: str,
         new_org_id: str | None,
         service_groups: Sequence[str] = (),
@@ -1546,7 +1621,16 @@ class PostgresInvitationService:
         invitation = _invitation(locked)
         if invitation.id != expect_invitation_id:  # pragma: no cover - the hash is unique
             raise InvitationNotFoundError("Invitation not found")
-        replay = _evaluate_acceptance(invitation, locked["server_now"], user_id, verified_email, True)
+        # `True` and no `require_verified`, deliberately: this is the re-check
+        # against the LOCKED row, and what it re-decides is the invitation's
+        # state, not the identity. `matched_email` is already the string the
+        # outer evaluation produced under whatever the deployment requires, so
+        # asking the question again here would either be a no-op or would let a
+        # setting change mid-acceptance. The address match still runs, against
+        # the locked row's email.
+        replay = _evaluate_acceptance(
+            invitation, locked["server_now"], user_id, matched_email, True, require_verified=True
+        )
         if replay is not None:
             # Raced by this same login's own duplicate submit. The right
             # answer is the same success, and no second audit row.
@@ -1590,7 +1674,7 @@ class PostgresInvitationService:
             ON CONFLICT (user_id) DO NOTHING
             RETURNING user_id
             """,
-            (user_id, org_id, invitation.granted_role, verified_email, display.name),
+            (user_id, org_id, invitation.granted_role, matched_email, display.name),
         ).fetchone()
         if member is None:
             # Lost the cross-token race on the membership primary key. The
@@ -1796,8 +1880,17 @@ def _evaluate_acceptance(
     user_id: str,
     claim_email: object,
     email_verified: object,
+    *,
+    require_verified: bool,
 ) -> InvitationAcceptance | None:
     """Run the accept-time checks; return a replay outcome or ``None``.
+
+    ``require_verified`` has **no default**, deliberately. It is an internal
+    hop, and a default here is the hazard rather than the safety property: a
+    caller that dropped the keyword would get working code that quietly ignored
+    the deployment's choice, which is exactly the defect review found in the
+    first version of this change (deleting both threads left the suite green).
+    Required, it is a ``TypeError`` at the first call instead.
 
     Raises the terminal state for every failure. The order is fixed and
     load-bearing: the token's own state is decided before anything about the
@@ -1830,8 +1923,20 @@ def _evaluate_acceptance(
         raise InvitationAlreadyUsedError("This invitation has already been used.")
     if status == STATUS_EXPIRED:
         raise InvitationExpiredError("This invitation has expired. Ask for a new one.")
-    verified_email = verified_claim_email(claim_email, email_verified)
-    if not emails_match(invitation.email, verified_email):
+    # The match is NOT conditional on `require_verified`, and it is worth being
+    # exact about why, because the reason differs by mode.
+    #
+    # Strict: the match is an access control. The accepter has proved control of
+    # a verified address, and this is what ties that proof to *this* invitation.
+    #
+    # Relaxed: the claim is self-asserted, so the match is not a barrier -- a
+    # link-holder can type the invited address. What it still buys is that the
+    # address recorded on the membership row is the invited one, which is worth
+    # keeping unconditional: an invitation that recorded any address would make
+    # the member list unreliable as well as the access. What it does not buy is
+    # protection against whoever holds the link.
+    matched_email = verified_claim_email(claim_email, email_verified, require_verified=require_verified)
+    if not emails_match(invitation.email, matched_email):
         raise InvitationEmailMismatchError(
             "This invitation was sent to a different email address. Sign in with the account "
             "for the address it was sent to."
