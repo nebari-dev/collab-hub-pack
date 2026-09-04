@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
 
 import httpx
@@ -507,38 +509,78 @@ async def github_api_get(
         "github_api_get_request",
         extra={"user": auth.user, "path": body.path, "media_type": body.media_type},
     )
+    # Broker the token OUTSIDE the concurrency permit: _github_client does a live
+    # Keycloak round-trip, and holding a permit across it would let a slow broker
+    # fill every slot with requests that fail before GitHub is even contacted (and
+    # the curated reads take no permit, so it bounds nothing). A token error then
+    # surfaces its own status without ever queueing behind the semaphore.
+    client = await _github_client(request, config)
+
     # Bound concurrent generic reads so an injected agent can't exhaust the hub's
-    # sockets/memory by fanning out api_get calls (each opens its own client plus
-    # a token-broker fetch). The semaphore is sized once at app startup (lifespan).
-    async with request.app.state.github_api_get_semaphore:
-        client = await _github_client(request, config)
-        try:
-            result = await client.api_get(
-                path=body.path,
-                params=body.params,
-                media_type=body.media_type,
-                max_chars=body.max_chars,
-            )
-        except GitHubApiRequestError as exc:
-            logger.info(
-                "github_api_get_refusal",
-                extra={"reason": str(exc), "path": body.path, "media_type": body.media_type},
-            )
+    # sockets/memory by fanning out api_get calls. Waiting for a permit is itself
+    # bounded (request_timeout_seconds): rather than queue unbounded and invisibly
+    # until the pod OOMs, a saturated read sheds itself as a 429 and logs a throttle
+    # event (with the queue depth) so contention is observable. The semaphore is
+    # sized once at app startup (lifespan).
+    semaphore = request.app.state.github_api_get_semaphore
+    request.app.state.github_api_get_waiters += 1
+    try:
+        async with asyncio.timeout(config.github.request_timeout_seconds):
+            await semaphore.acquire()
+    except TimeoutError as exc:
+        logger.info(
+            "github_api_get_throttled",
+            extra={
+                "user": auth.user,
+                "path": body.path,
+                "waiters": request.app.state.github_api_get_waiters,
+            },
+        )
+        # 429 Too Many Requests, with Retry-After so the client backs off ~the wait
+        # budget instead of immediately re-queuing and re-saturating the pool. The
+        # detail string ("busy") is distinct from the GitHub-upstream rate-limit
+        # 429 ("GitHub rate limit exceeded"), and apollo-desktop surfaces both
+        # generically by status+detail with no GitHub-specific 429 branch, so this
+        # cannot be mistaken for a GitHub rate limit. Retry-After is integer seconds
+        # (RFC 9110 delta-seconds), rounded up, floored at 1.
+        retry_after = str(max(1, math.ceil(config.github.request_timeout_seconds)))
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "generic GitHub read is busy; retry shortly",
+            headers={"Retry-After": retry_after},
+        ) from exc
+    finally:
+        request.app.state.github_api_get_waiters -= 1
+    try:
+        result = await client.api_get(
+            path=body.path,
+            params=body.params,
+            media_type=body.media_type,
+            max_chars=body.max_chars,
+        )
+    except GitHubApiRequestError as exc:
+        logger.info(
+            "github_api_get_refusal",
+            extra={"reason": str(exc), "path": body.path, "media_type": body.media_type},
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except GitHubUpstreamError as exc:
+        logger.info(
+            "github_api_get_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code, "path": body.path},
+        )
+        # A GitHub 400/422 on the generic read is model-correctable (malformed
+        # params, or paging a search-backed endpoint past its 1000-result cap),
+        # not a gateway failure — surface it as 422 so the model fixes the request
+        # rather than blindly retrying a 502. str(exc) carries only GitHub's
+        # structured message.
+        if exc.status_code in (status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_CONTENT):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-        except GitHubUpstreamError as exc:
-            logger.info(
-                "github_api_get_upstream_error",
-                extra={"operation": exc.operation, "status_code": exc.status_code, "path": body.path},
-            )
-            # A GitHub 422 on the generic read is model-correctable (bad params, or
-            # paging a search-backed endpoint past its 1000-result cap), not a gateway
-            # failure — surface it as 422 so the model fixes the request rather than
-            # blindly retrying a 502. str(exc) carries only GitHub's structured message.
-            if exc.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-            _raise_github_upstream(exc, not_found_detail=_GITHUB_NOT_FOUND_DETAIL)
-        except httpx.HTTPError as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API read failed") from exc
+        _raise_github_upstream(exc, not_found_detail=_GITHUB_NOT_FOUND_DETAIL)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API read failed") from exc
+    finally:
+        semaphore.release()
     if result.truncated:
         logger.info(
             "github_api_get_truncation",
@@ -768,9 +810,13 @@ def _validate_github_repo(repo: str) -> None:
 
 def _validate_github_path(path: str) -> None:
     candidate = path.strip()
-    # Reject traversal, absolute paths, backslashes, and control characters
-    # before the value is ever placed into an upstream URL. Spaces are legal in a
-    # file path, so only the shared control/DEL/zero-width class is rejected here.
+    # Reject traversal, absolute paths, backslashes, and non-printable characters
+    # before the value is ever placed into an upstream URL. An ordinary ASCII space
+    # is allowed (it stays printable), but non-printable Unicode — a non-breaking
+    # space, zero-width/bidi marks, control/DEL — is rejected on purpose even though
+    # GitHub may accept it in a name: on an LLM-facing surface those are
+    # homoglyph/Trojan-Source spoofing vectors, so a rare legitimate filename takes a
+    # clear 422 rather than resolving to a name that can disguise itself as another.
     if (
         not candidate
         or candidate.startswith("/")
@@ -785,6 +831,12 @@ def _validate_github_ref(ref: str) -> None:
     candidate = ref.strip()
     if not candidate:
         return  # empty ref = default branch
+    # Same strict rejection as _validate_github_path, for the same reason: a ref
+    # (branch/tag/sha) carrying a non-breaking space, zero-width/bidi mark, or
+    # control/DEL is refused even though git may permit it, because those are
+    # spoofing vectors on this surface. The two char checks are not redundant:
+    # isspace() also rejects an ordinary ASCII space — legal in a file path but
+    # never valid in a git ref — which isprintable() would otherwise let through.
     if (
         candidate.startswith("/")
         or candidate.startswith("-")

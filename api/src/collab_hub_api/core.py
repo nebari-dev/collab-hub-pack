@@ -288,6 +288,12 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.github_api_get_semaphore = asyncio.Semaphore(
                 config.connectors.github.api_get_max_concurrency
             )
+            # Observe-only gauge of how many requests are in the acquire phase
+            # (queued for a permit). A plain int is safe here: asyncio is
+            # single-threaded and the route never awaits between reading and
+            # mutating it. Logged in the throttle event so a deferred queue-length
+            # cap (max_waiting) stays a monitored deferral, not a blind one.
+            app.state.github_api_get_waiters = 0
             if config.web.enabled:
                 # Again at boot, and this is the **last** time either check
                 # runs. make_app verifies what *it* registered; this sees

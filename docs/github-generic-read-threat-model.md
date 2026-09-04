@@ -179,6 +179,22 @@ the path is the (possibly prompt-injected) agent, not the user (decision (b)).
 Sanitization masks link *shapes* in what comes back; it does NOT neutralize
 injection and does NOT change what is *reachable*.
 
+**Masking is fully bypassed for file contents — named explicitly.** The single
+most common long-tail read, `/repos/{o}/{r}/contents/{path}` via
+`media_type: "json"`, returns the file as a **base64 `content` field**. The
+base64 alphabet cannot contain `://` or any link shape, so `sanitize_github_api_text`
+provably cannot mask it: the decoded file text reaches the model with links,
+markdown, and any injection payload intact. Only the curated `files/read` sanitizes
+decoded file contents; through the generic read the masking layer does nothing for
+file bodies. This is accepted (code-shaped content is deliberately left readable —
+invariant 3), but the signer must weigh it knowing file fetches are unmasked.
+*Future trap:* if a `raw` media type is ever added to `_ACCEPT_BY_MEDIA` to return
+decoded bodies, GitHub labels them `Content-Type: application/vnd.github.raw+json`
+— `_is_json_content`'s `endswith("+json")` test would misroute that raw text into
+`json.loads` (failing into the truncated-prefix fallback with `truncated=True` on a
+complete file). The Accept table's first extension needs a matching content-type
+exception.
+
 **Detection.** The structured events are the alertable surface, with distinct
 names so ops can build per-user/agent volume and anomaly alerts:
 `github_api_get_request` (validated path + auth identity `auth.user` +

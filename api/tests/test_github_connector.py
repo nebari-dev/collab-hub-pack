@@ -1644,6 +1644,92 @@ async def test_api_get_enforces_time_budget(monkeypatch):
         await client.api_get(path="/repos/a/b")
 
 
+# --- generic read: latest-review hardening (batch, TDD) -------------------
+
+
+async def test_api_get_diff_single_long_line_keeps_budget(monkeypatch):
+    # Regression: a minified / single-long-line diff is ~40 chars of headers then
+    # one enormous line. Trimming to the last newline shed the whole budget back
+    # to the header (49.9k dropped, no offset to recover). Only a SHORT trailing
+    # partial line should be trimmed; a long one is kept.
+    header = "diff --git a/min.js b/min.js\n@@ -1 +1 @@\n"
+    text = (header + "+" + "a" * 200_000).encode()
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=text)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(
+        path="/repos/a/b/pulls/1", media_type="diff", max_chars=50_000
+    )
+    assert result.truncated is True
+    assert len(result.body_text) > 40_000  # budget preserved, not trimmed to the header
+
+
+async def test_api_get_error_body_is_capped(monkeypatch):
+    # Hardening: the >=400 error-body read was the one uncapped read left. A
+    # misbehaving GHE/proxy streaming a huge error page must not be fully buffered.
+    pulled = {"chunks": 0}
+
+    def handler(request: httpx.Request) -> Response:
+        async def gen():
+            for _ in range(1000):
+                pulled["chunks"] += 1
+                yield b"E" * 100_000  # 100 MB if fully drained
+
+        return Response(500, headers={"content-type": "application/json"}, content=gen())
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError):
+        await _api_client().api_get(path="/repos/a/b")
+    assert pulled["chunks"] < 50  # error body capped, not fully buffered
+
+
+async def test_read_capped_single_oversized_chunk_bounded():
+    # gzip-decompressed bodies yield decoded chunks that can be tens of MB in one
+    # go; read_capped must bound the retained/returned bytes to the cap regardless.
+    from collab_hub_api.connectors.http_stream import read_capped
+
+    async def gen():
+        yield b"z" * 10_000_000
+
+    response = httpx.Response(200, content=gen())
+    raw, truncated = await read_capped(response, 1000)
+    assert truncated is True
+    assert len(raw) <= 1000
+
+
+async def test_api_get_invalid_json_not_capped_gives_honest_message(monkeypatch):
+    # A whitespace-only / proxy-mangled 200 JSON body the cap did NOT truncate must
+    # not tell the model to shrink per_page — that guidance is untrue and wastes turns.
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=b"   ")
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b/commits")
+    msg = str(excinfo.value).lower()
+    assert "per_page" not in msg
+    assert "not valid json" in msg
+
+
+async def test_api_get_hop_cap_message_names_redirects_not_binary(monkeypatch):
+    # After >max_redirects SAME-origin hops the refusal is a redirect-loop, not an
+    # off-origin archive/binary download — the message must not misdirect.
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(1)
+        return Response(301, headers={"Location": f"https://github.test/api/x{len(seen)}"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b")
+    msg = str(excinfo.value).lower()
+    assert "redirect" in msg
+    assert "archive" not in msg and "binary" not in msg
+
+
 # --- generic read: request model + route ----------------------------------
 
 _API_GET_ROUTE = "/v1/connectors/github/api/get"
@@ -1773,6 +1859,59 @@ async def test_api_get_route_upstream_422_is_422(tmp_path, monkeypatch):
         response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/search/issues"})
     assert response.status_code == 422
     assert "1000" in response.json()["detail"]
+
+
+async def test_api_get_route_throttles_when_saturated(tmp_path, monkeypatch, caplog):
+    # 7b: when every permit is held, a request waits up to the timeout then sheds
+    # itself as a 429 with a Retry-After (not a silent unbounded queue) and logs a
+    # throttle event.
+    _install_mock_client(monkeypatch, lambda r: _json_response({"x": 1}))
+    app = make_app(_config(tmp_path, api_get_max_concurrency=1, request_timeout_seconds=0.2))
+    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+        async with _client(app) as client:
+            # Exhaust the single permit so the request has to wait — and time out.
+            await app.state.github_api_get_semaphore.acquire()
+            response = await client.post(
+                _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"}
+            )
+    assert response.status_code == 429
+    assert "busy" in response.json()["detail"].lower()
+    assert response.headers.get("retry-after") == "1"  # ceil(0.2s wait budget), floored at 1
+    assert any(r.msg == "github_api_get_throttled" for r in caplog.records)
+
+
+async def test_api_get_route_broker_error_not_blocked_by_saturation(tmp_path, monkeypatch):
+    # 7a: token brokering happens OUTSIDE the concurrency permit, so a token failure
+    # surfaces its own status (409 not-connected) even when the read pool is fully
+    # saturated — it never queues behind the semaphore or throttles to 503.
+    _install_mock_client(monkeypatch, lambda r: _json_response({"x": 1}))
+    # No static token and no broker URL -> ConnectorNotConnected -> 409, and it must
+    # be reached before the (exhausted) permit is ever awaited.
+    app = make_app(
+        _config(tmp_path, static_access_token="", api_get_max_concurrency=1, request_timeout_seconds=0.2)
+    )
+    async with _client(app) as client:
+        await app.state.github_api_get_semaphore.acquire()  # exhaust the pool
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"}
+        )
+    assert response.status_code == 409  # broker error surfaced, NOT a 503 throttle
+
+
+async def test_api_get_route_upstream_400_is_422(tmp_path, monkeypatch):
+    # A GitHub 400 on malformed GET params is model-correctable (bad query), so the
+    # generic read surfaces 422 with GitHub's message rather than a blind-retry 502.
+    def handler(request: httpx.Request) -> Response:
+        return Response(400, json={"message": "Problems parsing query"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/search/issues", "params": {"q": "bad"}}
+        )
+    assert response.status_code == 422
+    assert "parsing" in response.json()["detail"].lower()
 
 
 async def test_api_get_route_disabled_is_403(tmp_path, monkeypatch):

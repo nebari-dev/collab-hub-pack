@@ -114,10 +114,25 @@ _API_GET_JSON_ERROR = (
     "the JSON response exceeded the size cap before it could be parsed — narrow "
     "the request (e.g. a smaller per_page) or fetch a smaller resource"
 )
+# The cap did NOT fire: a proxy-mangled or whitespace-only 200 body. Telling the
+# model to shrink per_page here is untrue and uncorrectable, so keep the guidance
+# honest — the response simply was not valid JSON.
+_API_GET_JSON_INVALID = "the upstream returned a body that is not valid JSON"
 _API_GET_REDIRECT_REFUSAL = (
     "refused to follow a redirect off the GitHub API origin — the target is "
     "likely an archive or binary download, which this read tool does not support"
 )
+# Distinct from the off-origin refusal above: this fires only after >max_redirects
+# SAME-origin hops (a redirect loop or an unusually long renamed-repo chain), so
+# the "archive or binary download" framing would misdirect the model and operator.
+_API_GET_TOO_MANY_REDIRECTS = (
+    f"too many redirects on the GitHub API origin — did not resolve within "
+    f"{_API_GET_MAX_REDIRECTS} hops"
+)
+# Longest trailing partial line worth shedding on a truncated text/diff body.
+# Beyond this, cutting back to the last newline would discard most of the budget
+# (a single-long-line diff), so we keep the partial line instead.
+_API_GET_MAX_PARTIAL_LINE_TRIM = 1_000
 # Locally-owned recovery guidance only — do NOT restate GitHub's numeric diff
 # limits (lines / MB / files). Those drift and this code can't observe them, so
 # we append this to GitHub's own 406 message rather than stating stale numbers.
@@ -202,6 +217,14 @@ class GitHubClient:
         # api_get bounds the WHOLE call (validate + ≤3 hops) with this as an
         # overall deadline, so a slow redirect chain can't blow the apollo cap.
         self.timeout_seconds = timeout_seconds
+
+    def _headers(self, accept: str, *, api_version: bool = True) -> dict[str, str]:
+        """Auth + Accept header dict, one authority so a future API-version bump
+        can't miss a call site. GraphQL omits X-GitHub-Api-Version (api_version=False)."""
+        headers = {"Authorization": f"Bearer {self.access_token}", "Accept": accept}
+        if api_version:
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        return headers
 
     async def verify_access(self) -> GitHubAccessCheck:
         """Confirm the token can read, and resolve the connected login.
@@ -459,10 +482,7 @@ class GitHubClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 self.api_base_url + "/graphql",
-                headers={
-                    "Authorization": f"Bearer {self.access_token}",
-                    "Accept": "application/vnd.github+json",
-                },
+                headers=self._headers("application/vnd.github+json", api_version=False),
                 json={"query": query, "variables": variables},
             )
         _raise_for_github_status(response, operation=operation)
@@ -497,11 +517,7 @@ class GitHubClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
                 self.api_base_url + path,
-                headers={
-                    "Authorization": f"Bearer {self.access_token}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
+                headers=self._headers("application/vnd.github+json"),
                 params=params,
             )
         _raise_for_github_status(response, operation=operation)
@@ -562,11 +578,7 @@ class GitHubClient:
         # range, but api_get must not trust an out-of-range max_chars from any
         # caller (direct callers, tests) — clamp to [1, ceiling].
         resolved_max = max(1, min(resolved_max, _API_GET_MAX_CHARS_CEILING))
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Accept": _ACCEPT_BY_MEDIA[media_type],
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        headers = self._headers(_ACCEPT_BY_MEDIA[media_type])
         coerced = {key: coerce_github_param_value(value) for key, value in (params or {}).items()}
         current = start.copy_merge_params(coerced) if coerced else start
 
@@ -583,7 +595,9 @@ class GitHubClient:
                             return await self._read_api_result(response, media_type, resolved_max)
         except TimeoutError as exc:
             raise GitHubUpstreamError(operation="api get", message="request timed out") from exc
-        raise GitHubApiRequestError(_API_GET_REDIRECT_REFUSAL)
+        # Loop exhausted: every off-origin hop already raised inside
+        # _resolve_api_redirect, so reaching here means too many SAME-origin hops.
+        raise GitHubApiRequestError(_API_GET_TOO_MANY_REDIRECTS)
 
     def _validate_api_path(self, path: str) -> None:
         """Reject anything that isn't a plain, on-host GitHub API path (raw string)."""
@@ -652,15 +666,18 @@ class GitHubClient:
         has_more = "next" in response.links
 
         if status_code >= 400:
-            await response.aread()  # error bodies are small; load it so .json() works
+            # Cap the error-body read too — it was the one remaining uncapped read.
+            # api_base_url is configurable, so a misbehaving GHE/proxy could stream
+            # an unbounded error page; a few KB is plenty for the structured message.
+            error_body, _ = await read_capped(response, 65_536)
             if status_code == 406 and media_type in ("diff", "patch"):
                 # Surface GitHub's own message and append our locally-owned recovery
                 # guidance, rather than restating GitHub's (drift-prone) numeric
                 # limits ourselves — this code can't observe if they change.
-                upstream = _github_error_message(response)
+                upstream = _github_error_message(response, body=error_body)
                 message = f"{upstream}: {_API_GET_406_GUIDANCE}" if upstream else _API_GET_406_GUIDANCE
                 raise GitHubApiRequestError(message)
-            _raise_for_github_status(response, operation="api get")
+            _raise_for_github_status(response, operation="api get", body=error_body)
 
         if status_code in (202, 204):
             # 202: repo-statistics endpoints return empty body while GitHub
@@ -713,32 +730,27 @@ class GitHubClient:
             # renderer unmasked (the parsed and diff paths both sanitize).
             prefix = sanitize_github_api_text(text)[:max_chars]
             if not prefix.strip():
-                raise GitHubApiRequestError(_API_GET_JSON_ERROR) from exc
+                # Only claim the size cap fired when it actually did; otherwise the
+                # body was simply invalid (proxy-mangled / whitespace) and "shrink
+                # per_page" would send the model chasing an uncorrectable error.
+                message = _API_GET_JSON_ERROR if byte_truncated else _API_GET_JSON_INVALID
+                raise GitHubApiRequestError(message) from exc
             return GitHubApiGetResponse(
                 body=None, body_text=prefix, truncated=True, has_more=has_more,
                 content_type=content_type, status=status,
             )
         sanitized = self._sanitize_json_values(parsed)
-        # Measure the serialized length without materializing the whole document
-        # on the common fits-path (FastAPI re-serializes `body` anyway): stream
-        # chunks from iterencode and stop as soon as we cross the cap.
-        encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
-        pieces: list[str] = []
-        length = 0
-        overflowed = False
-        for chunk in encoder.iterencode(sanitized):
-            pieces.append(chunk)
-            length += len(chunk)
-            if length > max_chars:
-                overflowed = True
-                break
-        if not byte_truncated and not overflowed:
+        # The input was already hard-capped to max_chars*4+1 bytes by read_capped,
+        # so a plain serialize is bounded — no streaming length-probe needed (the
+        # old iterencode ran to completion on the fits path anyway, saving nothing).
+        serialized = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+        if not byte_truncated and len(serialized) <= max_chars:
             return GitHubApiGetResponse(
                 body=sanitized, body_text="", truncated=False, has_more=has_more,
                 content_type=content_type, status=status,
             )
         return GitHubApiGetResponse(
-            body=None, body_text="".join(pieces)[:max_chars], truncated=True, has_more=has_more,
+            body=None, body_text=serialized[:max_chars], truncated=True, has_more=has_more,
             content_type=content_type, status=status,
         )
 
@@ -754,8 +766,15 @@ class GitHubClient:
         sanitized = sanitize_github_api_text(raw.decode("utf-8", errors="replace"))
         truncated = byte_truncated or len(sanitized) > max_chars
         body_text = sanitized[:max_chars]
-        if truncated and "\n" in body_text:
-            body_text = body_text[: body_text.rfind("\n")]  # trim to the last complete line
+        if truncated:
+            cut = body_text.rfind("\n")
+            # Only shed a SHORT trailing partial line. rfind finds the last newline
+            # anywhere, so on a single-long-line diff (a minified file) it sits near
+            # the start — trimming to it would silently drop most of the budget with
+            # no offset to recover. Keep the partial line when the tail is long, and
+            # when there's no newline at all (cut == -1, so keep the whole prefix).
+            if cut != -1 and cut >= len(body_text) - _API_GET_MAX_PARTIAL_LINE_TRIM:
+                body_text = body_text[:cut]
         return GitHubApiGetResponse(
             body=None, body_text=body_text, truncated=truncated, has_more=has_more,
             content_type=content_type, status=status,
@@ -814,7 +833,9 @@ def _parse_oauth_scopes(header: str) -> list[str]:
     return [scope.strip() for scope in header.split(",") if scope.strip()]
 
 
-def _raise_for_github_status(response: httpx.Response, *, operation: str) -> None:
+def _raise_for_github_status(response: httpx.Response, *, operation: str, body: bytes | None = None) -> None:
+    # `body` lets a streamed caller (api_get) pass the already-read, size-capped
+    # bytes so the message is parsed from those rather than a second full read.
     if response.status_code < 400:
         return
     retry_after = response.headers.get("retry-after", "")
@@ -840,7 +861,7 @@ def _raise_for_github_status(response: httpx.Response, *, operation: str) -> Non
         # A 403 can be a permanent WAF/abuse block that merely carries Retry-After
         # (api_base_url is configurable for GHE/proxied hubs). Keep GitHub's own
         # structured reason instead of discarding it behind the generic 429 text.
-        detail = _github_error_message(response)
+        detail = _github_error_message(response, body=body)
         if detail:
             message = f"{message}: {detail}"
         raise GitHubUpstreamError(
@@ -852,19 +873,20 @@ def _raise_for_github_status(response: httpx.Response, *, operation: str) -> Non
     raise GitHubUpstreamError(
         operation=operation,
         status_code=response.status_code,
-        message=_github_error_message(response),
+        message=_github_error_message(response, body=body),
         retry_after=retry_after,
     )
 
 
-def _github_error_message(response: httpx.Response) -> str:
+def _github_error_message(response: httpx.Response, *, body: bytes | None = None) -> str:
     """Return only GitHub's structured error message, never a raw body.
 
     A non-JSON body (e.g. a proxy's HTML error page) yields ``""`` so infra
-    detail cannot leak into a 502.
+    detail cannot leak into a 502. ``body`` lets a streamed caller pass the
+    already-read, size-capped bytes instead of a second ``response.json()`` read.
     """
     try:
-        payload = response.json()
+        payload = json.loads(body) if body is not None else response.json()
     except ValueError:
         return ""
     if isinstance(payload, dict):
