@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 from contextlib import asynccontextmanager
 
 import httpx
@@ -10,7 +12,19 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config
-from collab_hub_api.connectors.models import GITHUB_READONLY_SCOPES, GitHubSearchRequest
+from collab_hub_api.connectors.connector_text import sanitize_github_api_text
+from collab_hub_api.connectors.github_client import (
+    GitHubApiRequestError,
+    GitHubClient,
+    GitHubUpstreamError,
+    _raise_for_github_status,
+)
+from collab_hub_api.connectors.models import (
+    GITHUB_READONLY_SCOPES,
+    GitHubApiGetRequest,
+    GitHubApiGetResponse,
+    GitHubSearchRequest,
+)
 from collab_hub_api.core import make_app
 
 STATIC_TOKEN = "gho_github-token-alice-secret"
@@ -306,6 +320,62 @@ async def test_github_search_sanitizes_link_text(tmp_path, monkeypatch):
             "/v1/connectors/github/search", headers=_auth_header(), json={"query": "bug"}
         )
     assert "http://evil.test" not in response.text
+
+
+def test_github_api_text_sanitizer_preserves_code_shapes():
+    # The generic read returns diffs, file contents, and refs where the shared
+    # sanitizer's bare-domain masking is destructive (config.py -> [link], and
+    # every dotted attribute access -- os.path, self.timeout_seconds -- reads as
+    # a bare domain too). The GitHub-local variant drops bare-domain masking
+    # entirely (the renderer-crash premise, apollo-desktop#365, has expired)
+    # while keeping scheme/www./markdown/email links neutralized.
+    for value in (
+        "config.py",
+        "src/components/App.tsx",
+        "release/2.0",
+        "(a3f5b9c)",
+        "a3f5b9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7",
+        "refs/heads/main",
+        "v1.2.3",
+        "os.path.join(base, x)",
+        "self.timeout_seconds = timeout_seconds",
+        "np.linalg.norm(x)",
+        "see foo.com for details",
+        "example.io test.dev foo.ai",
+        "numpy.linalg",
+        # The reviewer's own repro case for the old behavior: a domain:tag
+        # shape (colon before the tag, not a scheme prefix) must survive too.
+        "image: ghcr.io/openteams/collab:8da6475",
+    ):
+        assert sanitize_github_api_text(value) == value
+
+    # Real links and emails are still neutralized.
+    assert sanitize_github_api_text("Go to https://x.test/a") == "Go to [link]"
+    assert sanitize_github_api_text("See [the plan](https://x.test/plan).") == "See the plan."
+    assert sanitize_github_api_text("Email person@example.com") == "Email person [at] example [dot] com"
+    assert sanitize_github_api_text("mailto:bob@x.test") == "[link]"
+    assert sanitize_github_api_text("Meet at www.example.com/x") == "Meet at [link]"
+    assert sanitize_github_api_text("") == ""
+
+    # Idempotent across code-shaped and link-shaped inputs.
+    for value in (
+        "config.py",
+        "example.io",
+        "Go to https://x.test/a",
+        "Email person@example.com",
+        "See [the plan](https://x.test/plan).",
+    ):
+        once = sanitize_github_api_text(value)
+        assert sanitize_github_api_text(once) == once
+
+
+def test_shared_sanitizer_still_masks_bare_domains():
+    # Guard the intentional divergence: the SHARED sanitizer must keep masking
+    # bare domains (Gmail/Calendar/Drive/Slack + curated GitHub depend on it).
+    from collab_hub_api.connectors.connector_text import sanitize_connector_text
+
+    assert sanitize_connector_text("config.py") == "[link]"
+    assert sanitize_connector_text("see foo.com for details") == "see [link] for details"
 
 
 async def test_github_endpoints_do_not_expose_access_token(tmp_path, monkeypatch):
@@ -1018,3 +1088,1035 @@ async def test_github_list_repos_rejects_bad_owner(tmp_path, monkeypatch):
             "/v1/connectors/github/repos/list", headers=_auth_header(), json={"owner": "bad/owner"}
         )
     assert response.status_code == 422
+
+
+# --- generic read: GitHubClient.api_get -----------------------------------
+
+_API_BASE = "https://github.test/api"
+
+
+def _api_client() -> GitHubClient:
+    return GitHubClient(access_token=STATIC_TOKEN, api_base_url=_API_BASE)
+
+
+def _json_response(payload, *, headers=None, links=None) -> Response:
+    hdrs = {"content-type": "application/json; charset=utf-8"}
+    if links:
+        hdrs["Link"] = links
+    if headers:
+        hdrs.update(headers)
+    return Response(200, headers=hdrs, json=payload)
+
+
+async def test_api_get_happy_json(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> Response:
+        captured["path"] = request.url.path
+        captured["params"] = request.url.params
+        captured["accept"] = request.headers.get("accept")
+        captured["api_version"] = request.headers.get("x-github-api-version")
+        captured["auth"] = request.headers.get("authorization")
+        return _json_response({"number": 1, "title": "hi"})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/acme/widgets/pulls/1", params={"per_page": 3})
+    assert result.body == {"number": 1, "title": "hi"}
+    assert result.body_text == ""
+    assert result.truncated is False
+    assert result.has_more is False
+    assert result.content_type == "application/json"
+    assert result.status == 200
+    assert captured["path"] == "/api/repos/acme/widgets/pulls/1"
+    assert captured["params"].get("per_page") == "3"
+    assert captured["accept"] == "application/vnd.github+json"
+    assert captured["api_version"] == "2022-11-28"
+    assert captured["auth"] == f"Bearer {STATIC_TOKEN}"
+
+
+async def test_api_get_coerces_param_scalars(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> Response:
+        captured["params"] = request.url.params
+        return _json_response([])
+
+    _install_mock_client(monkeypatch, handler)
+    await _api_client().api_get(
+        path="/repos/acme/widgets/pulls", params={"per_page": 100, "page": 2, "all": True}
+    )
+    params = captured["params"]
+    assert params.get("per_page") == "100"
+    assert params.get("page") == "2"
+    assert params.get("all") == "true"  # bool -> lowercase, not "True"
+
+
+async def test_api_get_sanitizes_nested_string_values(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response(
+            {
+                "body": "see https://evil.test/x",
+                "path": "config.py",
+                "nested": {"url": "http://evil.test", "n": 5},
+                "list": ["visit www.evil.test/a", "release/2.0"],
+            }
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/issues/1")
+    assert result.body["body"] == "see [link]"
+    assert result.body["path"] == "config.py"  # code-shaped value preserved
+    assert result.body["nested"]["url"] == "[link]"
+    assert result.body["nested"]["n"] == 5  # non-string untouched
+    assert result.body["list"] == ["visit [link]", "release/2.0"]
+    assert set(result.body.keys()) == {"body", "path", "nested", "list"}  # non-link keys unchanged
+
+
+async def test_api_get_sanitizes_link_shaped_object_keys(monkeypatch):
+    # Gists key their `files` object by attacker-chosen filename, so an object KEY
+    # is as untrusted a channel as a value: a link-shaped key must be masked too.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"files": {"see https://evil.test/x.txt": {"content": "ok"}}})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/gists/abc123")
+    files = result.body["files"]
+    assert "https://evil.test" not in str(files)  # link-shaped key masked
+    assert list(files.values()) == [{"content": "ok"}]  # value under it preserved
+    assert any("[link]" in key for key in files)
+
+
+async def test_api_get_error_message_is_sanitized(monkeypatch):
+    # A 4xx message reflects request input; a link in it must be masked before it
+    # reaches the model through the error detail (the body path already sanitizes).
+    def handler(request: httpx.Request) -> Response:
+        return Response(422, json={"message": "Invalid ref: see http://evil.test/x for help"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b/issues/1")
+    assert "http://evil.test" not in str(excinfo.value)
+    assert "[link]" in str(excinfo.value)
+
+
+async def test_api_get_diff_media(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> Response:
+        captured["accept"] = request.headers.get("accept")
+        return Response(
+            200,
+            headers={"content-type": "application/vnd.github.diff; charset=utf-8"},
+            content=b"diff --git a/config.py b/config.py\n+see https://evil.test\n",
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff")
+    assert captured["accept"] == "application/vnd.github.diff"
+    assert result.content_type == "application/vnd.github.diff"
+    assert result.body is None
+    assert "config.py" in result.body_text  # code preserved
+    assert "[link]" in result.body_text  # url masked
+    assert "https://evil.test" not in result.body_text
+    assert result.status == 200
+
+
+async def test_api_get_diff_requested_json_returned_degrades(monkeypatch):
+    # GitHub silently returns JSON when a diff Accept is unsupported (e.g. issues);
+    # dispatch is keyed on Content-Type, and content_type echoes the degrade.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"number": 1})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/issues/1", media_type="diff")
+    assert result.body == {"number": 1}
+    assert result.content_type == "application/json"
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "no-slash",
+        "/a?q=1",
+        "/a#frag",
+        "/a/../b",
+        "//evil/x",
+        "https://evil.com",
+        "/a\x01b",
+        "/a\x7fb",
+        "/a\u200bb",
+        "/" + "x" * 500,
+        "",
+        "/a b",
+        "/%2e%2e/x",
+        "/a%2fb",
+        "/a%20b",
+        "/graphql",
+        "/GRAPHQL",
+        "/graphql/",
+    ],
+)
+async def test_api_get_rejects_bad_paths(monkeypatch, bad_path):
+    def handler(request: httpx.Request) -> Response:  # pragma: no cover - must not be reached
+        return _json_response({})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path=bad_path)
+
+
+async def test_api_get_follows_same_host_redirect(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append((str(request.url), request.headers.get("authorization")))
+        if request.url.path == "/api/repos/old/name":
+            return Response(301, headers={"Location": "https://github.test/api/repos/new/name"})
+        return _json_response({"ok": True})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/old/name")
+    assert result.body == {"ok": True}
+    assert len(seen) == 2
+    assert seen[1][0] == "https://github.test/api/repos/new/name"
+    assert seen[1][1] == f"Bearer {STATIC_TOKEN}"  # auth kept across the hop
+    for url, _auth in seen:
+        assert httpx.URL(url).host == "github.test"
+
+
+async def test_api_get_redirect_hop_cap(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(str(request.url))
+        # Always redirect on-host to a fresh path so only the hop cap can stop it.
+        return Response(301, headers={"Location": f"https://github.test/api/x{len(seen)}"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b")
+    assert len(seen) == 4  # initial + 3 followed hops, then refuse
+
+
+async def test_api_get_refuses_cross_host_redirect(monkeypatch):
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(str(request.url))
+        return Response(302, headers={"Location": "https://codeload.github.test/acme/widgets/tarball"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/acme/widgets/tarball")
+    assert len(seen) == 1  # never issued the cross-host hop
+    assert httpx.URL(seen[0]).host == "github.test"
+    message = str(excinfo.value).lower()
+    assert "archive" in message or "binary" in message
+
+
+async def test_api_get_refuses_downgrade_redirect(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(301, headers={"Location": "http://github.test/api/x"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b")
+
+
+async def test_api_get_refuses_userinfo_spoof_redirect(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(301, headers={"Location": "https://github.test@evil.com/x"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b")
+
+
+async def test_api_get_refuses_malformed_redirect_location(monkeypatch):
+    # A malformed upstream Location (unterminated IPv6 bracket) raises
+    # httpx.InvalidURL, which is NOT an httpx.HTTPError — it must degrade to the
+    # 422 refusal, not surface as an uncaught raw 500.
+    def handler(request: httpx.Request) -> Response:
+        return Response(301, headers={"Location": "https://[bad"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b")
+
+
+async def test_api_get_aborts_oversized_body(monkeypatch):
+    pulled = {"chunks": 0}
+
+    def handler(request: httpx.Request) -> Response:
+        async def gen():
+            for _ in range(1000):
+                pulled["chunks"] += 1
+                yield b"a" * 10_000  # 10 MB if fully drained
+
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=gen())
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=1000)
+    assert result.truncated is True
+    assert pulled["chunks"] < 100  # aborted at the byte cap, not fully buffered
+    assert len(result.body_text) <= 1000
+
+
+async def test_api_get_text_expansion_does_not_falsely_truncate(monkeypatch):
+    # Masking inflates length (a@b.co -> a [at] b [dot] co), so a diff that fit the
+    # raw byte budget must NOT be flagged truncated just because the masked form is
+    # longer than max_chars — that would set has_more and send the model paging for
+    # content it already holds in full.
+    raw = b"a@b.co c@d.co e@f.co"  # 20 bytes; masks to 53 chars
+    expected = "a [at] b [dot] co c [at] d [dot] co e [at] f [dot] co"
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=raw)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=30)
+    assert result.truncated is False
+    assert result.has_more is False
+    assert result.body_text == expected  # returned whole despite exceeding max_chars
+    assert len(result.body_text) > 30
+
+
+async def test_api_get_json_expansion_keeps_structure(monkeypatch):
+    # A JSON body that fit raw must stay STRUCTURED even when value masking inflates
+    # its serialized length past max_chars — don't downgrade a complete object to a
+    # truncated text prefix.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"e": "a@b.co c@d.co e@f.co"})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/issues/1", max_chars=30)
+    assert result.truncated is False
+    assert result.body == {"e": "a [at] b [dot] co c [at] d [dot] co e [at] f [dot] co"}
+    assert result.body_text == ""
+
+
+async def test_api_get_json_size_ignores_upstream_whitespace(monkeypatch):
+    # The size decision is made on the COMPACT parsed size, so a body padded with
+    # incidental upstream whitespace (indentation) that fits compact must NOT be
+    # flagged truncated — only the real content counts against max_chars.
+    raw = b'{\n    "a": 1,\n    "b": 2\n}'  # 26 bytes raw; compact {"a":1,"b":2} is 13
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=raw)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b", max_chars=20)
+    assert result.truncated is False
+    assert result.body == {"a": 1, "b": 2}
+
+
+async def test_api_get_partial_line_trim_keeps_long_partial_on_small_budget(monkeypatch):
+    # Shed threshold is min(1000-char cap, max_chars // divisor). On a small budget the
+    # max_chars//divisor floor takes over, so a LONG partial line is kept (trimming back
+    # to an early newline would discard most of the returned content) — unlike a bare
+    # 1000-char cap, which exceeds the whole body at this budget and would always fire.
+    content = b"xxxxx\n" + b"y" * 100
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=content)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=20)
+    assert result.truncated is True
+    assert len(result.body_text) == 20  # long partial line kept, budget not thrown away
+    assert result.body_text.startswith("xxxxx\ny")
+
+
+async def test_api_get_partial_line_trim_sheds_short_tail_on_small_budget(monkeypatch):
+    # ...but a SHORT trailing partial (within the threshold) IS still shed on the same
+    # small budget.
+    content = b"line1\nline2\nline3\n" + b"z" * 100
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=content)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=20)
+    assert result.truncated is True
+    assert result.body_text == "line1\nline2\nline3"  # partial "zz" tail dropped
+
+
+async def test_api_get_honors_timeout_override(monkeypatch):
+    # A caller can hand api_get a reduced deadline (the route charges the read only
+    # the budget left after the concurrency-permit wait); a slow upstream then times
+    # out within that override.
+    async def slow_body():
+        await asyncio.sleep(0.5)
+        yield b"{}"
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=slow_body())
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b", timeout_seconds=0.05)
+    assert "timed out" in str(excinfo.value)
+
+
+async def test_api_get_clamps_non_positive_timeout_override(monkeypatch):
+    # Defensive backstop (mirrors the max_chars clamp): a non-positive override from a
+    # direct caller must be ignored (fall back to the client deadline), NOT passed to
+    # asyncio.timeout — where 0/negative would fire immediately and fail the read.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"ok": 1})
+
+    _install_mock_client(monkeypatch, handler)
+    for bad in (0, -5):
+        result = await _api_client().api_get(path="/repos/a/b", timeout_seconds=bad)
+        assert result.body == {"ok": 1}  # succeeded on the fallback deadline, not an instant timeout
+
+
+async def test_api_get_refuses_binary_content(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/octet-stream"}, content=b"\x00\x01\x02")
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError):
+        await _api_client().api_get(path="/repos/a/b/contents/x")
+
+
+async def test_api_get_rate_limit_primary(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(
+            403,
+            headers={"x-ratelimit-remaining": "0", "retry-after": "60"},
+            json={"message": "API rate limit exceeded"},
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b")
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == "60"
+
+
+async def test_api_get_rate_limit_secondary_header(monkeypatch):
+    # 403 + Retry-After with remaining>0 is the secondary limit: NEW header-based
+    # normalization to 429 (would otherwise escape to 502 and drop the hint).
+    def handler(request: httpx.Request) -> Response:
+        return Response(
+            403,
+            headers={"x-ratelimit-remaining": "42", "retry-after": "30"},
+            json={"message": "You have exceeded a secondary rate limit"},
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b")
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == "30"
+    assert "30" in str(excinfo.value)  # retry_after surfaced in the detail string
+
+
+async def test_api_get_forbidden_without_rate_signal_is_upstream(monkeypatch):
+    # 403 with neither remaining:0 nor Retry-After stays a 403 upstream error
+    # (-> 502 at the route): we refuse to string-match GitHub's error prose.
+    def handler(request: httpx.Request) -> Response:
+        return Response(403, json={"message": "Forbidden"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b")
+    assert excinfo.value.status_code == 403
+
+
+# _raise_for_github_status is the SHARED classifier (every curated GitHub tool
+# routes 4xx/5xx through it), so pin its 403->429 behavior directly, not only via
+# api_get, which can be feature-flagged off.
+def test_raise_for_github_status_403_retry_after_keeps_upstream_detail():
+    # A 403 carrying Retry-After can be a permanent WAF/abuse block, not a rate
+    # limit: normalize to 429 (keep the backoff hint) WITHOUT discarding GitHub's
+    # own structured reason behind the generic message.
+    response = httpx.Response(
+        403,
+        headers={"retry-after": "45", "x-ratelimit-remaining": "99"},
+        json={"message": "Access blocked by our WAF"},
+    )
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        _raise_for_github_status(response, operation="curated read")
+    exc = excinfo.value
+    assert exc.status_code == 429
+    assert exc.retry_after == "45"
+    assert "retry after 45 seconds" in str(exc)
+    assert "Access blocked by our WAF" in str(exc)  # upstream detail not dropped
+
+
+def test_raise_for_github_status_http_date_retry_after_not_labeled_seconds():
+    # Retry-After is legally an HTTP-date (RFC 9110), not just delta-seconds. It
+    # must NOT be interpolated as "<date> seconds" into the model-visible detail,
+    # though the raw value still rides the retry_after field for the header.
+    response = httpx.Response(
+        403,
+        headers={"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT", "x-ratelimit-remaining": "0"},
+        json={"message": "API rate limit exceeded"},
+    )
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        _raise_for_github_status(response, operation="curated read")
+    exc = excinfo.value
+    assert exc.status_code == 429
+    assert "seconds" not in str(exc)  # a date was never mislabeled as seconds
+    assert exc.retry_after == "Wed, 21 Oct 2026 07:28:00 GMT"
+    assert "API rate limit exceeded" in str(exc)
+
+
+async def test_api_get_diff_406_friendly_message(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(406, json={"message": "Not Acceptable"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff")
+    message = str(excinfo.value).lower()
+    assert "pulls" in message and "files" in message
+
+
+async def test_api_get_202_empty_body(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(202, headers={"content-type": "application/json"})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/stats/contributors")
+    assert result.status == 202
+    assert result.body is None
+    assert result.body_text == ""
+    assert result.truncated is False
+
+
+async def test_api_get_204_empty_body(monkeypatch):
+    # Several GETs answer no-body-means-yes with a bare 204 and no Content-Type
+    # at all (e.g. /repos/{o}/{r}/collaborators/{user}, /user/following/{user},
+    # /repos/{o}/{r}/vulnerability-alerts). Must not fall through to the
+    # binary/unknown-content-type refusal.
+    def handler(request: httpx.Request) -> Response:
+        return Response(204)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/collaborators/carol")
+    assert result.status == 204
+    assert result.body is None
+    assert result.body_text == ""
+    assert result.truncated is False
+
+
+async def test_api_get_empty_200_body_is_not_a_size_cap_error(monkeypatch):
+    # A literal empty 200 body (Content-Length: 0, Content-Type: json) must not
+    # be reported as "exceeded the size cap before it could be parsed" -- that
+    # message is for a body that overflowed max_chars mid-parse, and would send
+    # someone debugging a legitimately-empty response looking at the wrong
+    # knob entirely. Nothing here was truncated: byte_truncated is False.
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=b"")
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/some/empty/json/endpoint")
+    assert result.status == 200
+    assert result.body is None
+    assert result.body_text == ""
+    assert result.truncated is False
+
+
+async def test_api_get_has_more_from_link_header(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response([{"n": 1}], links='<https://github.test/api/x?page=2>; rel="next"')
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls")
+    assert result.has_more is True
+
+
+async def test_api_get_json_over_max_chars_becomes_text_prefix(monkeypatch):
+    big = {"items": ["x" * 100 for _ in range(50)]}  # serialized well over 200 chars
+
+    def handler(request: httpx.Request) -> Response:
+        return _json_response(big)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls", max_chars=200)
+    assert result.body is None
+    assert result.truncated is True
+    assert len(result.body_text) <= 200
+
+
+async def test_api_get_truncated_unparseable_json_is_sanitized(monkeypatch):
+    # A JSON body that overflows the byte cap and fails to parse still has its
+    # link-shaped values masked — the truncated-prefix path must not leak raw
+    # URLs to the renderer (parity with the parsed and diff paths).
+    body = '{"u": "visit https://evil.test/x", "pad": "' + "y" * 5000 + '"}'
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=body.encode())
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/commits", max_chars=200)
+    assert result.body is None
+    assert result.truncated is True
+    assert "https://evil.test" not in result.body_text  # link masked, not leaked
+    assert "[link]" in result.body_text
+
+
+async def test_api_get_diff_trimmed_to_last_line(monkeypatch):
+    text = ("line one is here\n" * 100).encode()
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=text)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=50)
+    assert result.truncated is True
+    assert len(result.body_text) <= 50
+    assert result.body_text.endswith("here")  # cut at a line boundary, not mid-line
+
+
+async def test_api_get_exact_fit_not_truncated(monkeypatch):
+    payload = {"a": "bb"}
+
+    def handler(request: httpx.Request) -> Response:
+        return _json_response(payload)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b", max_chars=10_000)
+    assert result.truncated is False
+    assert result.body == payload
+
+
+async def test_api_get_json_default_max_chars(monkeypatch):
+    payload = {"items": ["y" * 100 for _ in range(300)]}  # serialized well over 20k
+
+    def handler(request: httpx.Request) -> Response:
+        return _json_response(payload)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls")  # omitted -> json default 20k
+    assert result.truncated is True
+    assert result.body is None
+
+
+async def test_api_get_diff_default_max_chars(monkeypatch):
+    text = b"a" * 30_000  # under the diff default of 50k
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=text)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff")  # -> 50k default
+    assert result.truncated is False
+    assert len(result.body_text) == 30_000
+
+
+async def test_api_get_never_exposes_token(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if path.endswith("/diff"):
+            return Response(
+                200,
+                headers={"content-type": "application/vnd.github.diff"},
+                content=b"diff config.py\n",
+            )
+        if path.endswith("/err"):
+            return Response(500, json={"message": "boom"})
+        if path.endswith("/binary"):
+            return Response(200, headers={"content-type": "application/octet-stream"}, content=b"\x00")
+        return _json_response({"t": "ok"})
+
+    _install_mock_client(monkeypatch, handler)
+    client = _api_client()
+
+    async def blob_of(path, **kwargs) -> str:
+        try:
+            result = await client.api_get(path=path, **kwargs)
+        except (GitHubApiRequestError, GitHubUpstreamError) as exc:
+            return str(exc)
+        return repr(result.body) + result.body_text + result.content_type + str(result.status)
+
+    assert STATIC_TOKEN not in await blob_of("/repos/a/b/json")
+    assert STATIC_TOKEN not in await blob_of("/repos/a/b/diff", media_type="diff")
+    assert STATIC_TOKEN not in await blob_of("/repos/a/b/err")
+    assert STATIC_TOKEN not in await blob_of("/repos/a/b/binary")
+    assert STATIC_TOKEN not in await blob_of("no-slash-refusal")  # validation refusal path
+
+
+async def test_api_get_enforces_time_budget(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        async def slow():
+            await asyncio.sleep(5)
+            yield b"{}"
+
+        return Response(200, headers={"content-type": "application/json"}, content=slow())
+
+    _install_mock_client(monkeypatch, handler)
+    client = GitHubClient(access_token=STATIC_TOKEN, api_base_url=_API_BASE, timeout_seconds=0.15)
+    with pytest.raises((GitHubUpstreamError, httpx.TimeoutException)):
+        await client.api_get(path="/repos/a/b")
+
+
+# --- generic read: latest-review hardening (batch, TDD) -------------------
+
+
+async def test_api_get_diff_single_long_line_keeps_budget(monkeypatch):
+    # Regression: a minified / single-long-line diff is ~40 chars of headers then
+    # one enormous line. Trimming to the last newline shed the whole budget back
+    # to the header (49.9k dropped, no offset to recover). At the 50k default the
+    # shed ceiling is the 1000-char cap (~2% of budget), so only a SHORT trailing
+    # partial line is trimmed; this long one is kept.
+    header = "diff --git a/min.js b/min.js\n@@ -1 +1 @@\n"
+    text = (header + "+" + "a" * 200_000).encode()
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=text)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(
+        path="/repos/a/b/pulls/1", media_type="diff", max_chars=50_000
+    )
+    assert result.truncated is True
+    assert len(result.body_text) > 40_000  # budget preserved, not trimmed to the header
+
+
+async def test_api_get_error_body_is_capped(monkeypatch):
+    # Hardening: the >=400 error-body read was the one uncapped read left. A
+    # misbehaving GHE/proxy streaming a huge error page must not be fully buffered.
+    pulled = {"chunks": 0}
+
+    def handler(request: httpx.Request) -> Response:
+        async def gen():
+            for _ in range(1000):
+                pulled["chunks"] += 1
+                yield b"E" * 100_000  # 100 MB if fully drained
+
+        return Response(500, headers={"content-type": "application/json"}, content=gen())
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError):
+        await _api_client().api_get(path="/repos/a/b")
+    assert pulled["chunks"] < 50  # error body capped, not fully buffered
+
+
+async def test_read_capped_single_oversized_chunk_bounded():
+    # gzip-decompressed bodies yield decoded chunks that can be tens of MB in one
+    # go; read_capped must bound the retained/returned bytes to the cap regardless.
+    from collab_hub_api.connectors.http_stream import read_capped
+
+    async def gen():
+        yield b"z" * 10_000_000
+
+    response = httpx.Response(200, content=gen())
+    raw, truncated = await read_capped(response, 1000)
+    assert truncated is True
+    assert len(raw) <= 1000
+
+
+async def test_api_get_invalid_json_not_capped_gives_honest_message(monkeypatch):
+    # A whitespace-only / proxy-mangled 200 JSON body the cap did NOT truncate must
+    # not tell the model to shrink per_page — that guidance is untrue and wastes turns.
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=b"   ")
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b/commits")
+    msg = str(excinfo.value).lower()
+    assert "per_page" not in msg
+    assert "not valid json" in msg
+
+
+async def test_api_get_hop_cap_message_names_redirects_not_binary(monkeypatch):
+    # After >max_redirects SAME-origin hops the refusal is a redirect-loop, not an
+    # off-origin archive/binary download — the message must not misdirect.
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(1)
+        return Response(301, headers={"Location": f"https://github.test/api/x{len(seen)}"})
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubApiRequestError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b")
+    msg = str(excinfo.value).lower()
+    assert "redirect" in msg
+    assert "archive" not in msg and "binary" not in msg
+
+
+# --- generic read: request model + route ----------------------------------
+
+_API_GET_ROUTE = "/v1/connectors/github/api/get"
+
+
+def test_api_get_request_coerces_and_bounds() -> None:
+    request = GitHubApiGetRequest(path="/repos/a/b/pulls", params={"per_page": 100, "draft": True})
+    assert request.params == {"per_page": "100", "draft": "true"}  # int/bool -> str
+    with pytest.raises(ValidationError):
+        GitHubApiGetRequest(path="/x", media_type="xml")
+    with pytest.raises(ValidationError):
+        GitHubApiGetRequest(path="/x", params={"k" * 65: "v"})
+    with pytest.raises(ValidationError):
+        GitHubApiGetRequest(path="/x", params={"k": "v" * 257})
+    with pytest.raises(ValidationError):
+        GitHubApiGetRequest(path="/x", params={f"k{i}": "v" for i in range(21)})
+
+
+async def test_api_get_route_happy(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"number": 7})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/acme/widgets/pulls/7"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["body"] == {"number": 7}
+    assert body["content_trust"] == "external_untrusted"
+    assert body["security_notice"]
+    assert body["status"] == 200
+
+
+async def test_api_get_route_coerces_params(tmp_path, monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> Response:
+        captured["params"] = request.url.params
+        return _json_response([])
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            _API_GET_ROUTE,
+            headers=_auth_header(),
+            json={"path": "/repos/a/b/pulls", "params": {"per_page": 5, "draft": True}},
+        )
+    assert response.status_code == 200
+    assert captured["params"].get("per_page") == "5"
+    assert captured["params"].get("draft") == "true"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"path": "/x", "media_type": "xml"},
+        {"path": "/x", "max_chars": 0},
+        {"path": "/x", "max_chars": 50_001},
+        {"path": ""},
+        {"path": "/x", "params": {f"k{i}": "v" for i in range(21)}},
+        {"path": "/x", "params": {"k" * 65: "v"}},
+        {"path": "/x", "params": {"k": "v" * 257}},
+    ],
+)
+async def test_api_get_route_model_validation_422(tmp_path, monkeypatch, payload):
+    _install_mock_client(monkeypatch, lambda r: _json_response({}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json=payload)
+    assert response.status_code == 422
+
+
+async def test_api_get_route_bad_path_shape_is_422(tmp_path, monkeypatch):
+    # Passes the Field length bound but fails client path validation -> 422 via
+    # the GitHubApiRequestError except clause (not 404/502).
+    _install_mock_client(monkeypatch, lambda r: _json_response({}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "no-leading-slash"}
+        )
+    assert response.status_code == 422
+
+
+async def test_api_get_route_rate_limit_propagates_retry_after(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(
+            429,
+            headers={"Retry-After": "42", "x-ratelimit-remaining": "0"},
+            json={"message": "API rate limit exceeded"},
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert response.status_code == 429
+    assert response.headers.get("Retry-After") == "42"
+    assert "42" in response.json()["detail"]  # duration surfaced in the detail string
+
+
+async def test_api_get_route_upstream_5xx_is_502(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(500, json={"message": "boom"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert response.status_code == 502
+
+
+async def test_api_get_route_upstream_422_is_422(tmp_path, monkeypatch):
+    # A GitHub 422 (e.g. paging a search-backed endpoint past its 1000-result
+    # cap) is model-correctable, so the generic read surfaces it as 422 with
+    # GitHub's message — not a blind-retry 502.
+    def handler(request: httpx.Request) -> Response:
+        return Response(422, json={"message": "Only the first 1000 search results are available"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/search/issues"})
+    assert response.status_code == 422
+    assert "1000" in response.json()["detail"]
+
+
+async def test_api_get_route_throttles_when_saturated(tmp_path, monkeypatch, caplog):
+    # 7b: when every permit is held, a request waits up to the timeout then sheds
+    # itself as a 429 with a Retry-After (not a silent unbounded queue) and logs a
+    # throttle event.
+    _install_mock_client(monkeypatch, lambda r: _json_response({"x": 1}))
+    app = make_app(_config(tmp_path, api_get_max_concurrency=1, request_timeout_seconds=0.2))
+    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+        async with _client(app) as client:
+            # Exhaust the single permit so the request has to wait — and time out.
+            await app.state.github_api_get_semaphore.acquire()
+            response = await client.post(
+                _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"}
+            )
+    assert response.status_code == 429
+    assert "busy" in response.json()["detail"].lower()
+    assert response.headers.get("retry-after") == "1"  # ceil(0.2s wait budget), floored at 1
+    throttle = next(r for r in caplog.records if r.msg == "github_api_get_throttled")
+    assert throttle.waiters == 1  # queue depth at shed time includes this request
+
+
+async def test_api_get_route_charges_read_the_remaining_budget(tmp_path, monkeypatch):
+    # 7b/perf: the permit wait and the upstream read share ONE budget, so the route
+    # hands the read only the time left after the wait — its deadline never stacks on
+    # top of the wait budget (which would double worst-case latency).
+    captured: dict = {}
+
+    async def fake_api_get(self, **kwargs):
+        captured.update(kwargs)
+        return GitHubApiGetResponse(
+            body={"x": 1}, body_text="", truncated=False, has_more=False,
+            content_type="application/json", status=200,
+        )
+
+    monkeypatch.setattr(GitHubClient, "api_get", fake_api_get)
+    app = make_app(_config(tmp_path, request_timeout_seconds=5.0))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert response.status_code == 200
+    assert 0 < captured["timeout_seconds"] <= 5.0  # bounded by the shared budget, not on top of it
+
+
+async def test_api_get_route_broker_error_not_blocked_by_saturation(tmp_path, monkeypatch):
+    # 7a: token brokering happens OUTSIDE the concurrency permit, so a token failure
+    # surfaces its own status (409 not-connected) even when the read pool is fully
+    # saturated — it never queues behind the semaphore or throttles to 503.
+    _install_mock_client(monkeypatch, lambda r: _json_response({"x": 1}))
+    # No static token and no broker URL -> ConnectorNotConnected -> 409, and it must
+    # be reached before the (exhausted) permit is ever awaited.
+    app = make_app(
+        _config(tmp_path, static_access_token="", api_get_max_concurrency=1, request_timeout_seconds=0.2)
+    )
+    async with _client(app) as client:
+        await app.state.github_api_get_semaphore.acquire()  # exhaust the pool
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"}
+        )
+    assert response.status_code == 409  # broker error surfaced, NOT a 503 throttle
+
+
+async def test_api_get_route_upstream_400_is_422(tmp_path, monkeypatch):
+    # A GitHub 400 on malformed GET params is model-correctable (bad query), so the
+    # generic read surfaces 422 with GitHub's message rather than a blind-retry 502.
+    def handler(request: httpx.Request) -> Response:
+        return Response(400, json={"message": "Problems parsing query"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            _API_GET_ROUTE, headers=_auth_header(), json={"path": "/search/issues", "params": {"q": "bad"}}
+        )
+    assert response.status_code == 422
+    assert "parsing" in response.json()["detail"].lower()
+
+
+async def test_api_get_route_disabled_is_403(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, lambda r: _json_response({"x": 1}))
+    app = make_app(_config(tmp_path, api_get_enabled=False))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert response.status_code == 403
+    assert "disabled" in response.json()["detail"].lower()
+
+
+async def test_api_get_route_requires_auth(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, lambda r: _json_response({}))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, json={"path": "/repos/a/b"})
+    assert response.status_code in (401, 403)
+
+
+async def test_api_get_route_does_not_expose_token(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"x": "ok"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert STATIC_TOKEN not in response.text
+
+
+async def test_api_get_route_logs_request_and_upstream_error(tmp_path, monkeypatch, caplog):
+    def handler(request: httpx.Request) -> Response:
+        return Response(500, json={"message": "boom"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+        async with _client(app) as client:
+            await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    requests = [r for r in caplog.records if r.msg == "github_api_get_request"]
+    assert requests and requests[0].path == "/repos/a/b" and requests[0].user
+    errors = [r for r in caplog.records if r.msg == "github_api_get_upstream_error"]
+    assert errors
+    assert errors[0].operation == "api get"
+    assert errors[0].status_code == 500
+    assert errors[0].path == "/repos/a/b"
+
+
+async def test_api_get_route_logs_truncation(tmp_path, monkeypatch, caplog):
+    big = {"items": ["y" * 100 for _ in range(300)]}
+
+    def handler(request: httpx.Request) -> Response:
+        return _json_response(big)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+        async with _client(app) as client:
+            response = await client.post(
+                _API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b", "max_chars": 200}
+            )
+    assert response.json()["truncated"] is True
+    assert any(r.msg == "github_api_get_truncation" for r in caplog.records)
+
+
+async def test_api_get_route_logs_refusal(tmp_path, monkeypatch, caplog):
+    _install_mock_client(monkeypatch, lambda r: _json_response({}))
+    app = make_app(_config(tmp_path))
+    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+        async with _client(app) as client:
+            response = await client.post(
+                _API_GET_ROUTE, headers=_auth_header(), json={"path": "no-slash"}
+            )
+    assert response.status_code == 422
+    assert any(r.msg == "github_api_get_refusal" for r in caplog.records)

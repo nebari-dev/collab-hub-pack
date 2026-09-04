@@ -6,6 +6,7 @@ from urllib.parse import quote
 
 import httpx
 
+from .http_stream import read_capped
 from .models import DriveFileMetadata, GoogleDriveFile
 
 GOOGLE_DOC_EXPORTS = {
@@ -204,9 +205,6 @@ class GoogleDriveClient:
         max_bytes: int,
         operation: str,
     ) -> tuple[bytes, bool]:
-        chunks: list[bytes] = []
-        total = 0
-        truncated = False
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with client.stream(
                 "GET",
@@ -215,18 +213,7 @@ class GoogleDriveClient:
                 params=params,
             ) as response:
                 _raise_for_drive_status(response, operation=operation)
-                async for chunk in response.aiter_bytes():
-                    remaining = (max_bytes + 1) - total
-                    if len(chunk) > remaining:
-                        chunks.append(chunk[:remaining])
-                        truncated = True
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total > max_bytes:
-                        truncated = True
-                        break
-        return b"".join(chunks)[:max_bytes], truncated
+                return await read_capped(response, max_bytes)
 
 
 def _drive_query(

@@ -93,8 +93,10 @@ kcadm.sh add-roles -r <realm> --rname default-roles-<realm> \
 - `POST /v1/connectors/github/search`
 - `POST /v1/connectors/github/items/{number}/read`
 - `POST /v1/connectors/github/files/read`
+- `POST /v1/connectors/github/repos/list`
 - `POST /v1/connectors/github/projects/list`
 - `POST /v1/connectors/github/projects/{number}/read`
+- `POST /v1/connectors/github/api/get`
 
 The two `projects` endpoints read **Projects V2** boards via GitHub's **GraphQL**
 API (`read:project` scope). `projects/list` takes an `owner` (org *or* user
@@ -117,8 +119,9 @@ for code search, which this connector does not use) is normalized to `429` with
 `items/{number}/read` reads one issue or pull request (body plus recent comments,
 capped at `max_chars`). Both issues and PRs carry their `assignees` and `labels`;
 pull requests additionally carry `requested_reviewers` and submitted `reviews`
-(user + review state), fetched from the pulls endpoint. Changed files and diffs
-are out of scope. `files/read` reads a repository file by `repo`, `path`,
+(user + review state), fetched from the pulls endpoint. For changed files and
+diffs, use `api/get` (below) against `/pulls/{number}` with `media_type: "diff"`,
+or `/pulls/{number}/files`. `files/read` reads a repository file by `repo`, `path`,
 and optional `ref` (branch/tag/SHA; default branch when omitted). The contents
 API only returns files up to 1 MB, so larger files come back with `too_large`;
 non-UTF-8 files come back with `binary`; git-lfs pointers and directories come
@@ -126,10 +129,38 @@ back with an `unsupported_reason`. In every case `content` is empty rather than
 garbage. `path` and `ref` are validated against traversal (`..`, absolute paths,
 control characters) before they are ever placed in an upstream URL.
 
-No endpoint returns a GitHub URL of any kind: the Collab chat renderer crashes on
-link-shaped text anywhere in tool output (apollo-desktop#365), so all provider
-text is link-sanitized and `repo`/`number` (not URLs) are what a follow-up read
-needs.
+`repos/list` returns the repositories visible to the linked account for an
+`owner` (org or user login).
+
+`api/get` is the generic long-tail read: a single **GET** against an arbitrary
+GitHub REST `path` (query args via `params`) for the endpoints the curated tools
+don't cover — e.g. `/repos/{o}/{r}/pulls/{n}/files`, `/commits`, `/releases`, or
+`/commits/{ref}/check-runs`. Prefer the curated tools for triage. `path` rejects
+`%`, so a contents path with a space or other percent-encoded character is
+unreachable via `api/get` — use `files/read` for those. The verb is
+always GET and `media_type` (`json`|`diff`|`patch`) selects a fixed `Accept`
+header, so GraphQL (POST-only) and writes are excluded **by construction**, not
+by a denylist. Pages via `params` `per_page`/`page`; `has_more` echoes the
+upstream `Link rel="next"`. `media_type: "diff"`/`"patch"` works only on
+pulls/commits/compare — issues silently return JSON, so check the echoed
+`content_type`. Bodies are size-capped (`max_chars`, default 20k for json / 50k
+for diff, 50k ceiling) with `truncated` set when cut; a `202` with an empty body
+means GitHub is still computing the result — retry. A `204` with an empty body
+is an affirmative result with nothing to return (e.g. a collaborator/following
+membership check). The read is origin-locked
+(GET stays on the API host; archive/binary redirects are refused) and can be
+turned off per hub with `api_get_enabled: false` without affecting the curated
+reads.
+
+The curated endpoints return no GitHub URL of any kind: all provider text is
+link-sanitized (bare domains included) and `repo`/`number` (not URLs) are what a
+follow-up read needs. This began as a workaround for a chat renderer that crashed
+on link-shaped text (apollo-desktop#365, now fixed) and is retained as
+defense-in-depth against link/markup injection through tool output. `api/get`
+uses a **code-aware** variant of that sanitizer:
+it still masks scheme-, `www.`-, markdown-, and `mailto`-shaped links, but
+preserves code-shaped text (dotted identifiers like `config.py`, SHAs, refs) so
+diffs and file contents come back intact.
 
 ## Runtime Boundary
 

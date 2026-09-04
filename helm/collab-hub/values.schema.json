@@ -855,6 +855,13 @@
             "requestTimeoutSeconds": {
               "type": "number",
               "minimum": 1
+            },
+            "apiGetEnabled": {
+              "type": "boolean"
+            },
+            "apiGetMaxConcurrency": {
+              "type": "integer",
+              "minimum": 1
             }
           },
           "additionalProperties": false
