@@ -493,6 +493,12 @@ async def search_github(
     return GitHubSearchResponse(hits=hits, next_page_token=next_page_token, incomplete_results=incomplete)
 
 
+# Floor for the upstream-read deadline after the concurrency-permit wait has eaten
+# into the shared request budget: keep a just-acquired permit from handing the read
+# a near-zero timeout that would 502 immediately.
+_API_GET_MIN_READ_BUDGET_SECONDS = 1.0
+
+
 @router.post("/github/api/get", response_model=GitHubApiGetResponse)
 async def github_api_get(
     body: GitHubApiGetRequest,
@@ -523,6 +529,8 @@ async def github_api_get(
     # event (with the queue depth) so contention is observable. The semaphore is
     # sized once at app startup (lifespan).
     semaphore = request.app.state.github_api_get_semaphore
+    loop = asyncio.get_running_loop()
+    wait_start = loop.time()
     request.app.state.github_api_get_waiters += 1
     try:
         async with asyncio.timeout(config.github.request_timeout_seconds):
@@ -533,6 +541,9 @@ async def github_api_get(
             extra={
                 "user": auth.user,
                 "path": body.path,
+                # Queue depth at shed time. Read before the finally decrement, so it
+                # includes this request — which WAS a waiter until it gave up here —
+                # i.e. the honest snapshot of the state variable, not "others only".
                 "waiters": request.app.state.github_api_get_waiters,
             },
         )
@@ -552,11 +563,20 @@ async def github_api_get(
     finally:
         request.app.state.github_api_get_waiters -= 1
     try:
+        # The permit wait and the upstream read draw on ONE budget
+        # (request_timeout_seconds). Charge the read only the time left after the
+        # wait so a saturated read is bounded to that budget total, not ~2x (a full
+        # wait followed by a full read). Floor a near-zero remainder so a
+        # just-acquired permit doesn't 502 the read on an empty deadline — but never
+        # above the configured budget itself (which may be sub-second).
+        budget = config.github.request_timeout_seconds
+        read_budget = max(min(budget, _API_GET_MIN_READ_BUDGET_SECONDS), budget - (loop.time() - wait_start))
         result = await client.api_get(
             path=body.path,
             params=body.params,
             media_type=body.media_type,
             max_chars=body.max_chars,
+            timeout_seconds=read_budget,
         )
     except GitHubApiRequestError as exc:
         logger.info(

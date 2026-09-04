@@ -129,10 +129,15 @@ _API_GET_TOO_MANY_REDIRECTS = (
     f"too many redirects on the GitHub API origin — did not resolve within "
     f"{_API_GET_MAX_REDIRECTS} hops"
 )
-# Longest trailing partial line worth shedding on a truncated text/diff body.
-# Beyond this, cutting back to the last newline would discard most of the budget
-# (a single-long-line diff), so we keep the partial line instead.
+# A trailing partial line is worth shedding from a truncated text/diff body only
+# when it's a small fraction of the budget; beyond that (a single-long-line minified
+# file) cutting back to the last newline would discard most of the returned content,
+# so we keep the partial line instead. The absolute cap is the shed ceiling at every
+# realistic budget (1000 of a 50k default read ~= 2%); the max_chars//DIVISOR floor
+# only takes over at tiny budgets, where a fixed 1000 would exceed the whole body and
+# always fire. Shed threshold = min(cap, max_chars // divisor).
 _API_GET_MAX_PARTIAL_LINE_TRIM = 1_000
+_API_GET_PARTIAL_LINE_TRIM_DIVISOR = 4
 # Locally-owned recovery guidance only — do NOT restate GitHub's numeric diff
 # limits (lines / MB / files). Those drift and this code can't observe them, so
 # we append this to GitHub's own 406 message rather than stating stale numbers.
@@ -539,6 +544,7 @@ class GitHubClient:
         params: dict[str, Any] | None = None,
         media_type: str = "json",
         max_chars: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> GitHubApiGetResponse:
         """GET an arbitrary GitHub REST endpoint: origin-locked, size-capped, sanitized.
 
@@ -582,9 +588,20 @@ class GitHubClient:
         coerced = {key: coerce_github_param_value(value) for key, value in (params or {}).items()}
         current = start.copy_merge_params(coerced) if coerced else start
 
+        # A caller that already spent part of a shared budget (e.g. the route's
+        # concurrency-permit wait) can hand the read only the time left, so the total
+        # stays bounded to one budget instead of ~2x. Defensive backstop (mirrors the
+        # max_chars clamp above): don't trust an out-of-range override from a direct
+        # caller — a non-positive value is ignored (falls back to the client deadline
+        # rather than reaching asyncio.timeout/httpx.Timeout), and the override can
+        # never exceed the client-wide deadline. The route already passes a floored,
+        # in-range value.
+        deadline = self.timeout_seconds
+        if timeout_seconds is not None and timeout_seconds > 0:
+            deadline = min(timeout_seconds, self.timeout_seconds)
         try:
-            async with asyncio.timeout(self.timeout_seconds):
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with asyncio.timeout(deadline):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(deadline)) as client:
                     for _hop in range(_API_GET_MAX_REDIRECTS + 1):
                         async with client.stream("GET", current, headers=headers) as response:
                             if response.is_redirect:
@@ -740,15 +757,24 @@ class GitHubClient:
                 content_type=content_type, status=status,
             )
         sanitized = self._sanitize_json_values(parsed)
-        # The input was already hard-capped to max_chars*4+1 bytes by read_capped,
-        # so a plain serialize is bounded — no streaming length-probe needed (the
-        # old iterencode ran to completion on the fits path anyway, saving nothing).
-        serialized = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
-        if not byte_truncated and len(serialized) <= max_chars:
+        # Judge truncation on the COMPACT size of the PARSED object — not the raw
+        # decoded text (which counts incidental upstream whitespace) and not the
+        # sanitized serialization (which value masking inflates: a@b.co -> a [at] b
+        # [dot] co). Both would flag a body that actually fit as truncated and strip
+        # its structure for content that was already complete. Computed once here
+        # purely for the size decision; the returned body is still the sanitized
+        # object. read_capped hard-capped the input to max_chars*4+1 bytes, so this
+        # serialize stays bounded.
+        compact = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        if not byte_truncated and len(compact) <= max_chars:
             return GitHubApiGetResponse(
                 body=sanitized, body_text="", truncated=False, has_more=has_more,
                 content_type=content_type, status=status,
             )
+        # Genuinely over budget (or byte-truncated): no complete structure worth
+        # returning, so serialize the SANITIZED value to a masked text prefix and
+        # flag it.
+        serialized = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
         return GitHubApiGetResponse(
             body=None, body_text=serialized[:max_chars], truncated=True, has_more=has_more,
             content_type=content_type, status=status,
@@ -763,18 +789,30 @@ class GitHubClient:
         status: int,
         max_chars: int,
     ) -> GitHubApiGetResponse:
-        sanitized = sanitize_github_api_text(raw.decode("utf-8", errors="replace"))
-        truncated = byte_truncated or len(sanitized) > max_chars
+        decoded = raw.decode("utf-8", errors="replace")
+        sanitized = sanitize_github_api_text(decoded)
+        # Judge truncation by the DECODED length, not the sanitized one: link/email
+        # masking inflates length (a@b.co -> a [at] b [dot] co), so a body that fit
+        # raw must not be flagged truncated — that would set has_more and send the
+        # model paging for content it already has in full. When nothing was actually
+        # cut, return the masked text whole (the expansion is our transform, not data).
+        truncated = byte_truncated or len(decoded) > max_chars
+        if not truncated:
+            return GitHubApiGetResponse(
+                body=None, body_text=sanitized, truncated=False, has_more=has_more,
+                content_type=content_type, status=status,
+            )
         body_text = sanitized[:max_chars]
-        if truncated:
-            cut = body_text.rfind("\n")
-            # Only shed a SHORT trailing partial line. rfind finds the last newline
-            # anywhere, so on a single-long-line diff (a minified file) it sits near
-            # the start — trimming to it would silently drop most of the budget with
-            # no offset to recover. Keep the partial line when the tail is long, and
-            # when there's no newline at all (cut == -1, so keep the whole prefix).
-            if cut != -1 and cut >= len(body_text) - _API_GET_MAX_PARTIAL_LINE_TRIM:
-                body_text = body_text[:cut]
+        cut = body_text.rfind("\n")
+        # Only shed a SHORT trailing partial line. rfind finds the last newline
+        # anywhere, so on a single-long-line diff (a minified file) it sits near the
+        # start — trimming to it would silently drop most of the budget with no offset
+        # to recover. Keep the partial line when the shed tail exceeds the threshold,
+        # and when there's no newline at all (cut == -1, keep the prefix — without this
+        # guard a short no-newline body would drop its last character).
+        shed_ceiling = min(_API_GET_MAX_PARTIAL_LINE_TRIM, max(1, max_chars // _API_GET_PARTIAL_LINE_TRIM_DIVISOR))
+        if cut != -1 and len(body_text) - cut <= shed_ceiling:
+            body_text = body_text[:cut]
         return GitHubApiGetResponse(
             body=None, body_text=body_text, truncated=truncated, has_more=has_more,
             content_type=content_type, status=status,

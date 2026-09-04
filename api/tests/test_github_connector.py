@@ -22,6 +22,7 @@ from collab_hub_api.connectors.github_client import (
 from collab_hub_api.connectors.models import (
     GITHUB_READONLY_SCOPES,
     GitHubApiGetRequest,
+    GitHubApiGetResponse,
     GitHubSearchRequest,
 )
 from collab_hub_api.core import make_app
@@ -1361,6 +1362,115 @@ async def test_api_get_aborts_oversized_body(monkeypatch):
     assert len(result.body_text) <= 1000
 
 
+async def test_api_get_text_expansion_does_not_falsely_truncate(monkeypatch):
+    # Masking inflates length (a@b.co -> a [at] b [dot] co), so a diff that fit the
+    # raw byte budget must NOT be flagged truncated just because the masked form is
+    # longer than max_chars — that would set has_more and send the model paging for
+    # content it already holds in full.
+    raw = b"a@b.co c@d.co e@f.co"  # 20 bytes; masks to 53 chars
+    expected = "a [at] b [dot] co c [at] d [dot] co e [at] f [dot] co"
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=raw)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=30)
+    assert result.truncated is False
+    assert result.has_more is False
+    assert result.body_text == expected  # returned whole despite exceeding max_chars
+    assert len(result.body_text) > 30
+
+
+async def test_api_get_json_expansion_keeps_structure(monkeypatch):
+    # A JSON body that fit raw must stay STRUCTURED even when value masking inflates
+    # its serialized length past max_chars — don't downgrade a complete object to a
+    # truncated text prefix.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"e": "a@b.co c@d.co e@f.co"})
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/issues/1", max_chars=30)
+    assert result.truncated is False
+    assert result.body == {"e": "a [at] b [dot] co c [at] d [dot] co e [at] f [dot] co"}
+    assert result.body_text == ""
+
+
+async def test_api_get_json_size_ignores_upstream_whitespace(monkeypatch):
+    # The size decision is made on the COMPACT parsed size, so a body padded with
+    # incidental upstream whitespace (indentation) that fits compact must NOT be
+    # flagged truncated — only the real content counts against max_chars.
+    raw = b'{\n    "a": 1,\n    "b": 2\n}'  # 26 bytes raw; compact {"a":1,"b":2} is 13
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=raw)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b", max_chars=20)
+    assert result.truncated is False
+    assert result.body == {"a": 1, "b": 2}
+
+
+async def test_api_get_partial_line_trim_keeps_long_partial_on_small_budget(monkeypatch):
+    # Shed threshold is min(1000-char cap, max_chars // divisor). On a small budget the
+    # max_chars//divisor floor takes over, so a LONG partial line is kept (trimming back
+    # to an early newline would discard most of the returned content) — unlike a bare
+    # 1000-char cap, which exceeds the whole body at this budget and would always fire.
+    content = b"xxxxx\n" + b"y" * 100
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=content)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=20)
+    assert result.truncated is True
+    assert len(result.body_text) == 20  # long partial line kept, budget not thrown away
+    assert result.body_text.startswith("xxxxx\ny")
+
+
+async def test_api_get_partial_line_trim_sheds_short_tail_on_small_budget(monkeypatch):
+    # ...but a SHORT trailing partial (within the threshold) IS still shed on the same
+    # small budget.
+    content = b"line1\nline2\nline3\n" + b"z" * 100
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/vnd.github.diff"}, content=content)
+
+    _install_mock_client(monkeypatch, handler)
+    result = await _api_client().api_get(path="/repos/a/b/pulls/1", media_type="diff", max_chars=20)
+    assert result.truncated is True
+    assert result.body_text == "line1\nline2\nline3"  # partial "zz" tail dropped
+
+
+async def test_api_get_honors_timeout_override(monkeypatch):
+    # A caller can hand api_get a reduced deadline (the route charges the read only
+    # the budget left after the concurrency-permit wait); a slow upstream then times
+    # out within that override.
+    async def slow_body():
+        await asyncio.sleep(0.5)
+        yield b"{}"
+
+    def handler(request: httpx.Request) -> Response:
+        return Response(200, headers={"content-type": "application/json"}, content=slow_body())
+
+    _install_mock_client(monkeypatch, handler)
+    with pytest.raises(GitHubUpstreamError) as excinfo:
+        await _api_client().api_get(path="/repos/a/b", timeout_seconds=0.05)
+    assert "timed out" in str(excinfo.value)
+
+
+async def test_api_get_clamps_non_positive_timeout_override(monkeypatch):
+    # Defensive backstop (mirrors the max_chars clamp): a non-positive override from a
+    # direct caller must be ignored (fall back to the client deadline), NOT passed to
+    # asyncio.timeout — where 0/negative would fire immediately and fail the read.
+    def handler(request: httpx.Request) -> Response:
+        return _json_response({"ok": 1})
+
+    _install_mock_client(monkeypatch, handler)
+    for bad in (0, -5):
+        result = await _api_client().api_get(path="/repos/a/b", timeout_seconds=bad)
+        assert result.body == {"ok": 1}  # succeeded on the fallback deadline, not an instant timeout
+
+
 async def test_api_get_refuses_binary_content(monkeypatch):
     def handler(request: httpx.Request) -> Response:
         return Response(200, headers={"content-type": "application/octet-stream"}, content=b"\x00\x01\x02")
@@ -1650,8 +1760,9 @@ async def test_api_get_enforces_time_budget(monkeypatch):
 async def test_api_get_diff_single_long_line_keeps_budget(monkeypatch):
     # Regression: a minified / single-long-line diff is ~40 chars of headers then
     # one enormous line. Trimming to the last newline shed the whole budget back
-    # to the header (49.9k dropped, no offset to recover). Only a SHORT trailing
-    # partial line should be trimmed; a long one is kept.
+    # to the header (49.9k dropped, no offset to recover). At the 50k default the
+    # shed ceiling is the 1000-char cap (~2% of budget), so only a SHORT trailing
+    # partial line is trimmed; this long one is kept.
     header = "diff --git a/min.js b/min.js\n@@ -1 +1 @@\n"
     text = (header + "+" + "a" * 200_000).encode()
 
@@ -1877,7 +1988,29 @@ async def test_api_get_route_throttles_when_saturated(tmp_path, monkeypatch, cap
     assert response.status_code == 429
     assert "busy" in response.json()["detail"].lower()
     assert response.headers.get("retry-after") == "1"  # ceil(0.2s wait budget), floored at 1
-    assert any(r.msg == "github_api_get_throttled" for r in caplog.records)
+    throttle = next(r for r in caplog.records if r.msg == "github_api_get_throttled")
+    assert throttle.waiters == 1  # queue depth at shed time includes this request
+
+
+async def test_api_get_route_charges_read_the_remaining_budget(tmp_path, monkeypatch):
+    # 7b/perf: the permit wait and the upstream read share ONE budget, so the route
+    # hands the read only the time left after the wait — its deadline never stacks on
+    # top of the wait budget (which would double worst-case latency).
+    captured: dict = {}
+
+    async def fake_api_get(self, **kwargs):
+        captured.update(kwargs)
+        return GitHubApiGetResponse(
+            body={"x": 1}, body_text="", truncated=False, has_more=False,
+            content_type="application/json", status=200,
+        )
+
+    monkeypatch.setattr(GitHubClient, "api_get", fake_api_get)
+    app = make_app(_config(tmp_path, request_timeout_seconds=5.0))
+    async with _client(app) as client:
+        response = await client.post(_API_GET_ROUTE, headers=_auth_header(), json={"path": "/repos/a/b"})
+    assert response.status_code == 200
+    assert 0 < captured["timeout_seconds"] <= 5.0  # bounded by the shared budget, not on top of it
 
 
 async def test_api_get_route_broker_error_not_blocked_by_saturation(tmp_path, monkeypatch):
