@@ -663,6 +663,12 @@ class GitHubClient:
             # except-HTTPError and surface as a raw 500. Degrade to the same
             # refusal the initial-URL guard uses.
             raise GitHubApiRequestError(_API_GET_REDIRECT_REFUSAL) from exc
+        # https-only by policy: a redirect target must stay on the https origin.
+        # NOTE this is intentionally not `base.scheme` — a hub configured with an
+        # http proxy base therefore can't follow ANY redirect (incl. the renamed-repo
+        # 301). That's the deliberate side: don't "fix" it to `base.scheme`, which
+        # would let an http->https same-host hop pass since both ports normalize to
+        # None. http bases simply don't support redirects.
         if (
             target.scheme != "https"
             or target.host != base.host
