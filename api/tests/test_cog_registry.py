@@ -107,8 +107,16 @@ def test_valid_configs_parse_and_normalize() -> None:
         ({"url": "ftp://registry.example"}, "url must be an http(s) URL"),
         ({"url": "https://"}, "url must be an http(s) URL"),
         ({"url": f"{URL}/?x=1"}, "must not carry a query"),
+        ({"url": f"{URL}/#frag"}, "must not carry a query or fragment"),
+        ({"url": "https://robot:hunter2@registry.example"}, "must not embed a username or password"),
+        ({"url": "https://robot@registry.example"}, "must not embed a username or password"),
+        ({"url": "https://registry.example:notaport"}, "url has an invalid port"),
+        ({"url": "https://registry.example:70000"}, "url has an invalid port"),
         ({"api_url": "not a url"}, "api_url must be an http(s) URL"),
+        ({"api_url": f"{API_URL}/api/v2.0?x=1"}, "api_url must not carry a query"),
+        ({"api_url": f"{API_URL}:99999"}, "api_url has an invalid port"),
         ({"token_url": "//no-scheme"}, "token_url must be an http(s) URL"),
+        ({"token_url": "http://svc:abc/service/token"}, "token_url has an invalid port"),
         # kind-specific shape
         ({"projects": []}, "requires at least one entry in projects"),
         ({"repositories": ["cogs/alpha"]}, "does not read repositories"),
@@ -162,12 +170,34 @@ def test_static_config_rejections(overrides: dict, fragment: str) -> None:
 
 def test_credentials_never_render_the_password() -> None:
     credentials = CogRegistryCredentials(username="robot$x", password="hunter2-secret")
-    config = CogRegistrySourceConfig(**harbor_config(credentials=credentials))
-    for rendered in (repr(credentials), str(credentials), repr(config), str(config)):
+    config = CogRegistrySourceConfig(**harbor_config(credentials=credentials, webhook_secret="hook-secret-value"))
+    dumped = json.dumps(config.model_dump(mode="json"))
+    for rendered in (repr(credentials), str(credentials), repr(config), str(config), dumped):
         assert "hunter2-secret" not in rendered
+        assert "hook-secret-value" not in rendered
         assert "robot$x" in rendered
-    assert credentials.password == "hunter2-secret"
-    assert "hunter2-secret" in json.dumps(config.model_dump())  # the value itself is intact for the adapters
+    # The values themselves are intact for the adapters.
+    assert credentials.password.get_secret_value() == "hunter2-secret"
+    assert config.webhook_secret.get_secret_value() == "hook-secret-value"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"credentials": {"username": "", "password": "hunter2-secret"}},  # the credentials rule itself
+        {"credentials": {"username": "robot$x", "password": "hunter2-secret"}, "url": "nope"},  # another field
+        {"credentials": {"username": "robot$x", "password": "hunter2-secret"}, "projects": []},  # a model rule
+        {"webhook_secret": "hook-secret-value", "url": "nope"},
+    ],
+)
+def test_validation_errors_never_echo_secrets(overrides: dict) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        CogRegistrySourceConfig(**harbor_config(**overrides))
+    # str() is what a failed startup renders; errors() carries pydantic's raw
+    # `input` by design, which is why hide_input_in_errors alone is not enough.
+    text = str(excinfo.value) + repr(excinfo.value.errors(include_input=False))
+    assert "hunter2-secret" not in text
+    assert "hook-secret-value" not in text
 
 
 def test_credentials_strip_whitespace_and_empty_is_unconfigured() -> None:
@@ -196,8 +226,16 @@ def test_registry_host_keeps_port_and_drops_everything_else() -> None:
     assert registry_host("https://registry.example") == "registry.example"
     assert registry_host("https://user:pw@registry.example:5000/v2/") == "registry.example:5000"
     assert registry_host("http://REGISTRY.example/") == "registry.example"
+    assert registry_host("https://[2001:db8::1]:5000") == "[2001:db8::1]:5000"
+    assert registry_host("https://[2001:db8::1]/") == "[2001:db8::1]"
     with pytest.raises(ValueError, match="no host"):
         registry_host("https:///nohost")
+
+
+def test_ipv6_host_survives_into_the_reference() -> None:
+    config = CogRegistrySourceConfig(**static_config(url="https://[2001:db8::1]:5000"))
+    [source] = build_registry_sources([config], oci_client_factory=FakeOCIFactory())
+    assert reference(source.host, "cogs/alpha", DIGEST_A) == f"[2001:db8::1]:5000/cogs/alpha@{DIGEST_A}"
 
 
 @pytest.mark.parametrize(
@@ -255,29 +293,33 @@ def test_build_registry_sources_dispatches_by_kind() -> None:
     assert build_registry_sources([], oci_client_factory=FakeOCIFactory()) == []
 
 
-def test_build_registry_sources_refuses_duplicate_ids() -> None:
+def test_build_registry_sources_refuses_duplicate_ids_before_building_anything() -> None:
     configs = [
         CogRegistrySourceConfig(**harbor_config(id="main")),
         CogRegistrySourceConfig(**static_config()),
         CogRegistrySourceConfig(**static_config(id="main")),
     ]
+    factory = FakeOCIFactory()
     with pytest.raises(RuntimeError) as excinfo:
-        build_registry_sources(configs, oci_client_factory=FakeOCIFactory())
+        build_registry_sources(configs, oci_client_factory=factory)
     message = str(excinfo.value)
     assert "cogs.registry.sources[2] reuses id 'main'" in message
     assert "sources[0]" in message
     assert "stored with every indexed row" in message
+    assert factory.clients == []  # preflight refused before any client was constructed
 
 
 def test_build_registry_sources_refuses_unknown_kind_at_runtime() -> None:
     # Literal catches this at parse time; model_construct bypasses validation
     # the way a future caller building configs by hand could.
     bogus = CogRegistrySourceConfig.model_construct(**harbor_config(kind="quay"))
+    factory = FakeOCIFactory()
     with pytest.raises(RuntimeError) as excinfo:
-        build_registry_sources([CogRegistrySourceConfig(**static_config()), bogus], oci_client_factory=FakeOCIFactory())
+        build_registry_sources([CogRegistrySourceConfig(**static_config()), bogus], oci_client_factory=factory)
     message = str(excinfo.value)
     assert "cogs.registry.sources[1] ('harbor-main') has unsupported kind 'quay'" in message
     assert "'harbor'" in message and "'static'" in message
+    assert factory.clients == []
 
 
 # --- parse_registry_event dispatch ----------------------------------------
@@ -406,6 +448,22 @@ async def test_contract_aclose_is_idempotent(contract) -> None:
     await source.aclose()
     await source.aclose()
     assert factory.clients[0].closed == 1
+
+
+async def test_contract_aclose_still_closes_oci_when_the_http_client_fails(contract, monkeypatch) -> None:
+    source, factory, _, _ = contract
+    http = getattr(source, "_http", None)
+    if http is None:
+        pytest.skip("this variant owns no HTTP client of its own")
+
+    async def boom() -> None:
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(http, "aclose", boom)
+    with pytest.raises(RuntimeError, match="close failed"):
+        await source.aclose()
+    assert factory.clients[0].closed == 1
+    await source.aclose()  # and a retry is a no-op, not a second failure
 
 
 async def test_contract_parse_event_rejects_foreign_payloads(contract) -> None:

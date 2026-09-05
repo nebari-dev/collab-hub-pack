@@ -98,7 +98,7 @@ class HarborRegistrySource:
         origin = _origin(config.api_url or config.url)
         self._api_base = origin + API_PREFIX
         credentials = (
-            BasicCredentials(config.credentials.username, config.credentials.password)
+            BasicCredentials(config.credentials.username, config.credentials.password.get_secret_value())
             if config.credentials.configured
             else None
         )
@@ -152,7 +152,10 @@ class HarborRegistrySource:
             f"/projects/{quote(project, safe='')}/repositories/{encoded_name}/artifacts",
             params={"with_tag": "true"},
         )
-        refs: dict[str, ArtifactRef] = {}
+        # One ref per digest even if the listing repeats one: tags accumulate,
+        # the first usable timestamp and media type win.
+        tags_by_digest: dict[str, set[str]] = {}
+        details: dict[str, ArtifactRef] = {}
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -163,19 +166,26 @@ class HarborRegistrySource:
                 )
                 continue
             tags = entry.get("tags")
-            names = sorted(
-                {tag["name"] for tag in tags if isinstance(tag, dict) and isinstance(tag.get("name"), str)}
-                if isinstance(tags, list)
-                else set()
-            )
+            names = tags_by_digest.setdefault(digest, set())
+            if isinstance(tags, list):
+                names.update(tag["name"] for tag in tags if isinstance(tag, dict) and isinstance(tag.get("name"), str))
             media_type = entry.get("manifest_media_type")
-            refs[digest] = ArtifactRef(
+            seen = details.get(digest)
+            details[digest] = ArtifactRef(
                 digest=digest,
-                tags=tuple(names),
-                pushed_at=parse_timestamp(entry.get("push_time")),
-                media_type=media_type if isinstance(media_type, str) and media_type else None,
+                pushed_at=(seen.pushed_at if seen else None) or parse_timestamp(entry.get("push_time")),
+                media_type=(seen.media_type if seen else None)
+                or (media_type if isinstance(media_type, str) and media_type else None),
             )
-        return [refs[digest] for digest in sorted(refs)]
+        return [
+            ArtifactRef(
+                digest=digest,
+                tags=tuple(sorted(tags_by_digest[digest])),
+                pushed_at=details[digest].pushed_at,
+                media_type=details[digest].media_type,
+            )
+            for digest in sorted(details)
+        ]
 
     def oci(self) -> OCIClient:
         return self._oci
@@ -184,8 +194,10 @@ class HarborRegistrySource:
         if self._closed:
             return
         self._closed = True
-        await self._http.aclose()
-        await self._oci.aclose()
+        try:
+            await self._http.aclose()
+        finally:
+            await self._oci.aclose()
 
     async def _paged(self, path: str, *, params: dict[str, str] | None = None) -> list[Any]:
         """Walk Harbor's page/page_size pagination.
@@ -250,7 +262,8 @@ class HarborRegistrySource:
             return None
         try:
             payload = json.loads(request.body)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: a body nested deeper than the interpreter's stack.
             return None
         if not isinstance(payload, dict):
             return None
@@ -269,11 +282,9 @@ class HarborRegistrySource:
         else:
             return None
 
-        if kind is None:
-            return []
-        if not isinstance(data, dict):
-            return []
-        repository = data.get("repository")
+        # Ownership first, for ignored types too: a scan event for another
+        # source's project must stay claimable by that source.
+        repository = data.get("repository") if isinstance(data, dict) else None
         if not isinstance(repository, dict):
             return []
         namespace = repository.get("namespace")
@@ -282,6 +293,8 @@ class HarborRegistrySource:
                 "cogs.registry: source %s dropping a webhook for project %r (not configured)", self.id, namespace
             )
             return None
+        if kind is None:
+            return []
         repo = repository.get("repo_full_name")
         if not isinstance(repo, str) or not repo:
             repo = f"{namespace}/{repository.get('name')}"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -180,7 +181,8 @@ async def test_list_artifacts_encodes_nested_repository_names_and_parses_fields(
                     "push_time": "2026-09-04T17:11:31.297Z",
                     "manifest_media_type": "application/vnd.oci.image.manifest.v1+json",
                 },
-                {"digest": DIGEST_A, "tags": None},  # duplicate digest: last one wins, still one ref
+                # The same digest listed again: tags accumulate, the first timestamp wins.
+                {"digest": DIGEST_A, "tags": [{"name": "v0.9"}], "push_time": "2020-01-01T00:00:00Z"},
                 {"digest": "not-a-digest", "tags": []},
                 {"tags": [{"name": "orphan"}]},
                 "not-an-object",
@@ -192,7 +194,12 @@ async def test_list_artifacts_encodes_nested_repository_names_and_parses_fields(
     assert request.url.raw_path.startswith(b"/api/v2.0/projects/cogs/repositories/nested%252Fcog-a/artifacts?")
     assert request.url.params["with_tag"] == "true"
     assert refs == [
-        ArtifactRef(digest=DIGEST_A, tags=(), pushed_at=None, media_type=None),
+        ArtifactRef(
+            digest=DIGEST_A,
+            tags=("latest", "v0.9", "v1"),  # tags accumulate across repeated entries; first timestamp wins
+            pushed_at=datetime(2026, 9, 4, 17, 11, 31, 297000, tzinfo=UTC),
+            media_type="application/vnd.oci.image.manifest.v1+json",
+        ),
         ArtifactRef(digest=DIGEST_B, tags=("v0",), pushed_at=None, media_type="m"),
     ]
 
@@ -337,6 +344,22 @@ def test_parse_event_not_mine(name: str, caplog) -> None:
         assert any("dropping a webhook for project 'library'" in r.message for r in caplog.records)
     if name == "default-push-other-host.json":
         assert any(r.levelno == logging.WARNING and "names another host" in r.message for r in caplog.records)
+
+
+def test_parse_event_ignored_type_for_another_project_is_not_claimed() -> None:
+    # A scan event for a project this source does not own must stay claimable
+    # by the source that does, so it is None here rather than [].
+    body = json.loads((FIXTURES / "default-scanning-completed.json").read_bytes())
+    body["event_data"]["repository"]["namespace"] = "library"
+    assert webhook_source().parse_event(payload(body)) is None
+    assert webhook_source(id="library", projects=["library"]).parse_event(payload(body)) == []
+
+
+def test_parse_event_deeply_nested_json_is_not_mine() -> None:
+    depth = 200_000
+    body = b"[" * depth + b"]" * depth
+    assert len(body) < MAX_WEBHOOK_BODY_BYTES
+    assert webhook_source().parse_event(WebhookRequest(headers={}, body=body)) is None
 
 
 def test_parse_event_other_project_is_claimable_by_a_second_source() -> None:

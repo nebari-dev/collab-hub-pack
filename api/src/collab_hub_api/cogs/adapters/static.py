@@ -60,7 +60,7 @@ class StaticRegistrySource:
         self._repositories = tuple(config.repositories)
         self._index_url = config.index_url
         credentials = (
-            BasicCredentials(config.credentials.username, config.credentials.password)
+            BasicCredentials(config.credentials.username, config.credentials.password.get_secret_value())
             if config.credentials.configured
             else None
         )
@@ -140,9 +140,11 @@ class StaticRegistrySource:
         if self._closed:
             return
         self._closed = True
-        if self._http is not None:
-            await self._http.aclose()
-        await self._oci.aclose()
+        try:
+            if self._http is not None:
+                await self._http.aclose()
+        finally:
+            await self._oci.aclose()
 
     async def _fetch_index(self) -> list[str]:
         assert self._http is not None

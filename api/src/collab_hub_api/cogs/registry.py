@@ -33,15 +33,20 @@ from typing import Any, Literal, Protocol, Self, runtime_checkable
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from .oci import OCIClient
 
 logger = logging.getLogger(__name__)
 
 RegistryKind = Literal["harbor", "static"]
-"""The adapters that exist. The vendor name appears here and in the dispatch of
-:func:`build_registry_sources`; nowhere else outside ``cogs/adapters/``."""
+"""The adapters that exist.
+
+Outside ``cogs/adapters/`` the vendor name appears only where the config enum
+is handled: here, in ``CogRegistrySourceConfig``'s kind-shape validator, and in
+the dispatch of :func:`build_registry_sources`. No vendor *logic* lives there;
+``test_module_is_the_only_home_of_the_vendor_name`` pins this.
+"""
 
 # Repository path grammar from the OCI Distribution spec: lowercase components
 # separated by "/", each component alphanumerics joined by ".", "_", "__" or
@@ -161,6 +166,8 @@ def registry_host(url: str) -> str:
     host = parts.hostname or ""
     if not host:
         raise ValueError(f"registry url {url!r} has no host")
+    if ":" in host:
+        host = f"[{host}]"  # IPv6 literal: keep the brackets so host:port stays unambiguous
     return f"{host}:{parts.port}" if parts.port is not None else host
 
 
@@ -199,6 +206,14 @@ def _http_url(value: str, *, field_name: str) -> str:
     parts = urlsplit(value)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError(f"{field_name} must be an http(s) URL with a host, got {value!r}")
+    if parts.username is not None or parts.password is not None:
+        # Refused before the value can be echoed anywhere: the URL is not a
+        # secret and is quoted in messages; credentials go in `credentials`.
+        raise ValueError(f"{field_name} must not embed a username or password; use credentials")
+    try:
+        parts.port  # noqa: B018 - raises for a non-numeric or out-of-range port
+    except ValueError:
+        raise ValueError(f"{field_name} has an invalid port, got {value!r}") from None
     if parts.query or parts.fragment:
         raise ValueError(f"{field_name} must not carry a query or fragment, got {value!r}")
     return value.rstrip("/")
@@ -212,8 +227,13 @@ class CogRegistryCredentials(BaseModel):
     shape a missing or misnamed Secret mount produces.
     """
 
+    # hide_input_in_errors keeps the submitted values out of a ValidationError's
+    # text; SecretStr keeps the password out of repr()/str() of this model and
+    # of any config that nests it. Adapters read it with get_secret_value().
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     username: str = ""
-    password: str = ""
+    password: SecretStr = SecretStr("")
 
     @field_validator("username", "password", mode="before")
     @classmethod
@@ -222,7 +242,7 @@ class CogRegistryCredentials(BaseModel):
 
     @model_validator(mode="after")
     def _both_or_neither(self) -> Self:
-        if bool(self.username) != bool(self.password):
+        if bool(self.username) != bool(self.password.get_secret_value()):
             raise ValueError(
                 "credentials.username and credentials.password must be set together: one without the "
                 "other is what a missing Secret mount looks like, and the registry would answer 401 on "
@@ -234,15 +254,11 @@ class CogRegistryCredentials(BaseModel):
     def configured(self) -> bool:
         return bool(self.username)
 
-    def __repr_args__(self):  # type: ignore[override]
-        # Never let the password reach a log or a traceback through repr() or
-        # str() of this model or of a config that nests it.
-        yield "username", self.username
-        yield "password", "***" if self.password else ""
-
 
 class CogRegistrySourceConfig(BaseModel):
     """One registry the hub indexes. Shape shared with the ``cogs:`` config block (#87)."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     id: str
     kind: RegistryKind
@@ -257,7 +273,7 @@ class CogRegistrySourceConfig(BaseModel):
     index_url: str = ""
     ca_bundle_path: str = ""
     credentials: CogRegistryCredentials = Field(default_factory=CogRegistryCredentials)
-    webhook_secret: str = ""
+    webhook_secret: SecretStr = SecretStr("")
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
     @field_validator(
@@ -340,7 +356,7 @@ class CogRegistrySourceConfig(BaseModel):
             for name in ("projects", "api_url"):
                 if getattr(self, name):
                     raise ValueError(f"{label} does not read {name}; that field belongs to kind 'harbor'")
-            if self.webhook_secret:
+            if self.webhook_secret.get_secret_value():
                 raise ValueError(f"{label} has no webhook; webhook_secret is not read")
         return self
 
@@ -369,8 +385,9 @@ def build_registry_sources(
     from .adapters.harbor import HarborRegistrySource
     from .adapters.static import StaticRegistrySource
 
+    # Preflight every config before constructing any source, so a refusal
+    # leaves nothing half-built (no HTTP clients to close).
     seen: dict[str, int] = {}
-    sources: list[RegistrySource] = []
     for index, config in enumerate(configs):
         if config.id in seen:
             raise RuntimeError(
@@ -379,18 +396,21 @@ def build_registry_sources(
                 "artifacts indistinguishable. Give each source a distinct id."
             )
         seen[config.id] = index
-        if config.kind == "harbor":
-            source: RegistrySource = HarborRegistrySource(
-                config, oci_client_factory=oci_client_factory, http_transport=http_transport
-            )
-        elif config.kind == "static":
-            source = StaticRegistrySource(config, oci_client_factory=oci_client_factory, http_transport=http_transport)
-        else:
+        if config.kind not in ("harbor", "static"):
             raise RuntimeError(
                 f"cogs.registry.sources[{index}] ({config.id!r}) has unsupported kind {config.kind!r}: expected "
                 "exactly 'harbor' (enumerate projects through the registry's REST API and translate its webhooks) or "
                 "'static' (a configured repository list and/or a catalog.v1.json index; generic OCI only)."
             )
+
+    sources: list[RegistrySource] = []
+    for config in configs:
+        if config.kind == "harbor":
+            source: RegistrySource = HarborRegistrySource(
+                config, oci_client_factory=oci_client_factory, http_transport=http_transport
+            )
+        else:
+            source = StaticRegistrySource(config, oci_client_factory=oci_client_factory, http_transport=http_transport)
         sources.append(source)
     return sources
 
