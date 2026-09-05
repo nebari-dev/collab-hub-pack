@@ -8,6 +8,7 @@ real registry when ``COLLAB_HUB_TEST_OCI_URL`` is set.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -38,6 +39,7 @@ from collab_hub_api.cogs.oci import (
     OCINotFound,
     OCIProtocolError,
     OCITooLarge,
+    OCITransportError,
     fetch_bundle_files,
     select_bundle_layers,
 )
@@ -120,7 +122,8 @@ class FakeRegistry:
     blob_content_length: str | None = "auto"
     blob_body_override: bytes | None = None
     manifest_content_length: str | None = "auto"
-    token_ttl: int = 300
+    token_ttl: int | None = 300
+    async_token: bool = False
     token_field: str = "token"
     reject_all_tokens: bool = False
     challenge_scope: str | None = None
@@ -130,7 +133,13 @@ class FakeRegistry:
     valid_tokens: set[str] = field(default_factory=set)
 
     def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
+        return httpx.MockTransport(self.handle_async if self.async_token else self.handle)
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        # Yield to the event loop at the token endpoint so concurrent callers interleave.
+        if request.url.path == "/service/token" or request.url.host == "auth.example":
+            await asyncio.sleep(0)
+        return self.handle(request)
 
     # -- routing ------------------------------------------------------------
 
@@ -182,7 +191,10 @@ class FakeRegistry:
         self.issued += 1
         token = f"tok-{self.issued}"
         self.valid_tokens.add(token)
-        return httpx.Response(200, json={self.token_field: token, "expires_in": self.token_ttl})
+        payload = {self.token_field: token}
+        if self.token_ttl is not None:
+            payload["expires_in"] = self.token_ttl
+        return httpx.Response(200, json=payload)
 
     def manifest(self, ref: str, request: httpx.Request) -> httpx.Response:
         body = self.manifests.get(ref)
@@ -200,7 +212,12 @@ class FakeRegistry:
 
     def blob(self, digest: str, request: httpx.Request) -> httpx.Response:
         if self.blob_redirect:
-            return httpx.Response(307, headers={"Location": f"{BLOB_STORE}/store/{digest}?sig=abc"})
+            # A redirect body the client must never read: reading it fails the test.
+            return httpx.Response(
+                307,
+                headers={"Location": f"{BLOB_STORE}/store/{digest}?sig=abc", "Content-Length": str(10**9)},
+                stream=_AsyncChunks(_never_read()),
+            )
         return self._blob_body(digest)
 
     def blob_store(self, request: httpx.Request) -> httpx.Response:
@@ -244,6 +261,11 @@ class FakeRegistry:
 
             return httpx.Response(200, headers=headers, stream=_AsyncChunks(chunks()))
         return httpx.Response(200, headers=headers, content=body)
+
+
+async def _never_read():
+    raise AssertionError("redirect body was read")
+    yield b""  # pragma: no cover
 
 
 class _AsyncChunks(httpx.AsyncByteStream):
@@ -413,7 +435,8 @@ async def test_short_lived_token_is_not_cached():
 
 
 async def test_access_token_field_and_default_ttl_accepted():
-    registry = FakeRegistry(auth="bearer", token_field="access_token")
+    # No expires_in in the response: the spec default of 60 s applies, so the token is cached.
+    registry = FakeRegistry(auth="bearer", token_field="access_token", token_ttl=None)
     async with client_for(registry) as client:
         await client.list_tags(REPO)
         await client.list_tags(REPO)
@@ -637,7 +660,24 @@ async def test_index_children_are_bounded_and_validated():
     bad_child = {"mediaType": MEDIA_TYPE_OCI_INDEX, "manifests": [{"digest": "x"}]}
     registry.manifests["latest"] = json.dumps(bad_child).encode()
     async with client_for(registry) as client:
-        with pytest.raises(OCIProtocolError, match="malformed digest"):
+        with pytest.raises(OCIProtocolError, match="index entry descriptor"):
+            await client.get_manifest(REPO, "latest")
+    # A child whose bytes do not match the size its index entry declares is malformed.
+    lying = {
+        "mediaType": MEDIA_TYPE_OCI_INDEX,
+        "manifests": [{"mediaType": MEDIA_TYPE_OCI_MANIFEST, "digest": MANIFEST_DIGEST, "size": len(MANIFEST) + 1}],
+    }
+    registry.manifests["latest"] = json.dumps(lying).encode()
+    async with client_for(registry) as client:
+        with pytest.raises(OCIProtocolError, match="declared size"):
+            await client.get_manifest(REPO, "latest")
+    huge = {
+        "mediaType": MEDIA_TYPE_OCI_INDEX,
+        "manifests": [{"mediaType": MEDIA_TYPE_OCI_MANIFEST, "digest": MANIFEST_DIGEST, "size": 10**9}],
+    }
+    registry.manifests["latest"] = json.dumps(huge).encode()
+    async with client_for(registry) as client:
+        with pytest.raises(OCITooLarge):
             await client.get_manifest(REPO, "latest")
     registry.manifests["latest"] = json.dumps({"mediaType": MEDIA_TYPE_OCI_INDEX, "manifests": 1}).encode()
     async with client_for(registry) as client:
@@ -757,7 +797,8 @@ async def test_list_tags_pagination_bounded_and_same_origin():
         )
 
     async with OCIClient(REGISTRY, transport=httpx.MockTransport(endless)) as client:
-        assert await client.list_tags(REPO) == ["x"]
+        with pytest.raises(OCIProtocolError, match="did not end within"):
+            await client.list_tags(REPO)
 
     def offsite(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -774,7 +815,8 @@ async def test_list_tags_pagination_bounded_and_same_origin():
 
 @pytest.mark.parametrize(
     "repo",
-    ["Cogs/upper", "cogs//double", "/leading", "trailing/", "cogs/../etc", "a b", "", "cogs/x?y=1", "x" * 256],
+    ["Cogs/upper", "cogs//double", "/leading", "trailing/", "cogs/../etc", "a b", "", "cogs/x?y=1", "x" * 256]
+    + ["a\n", 7],
 )
 async def test_invalid_repo_rejected_before_any_request(repo):
     registry = FakeRegistry(auth="open")
@@ -788,7 +830,9 @@ async def test_invalid_repo_rejected_before_any_request(repo):
     assert registry.requests == []
 
 
-@pytest.mark.parametrize("ref", ["", ".hidden", "tag/with/slash", "t" * 129, "sha256:short", "sha512:" + "a" * 128])
+@pytest.mark.parametrize(
+    "ref", ["", ".hidden", "tag/with/slash", "t" * 129, "sha256:short", "sha512:" + "a" * 128, "latest\n", None]
+)
 async def test_invalid_ref_rejected_before_any_request(ref):
     registry = FakeRegistry(auth="open")
     async with client_for(registry) as client:
@@ -797,7 +841,10 @@ async def test_invalid_ref_rejected_before_any_request(ref):
     assert registry.requests == []
 
 
-@pytest.mark.parametrize("digest", ["latest", "sha256:" + "G" * 64, "sha256:" + "a" * 63, "sha256:" + "a" * 64 + "/x"])
+@pytest.mark.parametrize(
+    "digest",
+    ["latest", "sha256:" + "G" * 64, "sha256:" + "a" * 63, "sha256:" + "a" * 64 + "/x", sha256(b"") + "\n", b""],
+)
 async def test_invalid_digest_rejected_before_any_request(digest):
     registry = FakeRegistry(auth="open")
     async with client_for(registry) as client:
@@ -874,6 +921,223 @@ async def test_fetch_bundle_files_single_bad_file_raises():
         registry.blobs[sha256(PIXI_TOML)] = PIXI_TOML + b"# appended\n"
         with pytest.raises(OCIDigestMismatch):
             await fetch_bundle_files(client, REPO, manifest)
+
+
+# --- review regressions -------------------------------------------------------
+
+
+async def test_concurrent_misses_mint_one_token():
+    registry = FakeRegistry(auth="bearer", async_token=True)
+    async with client_for(registry) as client:
+        results = await asyncio.gather(client.list_tags(REPO), client.list_tags(REPO), client.list_tags(REPO))
+    assert results == [["latest", "v1", "v2"]] * 3
+    assert len(registry.token_requests) == 1
+
+
+async def test_token_cache_key_includes_endpoint_and_service():
+    # Same scope, different token endpoint (override vs realm): distinct cache entries.
+    registry = FakeRegistry(auth="bearer")
+    async with client_for(registry) as client:
+        await client.list_tags(REPO)
+        key = next(iter(client._tokens))
+    assert key == (REALM, "registry.example", f"repository:{REPO}:pull")
+    assert "tok-1" not in repr(client._tokens[key])
+    assert "***" in repr(client._tokens[key])
+
+
+def test_store_token_evicts_stale_and_oldest(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(oci, "_monotonic", lambda: now[0])
+    client = OCIClient(REGISTRY, transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    client._store_token(("e", "s", "stale"), "Bearer a", expires_at=150.0)
+    now[0] = 200.0
+    client._store_token(("e", "s", "fresh"), "Bearer b", expires_at=900.0)
+    assert list(client._tokens) == [("e", "s", "fresh")]
+    for i in range(oci.MAX_CACHED_TOKENS + 5):
+        client._store_token(("e", "s", f"scope-{i}"), "Bearer c", expires_at=900.0)
+    assert len(client._tokens) == oci.MAX_CACHED_TOKENS
+    assert ("e", "s", "fresh") not in client._tokens
+    assert ("e", "s", f"scope-{oci.MAX_CACHED_TOKENS + 4}") in client._tokens
+    for i in range(oci.MAX_CACHED_TOKENS + 5):
+        client._alias(f"hint-{i}", ("e", "s", "x"))
+    assert len(client._scope_aliases) == oci.MAX_CACHED_TOKENS
+
+
+async def test_invalid_expires_in_falls_back_to_default():
+    registry = FakeRegistry(auth="bearer", token_ttl="soon")  # type: ignore[arg-type]
+    async with client_for(registry) as client:
+        await client.list_tags(REPO)
+        await client.list_tags(REPO)
+    assert len(registry.token_requests) == 1
+
+
+async def test_transport_errors_are_wrapped():
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(refuse)) as client:
+        with pytest.raises(OCITransportError, match="ConnectError"):
+            await client.list_tags(REPO)
+
+    async def broken_body():
+        yield b"partial"
+        raise httpx.ReadError("reset")
+
+    def mid_body(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_AsyncChunks(broken_body()))
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(mid_body)) as client:
+        with pytest.raises(OCITransportError, match="ReadError while reading"):
+            await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
+
+    def token_down(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "auth.example":
+            raise httpx.ConnectTimeout("timeout")
+        return httpx.Response(401, headers={"WWW-Authenticate": f'Bearer realm="{REALM}"'})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(token_down)) as client:
+        with pytest.raises(OCITransportError, match="token endpoint: ConnectTimeout"):
+            await client.list_tags(REPO)
+
+
+async def test_malformed_urls_are_protocol_errors():
+    def bad_realm(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, headers={"WWW-Authenticate": 'Bearer realm="http://auth.example:abc/token"'})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(bad_realm)) as client:
+        with pytest.raises(OCIProtocolError, match="token endpoint is not a valid URL"):
+            await client.list_tags(REPO)
+
+    def bad_link(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Link": '<http://registry.example:abc/x>; rel="next"'}, json={"tags": []})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(bad_link)) as client:
+        with pytest.raises(OCIProtocolError, match="pagination link is not a valid URL"):
+            await client.list_tags(REPO)
+
+    def prev_only(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Link": f'</v2/{REPO}/tags/list?n=1>; rel="prev"'}, json={"tags": ["a"]})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(prev_only)) as client:
+        assert await client.list_tags(REPO) == ["a"]
+
+    with pytest.raises(ValueError, match="not a valid URL"):
+        OCIClient("https://registry.example:abc")
+
+
+async def test_redirect_chain_edges():
+    def build(handler):
+        return OCIClient(REGISTRY, transport=httpx.MockTransport(handler))
+
+    def loop_forever(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": request.url.path + "x"})
+
+    async with build(loop_forever) as client:
+        with pytest.raises(OCIProtocolError, match="more than"):
+            await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
+
+    def no_location(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307)
+
+    async with build(no_location) as client:
+        with pytest.raises(OCIProtocolError, match="without a Location"):
+            await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
+
+    def ftp(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307, headers={"Location": "ftp://blobs.example/x"})
+
+    async with build(ftp) as client:
+        with pytest.raises(OCIProtocolError, match="not an http"):
+            await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
+
+    # Manifests and tag lists are never redirected: a 3xx there is an unexpected status.
+    async with build(lambda r: httpx.Response(302, headers={"Location": "/elsewhere"})) as client:
+        with pytest.raises(OCIProtocolError, match="HTTP 302"):
+            await client.get_manifest(REPO, "latest")
+
+
+async def test_redirect_same_origin_keeps_authorization_but_scheme_change_drops_it():
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("Authorization")))
+        if request.url.path.startswith("/v2/"):
+            if "Authorization" not in request.headers:
+                return httpx.Response(401, headers={"WWW-Authenticate": 'Basic realm="r"'})
+            return httpx.Response(302, headers={"Location": "/storage/one"})
+        if request.url.path == "/storage/one":
+            return httpx.Response(302, headers={"Location": "https://registry.example/storage/two"})
+        return httpx.Response(200, content=COG_MD)
+
+    client = OCIClient("http://registry.example", credentials=CREDS, transport=httpx.MockTransport(handler))
+    async with client:
+        assert await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024) == COG_MD
+    by_url = {url: auth for url, auth in seen}
+    assert by_url["http://registry.example/storage/one"] == basic_header(CREDS)  # same origin: kept
+    assert by_url["https://registry.example/storage/two"] is None  # scheme changed: dropped
+
+
+async def test_encoded_bodies_are_refused_and_identity_requested():
+    registry = FakeRegistry(auth="open")
+    async with client_for(registry) as client:
+        await client.list_tags(REPO)
+    assert registry.requests[-1].headers["Accept-Encoding"] == "identity"
+
+    def gzipped(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=b"\x1f\x8b")
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(gzipped)) as client:
+        with pytest.raises(OCIProtocolError, match="Content-Encoding"):
+            await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
+
+
+async def test_list_tags_rejects_malformed_tag_entries():
+    for entry in ("has space", ".dot-first", 3, "x" * 129):
+
+        def handler(request: httpx.Request, entry=entry) -> httpx.Response:
+            return httpx.Response(200, json={"name": REPO, "tags": ["ok", entry]})
+
+        async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(OCIProtocolError, match="malformed tag"):
+                await client.list_tags(REPO)
+
+
+def test_ca_bundle_path_is_loaded_at_construction(tmp_path):
+    import certifi
+
+    client = OCIClient(REGISTRY, ca_bundle_path=certifi.where())
+    assert client.base_url == REGISTRY
+    with pytest.raises(OSError):
+        OCIClient(REGISTRY, ca_bundle_path=str(tmp_path / "missing.pem"))
+
+
+def test_parse_challenges_skips_unparseable_bytes():
+    parsed = oci._parse_challenges(['Bearer realm="r" ??? service=s'])
+    assert parsed == [oci._Challenge("bearer", {"realm": "r", "service": "s"})]
+
+
+async def test_redirect_chain_at_the_bound_still_resolves():
+    hops = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal hops
+        if hops < oci.MAX_BLOB_REDIRECTS:
+            hops += 1
+            return httpx.Response(307, headers={"Location": f"/hop/{hops}"})
+        return httpx.Response(200, content=COG_MD)
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+        assert await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024) == COG_MD
+    assert hops == oci.MAX_BLOB_REDIRECTS
+
+
+async def test_alias_without_token_falls_back_to_challenge():
+    registry = FakeRegistry(auth="bearer")
+    async with client_for(registry) as client:
+        await client.list_tags(REPO)
+        client._tokens.clear()  # evicted (capacity or expiry sweep) while the alias remains
+        await client.list_tags(REPO)
+    assert len(registry.token_requests) == 2
 
 
 # --- live (opt-in) ------------------------------------------------------------
