@@ -618,8 +618,36 @@ def test_document_splitting_errors_keep_the_body(data: bytes, expected: str, bod
     doc = read_cog_document(data)
 
     assert doc.errors == [expected]
-    assert doc.fields == {}
+    assert doc.fields == {} and doc.parsed is False
     assert doc.body == body
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\xff\n",
+        b"# no frontmatter\n",
+        b"---\n---\n",
+        b"---\ntype: cog\nnot a field\n---\n",
+        b"---\ntype: cog\ndescription: |\n  block\n---\n",
+    ],
+)
+def test_unreadable_cog_md_is_unparsed_not_a_draft(data: bytes):
+    """Review finding: a document nothing could be read from is not a draft."""
+
+    card = read_cog_bundle({"COG.md": data})
+
+    assert card.profile_status == "unparsed"
+    assert card.errors and card.frontmatter == {}
+    assert card.profile is None and card.manifest is None
+
+
+def test_readable_frontmatter_with_field_errors_and_no_manifest_is_still_a_draft():
+    card = read_cog_bundle({"COG.md": cog_md("type: cog\nversion: 0.1")})
+
+    assert card.profile_status == "draft"
+    assert "frontmatter is missing the required 'name' field" in card.errors
+    assert "'version' must be a string" in card.errors
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1150,14 @@ environment = "default"
     assert card.ops == {"usage": [], "lifecycle": []}
 
 
+def test_capability_entries_that_are_not_tables_are_not_capabilities():
+    pixi = b'[tool.nebi.capability]\nspec-version = "0.1.0"\n[tool.nebi.capability.example]\nkey = "not a table"\n'
+    card = read_cog_bundle({"pixi.toml": pixi})
+
+    assert card.profile_status == "unparsed"
+    assert card.errors == ["[tool.nebi.capability] declares no <org>.<key> capability table"]
+
+
 def test_cog_md_wins_over_a_capability_table():
     card = read_cog_bundle(
         {"COG.md": cog_md(MINIMAL), "pixi.toml": b"[tool.nebi.capability.example.one]\ndescription = 'd'\n"}
@@ -1225,4 +1261,6 @@ def test_adversarial_documents_never_raise(data: bytes):
     card = read_cog_bundle({"COG.md": data}, bundle_paths=["COG.md"])
 
     json.dumps(card.to_dict())
-    assert card.profile_status in {"draft", "missing"}
+    assert card.profile_status in {"draft", "missing", "unparsed"}
+    # A draft is a readable document: unreadable ones must not pass as drafts.
+    assert card.profile_status != "draft" or card.frontmatter_raw != ""

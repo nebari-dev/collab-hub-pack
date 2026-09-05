@@ -77,12 +77,14 @@ PROFILE_MISSING = "missing"
 class Profile:
     """What following the ``manifest`` pointer produced.
 
-    ``status`` is one of ``parsed`` (the profile was read), ``draft`` (no
-    manifest declared), ``missing`` (declared but not in the bundle, or the
-    pointer is unusable) or ``unparsed`` (the file is there but this reader
-    cannot or does not read it: unknown schema, no schema, wrong format,
-    parse error). ``data`` is the full profile as JSON-shaped data; ``tasks``
-    the package's pixi tasks, which the card classifies into ``ops``.
+    ``status`` is one of ``parsed`` (the profile was read), ``draft`` (a
+    readable ``COG.md`` that declares no manifest), ``missing`` (declared but
+    not in the bundle, or the pointer is unusable) or ``unparsed`` (bytes are
+    there that this reader cannot or does not read: unknown schema, no schema,
+    wrong format, a manifest that does not parse -- or a ``COG.md`` whose
+    frontmatter itself was unreadable, so no pointer could be followed).
+    ``data`` is the full profile as JSON-shaped data; ``tasks`` the package's
+    pixi tasks, which the card classifies into ``ops``.
     """
 
     status: str
@@ -98,6 +100,10 @@ class Profile:
 def load_profile(doc: FrontmatterDocument, files: Mapping[str, bytes]) -> Profile:
     """Follow the document's manifest pointer into ``files`` and read the profile."""
 
+    if not doc.parsed:
+        # Nothing is known about the manifest, so this is not a draft: a
+        # draft is a well-formed document that chose not to declare one.
+        return Profile(PROFILE_UNPARSED)
     declared = doc.fields.get("manifest") is not None or doc.fields.get("manifest_schema") is not None
     if not declared:
         return Profile(PROFILE_DRAFT)

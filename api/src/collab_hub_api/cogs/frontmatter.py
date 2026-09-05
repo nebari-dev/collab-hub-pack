@@ -175,11 +175,18 @@ class FrontmatterDocument:
     text here (``"0.1"``), with the type problem reported in ``errors`` --
     the catalog shows what the author wrote, and says why it is wrong.
 
+    ``parsed`` says whether the frontmatter block was found and read within
+    the spec subset. Field-level problems (a missing ``name``, a non-string
+    ``version``) leave it ``True``; only an unreadable document -- invalid
+    UTF-8, no frontmatter, syntax outside the subset -- leaves it ``False``,
+    in which case ``fields`` is empty because nothing could be trusted.
+
     ``manifest_path`` is set only when the ``manifest`` pointer is a usable
     relative path inside the bundle; ``manifest_schema`` only when it is a
     non-empty string. Both are ``None`` for a draft.
     """
 
+    parsed: bool = False
     fields: dict[str, Any] = field(default_factory=dict)
     raw: str = ""
     body: str = ""
@@ -216,6 +223,7 @@ def read_cog_document(data: bytes) -> FrontmatterDocument:
         doc.errors.append(f"frontmatter is outside the supported YAML subset: {err}")
         return doc
 
+    doc.parsed = True
     doc.fields = _plain(parsed)
     doc.errors.extend(_check_fields(parsed))
     doc.manifest_path, doc.manifest_schema, pointer_errors = _manifest_pointer(parsed)
