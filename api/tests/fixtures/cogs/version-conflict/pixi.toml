@@ -1,0 +1,21 @@
+[workspace]
+name = "cog-summarizer"
+version = "0.1.0"
+description = "Summarizes documents."
+
+[tasks]
+summarize = "python src/cog_cli.py"
+
+[tool.cog]
+schema = "openteams/cog-manifest [0.1]"
+id = "example/cog-summarizer"
+kind = "context"
+owner = "cogs@example.org"
+license = "BSD-3-Clause"
+
+[[tool.cog.interfaces]]
+name = "cli"
+kind = "command"
+task = "summarize"
+audience = "usage"
+default = true
