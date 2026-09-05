@@ -1,0 +1,108 @@
+# Local development stack for the Collab Hub API.
+#
+# Runs everything the API needs to exercise its real auth and invitation
+# paths on a laptop, with NO cluster: Keycloak (OIDC realm `nebari`),
+# Postgres (frames history/groups/orgs/invitations/active state), a fake
+# SES v2 endpoint (the only invitation-email provider the API has), and
+# Mailpit, where every email -- Keycloak's verification mail and the
+# API's invitation mail -- actually lands so you can click the links.
+#
+# The API itself runs on the HOST, not in Compose (`make -C dev api`). The web
+# surface only accepts a plain-http OIDC issuer when its host is loopback, and
+# the browser and the API must agree on the same issuer string -- so both
+# talk to Keycloak at http://localhost:${KEYCLOAK_PORT}. A containerised API
+# would see a different hostname and be refused at startup.
+#
+#   make -C dev up          start the stack (waits for health)
+#   make -C dev api         run the API against it on http://localhost:8010
+#   make -C dev down        stop; `make -C dev reset` also drops the data
+#
+# See dev/README.md for the full walkthrough (sign-in, operator bootstrap,
+# invitations, registration, acceptance).
+
+name: collab-hub-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: collab
+      POSTGRES_DB: collab
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab -d collab"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      # Dev-mode Keycloak derives the issuer from the request Host header, so
+      # both the browser and the host-run API see http://localhost:<port>/realms/nebari.
+      KC_HOSTNAME_STRICT: "false"
+    ports:
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    depends_on:
+      mailpit:
+        condition: service_started
+    healthcheck:
+      # The image ships no curl; probe the management port over /dev/tcp.
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  mailpit:
+    # Catches every email the stack sends (Keycloak verification + API
+    # invitations). UI at http://localhost:${MAILPIT_PORT:-8025}.
+    image: axllent/mailpit:v1.28
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "${MAILPIT_PORT:-8025}:8025"
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+
+  ses:
+    # Stand-in for Amazon SES v2 -- the API's only invitation-email provider.
+    # boto3 is pointed here with AWS_ENDPOINT_URL_SESV2 (see api.env); every
+    # SendEmail is relayed over SMTP into Mailpit. LocalStack's free tier does
+    # not emulate SES v2, so this is a ~100-line stdlib server (fake-ses/app.py).
+    image: python:3.14-slim
+    command: ["python", "-u", "/app/app.py"]
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+    ports:
+      - "${SES_PORT:-4566}:8080"
+    volumes:
+      - ./fake-ses/app.py:/app/app.py:ro
+    depends_on:
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres-data:

@@ -4,7 +4,9 @@ title = "collab-hub-pack gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Non-secret test fixtures (example values used by unit tests)"
+description = "Non-secret test fixtures (example values used by unit tests) and the throwaway localhost-only credentials of the dev compose stack"
 paths = [
   '''api/tests/test_web_surface\.py''',
+  '''dev/api\.env''',
+  '''dev/keycloak/nebari-realm\.json''',
 ]

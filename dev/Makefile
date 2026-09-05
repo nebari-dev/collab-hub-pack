@@ -1,19 +1,82 @@
-# Local development Makefile for Nebari Software Pack examples
+# Local development Makefile.
 #
-# Creates a kind cluster with the full Nebari infrastructure stack
-# (MetalLB, Envoy Gateway, cert-manager, Keycloak, nebari-operator)
-# so all examples deploy with NebariApp enabled.
+# Two modes live here:
 #
-# Prerequisites: docker, kind, helm, kubectl, git
+# 1. Compose stack (default, no cluster) -- Keycloak + Postgres + a fake
+#    SES v2 + Mailpit in Docker, the API on the host. Exercises the real OIDC
+#    web surface, invitations and registration end to end. See README.md in
+#    this directory.
 #
-# Usage:
-#   make up-vanilla    Deploy the vanilla YAML example
-#   make up-kustomize  Deploy the kustomize example (dev overlay)
-#   make up-basic      Deploy the basic nginx Helm example
-#   make up-fastapi    Deploy the FastAPI Helm example (pre-built GHCR image)
-#   make up-podinfo    Deploy the podinfo wrapper Helm example
-#   make update-hosts  Update /etc/hosts with NebariApp hostnames
-#   make down          Delete the kind cluster
+#      make up            Start the stack and wait for it to be healthy
+#      make api           Run the API on http://localhost:8010 against it
+#      make operator      Grant the seeded `operator` user the platform role
+#                         (USER=<keycloak-username> for someone else)
+#      make status        Show container health
+#      make logs          Follow container logs
+#      make down          Stop the stack (data kept)
+#      make reset         Stop the stack and drop its volumes
+#
+# 2. kind cluster (on request) -- the software-pack-template cluster with the
+#    full Nebari infrastructure stack (MetalLB, Envoy Gateway, cert-manager,
+#    Keycloak, nebari-operator). Only `make cluster` / `make kind-down` are
+#    useful in this repo; the template's example `up-*` targets reference
+#    charts that do not exist here and are kept only for reference.
+#
+#      make cluster       Create the kind cluster with the Nebari stack
+#      make update-hosts  Update /etc/hosts with NebariApp hostnames
+#      make kind-down     Delete the kind cluster
+#
+# Prerequisites: docker (compose v2), uv; for kind mode also kind, helm, kubectl, git
+
+COMPOSE_FILE  := docker-compose.yaml
+COMPOSE       := docker compose -f $(COMPOSE_FILE)
+API_ENV       := api.env
+API_DIR       := api
+USER          ?= operator
+
+.DEFAULT_GOAL := help
+
+.PHONY: help up down reset status logs api operator
+
+help:
+	@sed -n '2,31p' $(MAKEFILE_LIST) | sed 's/^# \{0,1\}//'
+
+# --------------------------------------------------------------------------
+# Compose stack
+# --------------------------------------------------------------------------
+up:
+	$(COMPOSE) up -d --wait
+	@echo ""
+	@echo "Stack is up:"
+	@echo "  Keycloak admin  http://localhost:$${KEYCLOAK_PORT:-8080}/admin/  (admin / admin, realm: nebari)"
+	@echo "  Mailpit         http://localhost:$${MAILPIT_PORT:-8025}"
+	@echo "  Postgres        postgresql://collab:collab@localhost:$${POSTGRES_PORT:-5432}/collab"
+	@echo "  Fake SES v2     http://localhost:$${SES_PORT:-4566}  (relays into Mailpit)"
+	@echo ""
+	@echo "Next: make api   (then make operator, in another shell, once the API has started)"
+
+down:
+	$(COMPOSE) down
+
+reset:
+	$(COMPOSE) down -v
+	rm -rf .data
+
+status:
+	$(COMPOSE) ps
+
+logs:
+	$(COMPOSE) logs -f
+
+# Runs in the foreground; Ctrl+C stops it. Paths in api.env are relative to
+# the repo root, so run from there.
+api:
+	@mkdir -p .data/frames
+	cd .. && set -a && . dev/$(API_ENV) && set +a && \
+		cd $(API_DIR) && uv sync --python 3.14 --quiet && uv run --python 3.14 python -m collab_hub_api
+
+operator:
+	./scripts/grant-operator.sh $(USER)
 
 VANILLA_DIR   := ../examples/vanilla-yaml
 KUSTOMIZE_DIR := ../examples/kustomize-nginx
@@ -48,7 +111,11 @@ spec:
 endef
 export METALLB_POOL
 
-.PHONY: up-vanilla up-kustomize up-basic up-fastapi up-podinfo down cluster update-hosts
+.PHONY: up-vanilla up-kustomize up-basic up-fastapi up-podinfo kind-down cluster update-hosts
+
+# --------------------------------------------------------------------------
+# kind mode (on request)
+# --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
 # cluster - create kind cluster with full Nebari infrastructure
@@ -199,7 +266,7 @@ update-hosts:
 	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
 
 # --------------------------------------------------------------------------
-# down - delete the kind cluster
+# kind-down - delete the kind cluster
 # --------------------------------------------------------------------------
-down:
+kind-down:
 	kind delete cluster --name $(CLUSTER_NAME)
