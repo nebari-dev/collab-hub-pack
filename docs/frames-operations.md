@@ -169,6 +169,7 @@ setting decides where that organization comes from.
 | --- | --- | --- |
 | `""` (default) or `claims` | unset / `claims` | `org_id`/`workspace_id` token claims, falling back to `frames.auth.defaults` |
 | `membership` | `membership` | the caller's one active `collab_org_members` row; workspace is always `default` |
+| `single` | `single` | membership resolution, plus auto-admission to one declared organization for sign-ins from declared identity providers (below) |
 
 **Why `claims` is not a neutral default.** No identity provider in use mints an
 `org_id` claim, so on a real deployment the *fallback* is what every caller
@@ -188,8 +189,9 @@ and only then retire the fallback. One fused switch has no middle state to stop
 in. Two switches, one a precondition of the other, keeps the steps
 independently reversible.
 
-Membership mode refuses to start unless all of the following hold, each checked
-at render time by the chart and again at startup by the API:
+Membership resolution (both `membership` and `single`) refuses to start unless
+all of the following hold, each checked at render time by the chart and again
+at startup by the API:
 
 - `frames.auth.identityClaim=sub` — membership rows are keyed by the OIDC
   subject, so a legacy principal would be looked up under the wrong key.
@@ -198,6 +200,75 @@ at render time by the chart and again at startup by the API:
   are invisible until someone flips `orgSource` back to `claims`.
 - A shared `frames.postgres` URL (or `existingSecret`) is configured.
 - The `collab_` schema is at the version this build requires (see below).
+
+### The single-organization mode (`orgSource=single`)
+
+A common deployment shape: one hub, one organization, everyone in it. Under
+plain `membership` that shape is unreachable without invitations — the only
+writer of `collab_org_members` is invitation acceptance, so on a hub with
+`frames.email.provider: disabled` a brand-new realm account dead-ends at
+`no_organization` and an operator has to write SQL. `single` closes that gap
+by declaration rather than by fallback:
+
+- The deployment declares **one organization** (`frames.auth.singleOrg.id` and
+  `.name`) and **which identity providers produce members**
+  (`frames.auth.singleOrg.memberSources`, a list of Keycloak identity-provider
+  aliases).
+- A caller with **no membership row at all** whose token shows a sign-in
+  brokered through a declared provider gets a real `member` row written on
+  their first authenticated request. The row is an ordinary membership row:
+  the member list shows them, the member picker finds them, and moving to
+  multi-org later is a configuration change, not a data migration.
+- Everything else is byte-for-byte membership mode. Existing rows — active in
+  any organization, or `removed` — are authoritative and never rewritten, so
+  **removal keeps taking effect on the very next request** and auto-admission
+  can never resurrect a removed member or move anyone. Turning the mode off
+  (back to `membership`) simply stops the writes and leaves every member
+  intact.
+
+**The gate is the token's `identity_provider` claim.** Keycloak records the
+broker alias in the `identity_provider` user session note; surface it with a
+"User Session Note" protocol mapper (session note `identity_provider`, claim
+name `identity_provider`, added to **ID and access tokens**) on the client or
+client scope the hub's tokens come from. A token without the claim — a local
+realm account, a realm missing the mapper — is never auto-admitted and
+resolves to `no_organization`, exactly like a sign-in from an undeclared
+provider. Absence fails closed on purpose: a missing mapper must degrade to
+"nobody is auto-admitted", never to "everybody is".
+
+**The access boundary, stated plainly.** On a single-organization hub, *the
+declared providers' membership policy is the hub's access policy*: everyone a
+listed provider admits becomes a member and can read every `internal` Frame.
+That is the intended behaviour of the mode, and it is why admission is gated
+on a declared provider rather than on authentication — "every authenticated
+user" would also admit self-registered and hand-created realm accounts, the
+latter being the one door with no policy on it at all. Before listing a
+provider, restrict it to your organization (for a Google provider,
+`hostedDomain`); an unrestricted provider on the list admits anyone with an
+account there. The API logs `single_org_mode_active` at startup naming the
+organization and the declared sources, so the declaration is visible in pod
+output rather than inferred from behaviour.
+
+Deliberately unchanged by this mode:
+
+- `identityClaim: sub` is still required; membership rows are keyed by the
+  subject, and the retired `frames.auth.defaults` are still refused. `single`
+  replaces the old default-org fallback; it does not revive it.
+- Auto-admitted members get the `member` role. Owner and operator remain
+  deliberate acts — the first operator is still the documented
+  `collab_platform_roles` bootstrap insert (below), and an operator signing in
+  through a declared provider is admitted as a member like anyone else, on top
+  of their platform role.
+- Invitations keep mounting: they carry more than membership (the granted
+  role, service-access grants on acceptance). On a single-org hub they are
+  optional for *access* and still useful for *role*.
+
+The organization row itself is created alongside the first admission (same
+transaction), with `created_by = 'single-org-configuration'`, if no
+`collab_orgs` row with the declared id exists; the configured name applies
+only at that creation and never renames an existing organization. The declared
+id is load-bearing: changing it later points new sign-ins at a *different*
+organization while every existing membership row stays where it was.
 
 ### What a caller without an organization gets
 
@@ -321,7 +392,8 @@ and records what it applied — lock, DDL, and bookkeeping commit together.
 
 #### Startup version preflight
 
-A deployment that reads these tables (`frames.auth.orgSource=membership`)
+A deployment that reads these tables (`frames.auth.orgSource=membership` or
+`single`)
 checks the recorded schema version at startup, before serving. Without it,
 `autoMigrate: false` against a database nobody migrated installs cleanly, starts
 cleanly, and then fails with `relation "collab_org_members" does not exist` —
@@ -554,8 +626,9 @@ is the first thing to try, before this query.
 
 ### Invitations
 
-The invitation surface exists only where `frames.auth.orgSource=membership`
-and the shared `frames.postgres` URL is set. Elsewhere the routes are either
+The invitation surface exists only where organizations are resolved from
+membership (`frames.auth.orgSource=membership` or `single`) and the shared
+`frames.postgres` URL is set. Elsewhere the routes are either
 not mounted at all (claims-sourced deployments) or answer 503
 `invitations_unavailable` — invitations write `collab_org_members`, and a
 "successful" invitation that grants nothing is worse than an absent feature.

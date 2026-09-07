@@ -304,7 +304,7 @@ def _sends_json(request: Request) -> bool:
 def make_routers(*, memberships_enabled: bool) -> tuple[APIRouter, APIRouter]:
     """Build the acceptance page's ``(public_router, session_gated_router)``.
 
-    ``memberships_enabled`` is ``org_source_is_membership()``, resolved once
+    ``memberships_enabled`` is ``org_source_resolves_membership()``, resolved once
     at startup. On a claims-sourced deployment redemption would write
     ``collab_org_members`` rows that the authentication choke point never
     reads — reporting success while granting nothing — which is the exact

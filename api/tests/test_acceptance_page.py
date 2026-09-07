@@ -159,7 +159,7 @@ def idp(monkeypatch):
 def membership_env(monkeypatch):
     """Membership mode, which is what makes acceptance mean anything.
 
-    ``make_routers`` takes ``org_source_is_membership()`` at startup: on a
+    ``make_routers`` takes ``org_source_resolves_membership()`` at startup: on a
     claims-sourced deployment a redemption would write ``collab_org_members``
     rows nothing reads, so the endpoint refuses instead of reporting a
     success that granted nothing (#89's reasoning, applied to this surface).

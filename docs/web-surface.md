@@ -546,7 +546,7 @@ An entry naming a path with **no** mounted route is tolerated, deliberately,
 and that tolerance is load-bearing twice over. Two of the three shipped entries
 name routes #91 has not landed, so a check requiring every entry to be mounted
 would refuse to start this branch. And after #91 lands it still matters:
-`make_app` mounts the operator router only when `org_source_is_membership()`,
+`make_app` mounts the operator router only when `org_source_resolves_membership()`,
 so on a claims-sourced deployment those routes are legitimately absent while
 the entries are correctly present, and failing on absence would refuse every
 such deployment. That leaves a typo inert, and the cost is

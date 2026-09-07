@@ -39,8 +39,10 @@ from .frames.observability import RequestObservabilityMiddleware, configure_logg
 from .frames.org_source import (
     ORG_SOURCE_ENV,
     ORG_SOURCE_MEMBERSHIP,
+    ORG_SOURCE_SINGLE,
     enforce_membership_org_source_preconditions,
-    org_source_is_membership,
+    org_source_resolves_membership,
+    single_org_declaration,
 )
 from .frames.orgs import OrgsUnavailableError, UnavailableOrgStore
 from .frames.store import ConcurrentFrameUpdateError
@@ -200,10 +202,11 @@ def make_app(config: BaseConfig) -> FastAPI:
     enforce_single_issuer_for_pin()
     # Same fail-fast contract for where the caller's organization comes from
     # (issue #63): a mistyped FRAMES_AUTH_ORG_SOURCE, membership resolution
-    # without the identity pin it is keyed on, or a leftover retired
-    # FRAMES_AUTH_DEFAULT_* fallback all fail the rollout here rather than
-    # misresolving tenancy on the first authenticated request.
-    org_source_is_membership()
+    # without the identity pin it is keyed on, a leftover retired
+    # FRAMES_AUTH_DEFAULT_* fallback, or an incomplete single-org declaration
+    # (issue #91) all fail the rollout here rather than misresolving tenancy
+    # on the first authenticated request.
+    org_source_resolves_membership()
     enforce_membership_org_source_preconditions()
     # Same fail-fast contract for the browser web surface (issue #88): a
     # configured client id with a missing/incoherent realm, or a protection
@@ -235,21 +238,40 @@ def make_app(config: BaseConfig) -> FastAPI:
     # construction the way the frames_server_ tables' DDL does. Same trigger
     # (frames.postgres.url + auto_migrate), same startup failure semantics.
     migrate_collab_schema(config, postgres_pools)
-    if org_source_is_membership():
-        # Third membership precondition (the two env-only ones are checked
-        # above): the organization store must have a real backend. Membership
-        # is an authorization input, so a store that fails closed would 503
-        # every authenticated request for as long as the pod lived — refuse the
+    if org_source_resolves_membership():
+        # Third membership precondition (the env-only ones are checked above):
+        # the organization store must have a real backend. Membership is an
+        # authorization input, so a store that fails closed would 503 every
+        # authenticated request for as long as the pod lived — refuse the
         # rollout instead of shipping an outage.
         if isinstance(org_store, UnavailableOrgStore):
             raise RuntimeError(
-                f"{ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP} requires an organization store: set the"
-                " shared frames.postgres URL (or frames.orgs.backend=memory for local development)."
+                f"{ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP} (and ={ORG_SOURCE_SINGLE}) requires an"
+                " organization store: set the shared frames.postgres URL (or"
+                " frames.orgs.backend=memory for local development)."
             )
         # And the schema behind it must be new enough to serve (issue #96).
         # This is the first consumer of the collab_ tables, so it is the first
         # build that a version skew can actually break.
         preflight_collab_schema(config, postgres_pools)
+    single_org = single_org_declaration()
+    if single_org is not None:
+        # The declaration, stated where an operator reads startup output: on
+        # this deployment, any account arriving through one of these identity
+        # providers becomes a member of this organization on its first
+        # authenticated request — so the *providers'* membership policy is the
+        # hub's access policy, and an unrestricted provider on this list is
+        # visible here rather than inferred from behaviour. The organization
+        # row itself is created on first admission, not here: startup
+        # deliberately tolerates an unreachable database.
+        logger.info(
+            "single_org_mode_active",
+            extra={
+                "org": single_org.org_id,
+                "org_name": single_org.org_name,
+                "member_sources": sorted(single_org.member_sources),
+            },
+        )
     mcp = create_mcp_server(frames_store, active_store=active_frame_store)
     mcp_app = mcp.streamable_http_app()
     # MCP traffic authenticates through the same get_auth_context, which
@@ -589,7 +611,7 @@ def make_app(config: BaseConfig) -> FastAPI:
         # costs the reviewed entry in PUBLIC_WEB_PATHS — make_router refuses
         # a public page route that is missing it.
         invite_public, invite_gated = invite.make_routers(
-            memberships_enabled=org_source_is_membership()
+            memberships_enabled=org_source_resolves_membership()
         )
         # The operator invitation page (issue #91). Mounted only where
         # invitations can mean anything, for the same reason #89's API router
@@ -599,7 +621,7 @@ def make_app(config: BaseConfig) -> FastAPI:
         # authentication choke point never reads. A page that is absent is a
         # truer answer than one that refuses everyone without saying why.
         page_routers = [invite_gated]
-        if org_source_is_membership():
+        if org_source_resolves_membership():
             page_routers.append(admin.make_router())
             # The owner invitation page (issue #142), same mounting rule and
             # for the same reason: on a claims-sourced deployment the org-role
@@ -672,7 +694,7 @@ def make_app(config: BaseConfig) -> FastAPI:
                 },
             )
 
-    if org_source_is_membership():
+    if org_source_resolves_membership():
         # Mounted only where it can mean anything. Invitations write
         # `collab_org_members`, which claims-sourced auth never reads, so a
         # claims-mode acceptance would report success and grant nothing —

@@ -214,6 +214,14 @@ spec:
             - name: FRAMES_AUTH_ORG_SOURCE
               value: {{ . | quote }}
             {{- end }}
+            {{- if eq .Values.frames.auth.orgSource "single" }}
+            - name: FRAMES_AUTH_SINGLE_ORG_ID
+              value: {{ .Values.frames.auth.singleOrg.id | quote }}
+            - name: FRAMES_AUTH_SINGLE_ORG_NAME
+              value: {{ .Values.frames.auth.singleOrg.name | quote }}
+            - name: FRAMES_AUTH_SINGLE_ORG_MEMBER_SOURCES
+              value: {{ join "," .Values.frames.auth.singleOrg.memberSources | quote }}
+            {{- end }}
             {{- with .Values.frames.auth.defaults.orgId }}
             - name: FRAMES_AUTH_DEFAULT_ORG
               value: {{ . | quote }}

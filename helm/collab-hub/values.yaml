@@ -356,8 +356,8 @@ frames:
     # only within one issuer, so frames.auth.bearer.issuer / idToken.issuer must
     # be set and agree (the API refuses to start otherwise).
     identityClaim: ""
-    # -- Where a caller's organization comes from: "" (same as "claims") or
-    # "membership".
+    # -- Where a caller's organization comes from: "" (same as "claims"),
+    # "membership", or "single".
     #
     # "claims" is the historical behavior — org and workspace are read from the
     # token, falling back to defaults below. Since no identity provider mints an
@@ -374,10 +374,47 @@ frames:
     # shared frames.postgres URL, and both defaults below left empty — the API
     # refuses to start otherwise.
     #
-    # Required (either value) whenever api.ingress.enabled: on a deployment
+    # "single" is membership resolution for a hub that declares it hosts
+    # exactly one organization (singleOrg below): a caller with no membership
+    # row whose sign-in arrived through one of singleOrg.memberSources gets a
+    # real member row written on their first authenticated request, so a
+    # brand-new realm account needs no invitation and no operator SQL. Existing
+    # rows — active or removed — are never rewritten: removal keeps sticking,
+    # and turning the mode off leaves every member intact. All the
+    # "membership" requirements apply unchanged.
+    #
+    # THE ACCESS BOUNDARY under "single" is the declared providers' membership
+    # policy: everyone those identity providers admit becomes a member and can
+    # read every "internal" Frame. Restrict each declared provider to your
+    # organization (for a Google provider, hostedDomain) — an unrestricted
+    # provider on this list admits anyone with an account there.
+    #
+    # Required (any value) whenever api.ingress.enabled: on a deployment
     # exposed on its own hostname, leaving this to a default is how everyone
     # silently ends up in one organization.
     orgSource: ""
+    # The one organization a "single" deployment hosts. Read only when
+    # orgSource=single, and refused (at render time) with any other orgSource,
+    # so a declaration cannot sit around half-armed.
+    singleOrg:
+      # -- The organization id every auto-admitted caller joins. Load-bearing:
+      # membership rows key on it, and changing it later points new sign-ins at
+      # a different organization while existing rows stay where they are. If no
+      # collab_orgs row with this id exists, it is created (with `name` below)
+      # alongside the first admission.
+      id: ""
+      # -- Display name for the organization, used only if its row is created
+      # by this mode; it never renames an existing organization.
+      name: ""
+      # -- Keycloak identity-provider aliases whose sign-ins are auto-admitted
+      # as members. Matched exactly against the token's `identity_provider`
+      # claim (surface it with a "User Session Note" protocol mapper on the
+      # client scope — session note `identity_provider`, added to ID and access
+      # tokens). Logins arriving any other way — hand-created realm accounts,
+      # self-registration, an undeclared provider — authenticate fine and
+      # resolve to no_organization until membership is granted deliberately.
+      # No wildcard, deliberately: name the providers.
+      memberSources: []
     defaults:
       # -- Default org id used when a verified token has no org claim. Must be
       # empty when orgSource=membership; the fallback is retired there, and
