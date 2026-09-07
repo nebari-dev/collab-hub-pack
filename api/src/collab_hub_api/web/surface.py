@@ -23,6 +23,7 @@ from ..config import WEB_SESSION_LIFETIME_CEILING_SECONDS, BaseConfig
 from ..frames.org_source import (
     ORG_SOURCE_ENV,
     ORG_SOURCE_MEMBERSHIP,
+    ORG_SOURCE_SINGLE,
     org_source_resolves_membership,
 )
 from ..path_protection import resolve_access
@@ -501,7 +502,8 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         # this when an operator signs in has already been running.
         raise RuntimeError(
             "web.public_base_url is required when the browser surface is enabled on a"
-            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}):"
+            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}"
+            f" or {ORG_SOURCE_SINGLE}):"
             " the surface builds absolute URLs (the OIDC redirect_uri among them) and must"
             " not take their origin from a request's Host header. Set"
             " COLLAB_HUB_API__WEB__PUBLIC_BASE_URL to this deployment's external origin,"

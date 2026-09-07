@@ -41,6 +41,7 @@ from .frames.org_source import (
     ORG_SOURCE_MEMBERSHIP,
     ORG_SOURCE_SINGLE,
     enforce_membership_org_source_preconditions,
+    org_source_is_single,
     org_source_resolves_membership,
     single_org_declaration,
 )
@@ -622,7 +623,17 @@ def make_app(config: BaseConfig) -> FastAPI:
         # truer answer than one that refuses everyone without saying why.
         page_routers = [invite_gated]
         if org_source_resolves_membership():
-            page_routers.append(admin.make_router())
+            if not org_source_is_single():
+                # Under the single-organization source (issue #91) the page is
+                # not mounted, by the same "absent is truer than broken" rule:
+                # its one send is the org-creating invitation ("org_id=None is
+                # not a parameter and never will be on this surface"), which
+                # the invitation service refuses on a deployment that declares
+                # exactly one organization. Operators keep the /v1 operator
+                # routes for listing/revoking, and invitations *into* the
+                # declared organization — how a single-org hub grants `owner`
+                # — go through the owner page and API as usual.
+                page_routers.append(admin.make_router())
             # The owner invitation page (issue #142), same mounting rule and
             # for the same reason: on a claims-sourced deployment the org-role
             # axis is structurally None, so every owner would be refused, and

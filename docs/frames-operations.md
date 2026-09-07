@@ -261,7 +261,19 @@ Deliberately unchanged by this mode:
   of their platform role.
 - Invitations keep mounting: they carry more than membership (the granted
   role, service-access grants on acceptance). On a single-org hub they are
-  optional for *access* and still useful for *role*.
+  optional for *access* and still useful for *role* — an owner invitation into
+  the declared organization is how a single-org hub grants `owner`, since
+  auto-admission never does. Note the ordering: acceptance refuses an existing
+  member, and a declared sign-in becomes a member on their first authenticated
+  API request, so an owner-to-be should accept their invitation before opening
+  the app (an existing member is promoted through the owner surface instead).
+  One kind of invitation is refused, at issuance and at acceptance: the
+  **org-creating** invitation (no `org_id`), which would mint the second
+  organization the mode declares away (`409 organization_creation_refused`;
+  a pre-flip invitation refused at acceptance is not consumed). The operator
+  invitation *page* only issues org-creating invitations, so under `single` it
+  is not mounted — the `/v1` operator routes still list, revoke, and issue
+  into existing organizations.
 
 The organization row itself is created alongside the first admission (same
 transaction), with `created_by = 'single-org-configuration'`, if no

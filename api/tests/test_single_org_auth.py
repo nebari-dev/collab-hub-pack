@@ -477,6 +477,48 @@ async def test_removal_still_takes_effect_on_the_very_next_request(single_org_cl
 
 
 # --------------------------------------------------------------------------
+# Org-creating invitations are refused: the one write that would mint a
+# second organization on a hub that declares exactly one
+# --------------------------------------------------------------------------
+
+
+def _operator_ctx() -> object:
+    from collab_hub_api.frames.auth import AuthContext
+
+    return AuthContext(user=CAROL, home_org_id=None, workspace_id=WORKSPACE_DEFAULT)
+
+
+def test_org_creating_invitations_are_refused_at_issuance(monkeypatch):
+    from collab_hub_api.frames.invitations import (
+        OrganizationCreationRefusedError,
+        PostgresInvitationService,
+    )
+
+    _single_env(monkeypatch)
+    # The guard answers before the database is touched — a sentinel proves it.
+    service = PostgresInvitationService(object())
+    with pytest.raises(OrganizationCreationRefusedError):
+        service.create(_operator_ctx(), email="new@example.test", org_id=None)
+    with pytest.raises(OrganizationCreationRefusedError):
+        service.create_unless_live(_operator_ctx(), email="new@example.test", org_id=None)
+
+
+def test_invitations_into_an_existing_organization_pass_the_guard(monkeypatch):
+    from collab_hub_api.frames.invitations import _refuse_org_creation_under_single_org
+
+    _single_env(monkeypatch)
+    # No raise: targeted invitations are how a single-org hub grants `owner`.
+    _refuse_org_creation_under_single_org(THE_ORG)
+
+
+def test_org_creating_invitations_stay_allowed_under_membership(monkeypatch):
+    from collab_hub_api.frames.invitations import _refuse_org_creation_under_single_org
+
+    monkeypatch.setenv(ORG_SOURCE_ENV, "membership")
+    _refuse_org_creation_under_single_org(None)
+
+
+# --------------------------------------------------------------------------
 # The Postgres write, against a stub connection (the live test proves the SQL)
 # --------------------------------------------------------------------------
 
@@ -642,3 +684,54 @@ def test_live_provision_admits_creates_the_org_and_respects_removal(migrated_dat
         auth_context_from_membership(claims_for(ALICE), store, auto_admit=DECLARATION)
     context = auth_context_from_membership(claims_for(BOB), store, auto_admit=DECLARATION)
     assert context is not None and context.org_id == THE_ORG
+
+
+@live_postgres
+def test_live_a_preexisting_org_creating_invitation_cannot_mint_a_second_org(
+    migrated_database, monkeypatch
+):
+    """The acceptance-side half of the guard, against the real transaction.
+
+    An org-creating invitation issued *before* the deployment flipped to
+    `single` is still live; accepting it is the write that would make the
+    declaration false. The refusal must consume nothing — flip the source
+    back, and the same token accepts.
+    """
+
+    from collab_hub_api.frames.auth import DisplayIdentity
+    from collab_hub_api.frames.invitations import (
+        OrganizationCreationRefusedError,
+        PostgresInvitationService,
+        hash_invitation_secret,
+    )
+
+    service = PostgresInvitationService(migrated_database)
+    monkeypatch.setenv(ORG_SOURCE_ENV, "membership")
+    issued = service.create(_operator_ctx(), email="invitee@example.test", org_id=None)
+    token_hash = hash_invitation_secret(issued.raw_secret.reveal())
+
+    def accept():
+        return service.accept(
+            user_id=BOB,
+            display=DisplayIdentity(
+                name="Invitee", email="invitee@example.test", email_verified=True
+            ),
+            token_hash=token_hash,
+            claim_email="invitee@example.test",
+            email_verified=True,
+        )
+
+    _single_env(monkeypatch)
+    with pytest.raises(OrganizationCreationRefusedError):
+        accept()
+    with migrated_database.connection() as conn:
+        row = conn.execute("SELECT status FROM collab_invitations").fetchone()
+        orgs = conn.execute("SELECT count(*) AS n FROM collab_orgs").fetchone()
+    assert row == {"status": "pending"} and orgs == {"n": 0}
+
+    # Nothing was consumed: under membership the same token still works.
+    monkeypatch.setenv(ORG_SOURCE_ENV, "membership")
+    accept()
+    with migrated_database.connection() as conn:
+        settled = conn.execute("SELECT status FROM collab_invitations").fetchone()
+    assert settled == {"status": "accepted"}
