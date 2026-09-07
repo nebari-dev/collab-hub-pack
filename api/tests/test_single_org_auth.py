@@ -69,7 +69,9 @@ from collab_hub_api.frames.orgs import (
     SINGLE_ORG_CREATED_BY,
     InMemoryOrgStore,
     OrgSchemaMissingError,
+    OrgsUnavailableError,
     PostgresOrgStore,
+    UnavailableOrgStore,
 )
 
 psycopg = pytest.importorskip("psycopg")
@@ -386,6 +388,11 @@ def test_the_in_memory_store_provisions_once_and_then_returns_the_standing_row()
     again, created_again = store.provision_member(ALICE, THE_ORG, THE_ORG_NAME)
     assert created is True and created_again is False
     assert again == first
+
+
+def test_an_unavailable_store_raises_on_provision_rather_than_admitting():
+    with pytest.raises(OrgsUnavailableError):
+        UnavailableOrgStore().provision_member(ALICE, THE_ORG, THE_ORG_NAME)
 
 
 # --------------------------------------------------------------------------
