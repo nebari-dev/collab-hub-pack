@@ -395,6 +395,21 @@ def test_an_unavailable_store_raises_on_provision_rather_than_admitting():
         UnavailableOrgStore().provision_member(ALICE, THE_ORG, THE_ORG_NAME)
 
 
+def test_turning_the_mode_off_keeps_members_and_stops_admitting():
+    # The acceptance criterion verbatim: rows written under `single` are
+    # ordinary membership rows, so flipping back to `membership` keeps every
+    # member working and new sign-ins stop being admitted.
+    store = InMemoryOrgStore()
+    admitted = auth_context_from_membership(claims_for(ALICE), store, auto_admit=DECLARATION)
+    assert admitted is not None and admitted.org_id == THE_ORG
+
+    still_member = auth_context_from_membership(claims_for(ALICE), store)
+    assert still_member is not None and still_member.org_id == THE_ORG
+    assert still_member.org_role == ROLE_MEMBER
+    with pytest.raises(NoOrganizationError):
+        auth_context_from_membership(claims_for(BOB), store)
+
+
 # --------------------------------------------------------------------------
 # Through the app: acceptance criteria end to end
 # --------------------------------------------------------------------------
