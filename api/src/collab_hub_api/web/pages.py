@@ -123,7 +123,7 @@ dt { color: #666; font-size: 0.8rem; text-transform: uppercase;
 dd { margin: 0.15rem 0 0; }
 h2 { font-size: 1.05rem; margin: 2rem 0 0.75rem; }
 label { display: block; font-size: 0.8rem; color: #666; margin-bottom: 0.25rem; }
-input[type="email"] { font: inherit; width: 100%; box-sizing: border-box;
+input[type="email"], input[type="text"] { font: inherit; width: 100%; box-sizing: border-box;
        padding: 0.5rem; border: 1px solid #bbb; border-radius: 6px;
        margin-bottom: 0.75rem; background: transparent; color: inherit; }
 .notice { border-left: 3px solid #3452d9; padding-left: 0.75rem; }
@@ -136,7 +136,7 @@ form.inline { display: inline; }
   .brand, .identity, dt, label, th { color: #9a9aa8; }
   .identity { border-top-color: #3a3a48; }
   a, button.link { color: #96a9ff; }
-  input[type="email"] { border-color: #4a4a58; }
+  input[type="email"], input[type="text"] { border-color: #4a4a58; }
   th, td { border-bottom-color: #3a3a48; }
 }
 """
