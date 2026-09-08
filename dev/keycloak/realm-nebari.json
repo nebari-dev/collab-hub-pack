@@ -73,14 +73,15 @@
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
       "redirectUris": [
-        "http://localhost:8000/web/oidc/callback"
+        "http://localhost:8000/web/oidc/callback",
+        "http://localhost:*"
       ],
       "webOrigins": [
-        "http://localhost:8000"
+        "+"
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "http://localhost:8000/*"
+        "post.logout.redirect.uris": "+"
       },
       "defaultClientScopes": [
         "acr",

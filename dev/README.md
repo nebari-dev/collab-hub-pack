@@ -808,6 +808,14 @@ You are redirected to Keycloak for the authorization-code flow with the
 confidential `collab-web` client, and the app issues its own session cookie
 after verifying the ID token. Sign in as `dev` / `dev`.
 
+This works on a non-default `API_PORT` too. The realm lists both
+`http://localhost:8000/web/oidc/callback` and a bare `http://localhost:*`,
+because Keycloak honours a wildcard only at the **end** of a redirect URI —
+`http://localhost:*/web/oidc/callback` is rejected outright with
+`Invalid parameter: redirect_uri`. The wide entry is a local-dev realm
+convenience and has no counterpart in a deployed one, where the callback is a
+single exact URI.
+
 `/admin/invitations` additionally requires the platform `operator` role — see
 [`make seed-org`](#membership--the-multi-tenant-model) above.
 
@@ -944,6 +952,7 @@ Frames and the user directory work immediately. Three things do not:
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
 | Port already in use | Something else on 8000/8080/5432/9000/9080 | Override, e.g. `make api API_PORT=8010` |
+| `Invalid parameter: redirect_uri` signing in to `/web` | The realm was edited and lost its `http://localhost:*` entry | `make realm-import`, then `make broker-role` |
 | Collab has no Hub address that works | You are on `make api`/`api-pg`/`api-oidc`; the client needs all origins on one port | `make api-desktop`, then Hub address `localhost:9080` |
 | Collab: "Could not complete sign-in" | `/etc/hosts` entries missing, or the front door is down | `make hosts-check`, then `make desktop-check` |
 | Collab signs in but Frames are empty or error | Hub address was `localhost:8080` — every call landed on Keycloak | Enter `localhost:9080` |

@@ -23,6 +23,18 @@ API_HOST    ?= 127.0.0.1
 API_PORT    ?= 8000
 API_URL     := http://$(API_HOST):$(API_PORT)
 
+# --- Helpers ---------------------------------------------------------------
+# Reads one field out of a JSON response, and decodes a JWT payload for
+# `make sub`. Prefers the API's own virtualenv -- the interpreter pinned by
+# api/.python-version, present as soon as any api-* target has run -- then
+# whatever python is on PATH. Same precedence as resolve_python() in
+# scripts/smoke_frames_common.sh. Deliberately not `uv run python`: that
+# re-resolves the project on every call, and these run inside `$$(...)`
+# substitutions throughout dev/README.md.
+PYTHON      ?= $(shell [ -x "$(API_DIR)/.venv/bin/python" ] \
+                 && printf '%s' "$(API_DIR)/.venv/bin/python" \
+                 || command -v python3 || command -v python || printf 'python3')
+
 # --- Keycloak --------------------------------------------------------------
 KC_URL      ?= http://localhost:8080
 REALM       ?= nebari
@@ -246,11 +258,11 @@ api-desktop-fakes: hub-proxy fakes | $(LOCAL)/frames ## Same, with the fake conn
 	cd $(API_DIR) && env $(BASE_ENV) COLLAB_HUB_API__SERVER__HOSTNAME=0.0.0.0 \
 		$(DESKTOP_OIDC_ENV) $(PG_ENV) $(FAKE_CONNECTOR_ENV) uv run python -m collab_hub_api
 
-desktop-check: ## Verify all four origins the desktop derives actually answer
+desktop-check: ## Probe the three origins the desktop actually calls (issuer, hub API, Frames)
 	@set -e; \
 	printf '%-34s ' "keycloak.localhost:$(DESKTOP_PORT) (issuer)"; \
 	curl -sf -m 5 $(DESKTOP_RESOLVE) http://keycloak.localhost:$(DESKTOP_PORT)/realms/$(REALM)/.well-known/openid-configuration \
-		| python3 -c 'import json,sys; print("OK  iss =", json.load(sys.stdin)["issuer"])'; \
+		| $(PYTHON) -c 'import json,sys; print("OK  iss =", json.load(sys.stdin)["issuer"])'; \
 	printf '%-34s ' "localhost:$(DESKTOP_PORT) (hub API)"; \
 	curl -sf -m 5 -o /dev/null -w 'OK  /healthz -> %{http_code}\n' http://localhost:$(DESKTOP_PORT)/healthz; \
 	printf '%-34s ' "frames.localhost:$(DESKTOP_PORT) (frames)"; \
@@ -349,11 +361,11 @@ token: ## Print a bearer token for KC_USER (default: dev/dev)
 	@curl -sfS -X POST $(KC_URL)/realms/$(REALM)/protocol/openid-connect/token \
 		-d grant_type=password -d client_id=apollo-desktop -d scope=openid \
 		-d username=$(KC_USER) -d password=$(KC_PASS) \
-		| python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+		| $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 
 sub: ## Print the OIDC subject (sub claim) for KC_USER
 	@$(MAKE) --no-print-directory token \
-		| python3 -c 'import base64,json,sys; p=sys.stdin.read().strip().split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["sub"])'
+		| $(PYTHON) -c 'import base64,json,sys; p=sys.stdin.read().strip().split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["sub"])'
 
 whoami: ## Call the API with a real token and show what it resolved
 	@curl -sfS -H "Authorization: Bearer $$($(MAKE) --no-print-directory token)" \

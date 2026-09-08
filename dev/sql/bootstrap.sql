@@ -21,9 +21,11 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO collab_org_members (user_id, org_id, role, email, display_name, status)
 VALUES (:'sub', 'dev-org', 'owner', :'email', :'email', 'active')
 ON CONFLICT (user_id) DO UPDATE
-    SET org_id = EXCLUDED.org_id,
-        role   = EXCLUDED.role,
-        status = 'active';
+    SET org_id       = EXCLUDED.org_id,
+        role         = EXCLUDED.role,
+        email        = EXCLUDED.email,
+        display_name = EXCLUDED.display_name,
+        status       = 'active';
 
 INSERT INTO collab_platform_roles (user_id, role, granted_by, status)
 VALUES (:'sub', 'operator', NULL, 'active')
