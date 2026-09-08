@@ -1,0 +1,41 @@
+# Host-routing front door for the Collab desktop client.
+#
+# Apollo Desktop derives every service origin from the OIDC issuer by label
+# surgery on the hostname, so all four services must answer on ONE port:
+#
+#   Hub address you type      localhost:9080
+#   issuer it builds          http://keycloak.localhost:9080/realms/nebari
+#   hub API it derives        http://localhost:9080
+#   Frames + connectors       http://frames.localhost:9080
+#   internal LLM              http://llm-internal.localhost:9080
+#
+# host.docker.internal is the API running on your machine (uvicorn :8000).
+
+{
+	admin off
+	auto_https off
+	log {
+		output stderr
+		format console
+		level ERROR
+	}
+}
+
+:9080 {
+	@keycloak host keycloak.localhost
+	handle @keycloak {
+		reverse_proxy keycloak:8080
+	}
+
+	# The desktop's health probe asks for /healthz; the hub serves /health.
+	handle /healthz {
+		rewrite * /health
+		reverse_proxy host.docker.internal:8000
+	}
+
+	# localhost:9080 (hub API) and frames.localhost:9080 (Frames, connectors)
+	# are the same FastAPI application in this pack.
+	handle {
+		reverse_proxy host.docker.internal:8000
+	}
+}

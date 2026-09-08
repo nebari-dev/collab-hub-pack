@@ -1,205 +1,423 @@
-# Local development Makefile for Nebari Software Pack examples
+# Local development for the Collab Hub API.
 #
-# Creates a kind cluster with the full Nebari infrastructure stack
-# (MetalLB, Envoy Gateway, cert-manager, Keycloak, nebari-operator)
-# so all examples deploy with NebariApp enabled.
+# Start here:  make help
+# Full guide:  dev/README.md
 #
-# Prerequisites: docker, kind, helm, kubectl, git
+# Every api-* target starts the containers it needs (idempotently) before
+# launching the API, so you never run `docker compose` by hand. `make api` is
+# the exception: it starts nothing at all. See the table in dev/README.md.
 #
-# Usage:
-#   make up-vanilla    Deploy the vanilla YAML example
-#   make up-kustomize  Deploy the kustomize example (dev overlay)
-#   make up-basic      Deploy the basic nginx Helm example
-#   make up-fastapi    Deploy the FastAPI Helm example (pre-built GHCR image)
-#   make up-podinfo    Deploy the podinfo wrapper Helm example
-#   make update-hosts  Update /etc/hosts with NebariApp hostnames
-#   make down          Delete the kind cluster
+# Prerequisites: uv, plus docker (with compose) for everything above `make api`.
+# The kind-* targets additionally need kind, helm and kubectl.
 
-VANILLA_DIR   := ../examples/vanilla-yaml
-KUSTOMIZE_DIR := ../examples/kustomize-nginx
-CHART_BASIC   := ../examples/basic-nginx/chart
-CHART_FASTAPI := ../examples/auth-fastapi/chart
-CHART_PODINFO := ../examples/wrap-existing-chart/chart
-CLUSTER_NAME  := my-pack-dev
-HOSTNAME      := my-pack.nebari.local
-CACHE_DIR     := .cache
-OPERATOR_REPO := $(CACHE_DIR)/nebari-operator
+SHELL := /bin/bash
 
-# MetalLB IP pool configuration template.
-# METALLB_BASE_IP is substituted at runtime with the Kind network base.
-define METALLB_POOL
-apiVersion: metallb.io/v1beta1
-kind: IPAddressPool
-metadata:
-  name: kind-pool
-  namespace: metallb-system
-spec:
-  addresses:
-  - METALLB_BASE_IP.255.200-METALLB_BASE_IP.255.250
----
-apiVersion: metallb.io/v1beta1
-kind: L2Advertisement
-metadata:
-  name: kind-l2
-  namespace: metallb-system
-spec:
-  ipAddressPools:
-  - kind-pool
-endef
-export METALLB_POOL
+ROOT        := $(abspath $(CURDIR)/..)
+API_DIR     := $(ROOT)/api
+LOCAL       := $(CURDIR)/.local
+COMPOSE     := docker compose -f $(CURDIR)/compose.yaml
+ALL_PROFILES := --profile auth --profile fakes --profile desktop
 
-.PHONY: up-vanilla up-kustomize up-basic up-fastapi up-podinfo down cluster update-hosts
+# --- API process -----------------------------------------------------------
+API_HOST    ?= 127.0.0.1
+API_PORT    ?= 8000
+API_URL     := http://$(API_HOST):$(API_PORT)
 
-# --------------------------------------------------------------------------
-# cluster - create kind cluster with full Nebari infrastructure
-# --------------------------------------------------------------------------
-cluster:
-	@if kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$"; then \
-		echo "Cluster '$(CLUSTER_NAME)' already exists, skipping setup"; \
-	else \
-		$(MAKE) _cluster-create; \
-	fi
+# --- Keycloak --------------------------------------------------------------
+KC_URL      ?= http://localhost:8080
+REALM       ?= nebari
+KC_ADMIN    ?= admin
+KC_ADMIN_PW ?= admin
+KC_USER     ?= dev
+KC_PASS     ?= dev
+KCADM       := $(COMPOSE) exec -T keycloak /opt/keycloak/bin/kcadm.sh
 
-_cluster-create: _clone-operator _kind-create _metallb _services _keycloak-setup _operator _label-namespace
+# --- Apollo Desktop front door -------------------------------------------
+# The desktop derives every service origin from the issuer hostname, so all
+# four must answer on one port. `make hub-proxy` puts them there.
+DESKTOP_PORT ?= 9080
+DESKTOP_KC   := http://keycloak.localhost:$(DESKTOP_PORT)
+# curl needs these when /etc/hosts is not set up yet; harmless when it is.
+DESKTOP_RESOLVE := --resolve keycloak.localhost:$(DESKTOP_PORT):127.0.0.1 \
+                   --resolve frames.localhost:$(DESKTOP_PORT):127.0.0.1
+DESKTOP_HOSTS := keycloak.localhost frames.localhost llm-internal.localhost
+
+# --- Datastores ------------------------------------------------------------
+PG_URL      ?= postgresql://collab:collab@127.0.0.1:5432/collab
+S3_ENDPOINT ?= http://127.0.0.1:9000
+
+# --- kind ------------------------------------------------------------------
+CLUSTER_NAME ?= collab-hub-dev
+NAMESPACE    ?= collab-hub
+RELEASE      ?= collab-hub
+IMAGE        ?= collab-hub-api:dev
+FORWARD_PORT ?= 18080
+KUBECTL      := kubectl --context kind-$(CLUSTER_NAME)
+
+# ---------------------------------------------------------------------------
+# Environment blocks. Passed through `env` rather than exported, so each target
+# states exactly what the process it starts can see.
+# ---------------------------------------------------------------------------
+
+# Server binding + on-disk frame content.
+BASE_ENV := \
+  COLLAB_HUB_API__SERVER__HOSTNAME=$(API_HOST) \
+  COLLAB_HUB_API__SERVER__PORT=$(API_PORT) \
+  COLLAB_HUB_API__STORAGE__FRAMES_PATH=$(LOCAL)/frames
+
+# The dev-auth shortcut. All THREE are required: FRAMES_UNSAFE_AUTH_ENABLED
+# opens the door, DEV_AUTH_ENABLED turns the shortcut on, DEV_AUTH_USER names
+# the subject. Setting only DEV_AUTH_USER authenticates nothing.
+DEV_AUTH_ENV := \
+  FRAMES_UNSAFE_AUTH_ENABLED=true \
+  DEV_AUTH_ENABLED=true \
+  DEV_AUTH_USER=dev-user \
+  DEV_AUTH_ORG=dev-org \
+  DEV_AUTH_WORKSPACE=default
+
+# Real bearer verification against the local Keycloak realm.
+#
+# FRAMES_AUTH_IDENTITY_CLAIM=sub matches the production convention: the OIDC
+# subject is the ACL principal. Without the pin the legacy precedence applies
+# (preferred_username, then email, then sub), so frames would be owned by a
+# mutable username and `make seed-org SUB=...` would key rows nobody matches.
+OIDC_BASE_ENV := \
+  FRAMES_BEARER_JWKS_URL=$(KC_URL)/realms/$(REALM)/protocol/openid-connect/certs \
+  FRAMES_BEARER_ISSUER=$(KC_URL)/realms/$(REALM) \
+  FRAMES_BEARER_AUDIENCE=apollo-desktop \
+  FRAMES_AUTH_IDENTITY_CLAIM=sub
+
+# Organization from token claims: one shared org, no database needed.
+CLAIMS_ORG_ENV := \
+  FRAMES_AUTH_DEFAULT_ORG=dev-org \
+  FRAMES_AUTH_DEFAULT_WORKSPACE=default
+
+OIDC_ENV := $(OIDC_BASE_ENV) $(CLAIMS_ORG_ENV)
+
+# Organization from the server's own collab_org_members table. Needs Postgres,
+# the sub pin, and BOTH defaults left unset -- the API refuses to start
+# otherwise. Seed a membership row first: make seed-org SUB=$$(make -s sub)
+MEMBERSHIP_ENV := \
+  $(OIDC_BASE_ENV) \
+  FRAMES_AUTH_ORG_SOURCE=membership
+
+PG_ENV := \
+  COLLAB_HUB_API__FRAMES__POSTGRES__URL=$(PG_URL) \
+  COLLAB_HUB_API__FRAMES__POSTGRES__AUTO_MIGRATE=true \
+  COLLAB_HUB_API__FRAMES__ACTIVE_STATE__BACKEND=postgres \
+  COLLAB_HUB_API__TASKS__BACKEND=postgres
+
+S3_ENV := \
+  COLLAB_HUB_API__FRAMES__STORAGE_BACKEND=s3 \
+  COLLAB_HUB_API__FRAMES__S3__BUCKET=frames \
+  COLLAB_HUB_API__FRAMES__S3__ENDPOINT_URL=$(S3_ENDPOINT) \
+  COLLAB_HUB_API__FRAMES__S3__REGION=us-east-1 \
+  AWS_ACCESS_KEY_ID=minioadmin \
+  AWS_SECRET_ACCESS_KEY=minioadmin123
+
+# The server-rendered /web and /admin pages.
+WEB_ENV := \
+  COLLAB_HUB_API__WEB__CLIENT_ID=collab-web \
+  COLLAB_HUB_API__WEB__CLIENT_SECRET=collab-web-dev-secret \
+  COLLAB_HUB_API__WEB__ISSUER_URL=$(KC_URL)/realms/$(REALM) \
+  COLLAB_HUB_API__WEB__PUBLIC_BASE_URL=http://localhost:$(API_PORT) \
+  COLLAB_HUB_API__WEB__SESSION_SECRET=local-dev-session-secret-change-me-1234
+
+# Connectors pointed at the compose fakes.
+FAKE_CONNECTOR_ENV := \
+  COLLAB_HUB_API__CONNECTORS__GOOGLE__BROKER_TOKEN_URL=http://127.0.0.1:8081/broker/token \
+  COLLAB_HUB_API__CONNECTORS__GOOGLE__DRIVE_API_BASE_URL=http://127.0.0.1:8081/drive/v3 \
+  COLLAB_HUB_API__CONNECTORS__GOOGLE__GMAIL_API_BASE_URL=http://127.0.0.1:8081/gmail/v1 \
+  COLLAB_HUB_API__CONNECTORS__GOOGLE__CALENDAR_API_BASE_URL=http://127.0.0.1:8081/calendar/v3 \
+  COLLAB_HUB_API__CONNECTORS__SLACK__BROKER_TOKEN_URL=http://127.0.0.1:8082/broker/token \
+  COLLAB_HUB_API__CONNECTORS__SLACK__API_BASE_URL=http://127.0.0.1:8082/api
+
+# Bearer verification for tokens minted through the desktop front door. The
+# issuer must be the origin the token was ACTUALLY minted on -- the desktop
+# reaches Keycloak at keycloak.localhost:$(DESKTOP_PORT), so that is the `iss`
+# its tokens carry, and the API compares it exactly.
+DESKTOP_OIDC_ENV := \
+  FRAMES_BEARER_JWKS_URL=$(DESKTOP_KC)/realms/$(REALM)/protocol/openid-connect/certs \
+  FRAMES_BEARER_ISSUER=$(DESKTOP_KC)/realms/$(REALM) \
+  FRAMES_BEARER_AUDIENCE=apollo-desktop \
+  FRAMES_AUTH_IDENTITY_CLAIM=sub \
+  $(CLAIMS_ORG_ENV)
+
+# Connectors brokered by the local Keycloak (real providers).
+KC_CONNECTOR_ENV := \
+  COLLAB_HUB_API__CONNECTORS__GOOGLE__BROKER_TOKEN_URL=$(KC_URL)/realms/$(REALM)/broker/google/token \
+  COLLAB_HUB_API__CONNECTORS__SLACK__BROKER_TOKEN_URL=$(KC_URL)/realms/$(REALM)/broker/slack/token \
+  COLLAB_HUB_API__CONNECTORS__GITHUB__BROKER_TOKEN_URL=$(KC_URL)/realms/$(REALM)/broker/github/token
+
+.DEFAULT_GOAL := help
+.PHONY: help api api-watch api-pg api-oidc api-fakes api-full api-membership \
+        api-desktop api-desktop-fakes hosts-check hub-proxy hub-proxy-down desktop-check \
+        services keycloak fakes up down destroy logs ps \
+        realm-import broker-role idp-google idp-github idp-list \
+        token sub whoami seed-org psql \
+        kind-up kind-cluster kind-image kind-redeploy kind-forward kind-logs \
+        kind-smoke kind-down test lint clean
+
+help: ## Show this help
+	@awk 'BEGIN {FS = ":.*?## "; \
+		print ""; print "Collab Hub — local development"; print ""; \
+		print "  Full walkthrough: dev/README.md"; print ""} \
+		/^## /{printf "\n\033[1m%s\033[0m\n", substr($$0, 4); next} \
+		/^[a-zA-Z0-9_-]+:.*?## /{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' \
+		$(MAKEFILE_LIST)
 	@echo ""
-	@echo "=========================================="
-	@echo "Cluster setup complete!"
-	@echo "=========================================="
+
+# ---------------------------------------------------------------------------
+## Level 1 — the API process
+# ---------------------------------------------------------------------------
+
+api: | $(LOCAL)/frames ## The API alone: no containers, dev auth, local-FS frames, in-memory stores
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) uv run python -m collab_hub_api
+
+api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on every source change
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) \
+		uv run --with watchfiles watchfiles 'python -m collab_hub_api' src
+
+# ---------------------------------------------------------------------------
+## Level 2 — API with real datastores
+# ---------------------------------------------------------------------------
+
+api-pg: services | $(LOCAL)/frames ## Starts Postgres+MinIO, then the API: history, groups, orgs, tasks
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(PG_ENV) uv run python -m collab_hub_api
+
+# ---------------------------------------------------------------------------
+## Level 3 — API with Keycloak (real bearer tokens, web surface, connectors)
+# ---------------------------------------------------------------------------
+
+api-oidc: services keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) uv run python -m collab_hub_api
+
+# Connector routes exchange the CALLER's bearer with the broker, so the
+# dev-auth shortcut cannot reach them -- it authenticates a subject without
+# ever producing a token to forward. This target therefore runs real Keycloak
+# verification and points only the provider APIs at the fakes.
+api-fakes: services keycloak fakes | $(LOCAL)/frames ## API + Keycloak + fake Google/Slack connector providers
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(FAKE_CONNECTOR_ENV) \
+		uv run python -m collab_hub_api
+
+api-full: services keycloak | $(LOCAL)/frames ## Everything: OIDC + Postgres + S3 + web surface + Keycloak-brokered connectors
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(S3_ENV) $(WEB_ENV) $(KC_CONNECTOR_ENV) \
+		uv run python -m collab_hub_api
+
+api-membership: services keycloak | $(LOCAL)/frames ## API in multi-tenant mode: organization comes from collab_org_members
+	cd $(API_DIR) && env $(BASE_ENV) $(MEMBERSHIP_ENV) $(PG_ENV) $(WEB_ENV) uv run python -m collab_hub_api
+
+# ---------------------------------------------------------------------------
+## Apollo Desktop — connect the Collab client to this hub
+# ---------------------------------------------------------------------------
+
+hosts-check: ## Check the /etc/hosts entries the desktop client needs
+	@missing=""; for h in $(DESKTOP_HOSTS); do \
+		getent hosts $$h >/dev/null 2>&1 || missing="$$missing $$h"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "Missing from /etc/hosts:$$missing"; \
+		echo ""; \
+		echo "Add them once (they all point at your own machine):"; \
+		echo "  echo '127.0.0.1 $(DESKTOP_HOSTS)' | sudo tee -a /etc/hosts"; \
+		exit 1; \
+	fi; \
+	echo "All desktop hostnames resolve."
+
+hub-proxy: hosts-check services ## Start the single-port front door on :9080
+	$(COMPOSE) --profile auth up -d --wait keycloak
+	$(COMPOSE) --profile auth --profile desktop up -d hub-proxy
 	@echo ""
-	@echo "Run 'make up-basic' (or any up-* target) to deploy an example."
-
-OPERATOR_REF := v0.1.0-alpha.19
-
-_clone-operator:
-	@if [ ! -d "$(OPERATOR_REPO)" ]; then \
-		echo "Cloning nebari-operator ($(OPERATOR_REF)) into $(OPERATOR_REPO)..."; \
-		mkdir -p $(CACHE_DIR); \
-		git clone --depth 1 --branch $(OPERATOR_REF) \
-			https://github.com/nebari-dev/nebari-operator.git $(OPERATOR_REPO); \
-	else \
-		echo "nebari-operator already cloned"; \
-	fi
-
-_kind-create:
-	@echo "Creating kind cluster: $(CLUSTER_NAME)"
-	kind create cluster --name $(CLUSTER_NAME)
-
-_metallb:
-	@echo "Installing MetalLB..."
-	kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml 2>&1 | grep -v "unrecognized format"
-	kubectl wait --namespace metallb-system \
-		--for=condition=available deployment/controller \
-		--timeout=90s
-	kubectl wait --namespace metallb-system \
-		--for=jsonpath='{.status.numberReady}'=1 \
-		daemonset/speaker \
-		--timeout=90s
-	@KIND_NET_CIDR=$$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep '\.' | head -n1); \
-	BASE_IP=$$(echo $${KIND_NET_CIDR} | awk -F. '{print $$1"."$$2}'); \
-	echo "MetalLB IP pool: $${BASE_IP}.255.200-$${BASE_IP}.255.250"; \
-	echo "$$METALLB_POOL" | sed "s/METALLB_BASE_IP/$${BASE_IP}/g" | kubectl apply -f -
-	@echo "MetalLB installed"
-
-_services:
-	@echo "Installing foundational services (Envoy Gateway, cert-manager, Keycloak, Gateway, TLS)..."
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/services/install.sh
-
-_keycloak-setup:
-	@echo "Setting up Keycloak realm..."
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/services/keycloak/setup.sh
-
-_operator:
-	@echo "Installing nebari-operator..."
-	kubectl apply -f https://github.com/nebari-dev/nebari-operator/releases/download/$(OPERATOR_REF)/install.yaml
-	kubectl wait --for=condition=available deployment/nebari-operator-controller-manager \
-		-n nebari-operator-system --timeout=120s
-	@echo "nebari-operator is running"
-
-_label-namespace:
-	kubectl label namespace default nebari.dev/managed=true --overwrite
-
-# --------------------------------------------------------------------------
-# up-vanilla - deploy plain YAML example with NebariApp
-# --------------------------------------------------------------------------
-up-vanilla: cluster
-	kubectl apply -f $(VANILLA_DIR)/deployment.yaml \
-		-f $(VANILLA_DIR)/service.yaml
-	sed 's/my-pack.nebari.example.com/$(HOSTNAME)/' \
-		$(VANILLA_DIR)/nebariapp.yaml | kubectl apply -f -
-	kubectl wait --for=condition=ready pod -l app=my-pack --timeout=120s
-	kubectl wait --for=condition=Ready nebariapp/my-pack --timeout=120s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
+	@echo "Front door ready. In Collab, enter this as the Hub address:"
 	@echo ""
-	@echo "Vanilla nginx deployed with NebariApp."
-	@echo "  https://$(HOSTNAME)"
-
-# --------------------------------------------------------------------------
-# up-kustomize - deploy kustomize example (dev overlay) with NebariApp
-# --------------------------------------------------------------------------
-up-kustomize: cluster
-	kubectl kustomize $(KUSTOMIZE_DIR)/overlays/dev/ \
-		| sed 's/my-pack.dev.nebari.example.com/$(HOSTNAME)/' \
-		| kubectl apply -f -
-	kubectl wait --for=condition=ready pod -l app=my-pack --timeout=120s
-	kubectl wait --for=condition=Ready nebariapp/my-pack --timeout=120s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
+	@echo "    localhost:$(DESKTOP_PORT)"
 	@echo ""
-	@echo "Kustomize nginx deployed with NebariApp."
-	@echo "  https://$(HOSTNAME)"
+	@echo "Then run 'make api-desktop' in another shell. Sign in as dev / dev."
 
-# --------------------------------------------------------------------------
-# up-basic - deploy basic nginx Helm example with NebariApp
-# --------------------------------------------------------------------------
-up-basic: cluster
-	helm upgrade --install my-pack $(CHART_BASIC) \
-		--set nebariapp.enabled=true \
-		--set nebariapp.hostname=$(HOSTNAME) \
-		--wait --timeout 2m
-	kubectl wait --for=condition=Ready nebariapp/my-pack-my-pack --timeout=120s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
-	@echo ""
-	@echo "Basic nginx deployed with NebariApp."
-	@echo "  https://$(HOSTNAME)"
+# Binds 0.0.0.0, unlike every other target. The front door runs in a container
+# and reaches your machine through the docker gateway, which a process bound to
+# 127.0.0.1 will not answer on. Nothing else here binds beyond loopback, and
+# this mode has no dev-auth shortcut -- a caller still needs a valid token.
+api-desktop: hub-proxy | $(LOCAL)/frames ## API reachable by Apollo Desktop (binds 0.0.0.0)
+	cd $(API_DIR) && env $(BASE_ENV) COLLAB_HUB_API__SERVER__HOSTNAME=0.0.0.0 \
+		$(DESKTOP_OIDC_ENV) $(PG_ENV) uv run python -m collab_hub_api
 
-# --------------------------------------------------------------------------
-# up-fastapi - deploy auth-aware FastAPI Helm example with NebariApp
-# --------------------------------------------------------------------------
-up-fastapi: cluster
-	helm upgrade --install my-pack $(CHART_FASTAPI) \
-		--set nebariapp.enabled=true \
-		--set nebariapp.hostname=$(HOSTNAME) \
-		--set nebariapp.auth.enabled=true \
-		--wait --timeout 2m
-	kubectl wait --for=condition=Ready nebariapp/my-pack-my-pack --timeout=120s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
-	@echo ""
-	@echo "FastAPI app deployed with NebariApp (auth enabled)."
-	@echo "  https://$(HOSTNAME)"
-	@echo "  Keycloak login: admin / nebari-admin"
+api-desktop-fakes: hub-proxy fakes | $(LOCAL)/frames ## Same, with the fake connectors wired in so Collab shows them connected
+	cd $(API_DIR) && env $(BASE_ENV) COLLAB_HUB_API__SERVER__HOSTNAME=0.0.0.0 \
+		$(DESKTOP_OIDC_ENV) $(PG_ENV) $(FAKE_CONNECTOR_ENV) uv run python -m collab_hub_api
 
-# --------------------------------------------------------------------------
-# up-podinfo - deploy podinfo wrapper Helm example with NebariApp
-# --------------------------------------------------------------------------
-up-podinfo: cluster
-	helm dependency update $(CHART_PODINFO)
-	helm upgrade --install my-pack $(CHART_PODINFO) \
-		--set nebariapp.enabled=true \
-		--set nebariapp.hostname=$(HOSTNAME) \
+desktop-check: ## Verify all four origins the desktop derives actually answer
+	@set -e; \
+	printf '%-34s ' "keycloak.localhost:$(DESKTOP_PORT) (issuer)"; \
+	curl -sf -m 5 $(DESKTOP_RESOLVE) http://keycloak.localhost:$(DESKTOP_PORT)/realms/$(REALM)/.well-known/openid-configuration \
+		| python3 -c 'import json,sys; print("OK  iss =", json.load(sys.stdin)["issuer"])'; \
+	printf '%-34s ' "localhost:$(DESKTOP_PORT) (hub API)"; \
+	curl -sf -m 5 -o /dev/null -w 'OK  /healthz -> %{http_code}\n' http://localhost:$(DESKTOP_PORT)/healthz; \
+	printf '%-34s ' "frames.localhost:$(DESKTOP_PORT) (frames)"; \
+	curl -s -m 5 $(DESKTOP_RESOLVE) -o /dev/null -w 'OK  /v1/frames -> %{http_code}\n' http://frames.localhost:$(DESKTOP_PORT)/v1/frames
+
+hub-proxy-down: ## Stop the front door (Keycloak stays up on localhost:8080)
+	$(COMPOSE) --profile auth --profile desktop rm -sf hub-proxy
+
+# ---------------------------------------------------------------------------
+## Supporting services (docker compose)
+# ---------------------------------------------------------------------------
+
+services: ## Start Postgres + MinIO
+	$(COMPOSE) up -d --wait postgres minio
+	$(COMPOSE) up minio-init
+
+keycloak: ## Start Keycloak and import the `nebari` realm
+	$(COMPOSE) --profile auth up -d --wait keycloak
+	@echo "Keycloak admin console: $(KC_URL)  ($(KC_ADMIN)/$(KC_ADMIN_PW))"
+
+fakes: ## Start the fake Google and Slack providers
+	$(COMPOSE) --profile fakes up -d fake-google fake-slack
+
+up: services keycloak fakes ## Start every supporting service
+
+down: ## Stop every supporting service (data volumes survive)
+	$(COMPOSE) $(ALL_PROFILES) down
+
+destroy: ## Stop services AND delete their data volumes
+	$(COMPOSE) $(ALL_PROFILES) down -v
+
+ps: ## Show supporting-service status
+	$(COMPOSE) $(ALL_PROFILES) ps
+
+logs: ## Follow supporting-service logs
+	$(COMPOSE) $(ALL_PROFILES) logs -f
+
+# ---------------------------------------------------------------------------
+## Keycloak administration
+# ---------------------------------------------------------------------------
+
+realm-import: ## Re-import the realm into a running Keycloak (overwrites it)
+	$(KCADM) config credentials --server http://localhost:8080 \
+		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
+	-$(KCADM) delete realms/$(REALM)
+	$(KCADM) create realms -f /opt/keycloak/data/import/realm-nebari.json
+	@echo "Realm '$(REALM)' re-imported. Re-run 'make broker-role'."
+
+broker-role: ## Grant every realm user the broker `read-token` role (REQUIRED for all connectors)
+	$(KCADM) config credentials --server http://localhost:8080 \
+		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
+	$(KCADM) add-roles -r $(REALM) --rname default-roles-$(REALM) \
+		--cclientid broker --rolename read-token
+	@echo "default-roles-$(REALM) now includes broker:read-token"
+
+idp-google: ## Create the Google IdP (GOOGLE_CLIENT_ID= GOOGLE_CLIENT_SECRET= required)
+	@test -n "$(GOOGLE_CLIENT_ID)" -a -n "$(GOOGLE_CLIENT_SECRET)" || \
+		{ echo "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required"; exit 1; }
+	$(KCADM) config credentials --server http://localhost:8080 \
+		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
+	$(KCADM) create identity-provider/instances -r $(REALM) \
+		-s alias=google -s providerId=google -s enabled=true \
+		-s storeToken=true -s trustEmail=true -s hideOnLogin=true \
+		-s 'config.clientId=$(GOOGLE_CLIENT_ID)' \
+		-s 'config.clientSecret=$(GOOGLE_CLIENT_SECRET)' \
+		-s 'config.offlineAccess=true' -s 'config.prompt=consent' \
+		-s 'config.defaultScope=openid profile email https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly'
+	@echo "Google IdP created. Redirect URI to register with Google:"
+	@echo "  $(KC_URL)/realms/$(REALM)/broker/google/endpoint"
+
+idp-github: ## Create the GitHub IdP (GITHUB_CLIENT_ID= GITHUB_CLIENT_SECRET= required)
+	@test -n "$(GITHUB_CLIENT_ID)" -a -n "$(GITHUB_CLIENT_SECRET)" || \
+		{ echo "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are required"; exit 1; }
+	$(KCADM) config credentials --server http://localhost:8080 \
+		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
+	$(KCADM) create identity-provider/instances -r $(REALM) \
+		-s alias=github -s providerId=github -s enabled=true \
+		-s storeToken=true -s hideOnLogin=true \
+		-s 'config.clientId=$(GITHUB_CLIENT_ID)' \
+		-s 'config.clientSecret=$(GITHUB_CLIENT_SECRET)' \
+		-s 'config.defaultScope=user:email repo read:org read:project'
+	@echo "GitHub IdP created. Callback URL to register with GitHub:"
+	@echo "  $(KC_URL)/realms/$(REALM)/broker/github/endpoint"
+
+idp-list: ## List the realm's identity providers
+	$(KCADM) config credentials --server http://localhost:8080 \
+		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
+	$(KCADM) get identity-provider/instances -r $(REALM) \
+		--fields alias,providerId,enabled,storeToken
+
+# ---------------------------------------------------------------------------
+## Tokens, identity, seed data
+# ---------------------------------------------------------------------------
+
+token: ## Print a bearer token for KC_USER (default: dev/dev)
+	@curl -sfS -X POST $(KC_URL)/realms/$(REALM)/protocol/openid-connect/token \
+		-d grant_type=password -d client_id=apollo-desktop -d scope=openid \
+		-d username=$(KC_USER) -d password=$(KC_PASS) \
+		| python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+
+sub: ## Print the OIDC subject (sub claim) for KC_USER
+	@$(MAKE) --no-print-directory token \
+		| python3 -c 'import base64,json,sys; p=sys.stdin.read().strip().split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["sub"])'
+
+whoami: ## Call the API with a real token and show what it resolved
+	@curl -sfS -H "Authorization: Bearer $$($(MAKE) --no-print-directory token)" \
+		$(API_URL)/v1/frames | head -c 400; echo
+
+seed-org: ## Seed dev-org + owner membership + operator grant (SUB= EMAIL=)
+	@test -n "$(SUB)" || { echo 'SUB is required, e.g.  make seed-org SUB=$$(make -s sub) EMAIL=dev@example.com'; exit 1; }
+	$(COMPOSE) exec -T postgres psql -U collab -d collab \
+		-v sub='$(SUB)' -v email='$(or $(EMAIL),dev@example.com)' < $(CURDIR)/sql/bootstrap.sql
+
+psql: ## Open a psql shell on the dev database
+	$(COMPOSE) exec postgres psql -U collab -d collab
+
+# ---------------------------------------------------------------------------
+## kind — the chart on a real cluster
+# ---------------------------------------------------------------------------
+
+kind-up: kind-cluster kind-image ## Create the kind cluster and install the chart
+	helm upgrade --install $(RELEASE) $(ROOT)/helm/collab-hub \
+		--kube-context kind-$(CLUSTER_NAME) \
+		--namespace $(NAMESPACE) --create-namespace \
+		--set namespace.create=false \
+		-f $(CURDIR)/values/kind.yaml \
 		--wait --timeout 3m
-	kubectl wait --for=condition=Ready nebariapp/my-pack-my-pack --timeout=120s
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
 	@echo ""
-	@echo "Podinfo deployed with NebariApp."
-	@echo "  https://$(HOSTNAME)"
+	@echo "Installed. Reach it with:  make kind-forward   (then http://127.0.0.1:$(FORWARD_PORT))"
 
-# --------------------------------------------------------------------------
-# update-hosts - update /etc/hosts with all NebariApp hostnames
-# --------------------------------------------------------------------------
-update-hosts:
-	CLUSTER_NAME=$(CLUSTER_NAME) $(OPERATOR_REPO)/dev/scripts/networking/update-hosts.sh
+kind-cluster:
+	@kind get clusters 2>/dev/null | grep -qx $(CLUSTER_NAME) \
+		|| kind create cluster --name $(CLUSTER_NAME)
 
-# --------------------------------------------------------------------------
-# down - delete the kind cluster
-# --------------------------------------------------------------------------
-down:
+kind-image: ## Build the API image and load it into the kind cluster
+	docker build --build-context projectroot=$(ROOT) -t $(IMAGE) $(API_DIR)
+	kind load docker-image $(IMAGE) --name $(CLUSTER_NAME)
+
+kind-redeploy: kind-image ## Rebuild the image and roll the Deployment
+	$(KUBECTL) -n $(NAMESPACE) rollout restart deployment/collab-hub-api
+	$(KUBECTL) -n $(NAMESPACE) rollout status deployment/collab-hub-api --timeout=120s
+
+kind-forward: ## Port-forward the in-cluster API to 127.0.0.1:18080
+	$(KUBECTL) -n $(NAMESPACE) port-forward svc/collab-hub-api $(FORWARD_PORT):80
+
+kind-logs: ## Follow the in-cluster API logs
+	$(KUBECTL) -n $(NAMESPACE) logs -f deployment/collab-hub-api
+
+kind-smoke: ## Run the repo's kind connector/task smoke suite in its own namespace
+	CLUSTER_NAME=$(CLUSTER_NAME) $(ROOT)/scripts/smoke_local_collab_hub_features_kind.sh
+
+kind-down: ## Delete the kind cluster
 	kind delete cluster --name $(CLUSTER_NAME)
+
+# ---------------------------------------------------------------------------
+## Checks
+# ---------------------------------------------------------------------------
+
+test: ## Run the API test suite
+	cd $(API_DIR) && uv run --group test pytest
+
+lint: ## Lint the Helm chart and validate the rendered manifests
+	helm lint $(ROOT)/helm/collab-hub
+	helm template $(ROOT)/helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
+
+clean: ## Remove local frame content and caches (leaves docker volumes alone)
+	rm -rf $(LOCAL)
+
+$(LOCAL)/frames:
+	@mkdir -p $@

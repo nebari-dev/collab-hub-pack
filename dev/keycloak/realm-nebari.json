@@ -1,0 +1,142 @@
+{
+  "realm": "nebari",
+  "enabled": true,
+  "sslRequired": "none",
+  "loginTheme": "keycloak",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 3600,
+  "groups": [
+    {
+      "name": "collab-users"
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "apollo-desktop",
+      "name": "Apollo Desktop (Collab)",
+      "description": "Public native client. The client id is baked into the Apollo Desktop binary and cannot be renamed.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "http://127.0.0.1/*",
+        "http://127.0.0.1:*/*",
+        "http://localhost/*",
+        "http://localhost:*/*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "+"
+      },
+      "defaultClientScopes": [
+        "acr",
+        "basic",
+        "email",
+        "profile",
+        "roles",
+        "web-origins"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ],
+      "protocolMappers": [
+        {
+          "name": "apollo-desktop-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "apollo-desktop",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "collab-web",
+      "name": "Collab Hub web surface (dev)",
+      "description": "Confidential client for the server-rendered /web and /admin pages. The secret below is a local-development value and must never be reused.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "collab-web-dev-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8000/web/oidc/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:8000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:8000/*"
+      },
+      "defaultClientScopes": [
+        "acr",
+        "basic",
+        "email",
+        "profile",
+        "roles",
+        "web-origins"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "dev",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "dev@example.com",
+      "firstName": "Dev",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "dev",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/collab-users"
+      ],
+      "realmRoles": [
+        "default-roles-nebari"
+      ]
+    },
+    {
+      "username": "owner",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "owner@example.com",
+      "firstName": "Owner",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "owner",
+          "temporary": false
+        }
+      ],
+      "groups": [
+        "/collab-users"
+      ],
+      "realmRoles": [
+        "default-roles-nebari"
+      ]
+    }
+  ]
+}
