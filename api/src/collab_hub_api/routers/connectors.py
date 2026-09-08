@@ -30,6 +30,7 @@ from collab_hub_api.connectors.models import (
     DRIVE_READONLY_SCOPE,
     GMAIL_READONLY_SCOPE,
     GOOGLE_CALENDAR_READONLY_SCOPE,
+    NOTION_READONLY_CAPABILITIES,
     SLACK_READONLY_SCOPES,
     CalendarReadRequest,
     CalendarReadResponse,
@@ -60,6 +61,13 @@ from collab_hub_api.connectors.models import (
     GmailStatus,
     GoogleCalendarStatus,
     GoogleDriveStatus,
+    NotionDatabaseQueryRequest,
+    NotionDatabaseQueryResponse,
+    NotionPageReadRequest,
+    NotionPageReadResponse,
+    NotionSearchRequest,
+    NotionSearchResponse,
+    NotionStatus,
     SlackChannelsResponse,
     SlackDmsResponse,
     SlackReadRequest,
@@ -70,6 +78,13 @@ from collab_hub_api.connectors.models import (
     SlackThreadReadRequest,
     SlackThreadReadResponse,
 )
+from collab_hub_api.connectors.notion_client import (
+    NotionClient,
+    NotionSearchError,
+    NotionUpstreamError,
+    notion_time_bounds,
+)
+from collab_hub_api.connectors.notion_tokens import NotionTokenProvider
 from collab_hub_api.connectors.slack_client import (
     SLACK_TOKEN_INVALID_ERRORS,
     SlackClient,
@@ -99,6 +114,7 @@ async def list_connectors(
         await _google_calendar_status(request, config),
         await _slack_status(request, config),
         await _github_status(request, config),
+        await _notion_status(request, config),
     ]
 
 
@@ -622,6 +638,107 @@ async def read_github_project(
     )
 
 
+@router.get("/notion/status", response_model=NotionStatus)
+async def notion_status(
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionStatus:
+    return await _notion_status(request, config)
+
+
+@router.post("/notion/search", response_model=NotionSearchResponse)
+async def search_notion(
+    body: NotionSearchRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionSearchResponse:
+    client = await _notion_client(request, config)
+    lower, upper = notion_time_bounds(
+        days_back=body.days_back,
+        since_date=body.since_date,
+        until_date=body.until_date,
+        time_zone=body.time_zone,
+    )
+    try:
+        hits, next_page_token = await client.search(
+            query=body.query,
+            object_type=body.object_type,
+            limit=body.limit,
+            start_cursor=body.page_token,
+            lower=lower,
+            upper=upper,
+        )
+    except NotionSearchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except NotionUpstreamError as exc:
+        logger.info("notion_search_upstream_error", extra={"operation": exc.operation, "status_code": exc.status_code})
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion search failed") from exc
+    return NotionSearchResponse(hits=hits, next_page_token=next_page_token)
+
+
+@router.post("/notion/pages/{page_id}/read", response_model=NotionPageReadResponse)
+async def read_notion_page(
+    page_id: str,
+    body: NotionPageReadRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionPageReadResponse:
+    _validate_notion_id(page_id)
+    client = await _notion_client(request, config)
+    try:
+        return await client.read_page(page_id=page_id, max_chars=body.max_chars)
+    except NotionUpstreamError as exc:
+        logger.info(
+            "notion_page_read_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code},
+        )
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion page read failed") from exc
+
+
+@router.post("/notion/databases/{database_id}/query", response_model=NotionDatabaseQueryResponse)
+async def query_notion_database(
+    database_id: str,
+    body: NotionDatabaseQueryRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionDatabaseQueryResponse:
+    _validate_notion_id(database_id)
+    client = await _notion_client(request, config)
+    lower, upper = notion_time_bounds(
+        days_back=body.days_back,
+        since_date=body.since_date,
+        until_date=body.until_date,
+        time_zone=body.time_zone,
+    )
+    try:
+        rows, next_page_token = await client.query_database(
+            database_id=database_id,
+            limit=body.limit,
+            start_cursor=body.page_token,
+            lower=lower,
+            upper=upper,
+        )
+    except NotionSearchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except NotionUpstreamError as exc:
+        logger.info(
+            "notion_database_query_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code},
+        )
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion database query failed") from exc
+    return NotionDatabaseQueryResponse(rows=rows, next_page_token=next_page_token)
+
+
 async def _github_status(request: Request, config: ConnectorsConfig) -> GitHubStatus:
     provider = GitHubTokenProvider(config.github)
     try:
@@ -730,6 +847,73 @@ def _validate_github_ref(ref: str) -> None:
         or any(ord(ch) < 0x20 or ch.isspace() for ch in candidate)
     ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid GitHub ref")
+
+
+async def _notion_status(request: Request, config: ConnectorsConfig) -> NotionStatus:
+    provider = NotionTokenProvider(config.notion)
+    try:
+        token = await provider.access_token(request)
+    except ConnectorTokenError as exc:
+        return NotionStatus(connected=False, state=exc.state, scopes=[], detail=str(exc))
+    client = _new_notion_client(token, config)
+    try:
+        access = await client.verify_access()
+    except NotionUpstreamError as exc:
+        state = "reconnect_required" if exc.status_code in {401, 403} else "unavailable"
+        return NotionStatus(connected=False, state=state, scopes=[], detail=str(exc))
+    except httpx.HTTPError:
+        return NotionStatus(
+            connected=False,
+            state="unavailable",
+            scopes=[],
+            detail="Notion API access check failed.",
+        )
+    return NotionStatus(
+        connected=True,
+        state="connected",
+        scopes=[*NOTION_READONLY_CAPABILITIES],
+        account=access.workspace_name,
+    )
+
+
+def _new_notion_client(token: str, config: ConnectorsConfig) -> NotionClient:
+    return NotionClient(
+        access_token=token,
+        api_base_url=config.notion.api_base_url,
+        notion_version=config.notion.notion_version,
+        timeout_seconds=config.notion.request_timeout_seconds,
+    )
+
+
+async def _notion_client(request: Request, config: ConnectorsConfig) -> NotionClient:
+    provider = NotionTokenProvider(config.notion)
+    try:
+        token = await provider.access_token(request)
+    except ConnectorNotConnected as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ConnectorReconnectRequired as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ConnectorTokenError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return _new_notion_client(token, config)
+
+
+# A Notion id is 32 hex chars, optionally UUID dash-grouped (8-4-4-4-12).
+_NOTION_ID_PATTERN = r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
+def _validate_notion_id(value: str) -> None:
+    if not re.fullmatch(_NOTION_ID_PATTERN, value.strip()):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A valid Notion id is required")
+
+
+def _raise_notion_upstream(exc: NotionUpstreamError) -> None:
+    # Notion returns 400 for caller-correctable input: invalid params or a
+    # stale/garbage start_cursor. Surface those as 422; everything else
+    # (timeout, 5xx, bad JSON, cursor cycle) is a provider failure -> 502.
+    if exc.status_code == 400:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 
 
 async def _google_drive_status(request: Request, config: ConnectorsConfig) -> GoogleDriveStatus:

@@ -532,6 +532,19 @@ connectors:
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
     requestTimeoutSeconds: 10
+  notion:
+    # -- Keycloak broker token endpoint for the linked Notion workspace (Option A).
+    # Normal hub users must also receive the broker client role `read-token`
+    # through their default role or group; otherwise Keycloak returns 403. Leave
+    # empty under Option B (hub-side OAuth + token store). See docs/notion-connector.md.
+    brokerTokenUrl: ""
+    # -- Notion API base URL. Override for local fake Notion API smoke tests.
+    apiBaseUrl: https://api.notion.com
+    # -- Pinned Notion API version, sent on every request. Do not float; bumping
+    # it (2025-09-03+) is a code migration, not a config change.
+    notionVersion: "2022-06-28"
+    # -- Timeout for broker and Notion API requests.
+    requestTimeoutSeconds: 10
 
 userDirectory:
   # -- Whether to configure Collab Hub API access to the hub user directory.

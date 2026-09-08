@@ -556,10 +556,24 @@ class GitHubConnectorConfig(BaseModel):
     request_timeout_seconds: float = 10.0
 
 
+class NotionConnectorConfig(BaseModel):
+    # Option A: Keycloak generic-OAuth broker URL. Empty under Option B (the Hub
+    # owns the Notion OAuth flow and its own encrypted token store).
+    broker_token_url: str = ""
+    api_base_url: str = "https://api.notion.com"
+    # Pinned Notion API version, sent on every request. Do not float: newer
+    # versions (2025-09-03+) split databases into data sources and move the query
+    # endpoint, which is a migration, not a config change. See docs/notion-connector.md.
+    notion_version: str = "2022-06-28"
+    static_access_token: str = ""  # dev/CI only -- never in prod values
+    request_timeout_seconds: float = 10.0
+
+
 class ConnectorsConfig(BaseModel):
     google: GoogleConnectorConfig = Field(default_factory=GoogleConnectorConfig)
     slack: SlackConnectorConfig = Field(default_factory=SlackConnectorConfig)
     github: GitHubConnectorConfig = Field(default_factory=GitHubConnectorConfig)
+    notion: NotionConnectorConfig = Field(default_factory=NotionConnectorConfig)
 
 
 class KeycloakUserDirectoryConfig(BaseModel):

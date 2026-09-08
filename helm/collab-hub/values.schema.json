@@ -858,6 +858,25 @@
             }
           },
           "additionalProperties": false
+        },
+        "notion": {
+          "type": "object",
+          "properties": {
+            "brokerTokenUrl": {
+              "type": "string"
+            },
+            "apiBaseUrl": {
+              "type": "string"
+            },
+            "notionVersion": {
+              "type": "string"
+            },
+            "requestTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
