@@ -33,9 +33,9 @@ reuses its key.
 
 A signal is external feedback, not a Gate implementation. The current
 `PauseRequest` and E2E approval fixture exercise pause/resume transport.
-The [glossary](../docs/GLOSSARY.md) defines a Gate as an Op-owned decision;
-step-owned Gates and the [result envelope](../docs/cog-execution/result-envelope.md)
-remain follow-up work.
+The [glossary](../docs/GLOSSARY.md) defines a Gate as an Op-owned decision.
+This experimental implementation does not yet implement step-owned Gates or
+the [result envelope](../docs/cog-execution/result-envelope.md).
 
 `KubernetesCogExecutor(interaction_timeout=300)` sets the default worker HTTP
 client's timeout in seconds; `None` disables it. An injected `worker_http`
@@ -43,21 +43,6 @@ controls its own timeout. This is an HTTP timeout, not a run deadline.
 Only connection failures are retried automatically. Read/write timeouts and
 protocol failures propagate because the worker may already have executed the
 request; an HTTP failure does not prove that a side effect did not occur.
-
-## Remaining scope
-
-This package advances these issues without completing their acceptance criteria:
-
-- [#1](https://github.com/nebari-dev/collab-hub-pack/issues/1): hub integration,
-  coordinated advancement, and recovery across worker replacement.
-- [#2](https://github.com/nebari-dev/collab-hub-pack/issues/2): configured engine
-  selection and automatic recovery on durable infrastructure.
-- [#3](https://github.com/nebari-dev/collab-hub-pack/issues/3): deliver the resolved
-  model binding to the worker.
-- [#4](https://github.com/nebari-dev/collab-hub-pack/issues/4): enforced run
-  deadlines and warm workers with an idle-down policy.
-- [#5](https://github.com/nebari-dev/collab-hub-pack/issues/5): complete Track
-  accountability and deployed Track/catalog persistence.
 
 ## Development
 
