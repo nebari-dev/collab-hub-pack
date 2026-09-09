@@ -9,7 +9,12 @@
 #   Frames + connectors       http://frames.localhost:9080
 #   internal LLM              http://llm-internal.localhost:9080
 #
-# host.docker.internal is the API running on your machine (uvicorn :8000).
+# The listener and the upstream are both overridable, so `make ... DESKTOP_PORT`
+# and `API_PORT` move the whole set together rather than half of it:
+#
+#   DESKTOP_PORT   the port every derived origin shares (default 9080)
+#   API_UPSTREAM   the API on your machine, host:port (default
+#                  host.docker.internal:8000 -- compose builds it from API_PORT)
 
 {
 	admin off
@@ -21,7 +26,7 @@
 	}
 }
 
-:9080 {
+:{$DESKTOP_PORT:9080} {
 	@keycloak host keycloak.localhost
 	handle @keycloak {
 		reverse_proxy keycloak:8080
@@ -30,12 +35,12 @@
 	# The desktop's health probe asks for /healthz; the hub serves /health.
 	handle /healthz {
 		rewrite * /health
-		reverse_proxy host.docker.internal:8000
+		reverse_proxy {$API_UPSTREAM:host.docker.internal:8000}
 	}
 
-	# localhost:9080 (hub API) and frames.localhost:9080 (Frames, connectors)
-	# are the same FastAPI application in this pack.
+	# localhost (hub API) and frames.localhost (Frames, connectors) are the
+	# same FastAPI application in this pack.
 	handle {
-		reverse_proxy host.docker.internal:8000
+		reverse_proxy {$API_UPSTREAM:host.docker.internal:8000}
 	}
 }

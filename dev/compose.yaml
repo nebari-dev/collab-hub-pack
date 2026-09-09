@@ -119,8 +119,14 @@ services:
     depends_on:
       keycloak:
         condition: service_healthy
+    environment:
+      # The Makefile exports DESKTOP_PORT and API_PORT, so overriding either on
+      # the make command line moves the listener, the published port and the
+      # upstream together. Defaults keep a bare `docker compose` working.
+      DESKTOP_PORT: ${DESKTOP_PORT:-9080}
+      API_UPSTREAM: host.docker.internal:${API_PORT:-8000}
     ports:
-      - "127.0.0.1:9080:9080"
+      - "127.0.0.1:${DESKTOP_PORT:-9080}:${DESKTOP_PORT:-9080}"
     volumes:
       - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
     extra_hosts:

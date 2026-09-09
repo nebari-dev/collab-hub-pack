@@ -991,11 +991,15 @@ make lint     # helm lint + kubeconform on the rendered manifests
 
 ## Make target reference
 
-Run `make help` for the current list. Common overrides:
+Run `make help` for the current list. Common overrides — `API_PORT` and
+`DESKTOP_PORT` move every part that derives from them (the API, the front
+door's listener and published port, its upstream, and the issuer the desktop
+client is told about), so `make api-desktop DESKTOP_PORT=9090 API_PORT=8010`
+works as a set:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `API_PORT` | `8000` | Port the API binds |
+| `API_PORT` | `8000` | Port the API binds — also moves the front door's upstream |
 | `KC_URL` | `http://localhost:8080` | Keycloak base URL |
 | `REALM` | `nebari` | Realm name — Apollo Desktop hardcodes it |
 | `KC_USER` / `KC_PASS` | `dev` / `dev` | Whose token `make token` prints |
@@ -1006,7 +1010,7 @@ Run `make help` for the current list. Common overrides:
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
 | `IMAGE` | `collab-hub-api:dev` | Tag built and loaded by `make kind-image` |
 | `FORWARD_PORT` | `18080` | Local port for `make kind-forward` |
-| `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client |
+| `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
 
 ## Files in this directory
 

@@ -48,6 +48,15 @@ KCADM       := $(COMPOSE) exec -T keycloak /opt/keycloak/bin/kcadm.sh
 # The desktop derives every service origin from the issuer hostname, so all
 # four must answer on one port. `make hub-proxy` puts them there.
 DESKTOP_PORT ?= 9080
+
+# Exported so docker compose -- and through it the Caddyfile -- sees the same
+# values: the front door's listener, its published port and its upstream all
+# derive from these, so an override moves the whole set rather than half of it.
+# The exports MUST follow the assignments: a bare `export NAME` ahead of a
+# `?=` defines the variable as empty, and the `?=` then does nothing.
+export DESKTOP_PORT
+export API_PORT
+
 DESKTOP_KC   := http://keycloak.localhost:$(DESKTOP_PORT)
 # curl needs these when /etc/hosts is not set up yet; harmless when it is.
 DESKTOP_RESOLVE := --resolve keycloak.localhost:$(DESKTOP_PORT):127.0.0.1 \
