@@ -32,7 +32,7 @@ def test_multi_step_op_interacts_with_each_cog_and_completes():
 def test_paused_op_resumes_from_track_after_engine_restart():
     state = {"paused": True}
 
-    def handler(entry, value):
+    def handler(entry, value, *, signal=None):
         if state["paused"]:
             raise PauseRequest("needs approval")
         return value

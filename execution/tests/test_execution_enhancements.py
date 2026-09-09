@@ -22,7 +22,7 @@ from collab_hub_execution import (
     TrackEvent,
     derive_run_status,
 )
-from collab_hub_execution.orchestration import _serialize_op
+from collab_hub_execution.orchestration import _NO_SIGNAL, _serialize_op
 
 
 def test_token_budget_survives_restart_and_stops_the_run():
@@ -32,7 +32,7 @@ def test_token_budget_survives_restart_and_stops_the_run():
 
     state = {"paused": True}
 
-    def gate_then_usage(entry, value):
+    def gate_then_usage(entry, value, *, signal=None):
         if state["paused"]:
             raise PauseRequest("approve step 2")
         return {"result": value, "usage": {"tokens": 60}}
@@ -73,7 +73,7 @@ def test_duration_budget_stops_run_before_any_step_as_timed_out():
 
 
 def test_bounded_revise_loop_fails_after_max_revisions():
-    def always_pause(entry, value):
+    def always_pause(entry, value, *, signal=None):
         raise PauseRequest("needs another revision")
 
     track = InMemoryTrackStore()
@@ -98,7 +98,7 @@ def test_bounded_revise_loop_fails_after_max_revisions():
 def test_step_digest_is_recorded_and_survives_restart():
     state = {"paused": True}
 
-    def handler(entry, value):
+    def handler(entry, value, *, signal=None):
         if state["paused"]:
             raise PauseRequest("approve")
         return value
@@ -286,7 +286,7 @@ def test_retry_re_drives_a_failed_run_under_a_fresh_key():
 
 
 def test_retry_rejects_a_non_terminal_run():
-    def gate(entry, value):
+    def gate(entry, value, *, signal=None):
         raise PauseRequest("hold")
 
     engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": gate}), track=InMemoryTrackStore())
@@ -311,7 +311,7 @@ def test_re_submitting_a_paused_run_does_not_resume_it_behind_the_gate():
     calls = {"n": 0}
     state = {"approved": False}
 
-    def gate(entry, value):
+    def gate(entry, value, *, signal=None):
         calls["n"] += 1
         if not state["approved"]:
             raise PauseRequest("approve")
@@ -333,14 +333,13 @@ def test_re_submitting_a_paused_run_does_not_resume_it_behind_the_gate():
     assert engine().signal("run-gate", "go") is RunStatus.COMPLETED
 
 
-# --- duration budget must survive a crash between the two submission events ---
+# --- duration budget must survive a crash immediately after submission ---
 
 
-def test_duration_budget_survives_a_crash_between_the_two_submission_events():
+def test_duration_budget_survives_a_crash_after_submission():
     track = InMemoryTrackStore()
     op = OpDefinition("run-crash-budget", (OpStep("s", "c", "run"),))
-    # Simulate a crash after op_submitted committed but before `submitted`: only the
-    # first event exists, and it happened long ago.
+    # Simulate a crash after op_submitted committed, before advancement.
     long_ago = datetime.now(UTC) - timedelta(hours=1)
     track.append(
         TrackEvent(
@@ -368,10 +367,10 @@ def test_signal_value_is_durable_across_a_crash_mid_resume():
     seen = []
     crash = {"once": True}
 
-    def handler(entry, value):
-        if value != approval:  # the original input pauses at the gate
+    def handler(entry, value, *, signal=_NO_SIGNAL):
+        if signal is _NO_SIGNAL:
             raise PauseRequest("approve")
-        seen.append(value)  # resumed with the durable signal
+        seen.append((value, signal))
         if crash["once"]:
             crash["once"] = False
             raise SystemExit("crash after signal consumed, before completion")
@@ -386,19 +385,18 @@ def test_signal_value_is_durable_across_a_crash_mid_resume():
     assert engine().submit(op) is RunStatus.PAUSED
     with pytest.raises(SystemExit):  # crash while resuming with the approval
         engine().signal("run-sig", approval)
-    # recovery must replay with the approval from the Track, never the original input
+    # Recovery must preserve both input and approval from the Track.
     assert engine().submit(op) is RunStatus.COMPLETED
-    assert seen == [approval, approval]
-    assert "draft-v1" not in seen
+    assert seen == [("draft-v1", approval), ("draft-v1", approval)]
 
 
 def test_signal_can_resume_a_step_with_an_explicit_none():
     seen = []
 
-    def handler(entry, value):
-        if value == "GATE":  # original input pauses; a signal (even None) resumes
+    def handler(entry, value, *, signal=_NO_SIGNAL):
+        if signal is _NO_SIGNAL:  # an explicit None is still a signal
             raise PauseRequest("approve")
-        seen.append(value)
+        seen.append((value, signal))
         return {"ok": True}
 
     track = InMemoryTrackStore()
@@ -409,7 +407,7 @@ def test_signal_can_resume_a_step_with_an_explicit_none():
     op = OpDefinition("run-none", (OpStep("s", "c", "run", "GATE"),))
     assert engine().submit(op) is RunStatus.PAUSED
     assert engine().signal("run-none", None) is RunStatus.COMPLETED
-    assert seen == [None]  # the step saw the signal None, not its original input "GATE"
+    assert seen == [("GATE", None)]
 
 
 # --- idempotency keys are injective even when ids contain the delimiter ---

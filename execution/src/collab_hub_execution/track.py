@@ -67,7 +67,8 @@ class TrackStore(Protocol):
 
 
 _STATUS_EVENTS = {
-    "submitted": RunStatus.SUBMITTED,
+    "op_submitted": RunStatus.SUBMITTED,
+    "submitted": RunStatus.SUBMITTED,  # replay compatibility with older Tracks
     "step_started": RunStatus.RUNNING,
     "materialized": RunStatus.MATERIALIZED,
     "ready": RunStatus.READY,

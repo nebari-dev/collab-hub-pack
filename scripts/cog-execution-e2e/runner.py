@@ -1,8 +1,8 @@
 """Minimal Cog worker for the kind E2E: serves /healthz and /invoke (stdlib only).
 
-Gate behavior: a Cog whose COG_ID contains "gated" pauses until the input is an
-approval (``{"approved": true}``); any other Cog echoes an output. This lets the
-E2E exercise a real gate -> approve -> complete loop against materialized pods.
+Pause fixture: a Cog whose COG_ID contains "gated" pauses until a separate
+signal carries ``{"approved": true}``. This exercises transport and recovery;
+it does not implement the Op-owned Gate policy defined in docs/GLOSSARY.md.
 """
 
 from __future__ import annotations
@@ -41,14 +41,18 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         entry, value = payload.get("entry_point"), payload.get("input")
         key = payload.get("idempotency_key")
-        approved = isinstance(value, dict) and value.get("approved") is True
+        signal = payload.get("signal")
+        approved = isinstance(signal, dict) and signal.get("approved") is True
         if GATED and not approved:
             self._send(200, {"pause": True, "reason": f"{COG_ID} awaiting approval"})
             return
         if key is not None and key in _SEEN:  # replayed key -> no repeated side effect
             self._send(200, _SEEN[key])
             return
-        result = {"output": {"cog": COG_ID, "entry_point": entry, "echo": value, "usage": {"tokens": 10}}}
+        result = {"output": {
+            "cog": COG_ID, "entry_point": entry, "echo": value,
+            "signal": signal, "usage": {"tokens": 10},
+        }}
         if key is not None:
             _SEEN[key] = result
         self._send(200, result)

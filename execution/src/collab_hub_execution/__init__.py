@@ -1,5 +1,8 @@
 """Execution contracts shared by the Hub's Cog and Op implementations.
 
+Experimental: Python interfaces, the worker protocol, and event schemas are
+subject to breaking changes. See execution/README.md for current limitations.
+
 Guarantees and non-goals
 ------------------------
 ``DurableWorkflowEngine`` is a single-owner, at-least-once reference engine. Its
@@ -11,13 +14,16 @@ durability is Track-based recovery, not distributed ownership:
 - **At-least-once.** The engine keeps a stable idempotency key across a
   crash-recovery resume and passes it to the worker, but the reference and
   Kubernetes workers do not persist keys, so a replaced worker re-runs the side
-  effect. Terminal runs are immutable; re-running is an explicit ``retry()``.
+  effect. Terminal runs are immutable; failed runs can be retried explicitly.
+  Runs that exhausted a duration/token/cost budget require a new run id.
+- **Caller-driven recovery.** submit(), signal(), and retry() are synchronous.
+  After a process restart, a caller must resubmit the same incomplete Op. This
+  package provides no startup reconciliation or background recovery loop.
 
 Do not use this engine for multi-replica production execution until the
 crash-safe engine backing tracked in collab-hub-pack #1 supplies ownership leases
 and durable keyed (exactly-once) claims. ``WorkflowEngine`` and the Track/executor
-seams are stable; a production engine that provides those guarantees plugs in
-behind them without changing callers.
+interfaces separate these concerns, but their shapes are still experimental.
 """
 
 from .binding import (

@@ -62,13 +62,20 @@ def main() -> int:
 
     events = [e.event_type for e in track.replay("e2e-run")]
     print("track events:", events, flush=True)
-    for required in ("submitted", "materialized", "paused", "step_completed", "completed"):
+    for required in ("op_submitted", "materialized", "paused", "step_completed", "completed"):
         assert required in events, f"missing {required!r} in Track"
 
     # both Cogs were materialized as real pods and step outputs recorded with digests
     materialized = [e for e in track.replay("e2e-run") if e.event_type == "materialized"]
     assert any(e.payload.get("digest") == "sha256:research" for e in materialized)
     assert any(e.payload.get("digest") == "sha256:reviewer" for e in materialized)
+
+    review = next(
+        e.payload["output"] for e in track.replay("e2e-run")
+        if e.event_type == "step_completed" and e.payload["step"] == "review"
+    )
+    assert review["echo"] == {"draft": "v1"}
+    assert review["signal"] == {"approved": True}
 
     print("E2E OK: real Cog worker pods materialized, gated Op ran and completed, Track asserted", flush=True)
     return 0

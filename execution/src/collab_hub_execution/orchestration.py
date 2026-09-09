@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Callable, Mapping
@@ -111,12 +112,18 @@ class PauseRequest(Exception):
 
 
 class CogWorker(Protocol):
-    def interact(self, entry_point: str, input: Any = None, idempotency_key: str | None = None) -> Any:
+    def interact(
+        self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
+        *, signal: Any = _NO_SIGNAL,
+    ) -> Any:
         """Interact through a declared entry point.
 
         ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
         re-drives the same incomplete step with the *same* key, and an explicit
-        retry uses a *new* key. A worker that persists results by key can turn the
+        retry or resume after a pause uses a *new* key. ``input`` always contains
+        the step's original input; ``signal`` carries external feedback separately
+        and is omitted until supplied, including when its explicit value is None.
+        A worker that persists results by key can turn the
         replay into a no-op — but that durability is the worker's to provide. The
         reference and Kubernetes workers here do NOT persist keys across pod
         replacement, so a replaced worker re-runs the side effect: execution is
@@ -141,7 +148,7 @@ class CogExecutor(Protocol):
 
 
 class WorkflowEngine(Protocol):
-    """The stable boundary used by callers, independent of engine choice."""
+    """Experimental boundary used by callers, independent of engine choice."""
 
     def submit(self, op: OpDefinition) -> RunStatus:
         """Start or recover an Op."""
@@ -156,7 +163,7 @@ class WorkflowEngine(Protocol):
 class InMemoryCogExecutor(CogExecutor):
     """A fake executor for exercising orchestration without infrastructure."""
 
-    def __init__(self, handlers: dict[str, Callable[[str, Any], Any]]) -> None:
+    def __init__(self, handlers: dict[str, Callable[..., Any]]) -> None:
         self.handlers = handlers
         self.materialized: list[tuple[str, str]] = []
         self.torn_down: list[str] = []
@@ -170,16 +177,24 @@ class InMemoryCogExecutor(CogExecutor):
 
 
 class _Worker:
-    def __init__(self, cog: str, handler: Callable[[str, Any], Any]) -> None:
+    def __init__(self, cog: str, handler: Callable[..., Any]) -> None:
         self.cog = cog
         self.handler = handler
 
-    def interact(self, entry_point: str, input: Any = None, idempotency_key: str | None = None) -> Any:
-        return self.handler(entry_point, input)
+    def interact(
+        self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
+        *, signal: Any = _NO_SIGNAL,
+    ) -> Any:
+        feedback = {} if signal is _NO_SIGNAL else {"signal": signal}
+        return self.handler(entry_point, input, **feedback)
 
 
 class DurableWorkflowEngine(WorkflowEngine):
     """An engine whose recovery source is exclusively the Track.
+
+    Experimental: interfaces may change. submit(), signal(), and retry() run
+    synchronously until completion, pause, or failure. After a process restart,
+    a caller must resubmit the same Op; no background recovery loop is provided.
 
     Single-owner by assumption: it holds no cross-replica lease, so the same run
     must not be advanced from two API replicas concurrently. Multi-replica
@@ -221,10 +236,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         if self.budget is None:
             return None
         events = self.track.replay(run_id)
-        # Anchor the duration budget to when the run began. `submitted` is written
-        # right after `op_submitted`; if a crash landed between the two, `submitted`
-        # is missing on recovery — fall back to `op_submitted` (always the first
-        # event) so elapsed time isn't silently reset to now.
+        # New runs use op_submitted alone. Accept submitted for old Tracks.
         started_at = next(
             (e.occurred_at for e in events if e.event_type in ("submitted", "op_submitted")),
             None,
@@ -261,7 +273,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         """The latest durably-recorded signal value for a step, or ``_NO_SIGNAL``.
 
         Recovery re-reads the decision from the Track, so a crash after a signal
-        was recorded resumes with the signal — not the step's original input.
+        was recorded resumes with both the original input and the signal.
         """
         value: Any = _NO_SIGNAL
         for e in self.track.replay(run_id):
@@ -290,9 +302,8 @@ class DurableWorkflowEngine(WorkflowEngine):
         existing = self.track.replay(op.run_id)
         if not existing:
             self._append(op.run_id, "op_submitted", op=_serialize_op(op))
-            self._append(op.run_id, "submitted")
         else:
-            if self._submitted_definition(op.run_id) != op:
+            if _canonical_op(self._submitted_definition(op.run_id)) != _canonical_op(op):
                 raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
             status = derive_run_status(existing)
             if status in _TERMINAL_STATES:
@@ -314,9 +325,9 @@ class DurableWorkflowEngine(WorkflowEngine):
     def retry(self, run_id: str) -> RunStatus:
         """Re-drive an unsuccessfully-ended run from its first incomplete step.
 
-        Retry is for a run that stopped short — failed, timed out, or hit its
-        budget. A completed run has no incomplete steps, so retrying it would do
-        nothing but append a spurious `completed`; that is rejected (re-running
+        Retry is for failed runs. Exhausted duration/token/cost budgets are not
+        reset: start a new run instead. A completed run has no incomplete steps,
+        so retrying it would only append a spurious `completed`; that is rejected (re-running
         finished work is a new Op, with its own run id). Unlike a crash-recovery
         resume (which reuses the same idempotency key so a durable worker can
         dedupe), an explicit retry records a ``retry_requested`` marker that
@@ -326,6 +337,8 @@ class DurableWorkflowEngine(WorkflowEngine):
         status = self.observe(run_id)
         if status is RunStatus.COMPLETED:
             raise ValueError(f"run {run_id!r} completed; nothing to retry (start a new run instead)")
+        if status in (RunStatus.TIMED_OUT, RunStatus.BUDGET_EXCEEDED):
+            raise ValueError(f"run {run_id!r} exhausted its budget; start a new run instead")
         if status not in _TERMINAL_STATES:
             raise ValueError(f"run {run_id!r} is not terminal (status={status}); nothing to retry")
         op = self._submitted_definition(run_id)
@@ -369,9 +382,9 @@ class DurableWorkflowEngine(WorkflowEngine):
                 lifecycle.transition(LifecycleState.INTERACTING)
                 self._append(op.run_id, "interaction_started", step=step.name, entry_point=step.entry_point)
                 signal_value = self._signal_for(op.run_id, step.name)
-                arg = step.input if signal_value is _NO_SIGNAL else signal_value
+                feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
                 try:
-                    value = worker.interact(step.entry_point, arg, idempotency_key=key)
+                    value = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
                     outcome = ("ok", value)
                 except PauseRequest as pause:
                     outcome = ("pause", pause.reason)
@@ -435,10 +448,15 @@ class DurableWorkflowEngine(WorkflowEngine):
             raise ValueError(f"run {run_id!r} is not paused")
         op = self._submitted_definition(run_id)
         # Persist the decision before advancing so a crash mid-resume recovers the
-        # signal from the Track (and replays the step with it, not its original
-        # input). The value may legitimately be None — see _NO_SIGNAL.
+        # signal from the Track alongside the original input. The value may
+        # legitimately be None — see _NO_SIGNAL.
         self._append(run_id, "signal_received", step=self._paused_step(run_id), value=value)
         return self._advance(op)
+
+
+def _canonical_op(op: OpDefinition) -> str:
+    """Compare definitions using the same JSON representation as durable storage."""
+    return json.dumps(json.loads(json.dumps(_serialize_op(op))), sort_keys=True)
 
 
 def _serialize_op(op: OpDefinition) -> dict[str, Any]:

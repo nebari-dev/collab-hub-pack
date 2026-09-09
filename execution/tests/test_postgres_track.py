@@ -11,11 +11,16 @@ import os
 import pytest
 
 from collab_hub_execution import (
+    DurableWorkflowEngine,
+    InMemoryCogExecutor,
+    OpDefinition,
+    OpStep,
     PostgresTrackStore,
     RunStatus,
     TrackEvent,
     derive_run_status,
 )
+from collab_hub_execution.orchestration import _serialize_op
 
 TEST_PG = os.environ.get("TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to run Postgres adapter tests")
@@ -59,3 +64,18 @@ def test_only_one_submission_per_run(store):
     store.append(TrackEvent(run_id="r", event_type="op_submitted"))
     with pytest.raises(Exception):  # partial unique index blocks a second op_submitted (#4 guard)
         store.append(TrackEvent(run_id="r", event_type="op_submitted"))
+
+
+def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
+    op = OpDefinition("recover", (OpStep("s", "c", "run", {"items": ("a", "b")}),))
+    store.append(TrackEvent(run_id=op.run_id, event_type="op_submitted", payload={"op": _serialize_op(op)}))
+    calls = []
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda entry, value: calls.append(value) or value}),
+        track=store,
+    )
+    assert engine.observe(op.run_id) is RunStatus.SUBMITTED
+    assert engine.submit(op) is RunStatus.COMPLETED
+    assert len(calls) == 1
+    assert engine.submit(op) is RunStatus.COMPLETED
+    assert len(calls) == 1

@@ -3,6 +3,7 @@
 import logging
 import re
 
+import httpx
 import pytest
 
 from collab_hub_execution import (
@@ -12,6 +13,60 @@ from collab_hub_execution import (
     label_value,
     resource_name,
 )
+from collab_hub_execution.kubernetes import _KubernetesWorker
+
+
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError])
+def test_ambiguous_interaction_failure_is_not_reposted(error):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        raise error("response unavailable", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        worker = _KubernetesWorker("c", "worker", "http://worker", client)
+        with pytest.raises(error):
+            worker.interact("run", {"side_effect": True}, idempotency_key="r:s:0")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout])
+def test_connection_failure_can_retry_without_changing_payload(error, monkeypatch):
+    calls = []
+
+    def handle(request):
+        calls.append(request.content)
+        if len(calls) == 1:
+            raise error("not connected", request=request)
+        return httpx.Response(200, json={"output": "done"})
+
+    monkeypatch.setattr("collab_hub_execution.kubernetes.time.sleep", lambda _: None)
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        worker = _KubernetesWorker("c", "worker", "http://worker", client)
+        assert worker.interact("run", "draft", idempotency_key="r:s:0") == "done"
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("timeout", [300.0, None])
+def test_interaction_timeout_reaches_default_worker_client(timeout):
+    executor = KubernetesCogExecutor(
+        runner_image="worker:test", insecure_skip_network_policy=True, interaction_timeout=timeout,
+    )
+    with executor.worker_http as client:
+        assert client.timeout.read == timeout
+
+
+@pytest.mark.parametrize("signal", [{"approved": True}, None])
+def test_signal_is_sent_separately_from_original_input(signal):
+    http = FakeWorkerHttp()
+    worker = _KubernetesWorker("c", "worker", "http://worker", http)
+    worker.interact("review", {"draft": "v1"})
+    assert "signal" not in http.posts[-1][1]
+    worker.interact("review", {"draft": "v1"}, signal=signal)
+    assert http.posts[-1][1]["input"] == {"draft": "v1"}
+    assert http.posts[-1][1]["signal"] == signal
 
 
 class FakeResponse:

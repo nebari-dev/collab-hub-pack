@@ -35,6 +35,10 @@ import os
 import time
 from typing import Any, Protocol
 
+from httpx import ConnectError, ConnectTimeout
+
+from .orchestration import _NO_SIGNAL
+
 _log = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "collab-hub"
@@ -130,10 +134,10 @@ def _in_cluster_api() -> Any:
     )
 
 
-def _default_worker_http() -> Any:
+def _default_worker_http(interaction_timeout: float | None = 60.0) -> Any:
     import httpx
 
-    return httpx.Client(timeout=60)
+    return httpx.Client(timeout=interaction_timeout)
 
 
 class KubernetesCogExecutor:
@@ -151,6 +155,7 @@ class KubernetesCogExecutor:
         insecure_skip_network_policy: bool = False,
         api: K8sApi | None = None,
         worker_http: WorkerHttp | None = None,
+        interaction_timeout: float | None = 60.0,
         ready_timeout: float = 60.0,
         poll_interval: float = 1.0,
     ) -> None:
@@ -181,6 +186,7 @@ class KubernetesCogExecutor:
         self.allow_ingress_from_namespace = allow_ingress_from_namespace
         self._api = api
         self._worker_http = worker_http
+        self.interaction_timeout = interaction_timeout
         self.ready_timeout = ready_timeout
         self.poll_interval = poll_interval
 
@@ -193,7 +199,7 @@ class KubernetesCogExecutor:
     @property
     def worker_http(self) -> WorkerHttp:
         if self._worker_http is None:
-            self._worker_http = _default_worker_http()
+            self._worker_http = _default_worker_http(self.interaction_timeout)
         return self._worker_http
 
     def _service_url(self, name: str) -> str:
@@ -394,10 +400,16 @@ class _KubernetesWorker:
         self.url = url
         self.http = http
 
-    def interact(self, entry_point: str, input: Any = None, idempotency_key: str | None = None) -> Any:
+    def interact(
+        self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
+        *, signal: Any = _NO_SIGNAL,
+    ) -> Any:
+        payload = {"entry_point": entry_point, "input": input, "idempotency_key": idempotency_key}
+        if signal is not _NO_SIGNAL:
+            payload["signal"] = signal
         response = self._post_with_retry(
             f"{self.url}/invoke",
-            {"entry_point": entry_point, "input": input, "idempotency_key": idempotency_key},
+            payload,
         )
         response.raise_for_status()
         body = response.json()
@@ -417,7 +429,7 @@ class _KubernetesWorker:
         for _ in range(attempts):
             try:
                 return self.http.post(url, json=payload)
-            except Exception as exc:  # noqa: BLE001 - connection-level failures only
+            except (ConnectError, ConnectTimeout) as exc:
                 last = exc
                 time.sleep(delay)
         raise last  # type: ignore[misc]
