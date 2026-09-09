@@ -472,12 +472,19 @@ kind-logs: ## Follow the in-cluster API logs
 # `kind get kubeconfig` writes a kubeconfig holding exactly one cluster, with it
 # as the current context. Handing that to the script over KUBECONFIG pins every
 # kubectl and helm call it makes, without depending on the script cooperating.
+#
+# PYTHON_BIN for the same reason: the script's resolve_python() looks for
+# api/.venv/bin/python relative to the working directory, and this recipe runs
+# in dev/. Left to itself it would miss the virtualenv and fall back to whatever
+# bare `python` is on PATH -- which on a uv-managed machine is often absent, and
+# otherwise is an interpreter without the smoke clients' httpx. Either way it
+# fails at the first Python check, after the cluster, image and chart are up.
 kind-smoke: ## Run the repo's kind connector/task smoke suite in its own namespace
 	@kind get clusters 2>/dev/null | grep -qx $(CLUSTER_NAME) \
 		|| { echo "kind cluster '$(CLUSTER_NAME)' does not exist -- run 'make kind-up' first"; exit 1; }
 	@kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT && \
 		kind get kubeconfig --name $(CLUSTER_NAME) > "$$kubeconfig" && \
-		CLUSTER_NAME=$(CLUSTER_NAME) KUBECONFIG="$$kubeconfig" \
+		CLUSTER_NAME=$(CLUSTER_NAME) KUBECONFIG="$$kubeconfig" PYTHON_BIN="$(PYTHON)" \
 			$(ROOT)/scripts/smoke_local_collab_hub_features_kind.sh
 
 kind-down: ## Delete the kind cluster
