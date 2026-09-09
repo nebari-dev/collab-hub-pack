@@ -89,6 +89,13 @@ CLUSTER_NAME ?= collab-hub-dev
 NAMESPACE    ?= collab-hub
 RELEASE      ?= collab-hub
 IMAGE        ?= collab-hub-api:dev
+# The chart takes repository and tag separately, so IMAGE has to be split or the
+# install silently ignores it. Split on the LAST colon, and only when what
+# follows looks like a tag rather than a registry port -- a port is followed by
+# a path, so it contains a "/". `localhost:5000/collab-hub-api:dev` therefore
+# splits after the second colon, not the first.
+IMAGE_REPO   := $(shell printf '%s' '$(IMAGE)' | sed -E 's#:[^:/]+$$##')
+IMAGE_TAG    := $(shell printf '%s' '$(IMAGE)' | sed -nE 's#.*:([^:/]+)$$#\1#p')
 FORWARD_PORT ?= 18080
 KUBECTL      := kubectl --context kind-$(CLUSTER_NAME)
 
@@ -417,12 +424,20 @@ psql: ## Open a psql shell on the dev database
 ## kind — the chart on a real cluster
 # ---------------------------------------------------------------------------
 
+# `--set` follows `-f` so it wins: values/kind.yaml carries the default image,
+# and this pins whatever IMAGE actually named -- the same one kind-image just
+# built and loaded. Without it, `make kind-up IMAGE=...:custom` loads one image
+# and deploys another, which with pullPolicy: Never either fails to start or,
+# worse, quietly runs whatever stale `:dev` is left on the node.
 kind-up: kind-cluster kind-image ## Create the kind cluster and install the chart
+	@test -n "$(IMAGE_TAG)" || { echo "IMAGE ('$(IMAGE)') has no tag -- use repository:tag"; exit 1; }
 	helm upgrade --install $(RELEASE) $(ROOT)/helm/collab-hub \
 		--kube-context kind-$(CLUSTER_NAME) \
 		--namespace $(NAMESPACE) --create-namespace \
 		--set namespace.create=false \
 		-f $(CURDIR)/values/kind.yaml \
+		--set api.deployment.image.repository=$(IMAGE_REPO) \
+		--set api.deployment.image.tag=$(IMAGE_TAG) \
 		--wait --timeout 3m
 	@echo ""
 	@echo "Installed. Reach it with:  make kind-forward   (then http://127.0.0.1:$(FORWARD_PORT))"

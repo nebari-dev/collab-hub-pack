@@ -1008,7 +1008,7 @@ works as a set:
 | `S3_ENDPOINT` | `http://127.0.0.1:9000` | MinIO, for the S3 frame store |
 | `CLUSTER_NAME` | `collab-hub-dev` | kind cluster name |
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
-| `IMAGE` | `collab-hub-api:dev` | Tag built and loaded by `make kind-image` |
+| `IMAGE` | `collab-hub-api:dev` | Image `make kind-image` builds and loads, and `make kind-up` deploys |
 | `FORWARD_PORT` | `18080` | Local port for `make kind-forward` |
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
 
