@@ -492,6 +492,14 @@ make kind-smoke
 `kind-smoke` installs its own release in its own namespace, so it neither
 touches nor needs the one `make kind-up` created.
 
+It also cannot escape the kind cluster. The script it runs calls plain
+`kubectl` and `helm`, which would otherwise follow whatever context your
+kubeconfig points at — and it creates namespaces, secrets and a Helm release
+whose values turn on `FRAMES_UNSAFE_AUTH_ENABLED`. The target hands it a
+kubeconfig holding only the kind context, so a shell left pointing at a shared
+cluster cannot be deployed into by accident. If the cluster does not exist yet,
+the target says so rather than falling back to your current context.
+
 ---
 
 That is all four levels. Everything below is reference material for one topic

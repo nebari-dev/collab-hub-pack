@@ -411,8 +411,25 @@ kind-forward: ## Port-forward the in-cluster API to 127.0.0.1:18080
 kind-logs: ## Follow the in-cluster API logs
 	$(KUBECTL) -n $(NAMESPACE) logs -f deployment/collab-hub-api
 
+# Every other kind-* target pins its context ($(KUBECTL), and --kube-context on
+# the helm install). This one shells out to a script that does not: CLUSTER_NAME
+# only tells it where to `kind load` the image, while its kubectl and helm calls
+# follow whatever the ambient kubeconfig points at. That script creates a
+# namespace, secrets, deployments and a Helm release whose values set
+# FRAMES_UNSAFE_AUTH_ENABLED=true -- so on a developer who has switched to a
+# shared or production context, running it there is the kind of accident worth
+# making impossible rather than documenting.
+#
+# `kind get kubeconfig` writes a kubeconfig holding exactly one cluster, with it
+# as the current context. Handing that to the script over KUBECONFIG pins every
+# kubectl and helm call it makes, without depending on the script cooperating.
 kind-smoke: ## Run the repo's kind connector/task smoke suite in its own namespace
-	CLUSTER_NAME=$(CLUSTER_NAME) $(ROOT)/scripts/smoke_local_collab_hub_features_kind.sh
+	@kind get clusters 2>/dev/null | grep -qx $(CLUSTER_NAME) \
+		|| { echo "kind cluster '$(CLUSTER_NAME)' does not exist -- run 'make kind-up' first"; exit 1; }
+	@kubeconfig=$$(mktemp) && trap 'rm -f "$$kubeconfig"' EXIT && \
+		kind get kubeconfig --name $(CLUSTER_NAME) > "$$kubeconfig" && \
+		CLUSTER_NAME=$(CLUSTER_NAME) KUBECONFIG="$$kubeconfig" \
+			$(ROOT)/scripts/smoke_local_collab_hub_features_kind.sh
 
 kind-down: ## Delete the kind cluster
 	kind delete cluster --name $(CLUSTER_NAME)
