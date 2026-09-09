@@ -5,9 +5,8 @@ name: Test execution E2E (kind)
 # run a gated multi-step Op, asserting the Track. This is a separate job from
 # `Test execution` (the unit + Postgres suite) and runs concurrently with it.
 #
-# Based on the pack's local-kind CI pattern (nexus-pack-ci.yaml's
-# local-nexus-features-kind job): pinned kind + kubectl, a --wait cluster
-# bootstrap, and cluster diagnostics on failure. Path-gated because a kind run is
+# Uses kind with a pinned version, waits for cluster readiness, and collects
+# cluster diagnostics on failure. Path-gated because a kind run is
 # heavier than the unit job, so it only runs when the execution code or the E2E
 # harness changes.
 
