@@ -63,6 +63,23 @@ DESKTOP_RESOLVE := --resolve keycloak.localhost:$(DESKTOP_PORT):127.0.0.1 \
                    --resolve frames.localhost:$(DESKTOP_PORT):127.0.0.1
 DESKTOP_HOSTS := keycloak.localhost frames.localhost llm-internal.localhost
 
+# Does this name resolve, through the same path the API and curl will use?
+#
+# Three mechanisms because no single one is portable: `getent` is glibc-only
+# and simply does not exist on macOS -- where it would report every hostname
+# missing and block the desktop targets no matter what /etc/hosts says --
+# while `dscacheutil` is macOS-only. The Python fallback covers anything else
+# and needs no new dependency: $(PYTHON) is already what `make token` uses.
+#
+# Deliberately NOT `host` or `nslookup`: those query DNS directly and ignore
+# /etc/hosts, which is precisely the thing being checked, so they would answer
+# "no" for a correctly configured machine.
+define host-resolves
+{ command -v getent >/dev/null 2>&1 && getent hosts "$(1)" >/dev/null 2>&1; } \
+|| { command -v dscacheutil >/dev/null 2>&1 && dscacheutil -q host -a name "$(1)" 2>/dev/null | grep -q ip_address; } \
+|| { $(PYTHON) -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], None)' "$(1)" >/dev/null 2>&1; }
+endef
+
 # --- Datastores ------------------------------------------------------------
 PG_URL      ?= postgresql://collab:collab@127.0.0.1:5432/collab
 S3_ENDPOINT ?= http://127.0.0.1:9000
@@ -233,8 +250,16 @@ api-membership: services keycloak | $(LOCAL)/frames ## API in multi-tenant mode:
 # ---------------------------------------------------------------------------
 
 hosts-check: ## Check the /etc/hosts entries the desktop client needs
-	@missing=""; for h in $(DESKTOP_HOSTS); do \
-		getent hosts $$h >/dev/null 2>&1 || missing="$$missing $$h"; \
+	@if ! { command -v getent >/dev/null 2>&1 || command -v dscacheutil >/dev/null 2>&1 \
+	        || $(PYTHON) -c '' >/dev/null 2>&1; }; then \
+		echo "hosts-check: nothing here can resolve a hostname (no getent,"; \
+		echo "dscacheutil or python), so the check is skipped rather than"; \
+		echo "blocking you. Make sure these names point at 127.0.0.1:"; \
+		echo "  $(DESKTOP_HOSTS)"; \
+		exit 0; \
+	fi; \
+	missing=""; for h in $(DESKTOP_HOSTS); do \
+		$(call host-resolves,$$h) || missing="$$missing $$h"; \
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "Missing from /etc/hosts:$$missing"; \
