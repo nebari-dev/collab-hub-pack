@@ -987,9 +987,16 @@ make test     # the API test suite (pytest, with coverage)
 make lint     # helm lint + kubeconform on the rendered manifests
 ```
 
-CI runs this environment too, in
-[`.github/workflows/dev-env.yaml`](../.github/workflows/dev-env.yaml), with
-coverage that relaxes as the levels get more expensive:
+---
+
+## What CI checks
+
+Nothing used to check that `dev/` still runs the pack. The test workflow is
+pytest in `api/` and the lint workflow renders the chart, so a broken
+local-development setup reached contributors before it reached CI — the review
+of the change that introduced this directory turned up five such regressions.
+[`.github/workflows/dev-env.yaml`](../.github/workflows/dev-env.yaml) closes
+that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
@@ -998,12 +1005,30 @@ coverage that relaxes as the levels get more expensive:
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
 
-Level 1 is the one that runs on macOS, because GitHub's macOS runners have no
-Docker — and level 1 is the level that needs none. That is where the
-portability bugs live anyway. Level 4 is rendered rather than run: a kind
-cluster pulls a ~1 GB node image before it can tell you anything, and the
+**Coverage relaxes as the levels get more expensive**, which is how the levels
+are meant to be used in the first place.
+
+**Level 1 runs on macOS as well as Linux.** GitHub's macOS runners have no
+Docker, and level 1 is the level that needs none — so the split is not a
+compromise. It is also the right place to spend the macOS minutes, because
+macOS is where the portability bugs live: `getent` is glibc-only, and a
+`hosts-check` that relied on it reported every hostname missing there.
+
+**Levels 2 and 3 share one Linux runner**, so level 3 reuses level 2's
+containers rather than pulling them again.
+
+**Level 4 is rendered rather than run.** A kind cluster pulls a ~1 GB node
+image and builds the API image before it can report anything, while the
 failures that actually recur there — values drift, an image override that never
-reaches the install — are visible in the rendered manifests.
+reaches the install — are visible in the rendered manifests in seconds.
+
+**The assertions are the contracts, not smoke.** Each one is a behaviour this
+directory promises and has broken at least once: `/v1/frame-groups` answers 200
+instead of 503 once Postgres is up; an unauthenticated request is 401 and an
+authenticated one 200; the token carries a `sub`; the `IMAGE` override reaches
+the Deployment; `DESKTOP_PORT` and `API_PORT` move together; and `hosts-check`
+still refuses a name that does not resolve, so it cannot quietly degrade into a
+check that always passes.
 
 ---
 

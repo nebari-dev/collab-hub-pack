@@ -9,6 +9,10 @@
 #
 # Prerequisites: uv, plus docker (with compose) for everything above `make api`.
 # The kind-* targets additionally need kind, helm and kubectl.
+#
+# Keep this parseable by GNU Make 3.81, which is what macOS ships. In
+# particular: no "#" inside a $(...) call -- 3.81 reads it as the start of a
+# comment and truncates the line mid-call -- and nothing newer than 3.81.
 
 SHELL := /bin/bash
 
@@ -63,22 +67,6 @@ DESKTOP_RESOLVE := --resolve keycloak.localhost:$(DESKTOP_PORT):127.0.0.1 \
                    --resolve frames.localhost:$(DESKTOP_PORT):127.0.0.1
 DESKTOP_HOSTS := keycloak.localhost frames.localhost llm-internal.localhost
 
-# Does this name resolve, through the same path the API and curl will use?
-#
-# Three mechanisms because no single one is portable: `getent` is glibc-only
-# and simply does not exist on macOS -- where it would report every hostname
-# missing and block the desktop targets no matter what /etc/hosts says --
-# while `dscacheutil` is macOS-only. The Python fallback covers anything else
-# and needs no new dependency: $(PYTHON) is already what `make token` uses.
-#
-# Deliberately NOT `host` or `nslookup`: those query DNS directly and ignore
-# /etc/hosts, which is precisely the thing being checked, so they would answer
-# "no" for a correctly configured machine.
-define host-resolves
-{ command -v getent >/dev/null 2>&1 && getent hosts "$(1)" >/dev/null 2>&1; } \
-|| { command -v dscacheutil >/dev/null 2>&1 && dscacheutil -q host -a name "$(1)" 2>/dev/null | grep -q ip_address; } \
-|| { $(PYTHON) -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], None)' "$(1)" >/dev/null 2>&1; }
-endef
 
 # --- Datastores ------------------------------------------------------------
 PG_URL      ?= postgresql://collab:collab@127.0.0.1:5432/collab
@@ -94,8 +82,11 @@ IMAGE        ?= collab-hub-api:dev
 # follows looks like a tag rather than a registry port -- a port is followed by
 # a path, so it contains a "/". `localhost:5000/collab-hub-api:dev` therefore
 # splits after the second colon, not the first.
-IMAGE_REPO   := $(shell printf '%s' '$(IMAGE)' | sed -E 's#:[^:/]+$$##')
-IMAGE_TAG    := $(shell printf '%s' '$(IMAGE)' | sed -nE 's#.*:([^:/]+)$$#\1#p')
+# The sed delimiter is "|", not "#": macOS ships GNU Make 3.81, which treats a
+# "#" as the start of a comment even inside $(shell ...) and truncates the line
+# mid-call ("unterminated call to function `shell'").
+IMAGE_REPO   := $(shell printf '%s' '$(IMAGE)' | sed -E 's|:[^:/]+$$||')
+IMAGE_TAG    := $(shell printf '%s' '$(IMAGE)' | sed -nE 's|.*:([^:/]+)$$|\1|p')
 FORWARD_PORT ?= 18080
 KUBECTL      := kubectl --context kind-$(CLUSTER_NAME)
 
@@ -256,6 +247,13 @@ api-membership: services keycloak | $(LOCAL)/frames ## API in multi-tenant mode:
 ## Apollo Desktop — connect the Collab client to this hub
 # ---------------------------------------------------------------------------
 
+# Three mechanisms because none is portable on its own: `getent` is glibc-only
+# and absent on macOS, where it would report every hostname missing and block
+# the desktop targets whatever /etc/hosts says; `dscacheutil` is macOS-only; the
+# Python fallback covers anything else and adds no dependency, since $(PYTHON)
+# is already what `make token` uses. Deliberately NOT `host` or `nslookup`:
+# those query DNS directly and ignore /etc/hosts, which is the thing being
+# checked, so they would answer "no" for a correctly configured machine.
 hosts-check: ## Check the /etc/hosts entries the desktop client needs
 	@if ! { command -v getent >/dev/null 2>&1 || command -v dscacheutil >/dev/null 2>&1 \
 	        || $(PYTHON) -c '' >/dev/null 2>&1; }; then \
@@ -266,7 +264,12 @@ hosts-check: ## Check the /etc/hosts entries the desktop client needs
 		exit 0; \
 	fi; \
 	missing=""; for h in $(DESKTOP_HOSTS); do \
-		$(call host-resolves,$$h) || missing="$$missing $$h"; \
+		if command -v getent >/dev/null 2>&1 && getent hosts "$$h" >/dev/null 2>&1; then :; \
+		elif command -v dscacheutil >/dev/null 2>&1 \
+		     && dscacheutil -q host -a name "$$h" 2>/dev/null | grep -q ip_address; then :; \
+		elif $(PYTHON) -c 'import socket,sys; socket.getaddrinfo(sys.argv[1], None)' "$$h" \
+		     >/dev/null 2>&1; then :; \
+		else missing="$$missing $$h"; fi; \
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "Missing from /etc/hosts:$$missing"; \
