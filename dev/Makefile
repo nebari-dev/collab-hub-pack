@@ -44,6 +44,11 @@ KC_URL      ?= http://localhost:8080
 REALM       ?= nebari
 KC_ADMIN    ?= admin
 KC_ADMIN_PW ?= admin
+# Exported so compose seeds the container with the same credentials kcadm
+# sends. Bootstrap credentials are only read against an empty database, so a
+# change lands on the next `make destroy`, not the next restart.
+export KC_ADMIN
+export KC_ADMIN_PW
 KC_USER     ?= dev
 KC_PASS     ?= dev
 KCADM       := $(COMPOSE) exec -T keycloak /opt/keycloak/bin/kcadm.sh
@@ -191,7 +196,7 @@ KC_CONNECTOR_ENV := \
 .PHONY: help api api-watch api-pg api-oidc api-fakes api-full api-membership \
         api-desktop api-desktop-fakes hosts-check hub-proxy hub-proxy-down desktop-check \
         services keycloak fakes up down destroy logs ps \
-        realm-import broker-role idp-google idp-github idp-list \
+        keycloak-admin realm-import broker-role idp-google idp-github idp-list \
         token sub whoami seed-org psql \
         kind-up kind-cluster kind-image kind-redeploy kind-forward kind-logs \
         kind-smoke kind-down test lint clean
@@ -352,6 +357,21 @@ logs: ## Follow supporting-service logs
 # ---------------------------------------------------------------------------
 ## Keycloak administration
 # ---------------------------------------------------------------------------
+
+keycloak-admin: ## Print the admin console URL and check the credentials work
+	@printf 'Admin console  %s\n' "$(KC_URL)"
+	@printf 'Username       %s\n' "$(KC_ADMIN)"
+	@printf 'Password       %s\n' "$(KC_ADMIN_PW)"
+	@printf 'Sign-in        '
+	@curl -sfS -m 10 $(KC_URL)/realms/master/protocol/openid-connect/token \
+		-d grant_type=password -d client_id=admin-cli \
+		-d username='$(KC_ADMIN)' -d password='$(KC_ADMIN_PW)' 2>/dev/null \
+		| $(PYTHON) -c 'import json,sys; json.load(sys.stdin)["access_token"]; print("OK")' 2>/dev/null \
+		|| { echo "FAILED"; \
+		     echo ""; \
+		     echo "Keycloak reads KC_BOOTSTRAP_ADMIN_* only against an empty database,"; \
+		     echo "so changed credentials land on the next 'make destroy', not a restart."; \
+		     exit 1; }
 
 realm-import: ## Re-import the realm into a running Keycloak (overwrites it)
 	$(KCADM) config credentials --server http://localhost:8080 \

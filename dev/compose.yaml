@@ -76,8 +76,12 @@ services:
     profiles: ["auth"]
     command: ["start-dev", "--import-realm"]
     environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # From the Makefile's KC_ADMIN / KC_ADMIN_PW, so the console login and
+      # what `kcadm` sends cannot drift apart. Bootstrap credentials are only
+      # read when the database is empty, so changing them takes effect on the
+      # next `make destroy`, not the next restart.
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PW:-admin}
       # No KC_HOSTNAME pin: the issuer is derived from the request, so the
       # realm answers correctly both directly (localhost:8080) and through the
       # desktop front door (keycloak.localhost:9080), each self-consistent.

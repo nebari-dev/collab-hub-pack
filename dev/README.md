@@ -269,7 +269,8 @@ confidential client the web surface signs users in with, and — for connectors 
 
 It is **optional** for levels 1–2 and **required** for the connectors, the web
 surface, and the Collab desktop client — see
-[Is Keycloak required?](#is-keycloak-required).
+[Is Keycloak required?](#is-keycloak-required). `make keycloak-admin` prints
+the console URL and checks the admin credentials still work.
 
 **The issuer follows the way in.** `compose.yaml` pins no `KC_HOSTNAME`; it
 sets `KC_PROXY_HEADERS: xforwarded` instead, so the realm reports
@@ -527,7 +528,6 @@ make keycloak
 First run pulls the image and imports `dev/keycloak/realm-nebari.json`. When it
 reports healthy:
 
-- Admin console: <http://localhost:8080> — `admin` / `admin`
 - Realm: `nebari` — the name is **not** arbitrary: Apollo Desktop hardcodes it
 - Users: `dev` / `dev` and `owner` / `owner`
 
@@ -537,6 +537,50 @@ To reset the realm to the checked-in definition after experimenting:
 make realm-import     # deletes and recreates the realm
 make broker-role      # re-run this afterwards, see step 3
 ```
+
+### 1b. Sign in to the admin console
+
+Most of what this guide needs is a `make` target, but the console is where you
+go to look at a realm rather than change it — to see why a token lacks a claim,
+what scopes an identity provider actually requested, or whether a user's
+account link survived.
+
+```sh
+make keycloak-admin
+```
+
+It prints the URL and credentials and then proves them, by asking Keycloak for
+an admin token rather than trusting that the defaults are still in force:
+
+```
+Admin console  http://localhost:8080
+Username       admin
+Password       admin
+Sign-in        OK
+```
+
+Open <http://localhost:8080/admin/> and sign in with those. The realm switcher
+is top-left; `nebari` is the one this pack uses, `master` only holds the admin
+account itself.
+
+While the [desktop front door](#connecting-the-collab-desktop-client) is up the
+console is also reachable at <http://keycloak.localhost:9080/admin/>, which is
+useful when you want to see the realm exactly as Collab reaches it — same
+Keycloak, same session, different issuer.
+
+**Changing the credentials.** `KC_ADMIN` and `KC_ADMIN_PW` set both what the
+console expects and what `kcadm` sends:
+
+```sh
+make keycloak KC_ADMIN=root KC_ADMIN_PW=s3cret
+```
+
+With one catch worth knowing before you try it: Keycloak reads
+`KC_BOOTSTRAP_ADMIN_*` **only against an empty database**. Since the realm now
+lives in a volume, changing them on a Keycloak that has already started does
+nothing until `make destroy` — which also discards every identity provider you
+configured. `make keycloak-admin` fails with that explanation rather than
+leaving you guessing at a login screen.
 
 ### 2. What is in the realm
 
@@ -995,6 +1039,7 @@ Frames and the user directory work immediately. Three things do not:
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
+| Admin console rejects `admin` / `admin` | The credentials were changed after the database existed, so the new ones were never seeded | `make keycloak-admin` says so; `make destroy` re-seeds, at the cost of every configured identity provider |
 | Port already in use | Something else on 8000/8080/8081/8082/8083/5432/9000/9080 | Override, e.g. `make api API_PORT=8010` |
 | `Invalid parameter: redirect_uri` signing in to `/web` | The realm was edited and lost its `http://localhost:*` entry | `make realm-import`, then `make broker-role` |
 | Collab has no Hub address that works | You are on `make api`/`api-pg`/`api-oidc`; the client needs all origins on one port | `make api-desktop`, then Hub address `http://localhost:9080` |
@@ -1084,7 +1129,7 @@ works as a set:
 | `REALM` | `nebari` | Realm name — Apollo Desktop hardcodes it |
 | `KC_USER` / `KC_PASS` | `dev` / `dev` | Whose token `make token` prints |
 | `PG_URL` | `postgresql://collab:collab@127.0.0.1:5432/collab` | Dev database |
-| `KC_ADMIN` / `KC_ADMIN_PW` | `admin` / `admin` | Keycloak admin console and `kcadm` |
+| `KC_ADMIN` / `KC_ADMIN_PW` | `admin` / `admin` | Admin console **and** `kcadm`; only seeded against an empty database |
 | `S3_ENDPOINT` | `http://127.0.0.1:9000` | MinIO, for the S3 frame store |
 | `CLUSTER_NAME` | `collab-hub-dev` | kind cluster name |
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
