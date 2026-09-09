@@ -286,7 +286,10 @@ hub-proxy: hosts-check services ## Start the single-port front door on :9080
 	@echo ""
 	@echo "Front door ready. In Collab, enter this as the Hub address:"
 	@echo ""
-	@echo "    localhost:$(DESKTOP_PORT)"
+	@echo "    http://localhost:$(DESKTOP_PORT)"
+	@echo ""
+	@echo "The http:// is required: an address without a scheme is treated as"
+	@echo "https, and this front door speaks plaintext."
 	@echo ""
 	@echo "Then run 'make api-desktop' in another shell. Sign in as dev / dev."
 

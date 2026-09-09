@@ -81,7 +81,7 @@ changing, and only pay for the next when you need it.
 
 Plus two cross-cutting targets: **`make api-desktop`** puts every service behind
 a single port so the [Collab desktop client can connect](#connecting-the-collab-desktop-client)
-— Hub address `localhost:9080` — and **`make api-desktop-fakes`** does the same
+— Hub address `http://localhost:9080` — and **`make api-desktop-fakes`** does the same
 with the fake connectors wired in, so Collab shows them as connected.
 
 ### Do I need to start anything first?
@@ -202,7 +202,7 @@ flowchart LR
   api -->|"provider API calls"| fg
   api --> fs
   dev -->|"sign in"| kc
-  dev -.->|"Collab client:<br/>Hub address localhost:9080"| proxy
+  dev -.->|"Collab client:<br/>Hub address http://localhost:9080"| proxy
   proxy -.-> kc
   proxy -.-> api
 
@@ -841,8 +841,8 @@ from it. Only one target here is set up to answer at all four derived origins:
 
 | Target | Hub address to enter | |
 |---|---|---|
-| `make api-desktop` | **`localhost:9080`** | ✅ the one to use |
-| `make api-desktop-fakes` | **`localhost:9080`** | ✅ same, plus working (fake) connectors |
+| `make api-desktop` | **`http://localhost:9080`** | ✅ the one to use |
+| `make api-desktop-fakes` | **`http://localhost:9080`** | ✅ same, plus working (fake) connectors |
 | `make api` | — | No Keycloak running, and Collab's sign-in is OAuth-only: no API key, no token to paste, no bypass |
 | `make api-pg` | — | Same |
 | `make api-oidc` | — | Keycloak runs, but on a different port from the hub |
@@ -861,7 +861,17 @@ echo '127.0.0.1 keycloak.localhost frames.localhost llm-internal.localhost' \
 make api-desktop        # starts Postgres, Keycloak, the front door, and the API
 ```
 
-Then in Collab: **Hub address → `localhost:9080` → Sign in**, as `dev` / `dev`.
+Then in Collab: **Hub address → `http://localhost:9080` → Sign in**, as
+`dev` / `dev`.
+
+**Type the `http://` — it is not optional.** Collab prepends `https://` to an
+address given without a scheme, and for a local host it then keeps whatever
+scheme it ended up with. So both `localhost:9080` and `https://localhost:9080`
+build an `https://keycloak.localhost:9080/…` issuer, and the front door speaks
+plaintext HTTP, so sign-in fails with `OIDC discovery: discovery request
+failed`. Only an explicit `http://` reaches it. Use `localhost`, not
+`127.0.0.1`: the client prefixes the IdP label, and `keycloak.127.0.0.1` is not
+a resolvable name.
 
 Verify the plumbing before you blame the client:
 
@@ -876,7 +886,7 @@ derives all of them from what you type, by surgery on the hostname
 (`frontend/src/api/hub.ts` → `internal/hubauth/proxy_policy.go`):
 
 ```
-Hub address you type      localhost:9080
+Hub address you type      http://localhost:9080
         ↓  buildHubIssuerUrl: prefix "keycloak.", append /realms/nebari
 issuer                    http://keycloak.localhost:9080/realms/nebari
         ↓  ProxyRequestPolicy.TargetURL: strip "keycloak.", apply each prefix
@@ -910,7 +920,7 @@ derives the hub API as `http://localhost:8080` and Frames as
 `http://frames.localhost:8080`, which are *also* Keycloak. Every Frames and
 connector call lands on the identity provider and 404s.
 
-Enter `localhost:9080`, the front door.
+Enter `http://localhost:9080`, the front door.
 
 ### What `api-desktop` does differently
 
@@ -961,9 +971,10 @@ Frames and the user directory work immediately. Three things do not:
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
 | Port already in use | Something else on 8000/8080/5432/9000/9080 | Override, e.g. `make api API_PORT=8010` |
 | `Invalid parameter: redirect_uri` signing in to `/web` | The realm was edited and lost its `http://localhost:*` entry | `make realm-import`, then `make broker-role` |
-| Collab has no Hub address that works | You are on `make api`/`api-pg`/`api-oidc`; the client needs all origins on one port | `make api-desktop`, then Hub address `localhost:9080` |
+| Collab has no Hub address that works | You are on `make api`/`api-pg`/`api-oidc`; the client needs all origins on one port | `make api-desktop`, then Hub address `http://localhost:9080` |
 | Collab: "Could not complete sign-in" | `/etc/hosts` entries missing, or the front door is down | `make hosts-check`, then `make desktop-check` |
-| Collab signs in but Frames are empty or error | Hub address was `localhost:8080` — every call landed on Keycloak | Enter `localhost:9080` |
+| Collab signs in but Frames are empty or error | Hub address was `localhost:8080` — every call landed on Keycloak | Enter `http://localhost:9080` |
+| Collab: `OIDC discovery: discovery request failed` | The Hub address had no scheme, or `https://` — either builds an `https://` issuer the plaintext front door cannot answer | Enter `http://localhost:9080`, scheme included |
 | `api-desktop` answers 401 to a `make token` token | That token's `iss` is `localhost:8080` | `make token KC_URL=http://keycloak.localhost:9080` |
 | Front door returns 502 | The API is not running, or is bound to loopback only | `make api-desktop` binds `0.0.0.0` for exactly this |
 | Stale data after schema changes | Every volume survives `make down` | `make destroy` — see [What persists](#what-persists-and-what-resets) |
