@@ -3,6 +3,7 @@
 ![Status: Beta](https://img.shields.io/badge/status-beta-orange)
 [![Lint](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml)
 [![Test](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml)
+[![Dev Environment](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/dev-env.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/dev-env.yaml)
 
 > **Beta** — stable enough to deploy in your own environment with engineering
 > support. APIs and chart values may still change between releases. See the
@@ -67,11 +68,29 @@ flowchart LR
 
 ## Local development
 
+Everything is driven from [`dev/`](dev/), which runs the pack on your machine
+in four levels — from a bare process with no dependencies, up to real
+datastores, a real identity provider, and the chart on a kind cluster:
+
+```sh
+cd dev
+make help
+make api      # the API alone: no containers, no token needed
+```
+
+The full walkthrough, including the Keycloak setup each connector needs, is
+[`dev/README.md`](dev/README.md).
+
+The dev-auth shortcut needs **all three** of `FRAMES_UNSAFE_AUTH_ENABLED`,
+`DEV_AUTH_ENABLED` and `DEV_AUTH_USER`; setting only the last authenticates
+nothing and every route answers 401. `make api` sets them for you.
+
+To run the test suite:
+
 ```sh
 cd api
-uv sync
+uv sync --group test
 uv run pytest
-uv run python -m collab_hub_api   # DEV_AUTH_USER for unsafe local auth
 ```
 
 ## Documentation

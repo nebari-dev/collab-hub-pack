@@ -6,8 +6,19 @@ resolve_python() {
         printf '%s\n' "${candidate}"
         return
     fi
-    if [ -x "api/.venv/bin/python" ]; then
-        printf '%s\n' "api/.venv/bin/python"
+    # Anchored to ROOT_DIR, not the working directory. Every script that
+    # sources this sets ROOT_DIR before calling, and a caller invoked from
+    # elsewhere -- dev/Makefile runs its targets from dev/ -- would otherwise
+    # miss the virtualenv entirely and fall back to a bare `python`: often
+    # absent on a uv-managed machine, and otherwise an interpreter without the
+    # httpx the smoke clients import.
+    local venv="${ROOT_DIR:-.}/api/.venv/bin/python"
+    if [ -x "${venv}" ]; then
+        printf '%s\n' "${venv}"
+        return
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' python3
         return
     fi
     printf '%s\n' python

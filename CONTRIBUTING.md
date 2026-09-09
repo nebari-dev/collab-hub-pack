@@ -5,14 +5,35 @@ under the [Apache-2.0 license](LICENSE).
 
 ## Development setup
 
-The API lives in [`api/`](api/) and uses [uv](https://docs.astral.sh/uv/).
+Run the pack from [`dev/`](dev/), which starts whatever a given level needs and
+sets the environment for you:
+
+```sh
+cd dev
+make help
+make api      # the API alone: no containers, no token needed
+make test     # the API test suite
+make lint     # helm lint + kubeconform on the rendered manifests
+```
+
+There are four levels, from a bare process up to the chart on a kind cluster;
+[`dev/README.md`](dev/README.md) walks through them and through the Keycloak
+setup each connector needs. CI exercises all four —
+[`.github/workflows/dev-env.yaml`](.github/workflows/dev-env.yaml).
+
+The API itself lives in [`api/`](api/) and uses
+[uv](https://docs.astral.sh/uv/), if you would rather drive it directly:
 
 ```sh
 cd api
 uv sync --group test        # install runtime + test deps
 uv run pytest               # run the test suite
-uv run python -m collab_hub_api   # run locally (set DEV_AUTH_USER for unsafe local auth)
 ```
+
+Running it by hand needs **all three** dev-auth switches —
+`FRAMES_UNSAFE_AUTH_ENABLED=true`, `DEV_AUTH_ENABLED=true` and
+`DEV_AUTH_USER=<name>`. Setting only `DEV_AUTH_USER` authenticates nothing and
+every route answers 401, which is why `make api` is the easier path.
 
 The Helm chart is in [`helm/collab-hub/`](helm/collab-hub/):
 

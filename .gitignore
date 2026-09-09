@@ -32,3 +32,6 @@ Thumbs.db
 
 # Claude
 CLAUDE.md
+
+# Local development scratch state (dev/Makefile)
+dev/.local/

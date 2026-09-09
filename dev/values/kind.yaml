@@ -1,0 +1,56 @@
+# Helm values for the local kind tier (`make kind-up`).
+#
+# No NebariApp and no Ingress: the chart's protection map stays unenforced,
+# which is what makes the dev-auth switches below legal. With
+# api.ingress.enabled=true the chart REFUSES to render them — see
+# docs/standalone-deployment.md. Reach the API with `make kind-forward`.
+
+fullnameOverride: collab-hub
+
+api:
+  nebariapp:
+    enabled: false
+  ingress:
+    enabled: false
+  deployment:
+    image:
+      # The default pair. `make kind-up` overrides both from IMAGE with --set,
+      # so the image installed is always the one kind-image just built and
+      # loaded. They are spelled out here so `helm install -f values/kind.yaml`
+      # by hand still works, and because pullPolicy: Never means a mismatch
+      # does not fail loudly -- it either refuses to start or runs whatever
+      # stale image is left on the node.
+      repository: collab-hub-api
+      tag: dev
+      pullPolicy: Never
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+    extraEnv:
+      - name: FRAMES_UNSAFE_AUTH_ENABLED
+        value: "true"
+      - name: DEV_AUTH_ENABLED
+        value: "true"
+      - name: DEV_AUTH_USER
+        value: dev-user
+      - name: DEV_AUTH_ORG
+        value: dev-org
+      - name: DEV_AUTH_WORKSPACE
+        value: default
+      - name: FRAMES_BEARER_ALLOW_UNSIGNED
+        value: "true"
+
+frames:
+  storage:
+    backend: local
+  auth:
+    defaults:
+      orgId: dev-org
+      workspaceId: default
+
+tasks:
+  backend: memory
