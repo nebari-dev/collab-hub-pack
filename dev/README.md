@@ -987,6 +987,24 @@ make test     # the API test suite (pytest, with coverage)
 make lint     # helm lint + kubeconform on the rendered manifests
 ```
 
+CI runs this environment too, in
+[`.github/workflows/dev-env.yaml`](../.github/workflows/dev-env.yaml), with
+coverage that relaxes as the levels get more expensive:
+
+| Level | Where | What it asserts |
+|---|---|---|
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token |
+| 2 | Linux | `/health/db` reports a real database, and `/v1/frame-groups` answers 200 instead of 503 |
+| 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
+| 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
+
+Level 1 is the one that runs on macOS, because GitHub's macOS runners have no
+Docker — and level 1 is the level that needs none. That is where the
+portability bugs live anyway. Level 4 is rendered rather than run: a kind
+cluster pulls a ~1 GB node image before it can tell you anything, and the
+failures that actually recur there — values drift, an image override that never
+reaches the install — are visible in the rendered manifests.
+
 ---
 
 ## Make target reference
