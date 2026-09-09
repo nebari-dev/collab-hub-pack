@@ -155,6 +155,16 @@ services:
     volumes:
       - ../scripts/testdata:/app:ro
 
+  fake-github:
+    image: python:3.14-slim
+    profiles: ["fakes"]
+    command: ["python", "/app/fake_github_app.py"]
+    working_dir: /app
+    ports:
+      - "127.0.0.1:8083:8000"
+    volumes:
+      - ../scripts/testdata:/app:ro
+
 volumes:
   postgres-data:
   minio-data:

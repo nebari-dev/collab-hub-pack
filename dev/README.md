@@ -94,7 +94,7 @@ idempotent — already-running containers are left alone. You never run
 all**. The API is a plain process on your machine at every level except 4;
 Docker only ever supplies the things around it.
 
-| Command | Postgres | MinIO | Keycloak | Fake Google/Slack | Front door |
+| Command | Postgres | MinIO | Keycloak | Fake providers | Front door |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `make api` | – | – | – | – | – |
 | `make api-watch` | – | – | – | – | – |
@@ -191,6 +191,7 @@ flowchart LR
     minio[("<b>MinIO</b> :9000<br/>S3 frame store")]
     fg["fake Google :8081"]
     fs["fake Slack :8082"]
+    fg2["fake GitHub :8083"]
   end
 
   dev -->|"Bearer token"| api
@@ -201,6 +202,7 @@ flowchart LR
   api -.->|"frames.storage.backend=s3"| minio
   api -->|"provider API calls"| fg
   api --> fs
+  api --> fg2
   dev -->|"sign in"| kc
   dev -.->|"Collab client:<br/>Hub address http://localhost:9080"| proxy
   proxy -.-> kc
@@ -283,14 +285,21 @@ account links people make live in a named volume, so they survive `make down`.
 `make destroy` is what resets them, and `make realm-import` resets just the
 realm.
 
-### The fake Google and Slack providers
+### The fake Google, Slack and GitHub providers
 
-`scripts/testdata/fake_google_drive_app.py` and `fake_slack_app.py` — the same
-files the kind smoke tests use. Each serves both a `/broker/token` endpoint
-(standing in for Keycloak's broker) and the provider API surface, so the whole
-connector path can be exercised with no real OAuth app anywhere.
+`scripts/testdata/fake_google_drive_app.py`, `fake_slack_app.py` and
+`fake_github_app.py`. Each serves both a `/broker/token` endpoint (standing in
+for Keycloak's broker) and the provider API surface, so the whole connector
+path can be exercised with no real OAuth app anywhere.
 
-They are stdlib-only, so there is no image to build.
+They are stdlib-only, so there is no image to build. The first two are the same
+files the kind smoke tests use.
+
+The GitHub fake answers the REST calls the connector makes — `/user` (carrying
+the granted scopes in `X-OAuth-Scopes`, which is where the connector reads a
+token's *real* grant), `/user/repos`, `/search/issues`, issue and pull reads
+with their comments and reviews, and `/contents/…` — plus the GraphQL endpoint
+behind the Projects V2 boards.
 
 ### The front door (`make hub-proxy`)
 
@@ -445,7 +454,7 @@ Other level-3 targets:
 
 | Target | Adds |
 |---|---|
-| `make api-fakes` | Connector routes wired to the fake Google and Slack providers |
+| `make api-fakes` | Connector routes wired to the fake Google, Slack and GitHub providers |
 | `make api-full` | S3 frame storage, the web surface, and Keycloak-brokered connectors |
 | `make api-membership` | Multi-tenant mode: organization resolved from `collab_org_members` |
 | `make api-desktop` | Every origin on one port, so the [Collab client can sign in](#connecting-the-collab-desktop-client) |
@@ -713,16 +722,31 @@ The fastest way to exercise every connector route, with no OAuth app anywhere:
 make api-fakes
 TOKEN=$(make -s token)
 
-for c in google-drive gmail google-calendar slack; do
+for c in google-drive gmail google-calendar slack github; do
   printf '%-17s ' "$c"
   curl -s -H "Authorization: Bearer $TOKEN" localhost:8000/v1/connectors/$c/status
   echo
 done
 ```
 
-All four report `"state":"connected"` with realistic scope lists. The fakes
+All five report `"state":"connected"` with realistic scope lists. The fakes
 serve fixed fixtures, so searches and reads return stable data — which is what
 makes them useful in tests.
+
+Every GitHub route answers, not only `status`:
+
+```sh
+B=localhost:8000/v1/connectors/github
+post() { curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+           -H 'Content-Type: application/json' -d "$2" "$B/$1"; }
+
+post search            '{"query":"orbits"}'
+post items/42/read     '{"repo":"nebari-dev/collab-hub-pack"}'   # an issue
+post items/43/read     '{"repo":"nebari-dev/collab-hub-pack"}'   # a pull request
+post files/read        '{"repo":"nebari-dev/collab-hub-pack","path":"README.md"}'
+post projects/list     '{"owner":"nebari-dev"}'
+post projects/7/read   '{"owner":"nebari-dev"}'
+```
 
 ### 9. Alternative — a static access token
 
@@ -745,8 +769,9 @@ cd ../api && env \
 ```
 
 The other two are `…__CONNECTORS__SLACK__STATIC_ACCESS_TOKEN` (`xoxp-…`) and
-`…__CONNECTORS__GOOGLE__STATIC_ACCESS_TOKEN` (`ya29.…`). GitHub has no fake
-provider, so this is the only way to exercise it locally.
+`…__CONNECTORS__GOOGLE__STATIC_ACCESS_TOKEN` (`ya29.…`). Reach for this when
+you want a connector pointed at the *real* provider; the fakes cover all five
+otherwise.
 
 A static token takes precedence over the broker URL when both are set. That is exactly why
 it must never appear in deployed values: it would silently make every user of
@@ -945,9 +970,10 @@ for the other levels.
 Frames and the user directory work immediately. Three things do not:
 
 - **Connectors are unconfigured** by `api-desktop`, so Collab shows them as not
-  connected. Use `make api-desktop-fakes` instead to have all four report
-  `connected` against the fake providers, or configure real identity providers
-  per [Keycloak, step by step](#keycloak-step-by-step).
+  connected. Use `make api-desktop-fakes` instead to have all five — Drive,
+  Gmail, Calendar, Slack and GitHub — report `connected` against the fake
+  providers, or configure real identity providers per
+  [Keycloak, step by step](#keycloak-step-by-step).
 - **Internal LLM inference** (`llm-internal.localhost:9080`) has nothing behind
   it; this pack does not serve models. That is the `llm-serving-pack`'s job.
 - **Slack linking** needs an HTTPS broker endpoint — see
@@ -969,7 +995,7 @@ Frames and the user directory work immediately. Three things do not:
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
-| Port already in use | Something else on 8000/8080/5432/9000/9080 | Override, e.g. `make api API_PORT=8010` |
+| Port already in use | Something else on 8000/8080/8081/8082/8083/5432/9000/9080 | Override, e.g. `make api API_PORT=8010` |
 | `Invalid parameter: redirect_uri` signing in to `/web` | The realm was edited and lost its `http://localhost:*` entry | `make realm-import`, then `make broker-role` |
 | Collab has no Hub address that works | You are on `make api`/`api-pg`/`api-oidc`; the client needs all origins on one port | `make api-desktop`, then Hub address `http://localhost:9080` |
 | Collab: "Could not complete sign-in" | `/etc/hosts` entries missing, or the front door is down | `make hosts-check`, then `make desktop-check` |

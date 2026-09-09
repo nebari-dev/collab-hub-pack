@@ -166,7 +166,9 @@ FAKE_CONNECTOR_ENV := \
   COLLAB_HUB_API__CONNECTORS__GOOGLE__GMAIL_API_BASE_URL=http://127.0.0.1:8081/gmail/v1 \
   COLLAB_HUB_API__CONNECTORS__GOOGLE__CALENDAR_API_BASE_URL=http://127.0.0.1:8081/calendar/v3 \
   COLLAB_HUB_API__CONNECTORS__SLACK__BROKER_TOKEN_URL=http://127.0.0.1:8082/broker/token \
-  COLLAB_HUB_API__CONNECTORS__SLACK__API_BASE_URL=http://127.0.0.1:8082/api
+  COLLAB_HUB_API__CONNECTORS__SLACK__API_BASE_URL=http://127.0.0.1:8082/api \
+  COLLAB_HUB_API__CONNECTORS__GITHUB__BROKER_TOKEN_URL=http://127.0.0.1:8083/broker/token \
+  COLLAB_HUB_API__CONNECTORS__GITHUB__API_BASE_URL=http://127.0.0.1:8083/api
 
 # Bearer verification for tokens minted through the desktop front door. The
 # issuer must be the origin the token was ACTUALLY minted on -- the desktop
@@ -330,8 +332,8 @@ keycloak: ## Start Keycloak and import the `nebari` realm
 	$(COMPOSE) --profile auth up -d --wait keycloak
 	@echo "Keycloak admin console: $(KC_URL)  ($(KC_ADMIN)/$(KC_ADMIN_PW))"
 
-fakes: ## Start the fake Google and Slack providers
-	$(COMPOSE) --profile fakes up -d fake-google fake-slack
+fakes: ## Start the fake Google, Slack and GitHub providers
+	$(COMPOSE) --profile fakes up -d fake-google fake-slack fake-github
 
 up: services keycloak fakes ## Start every supporting service
 
