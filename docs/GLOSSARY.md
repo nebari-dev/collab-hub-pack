@@ -19,10 +19,11 @@ in the whitepaper and this glossary is their home.
 **Cog.** A packaged, installable AI worker (whitepaper §4.4: "a unit that
 can be installed and replaced"). A *complete* Cog is the model, the
 weights, the model runtime (including any harness), and the context. A Cog
-is described by its manifest (`cog.yaml`, following the shared Cog
-specification as a profile) and runs itself: it carries its own pinned
-environment and its own entry points. The hub never supplies a Cog's
-runtime. The whitepaper also describes governance parameters a Cog
+is described by its manifest (the `[tool.cog]` table of its `pixi.toml`,
+following the shared Cog specification as a profile; `COG.md` names it —
+ADR-0001 D9) and runs itself: it carries its own pinned environment and
+its own entry points, declared in that same file. The hub never supplies a
+Cog's runtime. The whitepaper also describes governance parameters a Cog
 carries; in the hub those are enforced by the environment (Guards, Gates,
 the capability list), not by the Cog's own code.
 
