@@ -267,3 +267,37 @@ def test_user_directory_config_parses_nested_environment(monkeypatch):
     assert config.user_directory.keycloak.issuer_url == "https://keycloak.example/realms/hub"
     assert config.user_directory.keycloak.client_id == "nexus-user-directory"
     assert config.user_directory.keycloak.client_secret == "secret"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("false", False), ("False", False), ("0", False), ("true", True), ("1", True)],
+)
+def test_the_verified_email_env_var_binds_to_the_field(monkeypatch, raw, expected) -> None:
+    """The one seam the chart's own CI cannot cover.
+
+    The workflow greps the rendered manifest for this variable's literal name,
+    which proves the chart agrees with the workflow -- not that
+    pydantic-settings binds that name to this field. Rename the field or the
+    submodel and the chart keeps emitting the old name, pydantic ignores it, and
+    a deployment that set `requireVerifiedEmail: false` refuses every acceptance
+    while its rendered manifest says relaxed.
+
+    The spellings are parametrized because the chart emits the string "false"
+    and the app has to read it as the boolean.
+    """
+
+    monkeypatch.setenv(
+        "COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL", raw
+    )
+    assert Config().frames.invitations.require_verified_email is expected
+
+
+def test_the_verified_email_default_needs_no_environment(monkeypatch) -> None:
+    """Absent means strict, which is what the chart relies on by rendering
+    nothing at the default."""
+
+    monkeypatch.delenv(
+        "COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL", raising=False
+    )
+    assert Config().frames.invitations.require_verified_email is True

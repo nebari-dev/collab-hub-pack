@@ -924,9 +924,14 @@ def accept_invitation(
     No authorization decorator, and that is the point rather than an
     omission: the accepter holds no role in any organization — that is the
     state the invitation exists to end. What stands in for a role is checked
-    inside the transaction: the secret must resolve to a live invitation, the
-    caller's ``email_verified`` claim must be boolean true, and their
-    ``email`` claim must equal the invited address exactly.
+    inside the transaction: the secret must resolve to a live invitation, and
+    their ``email`` claim must equal the invited address but for ASCII case.
+    On a deployment with ``frames.invitations.require_verified_email`` on --
+    the default -- the caller's ``email_verified`` claim must also be boolean
+    true; where it is off, the token itself is the proof of mailbox control and
+    those two are the only checks. This docstring is what a reader consults to
+    learn what stands in for a role here, so it states both shapes rather than
+    the stricter one.
 
     The secret arrives in the body and is hashed **here**, at the edge, so
     that the only name bound to it anywhere is ``payload`` — which refuses to

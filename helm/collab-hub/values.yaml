@@ -406,6 +406,27 @@ frames:
       regionKey: SES_REGION
       configurationSetKey: SES_CONFIGURATION_SET
       requestTimeoutSeconds: 10
+  invitations:
+    # -- Whether accepting an invitation additionally requires the identity
+    # provider to have verified the accepter's address.
+    #
+    # Gate B is two checks: the address is verified, AND it equals the invited
+    # address. This drops only the first. The argument for dropping it is that
+    # the invitation token already proves mailbox control -- a 256-bit secret
+    # delivered only to the invited address, which is exactly what a
+    # verification link proves.
+    #
+    # What it costs: a forwarded or shared-mailbox invitation becomes usable by
+    # whoever received it, and their account then carries the invited person's
+    # address permanently. Leave it true on any deployment whose invitees arrive
+    # through an identity provider with trustEmail -- there the check is free
+    # and the invitee never sees a verification step.
+    #
+    # Setting this false also requires the realm to stop forcing verification
+    # (Keycloak `verifyEmail=false`), or nothing changes: Keycloak will not
+    # issue a token to an unverified account, so the relaxed check is never
+    # reached.
+    requireVerifiedEmail: true
   serviceAccess:
     # -- Identity-provider group paths an accepted invitation grants. Empty
     # means grant nothing, which is the default and the only safe one: the

@@ -17,7 +17,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from typing import Any, Protocol
@@ -156,9 +156,17 @@ class ConfiguredInvitationEmailDelivery:
         *,
         accept_url: str,
         app_instructions: str,
+        require_verified_email: bool = True,
     ) -> None:
         self._provider = provider
         self._accept_url = validate_accept_url(accept_url)
+        # The copy has to describe the flow the deployment actually runs, so it
+        # is driven by the *same* setting as the acceptance check rather than a
+        # second switch someone could set differently. A deployment that stops
+        # requiring verification and keeps telling invitees to watch for a
+        # verification email has recreated the defect #171 existed to fix, with
+        # the sign flipped.
+        self._require_verified_email = require_verified_email
         # Validated at construction, not at first send: a deployment that
         # enables email without saying how invitees get the desktop app should
         # fail at startup, not silently produce a message with a placeholder in
@@ -168,6 +176,52 @@ class ConfiguredInvitationEmailDelivery:
                 "app_instructions is required when invitation email is enabled"
             )
         self._app_instructions = app_instructions
+        # Render one probe message now, for the same reason the check above
+        # happens here: a deployment that enables invitation email and cannot
+        # produce a message should fail where somebody is watching.
+        #
+        # **A probe render rather than a template check, and that distinction is
+        # the whole point.** Resolving the copy alone proved the *template* was
+        # sound and left `render_for_automated_delivery`'s placeholder refusal
+        # running per send -- into the `except (TypeError, ValueError)` below,
+        # which drops the message by design. Three review rounds running, a
+        # change in this module traded one failure for a sharper one inside that
+        # same swallow: first an unresolvable marker, then a widened pattern
+        # that matched brackets in an operator's own `app_instructions`
+        # ("Download [MACOS_ARM64] build" failed every send, silently). Each
+        # instance was fixed and the class stayed open.
+        #
+        # Rendering the message the send path renders, with this deployment's
+        # actual `app_instructions`, closes the class: anything that would make
+        # a real send unrenderable makes construction raise instead.
+        self._probe_render()
+
+    def _probe_render(self) -> None:
+        """Render a throwaway message, to fail at startup rather than per send.
+
+        Imported locally to keep the reason the send path's import is local:
+        nothing of the browser surface should reach the mail path at import
+        time.
+
+        The probe values are deliberately unroutable -- nothing is sent, and a
+        reader who finds one of these strings in a log knows it came from here.
+        """
+
+        from ..web.onboarding_email import render_for_automated_delivery
+
+        try:
+            render_for_automated_delivery(
+                link="https://startup-probe.invalid/invite#token=probe",
+                recipient="startup-probe@invalid",
+                expires_at=datetime(2000, 1, 1, tzinfo=UTC),
+                app_instructions=self._app_instructions,
+                require_verified_email=self._require_verified_email,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "invitation email is enabled but a message cannot be rendered, so no"
+                f" invitation could be sent: {exc}"
+            ) from exc
 
     def deliver(
         self,
@@ -186,6 +240,7 @@ class ConfiguredInvitationEmailDelivery:
                 setup_url=setup_url,
                 organization_name=organization_name,
                 expires_at=expires_at,
+                require_verified_email=self._require_verified_email,
             )
         except (TypeError, ValueError):
             # Validation failures are deterministic and happen before a
@@ -373,6 +428,7 @@ def render_invitation_email(
     organization_name: str | None,
     expires_at: datetime,
     app_instructions: str,
+    require_verified_email: bool = True,
 ) -> InvitationEmailMessage:
     """Render the **approved onboarding copy** for one invitation (#93).
 
@@ -397,6 +453,16 @@ def render_invitation_email(
     the failure above. Importing it costs nothing but strings —
     :mod:`..web.data_statement` defers its page import for exactly this reason —
     so no browser-surface machinery reaches the mail path.
+
+    ``require_verified_email`` **does** default here, unlike the other
+    pass-throughs. The fail-loud argument for requiring it is that a dropped
+    keyword should be a ``TypeError`` at the first call -- but this function's
+    only caller is inside :meth:`ConfiguredInvitationEmailDelivery.deliver`'s
+    ``try``, whose ``except (TypeError, ValueError)`` turns that into a dropped
+    email with the message never logged. So requiring it buys a silent outage
+    where defaulting it buys copy that over-explains. The seam is still covered:
+    the delivery threads the value and a test captures what the provider was
+    handed.
 
     ``organization_name`` is accepted and deliberately unused: the approved copy
     is org-neutral, because operator invitations may *create* an organization
@@ -423,6 +489,7 @@ def render_invitation_email(
         recipient=recipient,
         expires_at=expires_at,
         app_instructions=app_instructions,
+        require_verified_email=require_verified_email,
     )
     return InvitationEmailMessage(recipient=recipient, subject=SUBJECT, text_body=InvitationSecret(body))
 

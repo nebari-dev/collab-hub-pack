@@ -1359,7 +1359,7 @@ def test_the_acceptance_page_itself_passes_the_seam(tmp_path, idp):
     # The check has to admit the one router that legitimately uses it, or it
     # is only proving that nothing can be public.
     surface = build_web_surface(Config.parse(web_values(tmp_path, idp)))
-    public, gated = invite_router.make_routers(memberships_enabled=True)
+    public, gated = invite_router.make_routers(memberships_enabled=True, require_verified_email=True)
     make_router(surface, page_routers=[gated], public_page_routers=[public])
     assert [route.methods for route in public.routes] == [{"GET"}]
 
@@ -1884,3 +1884,173 @@ async def test_live_an_expired_invitation_renders_its_own_state(live_app, idp, l
     assert response.status_code == 410
     assert response.json() == {"outcome": "invitation_expired"}
     assert datetime.now(tz=timezone.utc) - issued.invitation.created_at < timedelta(minutes=5)
+
+
+def test_the_not_verified_copy_does_not_promise_mail_a_relaxed_deployment_never_sends() -> None:
+    """Review finding: this change made the invitation email's copy
+    configuration-aware and left the page's alone.
+
+    On a deployment with `requireVerifiedEmail: false`, `email_not_verified` is
+    reached only when the token carries no usable address -- not because an
+    address is unverified. The strict copy tells the reader to "follow the
+    verification link that was sent to your mailbox", and no such mail exists
+    there, so the page would send people looking for something that was never
+    sent. On the surface they are actually looking at.
+    """
+
+    strict = acceptance_page(require_verified_email=True)
+    relaxed = acceptance_page(require_verified_email=False)
+
+    # The strict copy now covers both conditions this state can mean -- an
+    # unconfirmed address, and a sign-in that carried none -- because the second
+    # is reachable on a strict deployment too when a client's scopes omit
+    # `email`, and "follow the verification link" is no remedy for it.
+    assert "follow its link" in strict
+    assert "confirmation email" in strict
+    assert "confirmation email" not in relaxed
+    assert "could not read an email address" in relaxed
+
+    # The sign-in state too. Its mention is hedged ("if you have to open an
+    # email-verification link") so it was never false, only noise about a step
+    # that does not happen -- on the page somebody reads while confused.
+    assert "email-verification link" in strict
+    assert "email-verification link" not in relaxed
+
+
+def test_no_state_mentions_verification_on_a_relaxed_deployment() -> None:
+    """The sweep, rather than a list of the two states someone remembered.
+
+    A future state whose copy mentions verification would be caught here even
+    if nobody thought to add it to `RELAXED_PARAGRAPHS` -- which is the failure
+    mode of an override table.
+    """
+
+    relaxed = acceptance_page(require_verified_email=False)
+    assert "verification" not in relaxed.lower()
+    assert "verify" not in relaxed.lower()
+
+
+def test_both_modes_render_exactly_the_same_states() -> None:
+    """Copy varies; the wire contract does not.
+
+    If a mode ever added or dropped a state, the client script and the service's
+    outcome mapping would disagree with the page -- so this pins that the
+    override table is a copy table and nothing more.
+    """
+
+    # `rendered_states` already exists in this file and anchors on `<section`;
+    # the local copy this replaced would have counted a `data-state` on any
+    # other element the page grows later, reporting a state no section renders.
+    assert rendered_states(acceptance_page(require_verified_email=True)) == rendered_states(
+        acceptance_page(require_verified_email=False)
+    )
+    assert rendered_states(acceptance_page(require_verified_email=True)) == set(PAGE_STATES)
+
+
+def test_every_override_names_a_state_that_exists() -> None:
+    """A key naming no state renders nothing and nothing notices.
+
+    `overrides.get(name, ...)` is driven by iteration over `_SECTIONS`, so a
+    typo'd or stale key is silently inert -- the override table's own failure
+    mode. Neither of the tests above closes it: one compares state names, which
+    are identical either way, and the other only catches today's keys because
+    both of their strict texts happen to mention verification.
+    """
+
+    from collab_hub_api.web.acceptance import RELAXED_HEADINGS, RELAXED_PARAGRAPHS
+
+    for table in (RELAXED_PARAGRAPHS, RELAXED_HEADINGS):
+        assert set(table) <= set(PAGE_STATES), sorted(set(table) - set(PAGE_STATES))
+
+
+@pytest.mark.parametrize(
+    ("table", "entry", "message"),
+    [
+        ("RELAXED_PARAGRAPHS", {"no_such_state": {0: "x"}}, "states that do not exist"),
+        ("RELAXED_HEADINGS", {"no_such_state": "x"}, "states that do not exist"),
+        ("RELAXED_PARAGRAPHS", {"email_not_verified": {99: "x"}}, "out of range"),
+    ],
+)
+def test_the_import_time_validator_refuses_a_bad_table(monkeypatch, table, entry, message) -> None:
+    """The validator's raise branches, which nothing exercised.
+
+    `test_every_override_names_a_state_that_exists` re-asserts the same set
+    relation from outside rather than constructing a bad table, so the branches
+    that make the assertion enforceable were the file's uncovered lines --
+    93% patch coverage against a 90 floor, so CI had nothing to say either.
+    """
+
+    from collab_hub_api.web import acceptance
+
+    monkeypatch.setattr(acceptance, table, entry)
+    with pytest.raises(ValueError, match=message):
+        acceptance._validate_overrides()
+
+
+def test_copy_that_does_not_vary_is_stored_once() -> None:
+    """The override table must not duplicate text it does not change.
+
+    The first version overrode whole sections, so the sign-in heading and its
+    first paragraph were byte-identical copies -- and rewording the shared text
+    would have left relaxed deployments on the old wording forever. Indexing by
+    paragraph keeps one copy; this asserts no entry has quietly gone back to
+    restating something unchanged.
+    """
+
+    from collab_hub_api.web.acceptance import (
+        _SECTIONS,
+        RELAXED_HEADINGS,
+        RELAXED_PARAGRAPHS,
+    )
+
+    strict_paragraphs = {name: paragraphs for name, _, paragraphs in _SECTIONS}
+    strict_headings = {name: heading for name, heading, _ in _SECTIONS}
+
+    for state, overrides in RELAXED_PARAGRAPHS.items():
+        for index, text in overrides.items():
+            assert text != strict_paragraphs[state][index], (
+                f"{state}[{index}] overrides with the same text it replaces"
+            )
+    # Headings too: a byte-identical entry would pass every other test and
+    # freeze relaxed deployments on wording a later edit moved past.
+    for state, heading in RELAXED_HEADINGS.items():
+        assert heading != strict_headings[state], (
+            f"{state} overrides its heading with the same text"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_app_renders_the_page_copy_the_configuration_asks_for(tmp_path, idp) -> None:
+    """The third instance of the wiring seam, which had no test.
+
+    Builders for the invitation service and the email delivery each got one,
+    because a builder that ignored the setting left the suite green. The page
+    path is the same shape and was missed: changing `core.py`'s
+    `require_verified_email=` to a literal `True` passes all ~1440 tests, while
+    every relaxed deployment's page tells invitees to follow a verification
+    link for mail it never sends -- the defect `RELAXED_PARAGRAPHS` exists to fix.
+
+    So this goes through `make_app` and fetches the page over HTTP, which is
+    the only way the value's whole path is exercised: config -> make_routers ->
+    acceptance_page.
+    """
+
+    from collab_hub_api.web.acceptance import ACCEPT_PAGE_PATH
+
+    for flag, expect_verification_copy in ((True, True), (False, False)):
+        # No Postgres URL. The page route mounts on `config.web.enabled` alone,
+        # never on invitation-service availability, so the URL bought nothing --
+        # and it was not free: `make_app`'s schema-version check dialled it,
+        # taking the test from 0.17s to 10.2s in repeated connection failures,
+        # with one run ending in a `PythonFinalizationError` from the pool's
+        # `__del__`. The comment that used to sit here claimed nothing connects.
+        values = web_values(tmp_path, idp, web={"public_base_url": PUBLIC_BASE_URL})
+        values["frames"]["invitations"] = {"require_verified_email": flag}
+        app = make_app(Config.parse(values))
+        async with web_client(app) as client:
+            response = await client.get(ACCEPT_PAGE_PATH)
+        assert response.status_code == 200
+        mentions = "verification" in response.text.lower()
+        assert mentions is expect_verification_copy, (
+            f"require_verified_email={flag} rendered the wrong copy"
+        )

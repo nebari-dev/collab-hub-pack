@@ -767,6 +767,16 @@
               }
             }
           }
+        },
+        "invitations": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requireVerifiedEmail": {
+              "type": "boolean",
+              "description": "Whether invitation acceptance also requires an identity-provider-verified address. True keeps Gate B's two checks; false relies on the invitation token as proof of mailbox control and keeps the address match."
+            }
+          }
         }
       },
       "additionalProperties": false

@@ -519,6 +519,58 @@ class FramesServiceAccessConfig(BaseModel):
         return self
 
 
+class FramesInvitationsConfig(BaseModel):
+    """What invitation acceptance requires of the accepter's identity."""
+
+    require_verified_email: bool = True
+    """Whether Gate B additionally requires the identity provider to have
+    verified the address (#190).
+
+    **True is the default and must stay the default.** Turning it off is a
+    deliberate deployment trade, and a default that silently weakened an
+    existing deployment on upgrade would be the wrong kind of convenient.
+
+    Gate B is two checks: the accepter's address is verified, *and* it equals
+    the invited address. Setting this false drops the first and keeps the
+    second, on the argument that the invitation token is itself proof of
+    mailbox control — it is a 256-bit secret delivered only to the invited
+    address, which is exactly what a verification link proves. Requiring both
+    is defence in depth rather than one necessary check.
+
+    **What is given up, stated so a deployment chooses it knowingly.** Once the
+    identity provider stops verifying addresses, the ``email`` claim is
+    *self-asserted*: whoever holds the invitation link can register an account
+    typing the invited address, or point an existing account at it, and redeem.
+    So the invitation becomes usable by **anyone who obtains the link by any
+    means** -- forwarding and shared mailboxes are the mundane cases, not the
+    boundary.
+
+    What they receive is the organization membership and role the invitation
+    grants, plus anything ``frames.service_access.grant_on_acceptance`` grants
+    at acceptance -- identity-provider group membership included. And the
+    account they end up with carries the invited person's address permanently,
+    which is an identity-confusion problem in the member list on top of the
+    access one.
+
+    **What the retained address match does and does not buy.** With verification
+    required it is an access control: an accepter must prove control of the
+    invited address. Without it, the match is a *labelling* property -- the
+    address recorded on the membership row is the invited one -- and not a
+    barrier, because the claim it compares is unverified. Keeping it
+    unconditional is still right; it is simply not the thing standing between a
+    link-holder and the grant.
+
+    **When to leave it true.** Any deployment whose invitees arrive through an
+    identity provider with ``trustEmail``: those accounts are already verified
+    on creation, so the check costs nothing and the invitee never sees a
+    verification step. Turning it off buys nothing there.
+
+    **When false is reasonable.** A password-based deployment with no identity
+    provider, a known invitee list, and a verification round trip that is
+    friction rather than assurance.
+    """
+
+
 class FramesConfig(BaseModel):
     storage_backend: str = "local"
     s3: FramesS3Config = Field(default_factory=FramesS3Config)
@@ -530,6 +582,7 @@ class FramesConfig(BaseModel):
     orgs: FramesOrgsConfig = Field(default_factory=FramesOrgsConfig)
     email: FramesEmailConfig = Field(default_factory=FramesEmailConfig)
     service_access: FramesServiceAccessConfig = Field(default_factory=FramesServiceAccessConfig)
+    invitations: FramesInvitationsConfig = Field(default_factory=FramesInvitationsConfig)
     mcp_session_manager_enabled: bool = True
 
 
@@ -730,7 +783,10 @@ def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> Invita
 
     url = config.frames.postgres.url
     if url:
-        return PostgresInvitationService(pools.database(url))
+        return PostgresInvitationService(
+            pools.database(url),
+            require_verified_email=config.frames.invitations.require_verified_email,
+        )
     return UnavailableInvitationService()
 
 
@@ -753,6 +809,9 @@ def build_invitation_email_delivery(
             provider,
             accept_url=email.accept_url,
             app_instructions=email.app_instructions,
+            # The same value the acceptance check reads, so the copy and the
+            # rule it describes cannot disagree.
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
     raise RuntimeError(f"Unsupported invitation email provider: {email.provider}")
 

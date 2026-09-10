@@ -251,6 +251,32 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__EMAIL__SES__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.frames.email.ses.requestTimeoutSeconds | quote }}
             {{- end }}
+            {{- /* Two hazards, both the same reflowing mistake at different
+                   depths, and neither caught by the schema because the key is
+                   gone before validation.
+
+                   `eq ... "false"` and not `if not`: a nil value is falsy, and
+                   Helm strips null-valued keys during coalescing rather than
+                   falling back to the chart default -- so `requireVerifiedEmail:`
+                   left empty rendered "false" and relaxed Gate B on a
+                   deployment that never asked.
+
+                   `dig` with `default dict`: commenting out the key and leaving
+                   the `invitations:` header made the whole submap nil, and
+                   indexing it was a template error rather than a fallback.
+                   Failing closed, but a deployment that cannot render at all is
+                   still a deployment down. Only an explicit false renders. */}}
+            {{- if eq (dig "requireVerifiedEmail" true (.Values.frames.invitations | default dict) | toString) "false" }}
+            {{- /*
+              Rendered only when turned OFF, so the strict default needs no env
+              var and cannot be weakened by an empty or malformed value. A
+              deployment that wants the relaxation says so explicitly, and the
+              rendered manifest shows it -- which is the point, since it is a
+              security trade rather than a preference.
+            */}}
+            - name: COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL
+              value: "false"
+            {{- end }}
             {{- if .Values.frames.serviceAccess.grantOnAcceptance }}
             {{- /*
               Rendered only when there is something to grant. An empty list is
@@ -273,7 +299,7 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__SERVICE_ACCESS__KEYCLOAK__ADMIN_API_BASE_URL
               value: {{ .Values.frames.serviceAccess.keycloak.adminApiBaseUrl | quote }}
             {{- if .Values.frames.serviceAccess.keycloak.groupIds }}
-            {{/*
+            {{- /*
               Rendered only when set: an empty mapping means "look every path
               up", and an env var holding `{}` would be indistinguishable from
               that while still occupying it -- the same reasoning as the group
