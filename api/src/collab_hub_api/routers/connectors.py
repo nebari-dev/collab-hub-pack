@@ -654,6 +654,7 @@ def _new_github_client(token: str, config: ConnectorsConfig) -> GitHubClient:
         access_token=token,
         api_base_url=config.github.api_base_url,
         timeout_seconds=config.github.request_timeout_seconds,
+        allowed_orgs=config.github.allowed_orgs,
     )
 
 

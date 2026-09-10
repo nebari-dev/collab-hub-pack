@@ -855,6 +855,15 @@
             "requestTimeoutSeconds": {
               "type": "number",
               "minimum": 1
+            },
+            "allowedOrgs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 39,
+                "pattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"
+              }
             }
           },
           "additionalProperties": false

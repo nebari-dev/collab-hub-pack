@@ -532,6 +532,10 @@ connectors:
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
     requestTimeoutSeconds: 10
+    # -- GitHub org logins to restrict search to. Empty = the token's full
+    # visibility (personal repos + every approved org). Set this so agent
+    # searches do not interleave personal and work results.
+    allowedOrgs: []
 
 userDirectory:
   # -- Whether to configure Collab Hub API access to the hub user directory.
