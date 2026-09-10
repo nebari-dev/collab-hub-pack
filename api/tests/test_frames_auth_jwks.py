@@ -177,6 +177,89 @@ def test_missing_jwks_url_is_a_decode_error():
         auth.decode_verified_jwt(_token(KEY_1_PEM, "key-1"), jwks_url=None, issuer=None, audience=None)
 
 
+# --- IdToken cookie fallback inherits the bearer audience (issue #41) -------
+
+
+def _audience_token(private_pem: bytes, kid: str, audience: str) -> str:
+    return jwt.encode(
+        {"preferred_username": "signed-user", "aud": audience},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def test_id_token_fallback_inherits_the_bearer_audience(jwks, monkeypatch):
+    # Bearer-only verifier config (no dedicated FRAMES_IDTOKEN_JWKS_URL):
+    # cookie verification falls back to the bearer verifier and must inherit
+    # its audience too — a same-realm token minted for a different audience
+    # must not be accepted as a cookie, or the bearer audience restriction is
+    # bypassed entirely.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_AUDIENCE", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "another-client"))
+
+
+def test_id_token_own_audience_still_wins_over_bearer(jwks, monkeypatch):
+    # Precedence pin, not a fix-discriminating test: FRAMES_IDTOKEN_AUDIENCE
+    # was already honored when set, before and after this change (only the
+    # no-dedicated-audience fallback changed). This guards that a dedicated
+    # FRAMES_IDTOKEN_AUDIENCE, even without a dedicated FRAMES_IDTOKEN_JWKS_URL,
+    # keeps winning over the bearer audience as the fallback path evolves —
+    # the inherited-audience test above is the one that fails on the old code.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+
+
+def _issuer_token(private_pem: bytes, kid: str, issuer: str) -> str:
+    return jwt.encode(
+        {"preferred_username": "signed-user", "iss": issuer},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def test_id_token_fallback_still_honors_a_dedicated_issuer(jwks, monkeypatch):
+    # A shared JWKS with a distinct IdToken issuer worked before this change
+    # and must keep working: the fallback path only gained audience
+    # inheritance, it must not also start discarding FRAMES_IDTOKEN_ISSUER in
+    # favor of the bearer issuer unconditionally (mirrors
+    # identity.enforce_single_issuer_for_pin's derived-exactly contract).
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_AUDIENCE", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_ISSUER", "https://idp.example.com/realms/idtoken-realm")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_ISSUER", "https://idp.example.com/realms/bearer-realm")
+
+    accepted = auth.decode_id_token_payload(
+        _issuer_token(KEY_1_PEM, "key-1", "https://idp.example.com/realms/idtoken-realm")
+    )
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(
+            _issuer_token(KEY_1_PEM, "key-1", "https://idp.example.com/realms/bearer-realm")
+        )
+
+
 def test_separate_urls_do_not_share_a_client(jwks):
     other = _JWKSEndpoint()
     other.keys = [KEY_2_JWK]
@@ -587,3 +670,22 @@ def test_first_fetch_failure_has_no_set_to_fall_back_to(jwks):
     # a failed first fetch caches nothing.
     jwks.keys = [KEY_1_JWK]
     assert _decode(_token(KEY_1_PEM, "key-1"), jwks.url)["preferred_username"] == "signed-user"
+
+
+def test_a_dedicated_id_token_verifier_is_used_when_configured(jwks, monkeypatch):
+    # The dedicated-verifier path is unchanged by the fallback work: with
+    # FRAMES_IDTOKEN_JWKS_URL set, cookie verification uses the dedicated
+    # verifier and its own audience — the bearer audience plays no part, so a
+    # token minted for the bearer client is refused even though the bearer
+    # config would have accepted it.
+    monkeypatch.setenv("FRAMES_IDTOKEN_JWKS_URL", jwks.url)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.delenv("FRAMES_BEARER_JWKS_URL", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))

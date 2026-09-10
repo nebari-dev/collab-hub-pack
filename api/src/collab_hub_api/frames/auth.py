@@ -263,11 +263,28 @@ def decode_id_token_payload(token: str) -> dict:
     if unsafe_auth_enabled() and os.environ.get("FRAMES_IDTOKEN_ALLOW_UNSIGNED") == "true":
         return decode_jwt_payload(token)
 
+    id_token_jwks_url = os.environ.get("FRAMES_IDTOKEN_JWKS_URL")
+    if id_token_jwks_url:
+        return decode_verified_jwt(
+            token,
+            jwks_url=id_token_jwks_url,
+            issuer=os.environ.get("FRAMES_IDTOKEN_ISSUER") or os.environ.get("FRAMES_BEARER_ISSUER"),
+            audience=os.environ.get("FRAMES_IDTOKEN_AUDIENCE"),
+        )
+
+    # No dedicated IdToken verifier: cookies fall back to the bearer JWKS —
+    # but issuer and audience each still let a dedicated FRAMES_IDTOKEN_*
+    # value win over the bearer one first. A deployment with a shared JWKS
+    # but a distinct IdToken issuer must keep working exactly as before;
+    # only the previously-missing audience inheritance changes (issue #41).
+    # Inheriting audience unconditionally (dropping the dedicated override)
+    # would accept a same-realm token minted for a different audience as a
+    # cookie, bypassing the bearer audience restriction.
     return decode_verified_jwt(
         token,
-        jwks_url=os.environ.get("FRAMES_IDTOKEN_JWKS_URL") or os.environ.get("FRAMES_BEARER_JWKS_URL"),
+        jwks_url=os.environ.get("FRAMES_BEARER_JWKS_URL"),
         issuer=os.environ.get("FRAMES_IDTOKEN_ISSUER") or os.environ.get("FRAMES_BEARER_ISSUER"),
-        audience=os.environ.get("FRAMES_IDTOKEN_AUDIENCE"),
+        audience=os.environ.get("FRAMES_IDTOKEN_AUDIENCE") or os.environ.get("FRAMES_BEARER_AUDIENCE"),
     )
 
 
