@@ -182,6 +182,10 @@ spec:
               value: {{ .Values.connectors.github.apiBaseUrl | quote }}
             - name: COLLAB_HUB_API__CONNECTORS__GITHUB__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.connectors.github.requestTimeoutSeconds | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GITHUB__API_GET_ENABLED
+              value: {{ .Values.connectors.github.apiGetEnabled | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GITHUB__API_GET_MAX_CONCURRENCY
+              value: {{ .Values.connectors.github.apiGetMaxConcurrency | quote }}
             {{- with .Values.frames.auth.idToken.jwksUrl }}
             - name: FRAMES_IDTOKEN_JWKS_URL
               value: {{ . | quote }}

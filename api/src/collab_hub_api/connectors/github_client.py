@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from .connector_text import sanitize_connector_text
+from .connector_text import sanitize_connector_text, sanitize_github_api_text
+from .http_stream import read_capped
 from .models import (
+    GitHubApiGetResponse,
     GitHubItem,
     GitHubProject,
     GitHubProjectItem,
     GitHubRepo,
     GitHubReview,
     GitHubSearchHit,
+    coerce_github_param_value,
 )
+from .validation import has_control_or_nonprintable
 
 # GitHub search returns at most 1000 results across all pages, regardless of
 # total_count, and caps per_page at 100. We never page past the 1000th result.
@@ -88,6 +94,60 @@ _PROJECT_PAGE_SIZE = 100
 _MAX_PROJECT_ITEMS = 500
 _MAX_PROJECT_PAGES = _MAX_PROJECT_ITEMS // _PROJECT_PAGE_SIZE
 
+# --- Generic read (api_get) -------------------------------------------------
+# The media enum maps to a FIXED Accept table — the model never controls Accept,
+# so the verb (GET) and the negotiated representation are both non-model-driven.
+_ACCEPT_BY_MEDIA = {
+    "json": "application/vnd.github+json",
+    "diff": "application/vnd.github.diff",
+    "patch": "application/vnd.github.patch",
+}
+# Media-aware char defaults (safe-by-default): a single raw PR is ~16.6k chars so
+# JSON needs headroom above that; a truncated diff is useless so text gets more.
+# 50k is the hard ceiling either way (see request-model bound).
+_API_GET_JSON_DEFAULT_MAX_CHARS = 20_000
+_API_GET_TEXT_DEFAULT_MAX_CHARS = 50_000
+_API_GET_MAX_CHARS_CEILING = 50_000
+# ≤3 hops keeps a renamed-repo 301 working while refusing archive/binary chains.
+_API_GET_MAX_REDIRECTS = 3
+_API_GET_JSON_ERROR = (
+    "the JSON response exceeded the size cap before it could be parsed — narrow "
+    "the request (e.g. a smaller per_page) or fetch a smaller resource"
+)
+# The cap did NOT fire: a proxy-mangled or whitespace-only 200 body. Telling the
+# model to shrink per_page here is untrue and uncorrectable, so keep the guidance
+# honest — the response simply was not valid JSON.
+_API_GET_JSON_INVALID = "the upstream returned a body that is not valid JSON"
+_API_GET_REDIRECT_REFUSAL = (
+    "refused to follow a redirect off the GitHub API origin — the target is "
+    "likely an archive or binary download, which this read tool does not support"
+)
+# Distinct from the off-origin refusal above: this fires only after >max_redirects
+# SAME-origin hops (a redirect loop or an unusually long renamed-repo chain), so
+# the "archive or binary download" framing would misdirect the model and operator.
+_API_GET_TOO_MANY_REDIRECTS = (
+    f"too many redirects on the GitHub API origin — did not resolve within "
+    f"{_API_GET_MAX_REDIRECTS} hops"
+)
+# A trailing partial line is worth shedding from a truncated text/diff body only
+# when it's a small fraction of the budget; beyond that (a single-long-line minified
+# file) cutting back to the last newline would discard most of the returned content,
+# so we keep the partial line instead. The absolute cap is the shed ceiling at every
+# realistic budget (1000 of a 50k default read ~= 2%); the max_chars//DIVISOR floor
+# only takes over at tiny budgets, where a fixed 1000 would exceed the whole body and
+# always fire. Shed threshold = min(cap, max_chars // divisor).
+_API_GET_MAX_PARTIAL_LINE_TRIM = 1_000
+_API_GET_PARTIAL_LINE_TRIM_DIVISOR = 4
+# Locally-owned recovery guidance only — do NOT restate GitHub's numeric diff
+# limits (lines / MB / files). Those drift and this code can't observe them, so
+# we append this to GitHub's own 406 message rather than stating stale numbers.
+_API_GET_406_GUIDANCE = (
+    "the diff or patch is too large to return — fetch changes per file via "
+    "/pulls/{number}/files (paginated), which also lets very large or binary "
+    "files omit their patch field"
+)
+_API_GET_DEPTH_GUARD = 30
+
 
 @dataclass
 class GitHubFileContent:
@@ -131,6 +191,16 @@ class GitHubSearchError(ValueError):
     """Caller-correctable search parameters (e.g. a stale page_token) -> 422."""
 
 
+class GitHubApiRequestError(ValueError):
+    """A generic-read failure the model can correct by changing its request.
+
+    Bad path shape, a refused cross-origin redirect, the redirect hop cap, or an
+    unsupported (binary) content type. The route maps this to 422 — distinct from
+    GitHubUpstreamError (transient/upstream -> 502) so the model does not blindly
+    retry an unfixable request.
+    """
+
+
 class GitHubClient:
     """Read-only GitHub API client. Only read methods are implemented.
 
@@ -149,6 +219,17 @@ class GitHubClient:
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
         self.timeout = httpx.Timeout(timeout_seconds)
+        # api_get bounds the WHOLE call (validate + ≤3 hops) with this as an
+        # overall deadline, so a slow redirect chain can't blow the apollo cap.
+        self.timeout_seconds = timeout_seconds
+
+    def _headers(self, accept: str, *, api_version: bool = True) -> dict[str, str]:
+        """Auth + Accept header dict, one authority so a future API-version bump
+        can't miss a call site. GraphQL omits X-GitHub-Api-Version (api_version=False)."""
+        headers = {"Authorization": f"Bearer {self.access_token}", "Accept": accept}
+        if api_version:
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+        return headers
 
     async def verify_access(self) -> GitHubAccessCheck:
         """Confirm the token can read, and resolve the connected login.
@@ -406,10 +487,7 @@ class GitHubClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
                 self.api_base_url + "/graphql",
-                headers={
-                    "Authorization": f"Bearer {self.access_token}",
-                    "Accept": "application/vnd.github+json",
-                },
+                headers=self._headers("application/vnd.github+json", api_version=False),
                 json={"query": query, "variables": variables},
             )
         _raise_for_github_status(response, operation=operation)
@@ -444,11 +522,7 @@ class GitHubClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.get(
                 self.api_base_url + path,
-                headers={
-                    "Authorization": f"Bearer {self.access_token}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
+                headers=self._headers("application/vnd.github+json"),
                 params=params,
             )
         _raise_for_github_status(response, operation=operation)
@@ -463,50 +537,412 @@ class GitHubClient:
                 operation=operation, status_code=response.status_code, message="invalid JSON"
             ) from exc
 
+    async def api_get(
+        self,
+        *,
+        path: str,
+        params: dict[str, Any] | None = None,
+        media_type: str = "json",
+        max_chars: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> GitHubApiGetResponse:
+        """GET an arbitrary GitHub REST endpoint: origin-locked, size-capped, sanitized.
+
+        The verb is hardcoded GET and Accept comes from a fixed table, so neither
+        is model-controllable (GraphQL, which is POST-only, is excluded by that
+        verb lock, not by any denylist). The host cannot be escaped: httpx resolves
+        ``base + path`` within the base authority, and redirects are followed only
+        back to the same origin. The body is streamed with a hard byte cap so an
+        unbounded upstream (e.g. ``/git/trees?recursive=1``) can't exhaust memory.
+        """
+        if media_type not in _ACCEPT_BY_MEDIA:
+            raise GitHubApiRequestError(f"unsupported media_type {media_type!r}")
+        self._validate_api_path(path)
+        base = httpx.URL(self.api_base_url)
+        try:
+            start = httpx.URL(self.api_base_url + path)
+        except httpx.InvalidURL as exc:
+            # A malformed path that slips past the string rules must degrade to a
+            # clean 422 refusal, not an uncaught httpx.InvalidURL -> raw 500.
+            raise GitHubApiRequestError("path is not a valid GitHub API URL") from exc
+        # Re-check the CONSTRUCTED URL's authority: a malformed base+path could in
+        # principle join to a different scheme/host, so verify both are unchanged.
+        # (httpx normalizes any ".." dot-segments before ``.path`` is readable, so
+        # the segment test below is belt-and-suspenders — the load-bearing
+        # traversal guard is _validate_api_path on the raw string, not this.)
+        if start.host != base.host or start.scheme != base.scheme or ".." in start.path.split("/"):
+            raise GitHubApiRequestError("path resolves outside the GitHub API base")
+
+        resolved_max = max_chars
+        if resolved_max is None:
+            resolved_max = (
+                _API_GET_JSON_DEFAULT_MAX_CHARS
+                if media_type == "json"
+                else _API_GET_TEXT_DEFAULT_MAX_CHARS
+            )
+        # Defensive backstop: the route's pydantic bound already enforces the
+        # range, but api_get must not trust an out-of-range max_chars from any
+        # caller (direct callers, tests) — clamp to [1, ceiling].
+        resolved_max = max(1, min(resolved_max, _API_GET_MAX_CHARS_CEILING))
+        headers = self._headers(_ACCEPT_BY_MEDIA[media_type])
+        coerced = {key: coerce_github_param_value(value) for key, value in (params or {}).items()}
+        current = start.copy_merge_params(coerced) if coerced else start
+
+        # A caller that already spent part of a shared budget (e.g. the route's
+        # concurrency-permit wait) can hand the read only the time left, so the total
+        # stays bounded to one budget instead of ~2x. Defensive backstop (mirrors the
+        # max_chars clamp above): don't trust an out-of-range override from a direct
+        # caller — a non-positive value is ignored (falls back to the client deadline
+        # rather than reaching asyncio.timeout/httpx.Timeout), and the override can
+        # never exceed the client-wide deadline. The route already passes a floored,
+        # in-range value.
+        deadline = self.timeout_seconds
+        if timeout_seconds is not None and timeout_seconds > 0:
+            deadline = min(timeout_seconds, self.timeout_seconds)
+        try:
+            async with asyncio.timeout(deadline):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(deadline)) as client:
+                    for _hop in range(_API_GET_MAX_REDIRECTS + 1):
+                        async with client.stream("GET", current, headers=headers) as response:
+                            if response.is_redirect:
+                                current = self._resolve_api_redirect(
+                                    current, response.headers.get("location", "")
+                                )
+                                continue
+                            return await self._read_api_result(response, media_type, resolved_max)
+        except TimeoutError as exc:
+            raise GitHubUpstreamError(operation="api get", message="request timed out") from exc
+        # Loop exhausted: every off-origin hop already raised inside
+        # _resolve_api_redirect, so reaching here means too many SAME-origin hops.
+        raise GitHubApiRequestError(_API_GET_TOO_MANY_REDIRECTS)
+
+    def _validate_api_path(self, path: str) -> None:
+        """Reject anything that isn't a plain, on-host GitHub API path (raw string)."""
+        if not path or not path.startswith("/"):
+            raise GitHubApiRequestError("path must start with '/'")
+        if len(path) > 500:
+            raise GitHubApiRequestError("path must be at most 500 characters")
+        if path.startswith("//"):
+            raise GitHubApiRequestError("path must not start with '//'")
+        if "?" in path or "#" in path:
+            raise GitHubApiRequestError("path must not contain '?' or '#' — pass query args via params")
+        if "%" in path:
+            # Percent-encoding buys nothing on this API and closes the encoded-bypass class.
+            raise GitHubApiRequestError("percent-encoding is not allowed in path")
+        if any(ch.isspace() for ch in path) or has_control_or_nonprintable(path):
+            # Whitespace plus the shared control/DEL/zero-width/non-printable class
+            # that would otherwise reach httpx.URL and 500 the request.
+            raise GitHubApiRequestError(
+                "path must not contain whitespace, control, or non-printable characters"
+            )
+        if ".." in path.split("/"):
+            raise GitHubApiRequestError("path must not contain a '..' segment")
+        # Courtesy only (NOT the exclusion mechanism — GraphQL is excluded by the
+        # GET-only verb lock): return a clearer error than upstream would, and cut
+        # the noise of harmless GET schema-introspection.
+        normalized = path.rstrip("/").lower()
+        if normalized == "/graphql" or normalized.startswith("/graphql/"):
+            raise GitHubApiRequestError("GraphQL is not available through this read tool (REST GET only)")
+
+    def _resolve_api_redirect(self, current: httpx.URL, location: str) -> httpx.URL:
+        """Follow a redirect ONLY back to the same origin; refuse anything else.
+
+        The target is resolved through httpx (never a string prefix match), then
+        its full origin is compared: https, same host, same port, no userinfo. A
+        renamed-repo 301 stays on the API host and is followed; a codeload/storage
+        hop, an https->http downgrade, or a ``host@evil`` userinfo spoof is refused.
+        """
+        if not location:
+            raise GitHubApiRequestError(_API_GET_REDIRECT_REFUSAL)
+        base = httpx.URL(self.api_base_url)
+        try:
+            target = current.join(location)
+        except httpx.InvalidURL as exc:
+            # httpx.InvalidURL is NOT an httpx.HTTPError, so a malformed upstream
+            # Location (e.g. "https://[bad") would slip past the caller's
+            # except-HTTPError and surface as a raw 500. Degrade to the same
+            # refusal the initial-URL guard uses.
+            raise GitHubApiRequestError(_API_GET_REDIRECT_REFUSAL) from exc
+        # https-only by policy: a redirect target must stay on the https origin.
+        # NOTE this is intentionally not `base.scheme` — a hub configured with an
+        # http proxy base therefore can't follow ANY redirect (incl. the renamed-repo
+        # 301). That's the deliberate side: don't "fix" it to `base.scheme`, which
+        # would let an http->https same-host hop pass since both ports normalize to
+        # None. http bases simply don't support redirects.
+        if (
+            target.scheme != "https"
+            or target.host != base.host
+            or target.port != base.port
+            or target.userinfo
+        ):
+            raise GitHubApiRequestError(_API_GET_REDIRECT_REFUSAL)
+        return target
+
+    async def _read_api_result(
+        self, response: httpx.Response, media_type: str, max_chars: int
+    ) -> GitHubApiGetResponse:
+        status_code = response.status_code
+        # Parse the Content-Type PARAMETER off: live GitHub always appends
+        # "; charset=utf-8", so bare-string equality would misroute every real
+        # response to the binary-refusal branch while clean-header mocks pass.
+        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+        has_more = "next" in response.links
+
+        if status_code >= 400:
+            # Cap the error-body read too — it was the one remaining uncapped read.
+            # api_base_url is configurable, so a misbehaving GHE/proxy could stream
+            # an unbounded error page; a few KB is plenty for the structured message.
+            error_body, _ = await read_capped(response, 65_536)
+            if status_code == 406 and media_type in ("diff", "patch"):
+                # Surface GitHub's own message and append our locally-owned recovery
+                # guidance, rather than restating GitHub's (drift-prone) numeric
+                # limits ourselves — this code can't observe if they change.
+                upstream = _github_error_message(response, body=error_body)
+                message = f"{upstream}: {_API_GET_406_GUIDANCE}" if upstream else _API_GET_406_GUIDANCE
+                raise GitHubApiRequestError(message)
+            _raise_for_github_status(response, operation="api get", body=error_body)
+
+        if status_code in (202, 204):
+            # 202: repo-statistics endpoints return empty body while GitHub
+            # computes; that is a retry signal, not an error. 204: several GETs
+            # answer no-body-means-yes (e.g. collaborator/following membership
+            # checks, vulnerability-alerts) with no Content-Type at all, which
+            # would otherwise fall through to the binary-refusal branch below.
+            return GitHubApiGetResponse(
+                body=None, body_text="", truncated=False, has_more=has_more,
+                content_type=content_type, status=status_code,
+            )
+
+        raw, byte_truncated = await read_capped(response, max_chars * 4 + 1)
+
+        if _is_json_content(content_type):
+            return self._json_result(raw, byte_truncated, has_more, content_type, status_code, max_chars)
+        if _is_text_content(content_type):
+            return self._text_result(raw, byte_truncated, has_more, content_type, status_code, max_chars)
+        raise GitHubApiRequestError(
+            f"unsupported content type {content_type or 'unknown'!r} — this read tool returns "
+            "JSON, diff, or patch text only, not binary or archive payloads"
+        )
+
+    def _json_result(
+        self,
+        raw: bytes,
+        byte_truncated: bool,
+        has_more: bool,
+        content_type: str,
+        status: int,
+        max_chars: int,
+    ) -> GitHubApiGetResponse:
+        if not raw:
+            # A literal empty 200 body (e.g. Content-Length: 0) is a valid empty
+            # result, not a truncation failure -- distinguish it from the
+            # size-cap error below, which would otherwise send a caller looking
+            # at max_chars for a body that was simply never there.
+            return GitHubApiGetResponse(
+                body=None, body_text="", truncated=False, has_more=has_more,
+                content_type=content_type, status=status,
+            )
+        text = raw.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            # Overflowed the byte cap mid-object (or otherwise invalid): keep the
+            # readable prefix as text, or refuse if nothing parseable survives.
+            # Sanitize it like any other untrusted body — an unparseable JSON
+            # prefix still carries link-shaped values that must not reach the
+            # renderer unmasked (the parsed and diff paths both sanitize).
+            prefix = sanitize_github_api_text(text)[:max_chars]
+            if not prefix.strip():
+                # Only claim the size cap fired when it actually did; otherwise the
+                # body was simply invalid (proxy-mangled / whitespace) and "shrink
+                # per_page" would send the model chasing an uncorrectable error.
+                message = _API_GET_JSON_ERROR if byte_truncated else _API_GET_JSON_INVALID
+                raise GitHubApiRequestError(message) from exc
+            return GitHubApiGetResponse(
+                body=None, body_text=prefix, truncated=True, has_more=has_more,
+                content_type=content_type, status=status,
+            )
+        sanitized = self._sanitize_json_values(parsed)
+        # Judge truncation on the COMPACT size of the PARSED object — not the raw
+        # decoded text (which counts incidental upstream whitespace) and not the
+        # sanitized serialization (which value masking inflates: a@b.co -> a [at] b
+        # [dot] co). Both would flag a body that actually fit as truncated and strip
+        # its structure for content that was already complete. Computed once here
+        # purely for the size decision; the returned body is still the sanitized
+        # object. read_capped hard-capped the input to max_chars*4+1 bytes, so this
+        # serialize stays bounded.
+        compact = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        if not byte_truncated and len(compact) <= max_chars:
+            return GitHubApiGetResponse(
+                body=sanitized, body_text="", truncated=False, has_more=has_more,
+                content_type=content_type, status=status,
+            )
+        # Genuinely over budget (or byte-truncated): no complete structure worth
+        # returning, so serialize the SANITIZED value to a masked text prefix and
+        # flag it.
+        serialized = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+        return GitHubApiGetResponse(
+            body=None, body_text=serialized[:max_chars], truncated=True, has_more=has_more,
+            content_type=content_type, status=status,
+        )
+
+    def _text_result(
+        self,
+        raw: bytes,
+        byte_truncated: bool,
+        has_more: bool,
+        content_type: str,
+        status: int,
+        max_chars: int,
+    ) -> GitHubApiGetResponse:
+        decoded = raw.decode("utf-8", errors="replace")
+        sanitized = sanitize_github_api_text(decoded)
+        # Judge truncation by the DECODED length, not the sanitized one: link/email
+        # masking inflates length (a@b.co -> a [at] b [dot] co), so a body that fit
+        # raw must not be flagged truncated — that would set has_more and send the
+        # model paging for content it already has in full. When nothing was actually
+        # cut, return the masked text whole (the expansion is our transform, not data).
+        truncated = byte_truncated or len(decoded) > max_chars
+        if not truncated:
+            return GitHubApiGetResponse(
+                body=None, body_text=sanitized, truncated=False, has_more=has_more,
+                content_type=content_type, status=status,
+            )
+        body_text = sanitized[:max_chars]
+        cut = body_text.rfind("\n")
+        # Only shed a SHORT trailing partial line. rfind finds the last newline
+        # anywhere, so on a single-long-line diff (a minified file) it sits near the
+        # start — trimming to it would silently drop most of the budget with no offset
+        # to recover. Keep the partial line when the shed tail exceeds the threshold,
+        # and when there's no newline at all (cut == -1, keep the prefix — without this
+        # guard a short no-newline body would drop its last character).
+        shed_ceiling = min(_API_GET_MAX_PARTIAL_LINE_TRIM, max(1, max_chars // _API_GET_PARTIAL_LINE_TRIM_DIVISOR))
+        if cut != -1 and len(body_text) - cut <= shed_ceiling:
+            body_text = body_text[:cut]
+        return GitHubApiGetResponse(
+            body=None, body_text=body_text, truncated=truncated, has_more=has_more,
+            content_type=content_type, status=status,
+        )
+
+    def _sanitize_json_values(self, value: Any, depth: int = 0) -> Any:
+        """Sanitize string keys and values recursively; non-string scalars pass through.
+
+        Keys are sanitized too: ``github_api_get`` reaches arbitrary paths, and some
+        (e.g. the Gists API) key objects by attacker-chosen strings (``files`` is
+        keyed by filename), so a key is as untrusted a channel as a value. Strings
+        are always masked, even past the depth guard; only nested containers are
+        dropped there, since unbounded depth can only arrive through them.
+        """
+        if isinstance(value, str):
+            return sanitize_github_api_text(value)
+        if isinstance(value, list):
+            if depth > _API_GET_DEPTH_GUARD:
+                return None
+            return [self._sanitize_json_values(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            if depth > _API_GET_DEPTH_GUARD:
+                return None
+            sanitized: dict[Any, Any] = {}
+            for key, item in value.items():
+                safe_key = sanitize_github_api_text(key) if isinstance(key, str) else key
+                # Two distinct keys can mask to the same string (e.g. two gist
+                # filenames that both reduce to "[link]"); disambiguate with a
+                # suffix instead of silently dropping the earlier entry.
+                if safe_key in sanitized:
+                    suffix = 2
+                    while f"{safe_key} ({suffix})" in sanitized:
+                        suffix += 1
+                    safe_key = f"{safe_key} ({suffix})"
+                sanitized[safe_key] = self._sanitize_json_values(item, depth + 1)
+            return sanitized
+        return value
+
+
+def _is_json_content(content_type: str) -> bool:
+    return (
+        content_type == "application/json"
+        or content_type.endswith("+json")
+        or (content_type.startswith("application/vnd.github") and content_type.endswith("json"))
+    )
+
+
+def _is_text_content(content_type: str) -> bool:
+    return content_type in ("application/vnd.github.diff", "application/vnd.github.patch") or (
+        content_type.startswith("text/")
+    )
+
 
 def _parse_oauth_scopes(header: str) -> list[str]:
     # GitHub returns the token's granted scopes as a comma-separated X-OAuth-Scopes header.
     return [scope.strip() for scope in header.split(",") if scope.strip()]
 
 
-def _raise_for_github_status(response: httpx.Response, *, operation: str) -> None:
+def _raise_for_github_status(response: httpx.Response, *, operation: str, body: bytes | None = None) -> None:
+    # `body` lets a streamed caller (api_get) pass the already-read, size-capped
+    # bytes so the message is parsed from those rather than a second full read.
     if response.status_code < 400:
         return
     retry_after = response.headers.get("retry-after", "")
     rate_limited = response.status_code == 429 or (
-        response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0"
+        response.status_code == 403
+        # remaining:0 is the primary limit; a bare Retry-After on a 403 is the
+        # secondary limit, which can carry remaining>0 and would otherwise escape
+        # to 502 and drop the backoff hint. We deliberately do NOT match GitHub's
+        # "secondary rate limit" prose — that copy changes without notice.
+        and (response.headers.get("x-ratelimit-remaining") == "0" or retry_after)
     )
     if rate_limited:
         # Normalize primary and secondary rate limits to 429 so the router maps
         # them consistently and can echo Retry-After.
+        message = "GitHub rate limit exceeded"
+        # Retry-After is legally an HTTP-date OR delta-seconds (RFC 9110). Only
+        # fold it into the model-visible prose when it's plain integer seconds, so
+        # we never emit "retry after <date> seconds". The raw header still rides
+        # the retry_after field for the response header either way. Both apollo
+        # tool paths surface only the detail string, so the hint must live here.
+        if retry_after.strip().isdigit():
+            message = f"{message}; retry after {retry_after.strip()} seconds"
+        # A 403 can be a permanent WAF/abuse block that merely carries Retry-After
+        # (api_base_url is configurable for GHE/proxied hubs). Keep GitHub's own
+        # structured reason instead of discarding it behind the generic 429 text.
+        detail = _github_error_message(response, body=body)
+        if detail:
+            message = f"{message}: {detail}"
         raise GitHubUpstreamError(
             operation=operation,
             status_code=429,
-            message="GitHub rate limit exceeded",
+            message=message,
             retry_after=retry_after,
         )
     raise GitHubUpstreamError(
         operation=operation,
         status_code=response.status_code,
-        message=_github_error_message(response),
+        message=_github_error_message(response, body=body),
         retry_after=retry_after,
     )
 
 
-def _github_error_message(response: httpx.Response) -> str:
+def _github_error_message(response: httpx.Response, *, body: bytes | None = None) -> str:
     """Return only GitHub's structured error message, never a raw body.
 
     A non-JSON body (e.g. a proxy's HTML error page) yields ``""`` so infra
-    detail cannot leak into a 502.
+    detail cannot leak into a 502. ``body`` lets a streamed caller pass the
+    already-read, size-capped bytes instead of a second ``response.json()`` read.
     """
     try:
-        payload = response.json()
+        payload = json.loads(body) if body is not None else response.json()
     except ValueError:
         return ""
     if isinstance(payload, dict):
         message = payload.get("message")
         if isinstance(message, str):
-            return message[:240].strip()
+            # A 4xx message reflects request input, so an attacker-shaped link or
+            # domain could otherwise reach the model unmasked via the error channel.
+            # Use the STRICT sanitizer (bare domains masked too): this is the shared
+            # classifier, so curated-tool errors flow through here and must stay as
+            # bare-domain-free as the rest of the curated surface. These are short
+            # GitHub status strings, not code, so nothing is lost by masking.
+            return sanitize_connector_text(message[:240]).strip()
     return ""
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -594,6 +594,71 @@ class GitHubReposListRequest(BaseModel):
 
 class GitHubReposListResponse(UntrustedConnectorResponse):
     repos: list[GitHubRepo]
+
+
+def coerce_github_param_value(value: str | int | bool) -> str:
+    """Single authority for the GitHub query-param wire format.
+
+    ``bool`` -> ``"true"``/``"false"`` (httpx's lowercase casing, not ``str(True)``
+    -> ``"True"``); every other scalar -> ``str``. Both ``GitHubApiGetRequest``'s
+    validator and ``GitHubClient.api_get`` call this so the route and direct-client
+    callers can never disagree on how a value is serialized.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+class GitHubApiGetRequest(BaseModel):
+    """A GET against an arbitrary GitHub REST path — the generic long-tail read.
+
+    ``path`` is the URL path only ('?'/'#' rejected; pass query args via
+    ``params``). ``params`` values may be sent as scalars and are coerced to the
+    string form GitHub expects (bool -> ``"true"``/``"false"``). ``media_type``
+    selects a fixed Accept header; the client never lets the model set Accept or
+    the verb. ``max_chars`` omitted resolves to a media-aware default in the
+    client (20k for json, 50k for diff/patch); the 50k ceiling is enforced here.
+    """
+
+    path: str = Field(min_length=1, max_length=500)
+    params: dict[str, str | int | bool] = Field(default_factory=dict)
+    media_type: Literal["json", "diff", "patch"] = "json"
+    max_chars: int | None = Field(default=None, ge=1, le=50_000)
+
+    @field_validator("params")
+    @classmethod
+    def _coerce_params(cls, value: dict[str, str | int | bool]) -> dict[str, str]:
+        # pydantic 2.13 does not coerce int->str, so accept scalars and normalize
+        # to the wire form here. The bool/str rule is the single authority in
+        # coerce_github_param_value (the client re-applies it), so a future param
+        # widening can't let route traffic diverge from direct-client callers.
+        # Bounds keep a single request from smuggling an oversized query.
+        if len(value) > 20:
+            raise ValueError("params accepts at most 20 entries")
+        coerced: dict[str, str] = {}
+        for key, raw in value.items():
+            if len(key) > 64:
+                raise ValueError("each params key must be at most 64 characters")
+            text = coerce_github_param_value(raw)
+            if len(text) > 256:
+                raise ValueError("each params value must be at most 256 characters")
+            coerced[key] = text
+        return coerced
+
+
+class GitHubApiGetResponse(UntrustedConnectorResponse):
+    # Parsed + sanitized JSON (only when media is json AND it fits); otherwise None.
+    body: Any | None = None
+    # Diff/patch text, a truncated-JSON prefix, or "".
+    body_text: str = ""
+    truncated: bool = False
+    # True when the upstream response carried a Link rel="next" (more pages exist).
+    has_more: bool = False
+    # The PARSED upstream media type (";"-parameter stripped); the model's only
+    # signal that a diff request silently degraded to JSON.
+    content_type: str = ""
+    # The upstream status (visible so the 202 "GitHub is computing" case is legible).
+    status: int = 0
 
 
 class GoogleDriveFile(BaseModel):
