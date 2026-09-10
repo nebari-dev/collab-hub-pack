@@ -65,7 +65,8 @@ This experimental implementation does not yet implement step-owned Gates or
 the [result envelope](../docs/cog-execution/result-envelope.md).
 
 `KubernetesCogExecutor(interaction_timeout=300)` sets the default worker HTTP
-client's timeout in seconds; `None` disables it. An injected `worker_http`
+client's read/write timeout in seconds (default: 60); `None` disables only those
+timeouts. Connect and pool timeouts remain 5 seconds. An injected `worker_http`
 controls its own timeout. This is an HTTP timeout, not a run deadline.
 Only connection failures are retried automatically. Read/write timeouts and
 protocol failures propagate because the worker may already have executed the

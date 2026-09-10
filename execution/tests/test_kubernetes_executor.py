@@ -50,13 +50,16 @@ def test_connection_failure_can_retry_without_changing_payload(error, monkeypatc
     assert calls[0] == calls[1]
 
 
-@pytest.mark.parametrize("timeout", [300.0, None])
-def test_interaction_timeout_reaches_default_worker_client(timeout):
+@pytest.mark.parametrize("timeout", [60.0, 300.0, None])
+def test_interaction_timeout_preserves_bounded_connections(timeout):
     executor = KubernetesCogExecutor(
         runner_image="worker:test", insecure_skip_network_policy=True, interaction_timeout=timeout,
     )
     with executor.worker_http as client:
         assert client.timeout.read == timeout
+        assert client.timeout.write == timeout
+        assert client.timeout.connect == 5.0
+        assert client.timeout.pool == 5.0
 
 
 @pytest.mark.parametrize("signal", [{"approved": True}, None])

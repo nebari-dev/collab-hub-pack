@@ -137,7 +137,9 @@ def _in_cluster_api() -> Any:
 def _default_worker_http(interaction_timeout: float | None = 60.0) -> Any:
     import httpx
 
-    return httpx.Client(timeout=interaction_timeout)
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=interaction_timeout, write=interaction_timeout, pool=5.0),
+    )
 
 
 class KubernetesCogExecutor:
