@@ -13,14 +13,17 @@ import pytest
 from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
+    InteractionResult,
     OpDefinition,
     OpStep,
+    PauseRequest,
     PostgresTrackStore,
+    RunBudget,
     RunStatus,
     TrackEvent,
     derive_run_status,
 )
-from collab_hub_execution.orchestration import _serialize_op
+from collab_hub_execution.orchestration import _NO_SIGNAL, _serialize_op
 
 TEST_PG = os.environ.get("TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to run Postgres adapter tests")
@@ -79,3 +82,20 @@ def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
     assert len(calls) == 1
     assert engine.submit(op) is RunStatus.COMPLETED
     assert len(calls) == 1
+
+
+def test_pause_accounting_survives_postgres_recovery(store):
+    def handler(entry, value, *, signal=_NO_SIGNAL):
+        if signal is _NO_SIGNAL:
+            raise PauseRequest("feedback", usage={"tokens": 6})
+        return InteractionResult(value, {"tokens": 6})
+
+    def engine():
+        return DurableWorkflowEngine(
+            executor=InMemoryCogExecutor({"c": handler}), track=store, budget=RunBudget(max_tokens=15),
+        )
+
+    op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
+    assert engine().submit(op) is RunStatus.PAUSED
+    assert engine().signal(op.run_id, "go") is RunStatus.BUDGET_EXCEEDED
+    assert engine()._budget_tracker(op.run_id).tokens == 18

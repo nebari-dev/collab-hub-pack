@@ -67,6 +67,10 @@ class RunBudget:
       once cumulative usage crosses the limit. A hard per-request token cap is the
       model gateway's job (its ``max_tokens``); wiring that enforcement into the
       executor rollout is tracked in collab-hub-pack #1.
+
+    Configured token/cost limits require corresponding usage from every worker
+    interaction, including a pause. Unknown or invalid usage fails accounting;
+    it is never counted as zero for a configured limit.
     """
 
     max_duration: timedelta | None = None

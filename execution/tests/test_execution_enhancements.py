@@ -5,7 +5,6 @@ defined but never enforced in a run, and the Track lacked per-step digests and a
 bounded revise loop.
 """
 
-import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,6 +13,7 @@ from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
@@ -28,14 +28,14 @@ from collab_hub_execution.orchestration import _NO_SIGNAL, _serialize_op
 def test_token_budget_survives_restart_and_stops_the_run():
     """Budget is reconstructed from the Track, so it holds across an engine restart."""
     def always_usage(entry, value):
-        return {"result": value, "usage": {"tokens": 60}}
+        return InteractionResult({"result": value}, {"tokens": 60})
 
     state = {"paused": True}
 
     def gate_then_usage(entry, value, *, signal=None):
         if state["paused"]:
-            raise PauseRequest("approve step 2")
-        return {"result": value, "usage": {"tokens": 60}}
+            raise PauseRequest("approve step 2", usage={"tokens": 0})
+        return InteractionResult({"result": value}, {"tokens": 60})
 
     track = InMemoryTrackStore()
     budget = RunBudget(max_tokens=100)
@@ -144,7 +144,7 @@ class _CapturingWorker:
 
     def interact(self, entry_point, input=None, idempotency_key=None):
         self.keys.append(idempotency_key)
-        return {"ok": True}
+        return InteractionResult({"ok": True})
 
 
 class _CapturingExecutor:
@@ -210,7 +210,7 @@ class _KeyHonoringWorker:
         if idempotency_key in self._seen:
             return self._seen[idempotency_key]  # replay -> no repeated side effect
         self.side_effects.append(idempotency_key)  # the side effect
-        self._seen[idempotency_key] = {"done": idempotency_key}
+        self._seen[idempotency_key] = InteractionResult({"done": idempotency_key})
         if self._crash_once:
             self._crash_once = False
             raise SystemExit("process died after side effect, before completion")
@@ -266,7 +266,7 @@ class _RetryProbeExecutor:
             self._outer.attempts += 1
             if self._outer.attempts == 1:
                 raise RuntimeError("first attempt fails")
-            return {"ok": True}
+            return InteractionResult({"ok": True})
 
     def materialize(self, cog, run_id, instance=""):
         return self._Worker(self)
@@ -374,7 +374,7 @@ def test_signal_value_is_durable_across_a_crash_mid_resume():
         if crash["once"]:
             crash["once"] = False
             raise SystemExit("crash after signal consumed, before completion")
-        return {"ok": True}
+        return InteractionResult({"ok": True})
 
     track = InMemoryTrackStore()
 
@@ -397,7 +397,7 @@ def test_signal_can_resume_a_step_with_an_explicit_none():
         if signal is _NO_SIGNAL:  # an explicit None is still a signal
             raise PauseRequest("approve")
         seen.append((value, signal))
-        return {"ok": True}
+        return InteractionResult({"ok": True})
 
     track = InMemoryTrackStore()
 
@@ -422,7 +422,7 @@ class _KeyCapture:
 
         def interact(self, entry_point, input=None, idempotency_key=None):
             self._outer.keys.append(idempotency_key)
-            return {"ok": True}
+            return InteractionResult({"ok": True})
 
     def __init__(self):
         self.keys = []
@@ -464,84 +464,11 @@ def test_between_steps_status_is_running_not_tearing_down():
 
 def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
     engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": {"tokens": 60}}}),
+        executor=InMemoryCogExecutor({"c": lambda e, v: InteractionResult(v, {"tokens": 60})}),
         track=InMemoryTrackStore(),
         budget=RunBudget(max_tokens=60),
     )
     assert engine.submit(OpDefinition("run-exact", (OpStep("s", "c", "run"),))) is RunStatus.BUDGET_EXCEEDED
-
-
-# --- a malformed usage from a Cog must not become an uncaught engine exception ---
-
-
-def test_malformed_usage_is_coerced_and_does_not_crash_the_engine():
-    track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": {"tokens": "lots", "cost": None}}}),
-        track=track,
-        budget=RunBudget(max_tokens=1000),
-    )
-    # non-numeric tokens/cost coerce to zero rather than raising in the accounting tail
-    assert engine.submit(OpDefinition("run-bad-usage", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
-    completed = [e for e in track.replay("run-bad-usage") if e.event_type == "step_completed"]
-    assert completed and completed[0].payload["usage"] == {"tokens": 0, "cost": 0.0}
-
-
-def test_non_mapping_usage_is_ignored_without_crashing():
-    track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: {"result": v, "usage": "huge"}}),
-        track=track,
-        budget=RunBudget(max_tokens=1000),
-    )
-    assert engine.submit(OpDefinition("run-str-usage", (OpStep("s", "c", "run"),))) is RunStatus.COMPLETED
-    completed = [e for e in track.replay("run-str-usage") if e.event_type == "step_completed"]
-    assert completed and completed[0].payload["usage"] is None
-
-
-def test_negative_or_nonfinite_usage_is_clamped_to_zero():
-    handlers = {
-        "neg": lambda e, v: {"usage": {"tokens": -100, "cost": -5.0}},
-        "cost_nan": lambda e, v: {"usage": {"cost": float("nan")}},
-        "cost_inf": lambda e, v: {"usage": {"cost": float("inf")}},
-        # tokens must be covered symmetrically: int(float("inf")) raises
-        # OverflowError, int(float("nan")) raises ValueError — both must clamp, not crash
-        "tokens_inf": lambda e, v: {"usage": {"tokens": float("inf")}},
-        "tokens_ninf": lambda e, v: {"usage": {"tokens": float("-inf")}},
-        "tokens_nan": lambda e, v: {"usage": {"tokens": float("nan")}},
-    }
-    for cog, handler in handlers.items():
-        track = InMemoryTrackStore()
-        engine = DurableWorkflowEngine(
-            executor=InMemoryCogExecutor({cog: handler}),
-            track=track,
-            budget=RunBudget(max_tokens=1000, max_cost=1000.0),
-        )
-        assert engine.submit(OpDefinition(f"run-{cog}", (OpStep("s", cog, "run"),))) is RunStatus.COMPLETED
-        usage = [e for e in track.replay(f"run-{cog}") if e.event_type == "step_completed"][0].payload["usage"]
-        assert usage["tokens"] >= 0
-        assert math.isfinite(usage["cost"]) and usage["cost"] >= 0
-
-
-def test_negative_tokens_cannot_lower_cumulative_usage_below_the_budget():
-    # s1 legitimately uses 900; s2 reports -1000 (clamped to 0, not subtracted);
-    # s3 uses 900 -> 900 + 0 + 900 >= max 1000, so the budget still stops the run.
-    track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor(
-            {
-                "big": lambda e, v: {"usage": {"tokens": 900}},
-                "cheat": lambda e, v: {"usage": {"tokens": -1000}},
-            }
-        ),
-        track=track,
-        budget=RunBudget(max_tokens=1000),
-    )
-    op = OpDefinition(
-        "run-cheat",
-        (OpStep("a", "big", "run"), OpStep("b", "cheat", "run"), OpStep("c", "big", "run")),
-    )
-    assert engine.submit(op) is RunStatus.BUDGET_EXCEEDED
 
 
 class _TeardownFailsExecutor:
@@ -549,7 +476,7 @@ class _TeardownFailsExecutor:
         cog = "c"
 
         def interact(self, entry_point, input=None, idempotency_key=None):
-            return {"ok": True}
+            return InteractionResult({"ok": True})
 
     def materialize(self, cog, run_id, instance=""):
         return self._Worker()

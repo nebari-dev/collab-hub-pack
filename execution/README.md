@@ -23,6 +23,33 @@ run with a new id. Budgets are not reset by retrying. Duration is checked at
 step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
+## Usage accounting
+
+Every `CogWorker.interact()` returns `InteractionResult(output, usage)`.
+Usage is separate from application output. The HTTP adapter reads it beside
+`output`, for example:
+
+```json
+{"output": {"answer": "..."}, "usage": {"tokens": 10, "cost": 0.002}}
+```
+
+`tokens` is a non-negative integer; `cost` is a finite, non-negative number in
+the same units as `RunBudget.max_cost`. Reports cover this interaction only,
+not cumulative usage. In-memory handlers return `InteractionResult` to report
+usage; raw handler values are output with unknown usage.
+
+Missing usage is unknown. A configured token limit requires `tokens`, and a
+configured cost limit requires `cost`; explicit zero is valid. Missing required
+or malformed usage fails the run with `UsageUnavailable` before another step
+starts. With neither spending limit configured, absent usage is allowed.
+
+Paused interactions report usage through `PauseRequest(..., usage=...)`, or a
+top-level `usage` field beside HTTP `pause`. The Track records each report before
+teardown, including pauses, so spending survives recovery. Unknown usage from a
+failed interaction prevents retry from advancing under a spending limit.
+These reports are worker-supplied accounting, not independent metering or hard
+per-request caps. This contract does not adopt the full result-envelope schema.
+
 ## Signals and workers
 
 A resumed worker receives its original `input` and a separate `signal` field.

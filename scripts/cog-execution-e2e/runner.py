@@ -44,15 +44,15 @@ class Handler(BaseHTTPRequestHandler):
         signal = payload.get("signal")
         approved = isinstance(signal, dict) and signal.get("approved") is True
         if GATED and not approved:
-            self._send(200, {"pause": True, "reason": f"{COG_ID} awaiting approval"})
+            self._send(200, {"pause": True, "reason": f"{COG_ID} awaiting approval", "usage": {"tokens": 0}})
             return
         if key is not None and key in _SEEN:  # replayed key -> no repeated side effect
             self._send(200, _SEEN[key])
             return
         result = {"output": {
             "cog": COG_ID, "entry_point": entry, "echo": value,
-            "signal": signal, "usage": {"tokens": 10},
-        }}
+            "signal": signal,
+        }, "usage": {"tokens": 10}}
         if key is not None:
             _SEEN[key] = result
         self._send(200, result)

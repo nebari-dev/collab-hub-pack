@@ -37,7 +37,7 @@ from typing import Any, Protocol
 
 from httpx import ConnectError, ConnectTimeout
 
-from .orchestration import _NO_SIGNAL
+from .orchestration import _NO_SIGNAL, InteractionResult, UsageUnavailable
 
 _log = logging.getLogger(__name__)
 
@@ -403,7 +403,7 @@ class _KubernetesWorker:
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> Any:
+    ) -> InteractionResult:
         payload = {"entry_point": entry_point, "input": input, "idempotency_key": idempotency_key}
         if signal is not _NO_SIGNAL:
             payload["signal"] = signal
@@ -413,13 +413,15 @@ class _KubernetesWorker:
         )
         response.raise_for_status()
         body = response.json()
+        if not isinstance(body, dict) or ("output" not in body and body.get("pause") is not True):
+            raise UsageUnavailable("/invoke must return output or pause with top-level usage")
         if body.get("pause"):
             # The Cog asked to pause for a decision — surface it as the engine's
             # PauseRequest so a Gate/human can approve, reject, or send back.
             from .orchestration import PauseRequest
 
-            raise PauseRequest(body.get("reason", "cog requested a pause"))
-        return body.get("output")
+            raise PauseRequest(body.get("reason", "cog requested a pause"), usage=body.get("usage"))
+        return InteractionResult(body["output"], body.get("usage"))
 
     def _post_with_retry(self, url: str, payload: Any, *, attempts: int = 40, delay: float = 0.5) -> Any:
         # A freshly materialized Service can be briefly unroutable (endpoints /

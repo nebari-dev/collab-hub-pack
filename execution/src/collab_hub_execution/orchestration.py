@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -17,8 +16,6 @@ from .lifecycle import (
     RunBudget,
 )
 from .track import RunStatus, TrackEvent, TrackStore, derive_run_status
-
-_log = logging.getLogger(__name__)
 
 # A run in one of these states is finished; its Track is immutable. Resuming it
 # takes an explicit retry(), never a re-submit (which would silently re-run steps).
@@ -44,44 +41,44 @@ def _key_component(value: str) -> str:
     return value.replace("%", "%25").replace(":", "%3A")
 
 
-def _coerce_usage(value: Any) -> dict[str, Any] | None:
-    """Extract usage from a Cog result as finite, non-negative tokens/cost.
+@dataclass(frozen=True, slots=True)
+class InteractionResult:
+    """Worker output and accounting, independent of the output's own schema.
 
-    Returns None when no usage mapping is present. Never raises on a malformed usage
-    — so the post-interaction accounting tail cannot turn a completed step into an
-    uncaught engine exception — and never trusts a value that could subvert a budget:
-    a non-numeric, negative, NaN, or infinite tokens/cost is clamped to zero (a
-    negative would *reduce* cumulative usage; a NaN makes every limit comparison
-    false; both bypass budgets). Clamped values are logged.
+    Every CogWorker returns this type. usage contains per-interaction tokens
+    (a non-negative integer) and/or cost (a finite non-negative number).
+    Missing usage is unknown, not zero.
     """
-    raw = value.get("usage") if isinstance(value, Mapping) else None
-    if not isinstance(raw, Mapping):
-        return None
-    return {"tokens": _nonneg_int(raw.get("tokens", 0)), "cost": _nonneg_float(raw.get("cost", 0.0))}
+
+    output: Any = None
+    usage: Mapping[str, Any] | None = None
 
 
-def _nonneg_int(candidate: Any) -> int:
-    try:
-        number = int(candidate)
-    except (TypeError, ValueError, OverflowError):  # OverflowError: int(float("inf"))
-        _log.warning("usage tokens %r is not a usable integer; counting as 0", candidate)
-        return 0
-    if number < 0:
-        _log.warning("usage tokens %r is negative; counting as 0", number)
-        return 0
-    return number
+class UsageUnavailable(ValueError):
+    """A configured budget cannot be accounted for, or usage is malformed."""
 
 
-def _nonneg_float(candidate: Any) -> float:
-    try:
-        number = float(candidate)
-    except (TypeError, ValueError):
-        _log.warning("usage cost %r is not a number; counting as 0", candidate)
-        return 0.0
-    if not math.isfinite(number) or number < 0:
-        _log.warning("usage cost %r is not finite and non-negative; counting as 0", candidate)
-        return 0.0
-    return number
+def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None:
+    if raw is not None and not isinstance(raw, Mapping):
+        raise UsageUnavailable("usage must be an object")
+    usage = dict(raw) if raw is not None else {}
+    for field in ("tokens", "cost"):
+        if field not in usage:
+            if budget is not None and getattr(budget, f"max_{field}") is not None:
+                raise UsageUnavailable(f"missing {field} usage for configured budget")
+            continue
+        value = usage[field]
+        valid = type(value) is int if field == "tokens" else type(value) in (int, float)
+        if not valid or value < 0 or (type(value) is float and not math.isfinite(value)):
+            raise UsageUnavailable(f"invalid {field} usage")
+        if field == "cost":
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                raise UsageUnavailable("invalid cost usage")
+    return {key: usage[key] for key in ("tokens", "cost") if key in usage} if raw is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,17 +103,21 @@ class OpDefinition:
 class PauseRequest(Exception):
     """A Cog's request for an external signal before continuing."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, usage: Mapping[str, Any] | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.usage = usage
 
 
 class CogWorker(Protocol):
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> Any:
+    ) -> InteractionResult:
         """Interact through a declared entry point.
+
+        Return InteractionResult(output, usage); never hide usage inside output.
+        A PauseRequest carries usage for the interaction that paused.
 
         ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
         re-drives the same incomplete step with the *same* key, and an explicit
@@ -161,7 +162,11 @@ class WorkflowEngine(Protocol):
 
 
 class InMemoryCogExecutor(CogExecutor):
-    """A fake executor for exercising orchestration without infrastructure."""
+    """A fake executor for exercising orchestration without infrastructure.
+
+    Handlers return InteractionResult to report usage. Raw values are wrapped as
+    output with unknown usage; they cannot satisfy a configured spending limit.
+    """
 
     def __init__(self, handlers: dict[str, Callable[..., Any]]) -> None:
         self.handlers = handlers
@@ -184,9 +189,10 @@ class _Worker:
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> Any:
+    ) -> InteractionResult:
         feedback = {} if signal is _NO_SIGNAL else {"signal": signal}
-        return self.handler(entry_point, input, **feedback)
+        result = self.handler(entry_point, input, **feedback)
+        return result if isinstance(result, InteractionResult) else InteractionResult(result)
 
 
 class DurableWorkflowEngine(WorkflowEngine):
@@ -242,9 +248,12 @@ class DurableWorkflowEngine(WorkflowEngine):
             None,
         )
         tracker = BudgetTracker(self.budget, started_at=started_at)
+        accounted_steps = {e.payload.get("step") for e in events if e.event_type == "interaction_usage"}
         for event in events:
-            if event.event_type == "step_completed":
-                usage = event.payload.get("usage") or {}
+            if event.event_type == "interaction_usage" or (
+                event.event_type == "step_completed" and event.payload.get("step") not in accounted_steps
+            ):
+                usage = _validate_usage(event.payload.get("usage"), self.budget) or {}
                 tracker.tokens += int(usage.get("tokens", 0))
                 tracker.cost += float(usage.get("cost", 0.0))
         return tracker
@@ -347,7 +356,11 @@ class DurableWorkflowEngine(WorkflowEngine):
 
     def _advance(self, op: OpDefinition) -> RunStatus:
         completed = self._completed_steps(op.run_id)
-        tracker = self._budget_tracker(op.run_id)
+        try:
+            tracker = self._budget_tracker(op.run_id)
+        except UsageUnavailable as exc:
+            self._append(op.run_id, "failed", error="UsageUnavailable", reason=str(exc))
+            return RunStatus.FAILED
         for step in op.steps:
             if step.name in completed:
                 continue
@@ -371,6 +384,9 @@ class DurableWorkflowEngine(WorkflowEngine):
             worker = None
             outcome: tuple[str, Any] = ("failed", "Unknown")
             teardown_error: str | None = None
+            usage = None
+            accounting_error = None
+            invoked = False
             # Materialize, interact, and teardown are all inside failure handling
             # so any infra error becomes a durable `failed` event (never a
             # non-terminal run); teardown is best-effort in `finally`.
@@ -384,11 +400,26 @@ class DurableWorkflowEngine(WorkflowEngine):
                 signal_value = self._signal_for(op.run_id, step.name)
                 feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
                 try:
+                    invoked = True
                     value = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
-                    outcome = ("ok", value)
+                    if not isinstance(value, InteractionResult):
+                        raise UsageUnavailable("interact() must return InteractionResult")
+                    outcome = ("ok", value.output)
+                    raw_usage = value.usage
                 except PauseRequest as pause:
                     outcome = ("pause", pause.reason)
+                    raw_usage = pause.usage
+                usage = _validate_usage(raw_usage, self.budget)
+                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=usage)
+            except UsageUnavailable as exc:
+                # Persist unknown accounting so recovery/retry cannot forget it.
+                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
+                accounting_error = str(exc)
+                outcome = ("failed", "UsageUnavailable")
             except Exception as exc:  # noqa: BLE001 - any materialize/interact failure is durable-failed
+                if invoked:
+                    # A failed request may have spent resources before failing.
+                    self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
                 outcome = ("failed", type(exc).__name__)
             finally:
                 if worker is not None:
@@ -407,9 +438,18 @@ class DurableWorkflowEngine(WorkflowEngine):
 
             kind, detail = outcome
             if kind == "failed":
-                self._append(op.run_id, "failed", step=step.name, error=detail)
+                self._append(op.run_id, "failed", step=step.name, error=detail,
+                             **({"reason": accounting_error} if accounting_error else {}))
                 return RunStatus.FAILED
+            budget_stop = None
+            if tracker is not None:
+                try:
+                    tracker.consume(tokens=(usage or {}).get("tokens", 0), cost=(usage or {}).get("cost", 0.0))
+                except BudgetExceeded as exc:
+                    budget_stop = exc
             if kind == "pause":
+                if budget_stop is not None:
+                    return self._record_budget_stop(op.run_id, step.name, budget_stop)
                 if self.max_revisions is not None and self._pause_count(op.run_id, step.name) >= self.max_revisions:
                     self._append(op.run_id, "failed", step=step.name, error="RevisionLimitExceeded")
                     return RunStatus.FAILED
@@ -422,16 +462,9 @@ class DurableWorkflowEngine(WorkflowEngine):
             lifecycle.transition(LifecycleState.TEARING_DOWN)
             self._append(op.run_id, "teardown_started", step=step.name)
             lifecycle.transition(LifecycleState.TORN_DOWN)
-            # Coerce usage defensively: a Cog returning a malformed usage (not a
-            # mapping, tokens="abc") must not surface as an uncaught engine exception
-            # in this post-interaction tail — it would leave the run non-terminal.
-            usage = _coerce_usage(value)
             self._append(op.run_id, "step_completed", step=step.name, output=value, usage=usage)
-            if tracker is not None and usage is not None:
-                try:
-                    tracker.consume(tokens=usage["tokens"], cost=usage["cost"])
-                except BudgetExceeded as exc:
-                    return self._record_budget_stop(op.run_id, step.name, exc)
+            if budget_stop is not None:
+                return self._record_budget_stop(op.run_id, step.name, budget_stop)
         self._append(op.run_id, "completed")
         return RunStatus.COMPLETED
 

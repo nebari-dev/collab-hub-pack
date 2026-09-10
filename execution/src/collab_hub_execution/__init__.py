@@ -45,9 +45,11 @@ from .lifecycle import (
 from .orchestration import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
+    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
+    UsageUnavailable,
     WorkflowEngine,
 )
 from .track import (
@@ -79,6 +81,8 @@ __all__ = [
     "ModelCog",
     "DurableWorkflowEngine",
     "InMemoryCogExecutor",
+    "InteractionResult",
+    "UsageUnavailable",
     "OpDefinition",
     "OpStep",
     "PauseRequest",

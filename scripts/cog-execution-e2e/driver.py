@@ -17,6 +17,7 @@ from collab_hub_execution import (
     KubernetesCogExecutor,
     OpDefinition,
     OpStep,
+    RunBudget,
     RunStatus,
 )
 
@@ -36,7 +37,7 @@ def main() -> int:
         poll_interval=2,
     )
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track)
+    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=25))
 
     op = OpDefinition(
         "e2e-run",
@@ -76,6 +77,10 @@ def main() -> int:
     )
     assert review["echo"] == {"draft": "v1"}
     assert review["signal"] == {"approved": True}
+    assert sum(
+        e.payload["usage"]["tokens"] for e in track.replay("e2e-run")
+        if e.event_type == "interaction_usage"
+    ) == 20
 
     print("E2E OK: real Cog worker pods materialized, gated Op ran and completed, Track asserted", flush=True)
     return 0
