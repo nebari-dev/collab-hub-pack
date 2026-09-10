@@ -1,4 +1,4 @@
-"""Where the auth choke point gets the caller's organization: claims, or membership.
+"""Where the auth choke point gets the caller's organization: claims, membership, or single.
 
 ``auth_context_from_claims`` historically read ``org_id``/``workspace_id`` from
 the token, with ``FRAMES_AUTH_DEFAULT_ORG``/``FRAMES_AUTH_DEFAULT_WORKSPACE``
@@ -15,6 +15,28 @@ on the server"**. Retiring it is issue #63.
   ``collab_org_members`` row decides ``(org_id, role)``, ``workspace_id`` is
   the constant ``"default"``, org claims in the token are ignored entirely, and
   the ``FRAMES_AUTH_DEFAULT_*`` fallbacks are refused rather than ignored.
+- ``single`` (issue #91) — membership resolution plus one declared difference:
+  the deployment states that it hosts exactly one organization, and a caller
+  with **no membership row at all** whose sign-in arrived through a *declared
+  identity source* is auto-admitted — a real ``collab_org_members`` row is
+  written on their first authenticated request. Everything else is byte for
+  byte membership mode: rows stay the single source of truth, existing rows
+  (active or removed, any organization) are authoritative and never rewritten,
+  and every membership-mode precondition still applies. This is the mode's
+  entire delta; it replaces the retired defaults, it does not revive them.
+
+**Why auto-admission is gated on a declared identity source, not on
+authentication.** "Every authenticated user is a member" admits every door
+into the realm equally: federated sign-in (constrained by the provider's
+domain policy), self-registration (constrained by ``registrationAllowed``),
+and accounts an administrator created by hand — constrained by nothing, and
+the mechanism by which one-off test accounts exist. Gating on the token's
+``identity_provider`` claim makes the boundary the *declared provider's*
+membership policy: a caller federated from a listed provider is admitted, and
+any other login authenticates fine but resolves to ``no_organization`` until
+membership is granted deliberately. The declaration is also checkable — the
+alias either exists on the realm or it does not — where "anyone who can
+authenticate" silently widens every time an account is created.
 
 **Why this is a separate switch from the identity pin.** It would have been
 shorter to hang membership resolution off ``FRAMES_AUTH_IDENTITY_CLAIM=sub``
@@ -29,15 +51,17 @@ keeps the two steps independently reversible.
 
 The parsing contract mirrors ``frames.identity``: exact match, no trimming or
 case folding, and an unrecognized value fails startup instead of guessing.
-Guessing is wrong in both directions here — quietly choosing ``claims`` would
-resurrect the default-org fallback on the external deployment, and quietly
+Guessing is wrong in every direction here — quietly choosing ``claims`` would
+resurrect the default-org fallback on the external deployment, quietly
 choosing ``membership`` would lock out every user of a hub that has no
-membership rows.
+membership rows, and quietly choosing ``single`` would start admitting realm
+accounts to an organization nobody declared.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from .identity import IDENTITY_CLAIM_ENV, identity_pinned_to_sub
 
@@ -45,37 +69,145 @@ ORG_SOURCE_ENV = "FRAMES_AUTH_ORG_SOURCE"
 
 ORG_SOURCE_CLAIMS = "claims"
 ORG_SOURCE_MEMBERSHIP = "membership"
+ORG_SOURCE_SINGLE = "single"
 
 DEFAULT_ORG_ENV = "FRAMES_AUTH_DEFAULT_ORG"
 DEFAULT_WORKSPACE_ENV = "FRAMES_AUTH_DEFAULT_WORKSPACE"
 RETIRED_DEFAULT_ENVS = (DEFAULT_ORG_ENV, DEFAULT_WORKSPACE_ENV)
-"""The fallbacks membership mode retires. Refused at startup, not ignored."""
+"""The fallbacks membership resolution retires. Refused at startup, not ignored."""
+
+SINGLE_ORG_ID_ENV = "FRAMES_AUTH_SINGLE_ORG_ID"
+SINGLE_ORG_NAME_ENV = "FRAMES_AUTH_SINGLE_ORG_NAME"
+SINGLE_ORG_MEMBER_SOURCES_ENV = "FRAMES_AUTH_SINGLE_ORG_MEMBER_SOURCES"
+"""Comma-separated identity-provider aliases whose sign-ins are auto-admitted.
+
+Matched exactly (no trimming beyond the commas, no case folding — Keycloak
+provider aliases are case-sensitive) against the token's
+:data:`IDENTITY_PROVIDER_CLAIM`. There is deliberately no wildcard: "every
+provider" is "every door into the realm", which is the shape this gate exists
+to refuse.
+"""
+
+IDENTITY_PROVIDER_CLAIM = "identity_provider"
+"""The claim naming which identity provider a session was brokered through.
+
+Keycloak records the broker alias in the ``identity_provider`` user session
+note; a "User Session Note" protocol mapper surfaces it as this claim on the
+tokens the session mints. A token without the claim — a local realm account,
+or a realm missing the mapper — is simply never auto-admitted: absence fails
+closed to ``no_organization``, exactly like an undeclared provider.
+"""
 
 
-def org_source_is_membership() -> bool:
-    """Return whether org context is resolved from ``collab_org_members``.
+@dataclass(frozen=True)
+class SingleOrgDeclaration:
+    """What ``orgSource=single`` declares: one organization, and who may join it.
 
-    ``make_app`` calls this once at startup so a mistyped value fails the
-    rollout rather than the first authenticated request.
+    ``org_id`` is load-bearing — membership rows key on it, and changing it
+    later starts admitting new sign-ins to a *different* organization while
+    every existing row stays where it was. ``org_name`` is display-only and is
+    used only if the organization row does not exist yet; it never renames an
+    existing row (renames are the audited ``org.rename``, a deliberate act).
     """
+
+    org_id: str
+    org_name: str
+    member_sources: frozenset[str]
+
+
+def _org_source() -> str:
+    """Parse ``FRAMES_AUTH_ORG_SOURCE`` exactly, failing loud on anything else."""
 
     mode = os.environ.get(ORG_SOURCE_ENV, "")
     if mode in ("", ORG_SOURCE_CLAIMS):
-        return False
-    if mode == ORG_SOURCE_MEMBERSHIP:
-        return True
+        return ORG_SOURCE_CLAIMS
+    if mode in (ORG_SOURCE_MEMBERSHIP, ORG_SOURCE_SINGLE):
+        return mode
     raise RuntimeError(
         f"Unsupported {ORG_SOURCE_ENV} value {mode!r}: expected exactly "
-        f"'{ORG_SOURCE_MEMBERSHIP}' (resolve the caller's organization from collab_org_members) "
+        f"'{ORG_SOURCE_MEMBERSHIP}' (resolve the caller's organization from collab_org_members), "
+        f"'{ORG_SOURCE_SINGLE}' (membership resolution plus auto-admission to one declared "
+        f"organization for sign-ins from declared identity sources), "
         f"or '{ORG_SOURCE_CLAIMS}' (org/workspace token claims with the "
         f"{DEFAULT_ORG_ENV}/{DEFAULT_WORKSPACE_ENV} fallbacks, the default)."
     )
 
 
-def enforce_membership_org_source_preconditions() -> None:
-    """Refuse to start in membership mode with an unsafe surrounding config.
+def org_source_resolves_membership() -> bool:
+    """Return whether org context is resolved from ``collab_org_members``.
 
-    Two preconditions, both checked from ``make_app``:
+    True for both ``membership`` and ``single`` — the single-organization mode
+    *is* membership resolution, differing only in how a missing row can come to
+    exist. Everything conditioned on this — mounting invitations, requiring an
+    organization store, the schema preflight, the ``collab_`` role axes —
+    wants exactly that property, not the literal value.
+
+    ``make_app`` calls this once at startup so a mistyped value fails the
+    rollout rather than the first authenticated request.
+    """
+
+    return _org_source() != ORG_SOURCE_CLAIMS
+
+
+def org_source_is_single() -> bool:
+    """Return whether this deployment declares exactly one organization."""
+
+    return _org_source() == ORG_SOURCE_SINGLE
+
+
+def single_org_declaration() -> SingleOrgDeclaration | None:
+    """The declared organization and its member sources, or ``None`` off ``single``.
+
+    Raises rather than degrading on a malformed declaration: an empty id would
+    write membership rows against an organization that cannot be addressed, an
+    empty source list would make the mode a silent no-op that strands every
+    user at ``no_organization`` anyway, and a ``*`` entry would be read by a
+    person as a wildcard that the exact-match contract does not implement.
+    ``make_app`` calls this at startup (via the precondition check below), so
+    all of it fails the rollout, not the first sign-in.
+    """
+
+    if not org_source_is_single():
+        return None
+
+    org_id = os.environ.get(SINGLE_ORG_ID_ENV, "").strip()
+    if not org_id:
+        raise RuntimeError(
+            f"{ORG_SOURCE_ENV}={ORG_SOURCE_SINGLE} requires {SINGLE_ORG_ID_ENV}: the mode is a "
+            "declaration that this hub hosts exactly one organization, and a declaration names it."
+        )
+    org_name = os.environ.get(SINGLE_ORG_NAME_ENV, "").strip()
+    if not org_name:
+        raise RuntimeError(
+            f"{ORG_SOURCE_ENV}={ORG_SOURCE_SINGLE} requires {SINGLE_ORG_NAME_ENV}: the name is "
+            "used if the organization row is created, and 'Unnamed organization' on every "
+            "member's screen is a misconfiguration nobody reports."
+        )
+    raw_sources = os.environ.get(SINGLE_ORG_MEMBER_SOURCES_ENV, "")
+    sources = frozenset(entry.strip() for entry in raw_sources.split(",") if entry.strip())
+    if not sources:
+        raise RuntimeError(
+            f"{ORG_SOURCE_ENV}={ORG_SOURCE_SINGLE} requires {SINGLE_ORG_MEMBER_SOURCES_ENV}: "
+            "auto-admission is gated on the identity-provider alias a sign-in arrived through, "
+            "so the deployment must name at least one. 'Every authenticated user' is not an "
+            "option, deliberately — it admits hand-created realm accounts, the one door with "
+            "no policy on it."
+        )
+    if "*" in sources:
+        raise RuntimeError(
+            f"{SINGLE_ORG_MEMBER_SOURCES_ENV} does not support '*': provider aliases are matched "
+            "exactly, and a wildcard would be 'every door into the realm' — the shape this gate "
+            "exists to refuse. Name the identity-provider alias(es)."
+        )
+    return SingleOrgDeclaration(org_id=org_id, org_name=org_name, member_sources=sources)
+
+
+def enforce_membership_org_source_preconditions() -> None:
+    """Refuse to start membership resolution with an unsafe surrounding config.
+
+    Applies to both membership-resolving sources (``membership`` and
+    ``single`` — the latter is the former plus auto-admission, so it inherits
+    every precondition). Checked from ``make_app``:
 
     1. **The identity pin must be on.** ``collab_org_members.user_id`` is the
        OIDC subject, so resolving a membership for a legacy
@@ -83,30 +215,35 @@ def enforce_membership_org_source_preconditions() -> None:
        denying everyone quietly, or worse, matching whoever happens to own a
        colliding value.
     2. **The retired fallbacks must be unset, not merely unread.** Nothing
-       reads them in membership mode, so a leftover value is invisible right up
-       until someone flips the source back to ``claims`` during an incident and
-       every user silently collapses into one organization again. A retirement
-       that is only "ignored" is not a retirement.
+       reads them under membership resolution, so a leftover value is invisible
+       right up until someone flips the source back to ``claims`` during an
+       incident and every user silently collapses into one organization again.
+       A retirement that is only "ignored" is not a retirement.
+    3. **A ``single`` declaration must be complete and well-formed** —
+       :func:`single_org_declaration` raises on a missing organization id or
+       name, an empty member-source list, and a ``*`` entry.
 
-    The third precondition — an organization store with a real backend — needs
-    the built store object and so lives in ``make_app`` itself.
+    The remaining precondition — an organization store with a real backend —
+    needs the built store object and so lives in ``make_app`` itself.
     """
 
-    if not org_source_is_membership():
+    if not org_source_resolves_membership():
         return
 
+    source = _org_source()
     if not identity_pinned_to_sub():
         raise RuntimeError(
-            f"{ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP} requires {IDENTITY_CLAIM_ENV}=sub: "
+            f"{ORG_SOURCE_ENV}={source} requires {IDENTITY_CLAIM_ENV}=sub: "
             "membership rows are keyed by the OIDC subject, so a legacy "
             "(preferred_username/email) principal would be resolved against the wrong key."
         )
     for retired in RETIRED_DEFAULT_ENVS:
         if os.environ.get(retired, "").strip():
             raise RuntimeError(
-                f"{retired} must be unset when {ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}: the "
+                f"{retired} must be unset when {ORG_SOURCE_ENV}={source}: the "
                 "default-org fallback is retired on membership-resolving deployments. Left set, "
                 "it would spring back the moment the source is flipped to "
                 f"'{ORG_SOURCE_CLAIMS}', collapsing every user into one organization where "
                 "'internal' means everyone on the server."
             )
+    single_org_declaration()

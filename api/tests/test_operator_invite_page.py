@@ -505,6 +505,22 @@ async def test_the_page_is_absent_where_operators_cannot_exist(tmp_path, idp, mo
     assert ADMIN_INVITATIONS_REVOKE_PATH not in paths
 
 
+async def test_the_page_is_absent_on_a_single_organization_deployment(tmp_path, idp, monkeypatch):
+    """The page's one send is the org-creating invitation, which a deployment
+    declaring a single organization (issue #91) refuses — absent is a truer
+    answer than a page whose every submit is refused. The owner surface and
+    the /v1 operator routes still serve invitations into the declared org."""
+
+    monkeypatch.setenv(ORG_SOURCE_ENV, "single")
+    monkeypatch.setenv("FRAMES_AUTH_SINGLE_ORG_ID", "org-solo")
+    monkeypatch.setenv("FRAMES_AUTH_SINGLE_ORG_NAME", "Example Corp")
+    monkeypatch.setenv("FRAMES_AUTH_SINGLE_ORG_MEMBER_SOURCES", "corp-google")
+    app = make_web_app(tmp_path, idp, web={"public_base_url": PUBLIC_BASE_URL})
+    paths = {getattr(route, "path", None) for route in app.routes}
+    assert ADMIN_INVITATIONS_PATH not in paths
+    assert ADMIN_INVITATIONS_REVOKE_PATH not in paths
+
+
 # ===========================================================================
 # Issuing: null org_id, exact address, one live token per address
 # ===========================================================================

@@ -101,6 +101,15 @@ Gate B chose **exact** match (2026-08-03), so this is reachable for addresses
 that differ only in case. Does not consume the invitation.
 """
 
+ORGANIZATION_CREATION_REFUSED = "organization_creation_refused"
+"""An org-creating invitation on a single-organization deployment (409).
+
+`frames.auth.orgSource=single` declares that the hub hosts exactly one
+organization; an invitation with no `org_id` would mint another on
+acceptance. Raised at issuance and, for invitations issued before the
+deployment flipped to `single`, at acceptance — where it consumes nothing.
+"""
+
 INVITATIONS_UNAVAILABLE = "invitations_unavailable"
 """The invitation service has no Postgres backend on this deployment (503).
 

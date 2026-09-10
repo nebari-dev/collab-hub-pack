@@ -21,8 +21,15 @@ from .identity import (
     PINNED_IDENTITY_CLAIM,
     identity_pinned_to_sub,
 )
-from .org_source import org_source_is_membership
+from .org_source import (
+    IDENTITY_PROVIDER_CLAIM,
+    SingleOrgDeclaration,
+    org_source_resolves_membership,
+    single_org_declaration,
+)
 from .orgs import OrgStore, OrgsUnavailableError
+
+auth_logger = logging.getLogger("frames_server.auth")
 
 usage_logger = logging.getLogger("frames_server.usage")
 
@@ -704,7 +711,11 @@ def auth_context_from_claims(claims: dict) -> AuthContext | None:
     )
 
 
-def auth_context_from_membership(claims: dict, org_store: OrgStore) -> AuthContext | None:
+def auth_context_from_membership(
+    claims: dict,
+    org_store: OrgStore,
+    auto_admit: SingleOrgDeclaration | None = None,
+) -> AuthContext | None:
     """Resolve the caller's organization from their ``collab_org_members`` row.
 
     Identity is still the verified token's subject (the identity pin is a
@@ -757,6 +768,21 @@ def auth_context_from_membership(claims: dict, org_store: OrgStore) -> AuthConte
     trip), so the answer is never partial: a store failure fails the whole
     request closed rather than resolving a membership whose platform role is
     unknown, which nothing downstream could tell from "not an operator".
+
+    **Auto-admission (the ``single`` org source, issue #91).** With an
+    *auto_admit* declaration, a caller with **no membership row at all** whose
+    token names a declared identity source gets a real ``member`` row written
+    right here, before the outcomes above are decided — resolution, not a
+    side effect, because every outcome below reads the row it creates. Three
+    boundaries hold it in shape: an existing row of any kind wins (a
+    ``removed`` row is never resurrected — removal keeps taking effect on the
+    next request — and an active row in another organization is never moved);
+    a token without the :data:`~.org_source.IDENTITY_PROVIDER_CLAIM`, or
+    naming an undeclared provider, falls through to exactly the outcomes a
+    membership-mode caller gets; and the write itself fails closed with the
+    store, never best-effort. A platform operator signing in through a
+    declared source is admitted like anyone else — membership and the platform
+    axis remain independent.
     """
 
     user = user_from_claims(claims)
@@ -765,6 +791,8 @@ def auth_context_from_membership(claims: dict, org_store: OrgStore) -> AuthConte
     principal = org_store.resolve_principal(user)
     membership = principal.membership
     display = display_identity_from_claims(claims)
+    if membership is None and auto_admit is not None:
+        membership = _auto_admit_member(claims, user, display, org_store, auto_admit)
     if membership is not None and membership.is_active:
         return AuthContext(
             user=user,
@@ -789,6 +817,43 @@ def auth_context_from_membership(claims: dict, org_store: OrgStore) -> AuthConte
     raise NoOrganizationError()
 
 
+def _auto_admit_member(
+    claims: dict,
+    user: str,
+    display: DisplayIdentity,
+    org_store: OrgStore,
+    declaration: SingleOrgDeclaration,
+):
+    """Write the declared organization's membership row for a declared sign-in.
+
+    Returns the row now standing, or ``None`` when this token does not qualify
+    — no :data:`~.org_source.IDENTITY_PROVIDER_CLAIM`, or an undeclared alias.
+    Absence and mismatch fail closed identically on purpose: a realm missing
+    the session-note mapper must not be distinguishable, to a caller, from a
+    login that is simply not eligible.
+    """
+
+    provider = claims.get(IDENTITY_PROVIDER_CLAIM)
+    if not isinstance(provider, str) or provider not in declaration.member_sources:
+        return None
+    membership, created = org_store.provision_member(
+        user,
+        declaration.org_id,
+        declaration.org_name,
+        # The email column mirrors invitation acceptance's discipline: stored
+        # only when the IdP asserted it verified, otherwise it is a
+        # self-asserted string with no place in a member roster.
+        email=display.email if display.email_verified else None,
+        display_name=display.name,
+    )
+    if created:
+        auth_logger.info(
+            "single_org_member_admitted",
+            extra={"user": user, "org": declaration.org_id, "identity_provider": provider},
+        )
+    return membership
+
+
 def _request_org_store(request: Request) -> OrgStore:
     """Return the org store owned by the app serving this request, failing closed.
 
@@ -809,8 +874,10 @@ def _request_org_store(request: Request) -> OrgStore:
 def resolve_auth_context(request: Request, claims: dict) -> AuthContext | None:
     """Build the auth context for accepted claims via the configured org source."""
 
-    if org_source_is_membership():
-        return auth_context_from_membership(claims, _request_org_store(request))
+    if org_source_resolves_membership():
+        return auth_context_from_membership(
+            claims, _request_org_store(request), auto_admit=single_org_declaration()
+        )
     return auth_context_from_claims(claims)
 
 
@@ -1019,7 +1086,10 @@ def get_auth_context(request: Request) -> AuthContext:
         # row gets no_organization, not a private organization of one). Keeping
         # a bypass here would leave a tenancy escape hatch behind a single
         # environment variable.
-        if org_source_is_membership():
+        if org_source_resolves_membership():
+            # No identity_provider claim is minted for the dev subject, so on a
+            # single-org deployment the dev user is not auto-admitted either:
+            # a shortcut nobody's IdP vouched for must not mint membership.
             auth_context = auth_context_from_membership(
                 {PINNED_IDENTITY_CLAIM: dev_user},
                 _request_org_store(request),

@@ -127,6 +127,7 @@ OUTCOME_EMAIL_MISMATCH = "invitation_email_mismatch"
 OUTCOME_EMAIL_NOT_VERIFIED = "email_not_verified"
 OUTCOME_ALREADY_IN_ORGANIZATION = "already_in_organization"
 OUTCOME_ORGANIZATION_MISSING = "organization_missing"
+OUTCOME_ORGANIZATION_CREATION_REFUSED = "organization_creation_refused"
 OUTCOME_UNAVAILABLE = "invitations_unavailable"
 OUTCOME_REAUTHENTICATION_REQUIRED = "reauthentication_required"
 """The session's verified-address assertion is too old to act on.
@@ -479,6 +480,18 @@ _SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "This invitation names an organization that no longer exists, so"
             " there is nothing to join. Nothing has changed about your account.",
             "Ask whoever invited you to send a new invitation.",
+        ),
+    ),
+    (
+        OUTCOME_ORGANIZATION_CREATION_REFUSED,
+        "This invitation cannot be accepted here",
+        (
+            "This invitation would create a new organization, and this"
+            " deployment hosts a single organization, so it cannot be"
+            " accepted. Nothing has changed about your account, and your"
+            " invitation has not been used.",
+            "Ask whoever invited you to send a new invitation into the"
+            " existing organization.",
         ),
     ),
     (

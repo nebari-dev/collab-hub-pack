@@ -3390,7 +3390,7 @@ def test_an_exemption_on_a_route_with_no_unsafe_method_fails_the_rollout(tmp_pat
 
 def test_an_exemption_naming_an_unmounted_path_is_tolerated(tmp_path, idp):
     # Deliberately not an error. make_app mounts the operator router only when
-    # org_source_is_membership(), so on a claims-sourced deployment #91's
+    # org_source_resolves_membership(), so on a claims-sourced deployment #91's
     # /admin routes are legitimately absent while its entries are correctly
     # present — and failing on absence would refuse every such deployment. It
     # also has to tolerate an entry landing one PR ahead of its route, which is
@@ -3454,7 +3454,7 @@ def test_the_shipped_admin_entries_lead_their_routes_without_failing(tmp_path, i
     # to start this very branch.
     #
     # It stays load-bearing after #91 too, for a different reason: make_app
-    # mounts the operator router only under org_source_is_membership(), so on a
+    # mounts the operator router only under org_source_resolves_membership(), so on a
     # claims-sourced deployment those routes are absent while the entries are
     # correctly present.
     from collab_hub_api.web.surface import CSRF_ENFORCED_IN_ROUTE
@@ -3467,7 +3467,7 @@ def test_the_shipped_admin_entries_lead_their_routes_without_failing(tmp_path, i
     assert unmounted == {
         "/admin/invitations",
         "/admin/invitations/revoke",
-        # #142's owner page mounts under the same org_source_is_membership()
+        # #142's owner page mounts under the same org_source_resolves_membership()
         # gate as #91's, so its entries are likewise correctly present while
         # a claims-sourced deployment serves neither route.
         "/web/org/invitations",

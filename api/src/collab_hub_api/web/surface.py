@@ -23,7 +23,8 @@ from ..config import WEB_SESSION_LIFETIME_CEILING_SECONDS, BaseConfig
 from ..frames.org_source import (
     ORG_SOURCE_ENV,
     ORG_SOURCE_MEMBERSHIP,
-    org_source_is_membership,
+    ORG_SOURCE_SINGLE,
+    org_source_resolves_membership,
 )
 from ..path_protection import resolve_access
 from .oidc import invalid_realm_url_reason, realm_endpoints
@@ -479,7 +480,7 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
                 f" {web.public_base_url!r}: set it to this deployment's external"
                 " origin, e.g. https://frames.example.com."
             )
-    elif org_source_is_membership():
+    elif org_source_resolves_membership():
         # The invitation pages (#91, #142) mount on a membership-resolving
         # deployment, and the surface builds absolute URLs — the OIDC
         # `redirect_uri` among them — for every operator and owner who signs
@@ -501,7 +502,8 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         # this when an operator signs in has already been running.
         raise RuntimeError(
             "web.public_base_url is required when the browser surface is enabled on a"
-            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}):"
+            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}"
+            f" or {ORG_SOURCE_SINGLE}):"
             " the surface builds absolute URLs (the OIDC redirect_uri among them) and must"
             " not take their origin from a request's Host header. Set"
             " COLLAB_HUB_API__WEB__PUBLIC_BASE_URL to this deployment's external origin,"
@@ -540,7 +542,7 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         ACCEPT_REDEEM_PATH,
         # #91's `/admin` paths are deliberately **not** here, and this is the
         # floor's own rule rather than an exception to it. They are mounted
-        # only when `org_source_is_membership()`, so demanding them
+        # only when `org_source_resolves_membership()`, so demanding them
         # unconditionally would refuse every claims-mode rollout over paths
         # that deployment does not serve — and the route-derived check names
         # them precisely, and only, where they exist.
