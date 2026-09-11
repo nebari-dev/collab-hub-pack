@@ -1,0 +1,22 @@
+{
+  "type": "SCANNING_COMPLETED",
+  "occur_at": 1788001200,
+  "operator": "auto",
+  "event_data": {
+    "resources": [
+      {
+        "digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "tag": "latest",
+        "resource_url": "harbor.example.com/cogs/cog-alpha-1a2b3c4d:latest",
+        "scan_overview": {"application/vnd.security.vulnerability.report; version=1.1": {"scan_status": "Success"}}
+      }
+    ],
+    "repository": {
+      "date_created": 1787990000,
+      "name": "cog-alpha-1a2b3c4d",
+      "namespace": "cogs",
+      "repo_full_name": "cogs/cog-alpha-1a2b3c4d",
+      "repo_type": "private"
+    }
+  }
+}

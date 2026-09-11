@@ -1,0 +1,21 @@
+{
+  "type": "PUSH_ARTIFACT",
+  "occur_at": 1788000000,
+  "operator": "robot$library+publisher",
+  "event_data": {
+    "resources": [
+      {
+        "digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "tag": "3.20",
+        "resource_url": "harbor.example.com/library/alpine:3.20"
+      }
+    ],
+    "repository": {
+      "date_created": 1787990000,
+      "name": "alpine",
+      "namespace": "library",
+      "repo_full_name": "library/alpine",
+      "repo_type": "public"
+    }
+  }
+}
