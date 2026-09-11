@@ -153,7 +153,7 @@ def _read(files: Mapping[str, bytes], bundle_paths: frozenset[str]) -> CogCard:
         warnings=list(profile.warnings),
     )
     if profile.status == PROFILE_PARSED and profile.data is not None:
-        fields, warnings = derive_card_fields(profile.data, profile.tasks, profile.manifest, bundle_paths)
+        fields, warnings = derive_card_fields(profile.data, profile.tasks, profile.manifest, envelope)
         for key, value in fields.items():
             setattr(card, key, value)
         card.warnings.extend(warnings)

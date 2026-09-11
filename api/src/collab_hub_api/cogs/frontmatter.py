@@ -322,6 +322,14 @@ def _parse_frontmatter(text: str) -> tuple[_Parsed | None, str | None]:
                     i = j
                     continue
                 if key != "metadata":
+                    # A block with no ``key: value`` line is not a mapping at
+                    # all: the author almost certainly continued the value onto
+                    # the next line, which deserves its own message.
+                    if not any(_META_LINE_RE.match(line) for line in block):
+                        return None, (
+                            f"value for {key!r} continues on the next line; "
+                            "a value must be written on the line of its key"
+                        )
                     return None, f"nested mapping under {key!r} is outside the supported subset"
                 meta, err = _parse_metadata_block(block)
                 if err:

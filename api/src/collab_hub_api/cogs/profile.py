@@ -112,6 +112,10 @@ def load_profile(doc: FrontmatterDocument, files: Mapping[str, bytes]) -> Profil
         # frontmatter reader already said which.
         return Profile(PROFILE_MISSING)
 
+    # ``Profile.manifest`` -- and so ``card.manifest`` -- is deliberately the
+    # basename (``manifest: profiles/cog.yaml`` shows as ``cog.yaml``): the
+    # card says which file holds the profile, and the full pointer is already
+    # on the card in the frontmatter's ``manifest`` field.
     name = posixpath.basename(doc.manifest_path)
     data = files.get(doc.manifest_path)
     if data is None:
@@ -215,9 +219,27 @@ def _profile_from_pixi(raw: str) -> tuple[dict[str, Any] | None, dict[str, Any],
     return jsonable(profile), (jsonable(tasks) if isinstance(tasks, dict) else {}), None
 
 
+class _NoAliasLoader(yaml.SafeLoader):
+    """``SafeLoader`` that refuses aliases at compose time.
+
+    An alias multiplies whatever its anchor holds: eight anchor levels of
+    eight references each fit in under 500 bytes and expand to 8**8 leaves,
+    which ``jsonable`` would walk and the store would keep as jsonb. Refusing
+    the alias -- the expansion step -- before anything is constructed matches
+    the frontmatter subset, which refuses anchors and aliases outright. An
+    anchor nothing references still parses: it names a node without
+    multiplying it.
+    """
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("aliases are not supported in cog.yaml")
+        return super().compose_node(parent, index)
+
+
 def _profile_from_yaml(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     try:
-        loaded = yaml.safe_load(raw)
+        loaded = yaml.load(raw, Loader=_NoAliasLoader)
     except Exception as exc:  # noqa: BLE001 -- same reasoning as load_pixi_document
         return None, f"manifest is not valid YAML: {exc}"
     if not isinstance(loaded, dict):
@@ -253,7 +275,7 @@ def derive_card_fields(
     profile: Mapping[str, Any],
     tasks: Mapping[str, Any],
     manifest: str | None,
-    bundle_paths: Collection[str],
+    envelope: int | None,
 ) -> tuple[dict[str, Any], list[str]]:
     """The build tool's card, computed from a parsed 0.1 profile.
 
@@ -352,7 +374,7 @@ def derive_card_fields(
         "prohibits": profile.get("prohibits") or [],
         "input_contract": context.get("input_schema"),
         "output_contract": context.get("output_schema"),
-        "envelope": envelope_version(bundle_paths),
+        "envelope": envelope,
         "fixtures": evaluation.get("fixtures") or [],
     }
     return fields, warnings

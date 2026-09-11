@@ -488,6 +488,10 @@ def test_quoted_or_unambiguous_values_are_strings(frontmatter: str, expected: li
         ("type: cog\n2001-99-99: a", "key '2001-99-99' resembles a YAML timestamp but names no real date or time"),
         ("type: cog\ntype: cog", "duplicate key: type"),
         ("type: cog\nnested:\n  a: b", "nested mapping under 'nested' is outside the supported subset"),
+        (
+            "type: cog\ndescription:\n  A value continued onto the next line.",
+            "value for 'description' continues on the next line; a value must be written on the line of its key",
+        ),
         ("type: cog\ndescription: &a x", "anchors, aliases, tags, and block scalars are outside the supported subset"),
         ("type: cog\ndescription: *a", "anchors, aliases, tags, and block scalars are outside the supported subset"),
         (
@@ -811,6 +815,35 @@ def test_yaml_profile_that_is_not_a_mapping_is_unparsed(cog_yaml: bytes, expecte
 
     assert card.profile_status == "unparsed"
     assert len(card.errors) == 1 and card.errors[0].startswith(expected), card.errors
+
+
+def test_yaml_profile_refuses_aliases_before_they_expand():
+    """Review finding: aliases turn ~450 bytes into 8**8 leaves; refuse them unexpanded."""
+
+    lines = ["id: example/sample-worker", "v0: &a0 [x, x, x, x, x, x, x, x]"]
+    for level in range(1, 9):
+        refs = ", ".join([f"*a{level - 1}"] * 8)
+        lines.append(f"v{level}: &a{level} [{refs}]")
+    cog_yaml = ("\n".join(lines) + "\n").encode()
+    assert len(cog_yaml) < 600
+
+    card = read_cog_bundle({"COG.md": cog_md(YAML_COG), "cog.yaml": cog_yaml})
+
+    assert card.profile_status == "unparsed"
+    assert card.errors == ["manifest is not valid YAML: aliases are not supported in cog.yaml"]
+    assert card.profile is None
+
+
+def test_yaml_profile_anchor_without_an_alias_still_parses():
+    # The loader refuses the alias -- the expansion step -- not the anchor: a
+    # node that is named but never referenced multiplies nothing.
+    cog_yaml = b"id: example/sample-worker\nversion: &v '0.1.0'\nkind: context\n"
+
+    card = read_cog_bundle({"COG.md": cog_md(YAML_COG), "cog.yaml": cog_yaml})
+
+    assert card.profile_status == "parsed"
+    assert card.errors == []
+    assert card.profile["version"] == "0.1.0"
 
 
 def test_yaml_profile_reads_tasks_from_a_sibling_pixi_toml_when_it_can():
