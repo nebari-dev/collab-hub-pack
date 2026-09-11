@@ -80,9 +80,6 @@ DEFAULT_MAX_BUNDLE_FILE_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
 COG_ENTRY_FILE = "COG.md"
-DEFAULT_BUNDLE_TITLES: frozenset[str] = frozenset({COG_ENTRY_FILE, "pixi.toml", "cog.yaml"})
-"""Layer titles the indexer always wants. The lockfile is never among them."""
-
 LOCKFILE_TITLE = "pixi.lock"
 
 # The Accept list a manifest GET advertises. Registries answer with whichever
@@ -260,7 +257,9 @@ class OCIClient:
     """Minimal OCI Distribution client over ``httpx``.
 
     ``base_url`` is the registry origin (``https://harbor.example.com`` or an
-    in-cluster ``http://harbor-core.harbor.svc``). ``token_url`` pins the
+    in-cluster ``http://harbor-core.harbor.svc``); a path prefix is rejected
+    at construction because every request path is built from ``/v2/`` and a
+    prefix would be silently discarded. ``token_url`` pins the
     bearer-token endpoint so an in-cluster caller is not bounced through the
     gateway when the challenge's ``realm`` advertises the external URL; the
     ``service``/``scope`` parameters from the challenge are still honoured.
@@ -272,7 +271,11 @@ class OCIClient:
     credential directly), and the request is retried exactly once. Tokens are
     cached per (token endpoint, service, scope) until shortly before
     ``expires_in`` so a sweep over one repository costs one token round trip,
-    not one per blob; concurrent misses on the same key mint one token.
+    not one per blob; concurrent misses on the same key mint one token. With
+    ``credentials`` set and no ``token_url``, the Basic credential is presented
+    to whatever ``realm`` the registry's challenge advertises — the token
+    spec's design; pin ``token_url`` when the endpoint must not be the
+    registry's choice.
 
     One client may be shared by concurrent coroutines. Construction fails
     (``ValueError``/``OSError``) for a malformed ``base_url`` or an unreadable
@@ -296,6 +299,10 @@ class OCIClient:
             raise ValueError("base_url is not a valid URL") from exc
         if origin.scheme not in ("http", "https") or not origin.host:
             raise ValueError("base_url must be an http(s) origin")
+        if origin.path not in ("", "/") or origin.query or origin.fragment:
+            # ``self._origin.join("/v2/...")`` would silently discard a path
+            # prefix; refuse it here, at startup, like the other config errors.
+            raise ValueError("base_url must be a bare origin, without a path, query, or fragment")
         self._base_url = str(origin)
         self._origin = origin
         self._credentials = credentials
@@ -528,10 +535,13 @@ class OCIClient:
                 raise OCIProtocolError(f"{what}: redirect without a Location header")
             target = _join_url(url, location, what=f"{what} redirect")
             hop_headers = dict(headers)
-            if not _same_origin(target, url):
-                # Object storage must never see the registry credential. This
-                # is stricter than httpx's own rule, which keeps the header on
-                # an http→https upgrade of the same host.
+            if not _same_origin(target, self._origin):
+                # Object storage must never see the registry credential. Every
+                # hop is compared against the *registry* origin, not the
+                # previous hop's, so a second hop between storage URLs cannot
+                # win the header back. This is stricter than httpx's own rule,
+                # which keeps the header on an http→https upgrade of the same
+                # host.
                 hop_headers.pop("Authorization", None)
             response = await self._dispatch(target, hop_headers, what=what)
             url = target
@@ -577,6 +587,10 @@ class OCIClient:
         lock = self._token_locks.get(key)
         if lock is None:
             lock = self._token_locks[key] = asyncio.Lock()
+            # Past MAX_CACHED_TOKENS distinct keys in flight this can evict a
+            # lock a coroutine still holds, and a later miss on that key mints
+            # a duplicate token. Harmless (both tokens work) and unreachable
+            # in practice; the bound is what matters.
             _bound(self._token_locks)
         async with lock:
             cached = self._tokens.get(key)
@@ -680,6 +694,11 @@ async def fetch_bundle_files(
     max_bytes_per_file: int = DEFAULT_MAX_BUNDLE_FILE_BYTES,
 ) -> dict[str, bytes]:
     """Fetch the selected layers and return ``{title: bytes}`` for the bundle reader.
+
+    ``manifest_file`` is the profile-manifest name from ``COG.md``'s
+    frontmatter — a file this call fetches. A caller that has not parsed
+    ``COG.md`` yet either calls twice (once for ``COG.md``, once with
+    ``manifest_file``) or passes the expected title via ``extra_titles``.
 
     Any single oversized or digest-mismatched layer raises; the indexer records
     that failure against the artifact rather than indexing a partial bundle.

@@ -866,6 +866,19 @@ def test_client_requires_http_origin():
     assert OCIClient("https://registry.example/").base_url == "https://registry.example"
 
 
+def test_client_rejects_base_url_with_path_query_or_fragment():
+    # A prefix would be silently discarded by ``origin.join("/v2/...")``;
+    # constructing with one is a configuration error, not a quiet rewrite.
+    for base_url in (
+        "https://registry.example/harbor",
+        "https://registry.example/harbor/",
+        "https://registry.example?insecure=1",
+        "https://registry.example#frag",
+    ):
+        with pytest.raises(ValueError, match="bare origin"):
+            OCIClient(base_url)
+
+
 # --- layer selection --------------------------------------------------------
 
 
@@ -1075,6 +1088,29 @@ async def test_redirect_same_origin_keeps_authorization_but_scheme_change_drops_
     by_url = {url: auth for url, auth in seen}
     assert by_url["http://registry.example/storage/one"] == basic_header(CREDS)  # same origin: kept
     assert by_url["https://registry.example/storage/two"] is None  # scheme changed: dropped
+
+
+async def test_second_hop_on_the_same_storage_host_still_carries_no_authorization():
+    # Hops are compared against the registry origin, not the previous hop, so
+    # storage→storage (same host as hop one, off the registry) never wins the
+    # bearer token back.
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers.get("Authorization")))
+        if request.url.host == "registry.example":
+            if "Authorization" not in request.headers:
+                return httpx.Response(401, headers={"WWW-Authenticate": f'Bearer realm="{REALM}",service="reg"'})
+            return httpx.Response(307, headers={"Location": "https://storage.example/a"})
+        if request.url.host == "auth.example":
+            return httpx.Response(200, json={"token": "tok-1", "expires_in": 300})
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"Location": "https://storage.example/b"})
+        return httpx.Response(200, content=COG_MD)
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+        assert await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024) == COG_MD
+    assert all(auth is None for url, auth in seen if "storage.example" in url)
 
 
 async def test_encoded_bodies_are_refused_and_identity_requested():
