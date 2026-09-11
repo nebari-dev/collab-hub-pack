@@ -7,8 +7,9 @@ surface** — the OIDC browser session, cookies, CSRF posture, page scaffolding,
 and authorization helpers ([#88]) — and the pages built on it: the
 invitation acceptance page ([#90], `/invite/accept`), the operator
 invitation page ([#91], `/admin/invitations`), the owner invitation page
-([#142], `/web/org/invitations`), and the data statement ([#146],
-`/web/data-statement`).
+([#142], `/web/org/invitations`), the data statement ([#146],
+`/web/data-statement`), and the canonical Terms of Service and Privacy
+Statement ([#95], `/web/terms` and `/web/privacy`).
 
 [#88]: https://github.com/nebari-dev/collab-hub-pack/issues/88
 [#90]: https://github.com/nebari-dev/collab-hub-pack/issues/90
@@ -16,6 +17,7 @@ invitation page ([#91], `/admin/invitations`), the owner invitation page
 [#142]: https://github.com/nebari-dev/collab-hub-pack/issues/142
 [#44]: https://github.com/nebari-dev/collab-hub-pack/issues/188
 [#146]: https://github.com/nebari-dev/collab-hub-pack/issues/146
+[#95]: https://github.com/nebari-dev/collab-hub-pack/issues/95
 
 ## Two auth axes, deliberately
 
@@ -308,7 +310,9 @@ a protection the middleware does not itself enforce.
 | `POST /web/signout` | CSRF-protected; clears the session cookie. |
 | `GET /web/signed-out` | Confirmation page. |
 | `GET /web/app.css` | The shared stylesheet (documents keep `style-src 'self'`). |
-| `GET /web/data-statement` | The data statement ([#146]): what is stored, who can see it, and the address deletion requests go to. **Anonymous** — see below. The copy lives in `web/data_statement.py` and the acceptance page renders the same constant above its accept control. |
+| `GET /web/data-statement` | The data statement ([#146]): what is stored, who can see it, and the address deletion requests go to. **Anonymous** — see below. The copy lives in `web/data_statement.py` and the acceptance page renders the same constant above its accept control. Links to the two documents below. |
+| `GET /web/terms` | The canonical Terms of Service ([#95]). **Anonymous** — see below. The copy lives in `web/terms_of_service.py` as one constant; placeholder until counsel replaces it. |
+| `GET /web/privacy` | The canonical Privacy Statement ([#95]). **Anonymous** — see below. The copy lives in `web/privacy_statement.py`, same shape. |
 | `GET /invite/accept` | The acceptance page ([#90]). **Anonymous** — see below. |
 | `POST /invite/accept/redeem` | Redeems the token from a JSON body. Session + CSRF required. |
 | `GET /admin/invitations` | The operator invitation page ([#91]). Session + `operator`. |
@@ -329,9 +333,15 @@ per request.
 ### Authenticated by default
 
 Every path under a guarded prefix requires a session unless it appears in
-`web.surface.PUBLIC_WEB_PATHS`, which names exactly six: sign-in, the
-callback, the signed-out confirmation, the stylesheet, the acceptance page, and
-the data statement.
+`web.surface.PUBLIC_WEB_PATHS`, which names exactly eight: sign-in, the
+callback, the signed-out confirmation, the stylesheet, the acceptance page,
+the data statement, and the Terms of Service and Privacy Statement.
+
+The last two ([#95]) are linked from the deployment's Keycloak
+terms-acceptance step, which runs *before* Keycloak issues a token — and this
+surface's session is minted from that token. A session gate on them would
+mean the documents could only be read by someone who had already accepted
+them, which is not a stricter policy but an incoherent one.
 That is enforced by a middleware, not by a convention, because the protection
 map cannot supply it — the map's `authenticated` level runs the *API*
 credential check, which a browser mid-sign-in cannot pass, so `/web` must be

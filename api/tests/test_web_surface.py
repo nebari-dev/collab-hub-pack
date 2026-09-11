@@ -56,8 +56,19 @@ from collab_hub_api.web.authz import (
     unwrap_dependency,
     verify_web_route_protection,
 )
-from collab_hub_api.web.data_statement import DATA_STATEMENT_TEXT
+from collab_hub_api.web.data_statement import DATA_STATEMENT_CONTACT, DATA_STATEMENT_TEXT
 from collab_hub_api.web.forms import MAX_FORM_BYTES
+from collab_hub_api.web.legal_documents import PLACEHOLDER_NOTICE
+from collab_hub_api.web.privacy_statement import (
+    PRIVACY_STATEMENT_IS_PLACEHOLDER,
+    PRIVACY_STATEMENT_TEXT,
+    privacy_statement_page,
+)
+from collab_hub_api.web.terms_of_service import (
+    TERMS_OF_SERVICE_IS_PLACEHOLDER,
+    TERMS_OF_SERVICE_TEXT,
+    terms_of_service_page,
+)
 from collab_hub_api.web.session import (
     SESSION_COOKIE,
     SESSION_PURPOSE,
@@ -67,7 +78,9 @@ from collab_hub_api.web.session import (
     WebSession,
 )
 from collab_hub_api.web.surface import (
+    PRIVACY_PATH,
     PUBLIC_WEB_PATHS,
+    TERMS_PATH,
     WEB_SURFACE_PREFIXES,
     WebSurface,
     blocked_web_route_paths,
@@ -2196,6 +2209,111 @@ async def test_the_data_statement_page_is_readable_without_an_account(tmp_path, 
     assert "What we store, and who can see it" in page.text
     assert html.escape(DATA_STATEMENT_TEXT) in page.text
     assert 'href="mailto:collab-support@openteams.com"' in page.text
+    # #95: the short form links to the long-form documents rather than
+    # absorbing them, so an invitee reading this can reach the Terms they are
+    # about to be asked to accept without going back to their email.
+    assert f'href="{TERMS_PATH}"' in page.text
+    assert f'href="{PRIVACY_PATH}"' in page.text
+
+
+async def test_the_legal_documents_are_readable_without_an_account(tmp_path, idp):
+    """#95: the Keycloak acceptance step links here *before* it issues a token.
+
+    This surface's session is minted from that token, so a session gate would
+    mean the documents could only be read by someone who had already accepted
+    them. Served to a browser with no session and no cookies.
+    """
+
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        terms = await client.get(TERMS_PATH)
+        privacy = await client.get(PRIVACY_PATH)
+
+    assert terms.status_code == 200
+    assert "Terms of Service" in terms.text
+    assert privacy.status_code == 200
+    assert "Privacy Statement" in privacy.text
+
+
+async def test_the_legal_documents_carry_the_surface_security_headers(tmp_path, idp):
+    # Anonymous does not mean unpoliced: these answer with the same headers as
+    # every other page of the surface, including the script-free CSP.
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        for path in (TERMS_PATH, PRIVACY_PATH):
+            response = await client.get(path)
+            assert response.headers["referrer-policy"] == "no-referrer"
+            assert "no-store" in response.headers["cache-control"]
+            assert response.headers["x-frame-options"] == "DENY"
+            policy = response.headers["content-security-policy"]
+            assert "default-src 'none'" in policy
+            # Plain documents. The acceptance page is the surface's only
+            # script budget, and these must not have quietly acquired one.
+            assert "script-src" not in policy
+
+
+def test_the_legal_document_paths_are_allowlisted() -> None:
+    # Anonymity costs the reviewed line in the allowlist; `make_router`
+    # refuses a public page route whose path is not in this set, so these two
+    # assertions are what keep the routes registrable at all.
+    assert TERMS_PATH in PUBLIC_WEB_PATHS
+    assert PRIVACY_PATH in PUBLIC_WEB_PATHS
+
+
+def test_each_document_renders_every_section_of_its_one_constant() -> None:
+    """#95 keeps each document in a *single* module-level constant.
+
+    That is what makes the git history usable as the acceptance record —
+    Keycloak stores only a timestamp, with no document version — and it only
+    holds if the page is rendered from the constant rather than from a second
+    copy of the prose in the template. Every heading and every paragraph of
+    the constant has to appear on the page.
+    """
+
+    pages = (
+        (terms_of_service_page(), TERMS_OF_SERVICE_TEXT),
+        (privacy_statement_page(), PRIVACY_STATEMENT_TEXT),
+    )
+    for page, document in pages:
+        assert document, "a document with no sections would pass vacuously"
+        for heading, paragraphs in document:
+            assert html.escape(heading) in page
+            for paragraph in paragraphs:
+                assert html.escape(paragraph) in page
+
+
+def test_placeholder_copy_is_labelled_as_placeholder() -> None:
+    # Unreviewed legal text is linked from a real consent gate, so it must say
+    # so on its face. The banner is driven by each document's own flag, and
+    # clearing that flag is the act that asserts counsel has seen the copy.
+    assert TERMS_OF_SERVICE_IS_PLACEHOLDER is (
+        html.escape(PLACEHOLDER_NOTICE) in terms_of_service_page()
+    )
+    assert PRIVACY_STATEMENT_IS_PLACEHOLDER is (
+        html.escape(PLACEHOLDER_NOTICE) in privacy_statement_page()
+    )
+
+
+def test_the_documents_publish_the_data_statement_contact() -> None:
+    # One address across all three documents: they are read by the same person
+    # minutes apart, and a second spelling is how they come to disagree.
+    assert DATA_STATEMENT_CONTACT in terms_of_service_page()
+    assert DATA_STATEMENT_CONTACT in privacy_statement_page()
+
+
+def test_the_documents_cross_link_each_other_and_the_data_statement() -> None:
+    assert f'href="{PRIVACY_PATH}"' in terms_of_service_page()
+    assert f'href="{TERMS_PATH}"' in privacy_statement_page()
+    for page in (terms_of_service_page(), privacy_statement_page()):
+        assert 'href="/web/data-statement"' in page
+
+
+def test_the_documents_honour_a_root_path() -> None:
+    # Every link on these pages is app-relative, so a deployment mounted under
+    # a prefix must not emit links that escape it.
+    page = terms_of_service_page(root_path="/hub")
+    assert f'href="/hub{PRIVACY_PATH}"' in page
+    assert f'href="{PRIVACY_PATH}"' not in page.replace(f"/hub{PRIVACY_PATH}", "")
 
 
 async def test_the_guard_leaves_the_public_allowlist_reachable(tmp_path, idp):
