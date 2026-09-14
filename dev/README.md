@@ -1025,6 +1025,45 @@ Frames and the user directory work immediately. Three things do not:
 
 ---
 
+## Running Cogs and Ops
+
+Nothing here runs a Cog through the hub yet: the API does not import the
+execution package (#35), and there is no run controller or run API to call.
+This section is where they arrive, one target at a time, under the rule
+[ADR-0002](../docs/adr/0002-lifecycle-runner-durability-and-placement.md) D9
+sets for every Cog execution change. In the same PR, what a change adds is:
+
+1. **runnable from here**, at the lowest level that can host it, through a
+   `make` target;
+2. **documented in this section** — the target, the level, what persists, and a
+   [troubleshooting](#troubleshooting) row for its first failure mode;
+3. **asserted in CI at that level** — no containers at level 1, no large image
+   downloads, and real clusters and heavy engines in their own workflows, never
+   in `dev-env.yaml` (see [What CI checks](#what-ci-checks)).
+
+What already runs, outside the hub:
+
+| What | Command | Needs |
+|---|---|---|
+| The execution package's tests | `cd execution && uv run --group test pytest` | nothing — the Postgres Track tests skip unless `TEST_POSTGRES_URL` is set |
+| A gated two-step Op on real worker pods, through `KubernetesCogExecutor` | `scripts/cog-execution-e2e/run.sh`, from the repository root | Docker, kind, `kubectl` |
+
+**Point `TEST_POSTGRES_URL` at a database of its own.** The Postgres Track tests
+drop and recreate `collab_track_events`. With level 2 up, `make psql`, run
+`CREATE DATABASE execution_test;`, then:
+
+```sh
+cd execution
+TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
+  uv run --group test pytest
+```
+
+**The E2E script brings its own cluster.** It creates a kind cluster named
+`cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
+runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

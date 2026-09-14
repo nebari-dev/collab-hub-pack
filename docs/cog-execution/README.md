@@ -4,8 +4,9 @@ This directory is the basis for the hub's Cog and Op execution work: the
 vocabulary, the boundary between the hub and a Cog, and the contracts that
 cross it. Read it before picking up any issue labeled `cog-execution`, and
 check work against it in review. The decisions themselves are recorded in
-[ADR-0001](../adr/0001-cog-execution.md); this directory explains the terms
-and the seam the ADR assumes.
+[ADR-0001](../adr/0001-cog-execution.md) and
+[ADR-0002](../adr/0002-lifecycle-runner-durability-and-placement.md); this
+directory explains the terms and the seam the ADRs assume.
 
 Contents:
 
@@ -59,8 +60,8 @@ hub to is drifting:
 
 ## Review checklist
 
-Ask these of every `cog-execution` change; each maps to an ADR-0001
-invariant or a seam rule.
+Ask these of every `cog-execution` change; each maps to an ADR invariant or
+decision, or a seam rule. A bare *Invariant N* is ADR-0001's.
 
 1. Does the orchestrator touch the Cog only through declared entry points?
    (Invariant 5.) A step that reaches into a package, builds a prompt for
@@ -81,6 +82,18 @@ invariant or a seam rule.
    (D9.)
 8. Does an unknown or unavailable capability degrade uniformly rather than
    being special-cased? (Invariant 4.)
+9. Does any lifecycle logic live in a durability backend? Would the change
+   behave differently under `none`, `dbos` or `temporal` in anything but
+   what survives a restart? (ADR-0002 invariant 1.)
+10. Is run status read from anywhere but the Track? (ADR-0002 invariant 2.)
+11. Can the public API reach the executor, or does anything besides the run
+    controller hold workload permissions? (ADR-0002 invariant 3.)
+12. Is it harness-neutral — does the hub side depend only on the seam,
+    never on the worker SDK or a particular harness? (ADR-0002 invariant 4.)
+13. Is what it adds runnable from `dev/` at the lowest level that can host
+    it, and asserted in CI at that level? (ADR-0002 D9.)
+14. Which documents did it make stale, and are they updated in the same PR?
+    (ADR-0002 D10.)
 
 ## How the open issues map to the ADR
 

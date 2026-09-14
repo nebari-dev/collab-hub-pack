@@ -10,7 +10,8 @@ Two tiers. **Platform concepts** come from the public
 [Intelligence Hub whitepaper](https://github.com/openteams-ai/inthub-whitepaper/blob/main/whitepaper.md),
 which is the authority on what they mean; where the hub's usage is narrower
 than the whitepaper's, the entry says so. **Hub execution vocabulary** is
-defined by [ADR-0001](adr/0001-cog-execution.md) and the
+defined by [ADR-0001](adr/0001-cog-execution.md),
+[ADR-0002](adr/0002-lifecycle-runner-durability-and-placement.md) and the
 [cog-execution docs](cog-execution/README.md) — these terms do not appear
 in the whitepaper and this glossary is their home.
 
@@ -55,7 +56,7 @@ memory. The Track is the accountability record — a Gate signature is only
 meaningful because the Track can say *which* model, *which* weights,
 *which* evidence produced the thing that was signed.
 
-## Hub execution vocabulary (defined by ADR-0001 and the cog-execution docs)
+## Hub execution vocabulary (defined by ADR-0001, ADR-0002 and the cog-execution docs)
 
 **A4.** The current delivery milestone. ADR-0001 scopes several decisions
 "for A4"; it is a schedule boundary, not an architecture concept.
@@ -87,6 +88,15 @@ Cogs carry prompts, schemas, and frames and point at a model rather than
 carrying one; *complete* Cogs carry all three. Classes compose through
 `provides`/`requires`. (ADR-0001 D3.)
 
+**Conformance suites (lifecycle, durability).** The two test suites every
+durability backend runs unchanged. The *lifecycle suite* — multi-step
+completion, a Gate escalating and each human decision, cancel, a budget
+stop, retry as a new attempt, the Track's contents — must pass on every
+backend. The *durability suite* — resuming after a kill mid-step, resuming
+at a Gate after a restart, replicas never both running one step — must pass
+on `dbos` and `temporal`; on `none` it asserts the `interrupted` contract
+instead. Passing both is what makes a backend swappable. (ADR-0002 D1–D2.)
+
 **Contract check.** A Cog's own in-package validation of its declared
 contract (schema, grounding, citation, identity), self-reported in the
 envelope's `problems` list. Input to Guards, never a Guard's verdict —
@@ -96,10 +106,20 @@ and never called a Guard. (Envelope doc, `problems`.)
 shared sensitivity scale. Labels are born on data, in the catalog — not
 declared by Cogs. (ADR-0001 D10; sensitivity doc.)
 
+**Durability backend.** What schedules the lifecycle runner's step
+functions and decides whether progress between them is checkpointed:
+`none` (no durability engine — the functions are called in process and
+nothing is checkpointed), `dbos` (the steps of a DBOS workflow) or
+`temporal` (the activities of a Temporal workflow). Selected by
+configuration. It never contains lifecycle logic and never answers what a
+run's status is — the Track does. (ADR-0002 D1–D3.)
+
 **Engine (orchestration engine).** The component that runs an Op's steps
 durably: submit, signal a paused step, observe state. Sits behind its own
 interface so the implementation is swappable; distinct from the executor.
-(ADR-0001 D5; issue #2.)
+ADR-0002 splits it in two: the *lifecycle runner* runs the steps, and a
+*durability backend* decides whether progress between them is checkpointed.
+(ADR-0001 D5; ADR-0002 D1; issue #2.)
 
 **Entry point.** A declared, invokable interface of a Cog. Two audiences:
 *usage* entry points (`ask`, `chat`, …) face end users and the Op layer;
@@ -110,6 +130,17 @@ hosting environment. (Cog-execution README; seam note.)
 on some substrate (Kubernetes is the default implementation). Pluggable;
 no raw cluster primitives leak past it into orchestration. (ADR-0001 D5,
 invariant 2.)
+
+**Grant.** A user's standing, revocable permission for Cogs to use one
+connector, with given scopes, on that user's behalf when no request of
+theirs is in flight — what an unattended run needs. The hub holds whatever
+backs a grant; a worker never does. (ADR-0001 *Out of scope / deferred*;
+issue #8.)
+
+**Harness adapter.** The part of the worker SDK that drives one kind of
+harness — an ACP agent over stdio, or a direct OpenAI-compatible model
+call — behind one interface (`start`, `interact`, `cancel`, `close`). The
+SDK turns what an adapter returns into a result envelope. (ADR-0002 D5.)
 
 **Hosting environment.** The place a Cog is installed and run — the hub,
 or later a desktop. It owns the lifecycle entry points, offers the
@@ -126,6 +157,25 @@ note.)
 environment, run its checks, resolve its requirements, record the binding,
 derive its catalog card. Distinct from materialize — installing does not
 start a worker. (Cog-execution README, "Materialize / worker".)
+
+**Interrupted.** The terminal status of a run that a host was advancing
+when it stopped, under a backend that cannot resume it (`none`). Recorded
+on the Track when the host next starts. The run is never resumed; retrying
+it is a new attempt. (ADR-0002 D2.)
+
+**Keyed claim.** How a step that is invoked again — after a crash under a
+durable backend, or on retry — avoids repeating a side effect: each
+interaction carries an idempotency key for its step attempt, the first
+writer of a key records its envelope, and a later invocation with the same
+key gets that envelope back instead of acting again. Not a lease: it does
+not decide who runs a step, only that the step acts once. (ADR-0002 D1;
+issue #1.)
+
+**Lifecycle runner.** The one component that runs a Cog's lifecycle —
+resolve, materialize, interact, read the envelope, Guards, Gate, idle or
+teardown, with budgets, cancellation and Track recording — written once as
+plain step functions. A durability backend schedules those functions; it
+never reimplements them. (ADR-0002 D1; ADR-0001 invariant 1.)
 
 **Locality.** Where a satisfier runs and where data goes when it is used —
 in-cluster, on-prem, or an external provider. A bind-time constraint that
@@ -148,6 +198,22 @@ through Nebi to an OCI registry the hub indexes. (ADR-0001 D6.)
 Guards check, Gates read, and Tracks record. (The
 [envelope doc](cog-execution/result-envelope.md).)
 
+**Run controller.** The hub process that advances runs: it runs the
+lifecycle runner and owns the executor, so it is the only identity allowed
+to create workloads. The public API records a run's intent and reads its
+Track; it never calls the executor. (ADR-0002 D4; ADR-0001 invariant 2;
+issue #6.)
+
+**Run pickup.** Under `none`, how exactly one run controller starts a
+submitted run: an atomic pickup record. The run then belongs to that
+controller, and ends `interrupted` if the controller stops. `dbos` and
+`temporal` replace pickup with their own queues. (ADR-0002 D4.)
+
+**Run target.** Where Collab sends a run: the hub, or the local host on the
+user's machine. Both serve the same run API. Placement chooses the target,
+and a run bound to local-only resources never reaches the hub. (ADR-0002
+D6–D7.)
+
 **Satisfier / resolution.** A Cog declares what it `requires` (a model
 capability, a harness, a connector); a *satisfier* is something in the
 environment that `provides` it. *Resolution* is the Cog's own `resolve`
@@ -161,3 +227,9 @@ is the strictest value on each axis across the sources actually bound; a
 step's output label is at least the strictest of its inputs, absent a
 declared, Guard-verified, Gate-signed downgrade. (ADR-0001 D10, invariants
 6–7; sensitivity doc.)
+
+**Worker SDK.** An optional library that implements the worker side of the
+seam once — `/invoke` returning an envelope, the health probe, the keyed
+claim, the binding, cancellation, usage — and hands each interaction to a
+harness adapter. A Cog may use it; the hub requires only the seam and never
+imports the SDK. (ADR-0002 D5.)
