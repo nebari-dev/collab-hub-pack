@@ -30,6 +30,12 @@ uv sync --group test        # install runtime + test deps
 uv run pytest               # run the test suite
 ```
 
+The API supports **Python 3.13 and later**. `api/.python-version` pins 3.14,
+the version the image runs, and CI runs the suite on 3.13 as well
+(`Test (Python 3.13)`). To reproduce that job, prefix the commands with
+`UV_PYTHON=3.13`. Keep code valid on 3.13: ruff targets `py313` and reports
+newer syntax.
+
 Running it by hand needs **all three** dev-auth switches —
 `FRAMES_UNSAFE_AUTH_ENABLED=true`, `DEV_AUTH_ENABLED=true` and
 `DEV_AUTH_USER=<name>`. Setting only `DEV_AUTH_USER` authenticates nothing and

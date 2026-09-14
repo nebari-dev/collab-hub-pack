@@ -28,8 +28,10 @@ one, and only matters once you reach level 3.
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
 
-You do **not** need a local Python 3.14: `uv` provisions the pinned interpreter
-from `api/.python-version` on first run.
+You do **not** need a local Python: `uv` provisions the interpreter pinned in
+`api/.python-version` (3.14, the one the image runs) on first run. The API
+supports Python 3.13 and later; prefix any target with `UV_PYTHON=3.13` to run
+it on 3.13, the version CI also tests.
 
 One thing is not a tool. Connecting the Collab desktop client needs three
 hostnames pointed at your own machine, once per machine:
