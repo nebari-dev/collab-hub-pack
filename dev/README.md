@@ -1041,7 +1041,9 @@ sets for every Cog execution change. In the same PR, what a change adds is:
    downloads, and real clusters and heavy engines in their own workflows, never
    in `dev-env.yaml` (see [What CI checks](#what-ci-checks)).
 
-What already runs, outside the hub:
+Two things already run outside the hub. They predate this rule, so they are
+run directly rather than through `make`, and CI covers them in
+`test-execution.yaml` and `test-execution-e2e.yaml`:
 
 | What | Command | Needs |
 |---|---|---|

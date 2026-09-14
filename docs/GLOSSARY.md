@@ -61,6 +61,12 @@ meaningful because the Track can say *which* model, *which* weights,
 **A4.** The current delivery milestone. ADR-0001 scopes several decisions
 "for A4"; it is a schedule boundary, not an architecture concept.
 
+**ACP (Agent Client Protocol).** An open protocol, JSON-RPC over stdio,
+through which a client drives an agent harness: it opens a session, sends
+prompts, and receives streamed updates and permission requests. The worker
+SDK's first harness adapter speaks ACP, so any harness that implements it
+can be wrapped without new adapter code. (ADR-0002 D5.)
+
 **Binding record.** The output of resolution: which pinned model, which
 endpoint, which harness, which evidence — the identity that every result
 envelope and every Track entry carries. Credentials appear in a binding
@@ -88,14 +94,15 @@ Cogs carry prompts, schemas, and frames and point at a model rather than
 carrying one; *complete* Cogs carry all three. Classes compose through
 `provides`/`requires`. (ADR-0001 D3.)
 
-**Conformance suites (lifecycle, durability).** The two test suites every
-durability backend runs unchanged. The *lifecycle suite* — multi-step
-completion, a Gate escalating and each human decision, cancel, a budget
-stop, retry as a new attempt, the Track's contents — must pass on every
-backend. The *durability suite* — resuming after a kill mid-step, resuming
-at a Gate after a restart, replicas never both running one step — must pass
-on `dbos` and `temporal`; on `none` it asserts the `interrupted` contract
-instead. Passing both is what makes a backend swappable. (ADR-0002 D1–D2.)
+**Conformance suites (lifecycle, durability).** Two test suites shared by
+every durability backend. The *lifecycle suite* (multi-step completion, a
+Gate escalating and each human decision, cancel, a budget stop, retry as a
+new attempt, the Track's contents) passes unchanged on every backend. The
+*durability suite* runs one set of scenarios (a kill mid-step, a restart
+while a run waits at a Gate, several replicas) with an outcome that depends
+on the backend: on `dbos` and `temporal` the run resumes and no step runs
+on two replicas at once; on `none` the run ends `interrupted` and is never
+resumed. Passing both is what makes a backend swappable. (ADR-0002 D1–D2.)
 
 **Contract check.** A Cog's own in-package validation of its declared
 contract (schema, grounding, citation, identity), self-reported in the
@@ -114,12 +121,14 @@ nothing is checkpointed), `dbos` (the steps of a DBOS workflow) or
 configuration. It never contains lifecycle logic and never answers what a
 run's status is — the Track does. (ADR-0002 D1–D3.)
 
-**Engine (orchestration engine).** The component that runs an Op's steps
-durably: submit, signal a paused step, observe state. Sits behind its own
-interface so the implementation is swappable; distinct from the executor.
-ADR-0002 splits it in two: the *lifecycle runner* runs the steps, and a
-*durability backend* decides whether progress between them is checkpointed.
-(ADR-0001 D5; ADR-0002 D1; issue #2.)
+**Engine (orchestration engine).** ADR-0001's name for the run-facing
+boundary behind which an Op's steps run: submit a run, signal a paused
+step, observe its state. It sits behind its own interface so the
+implementation is swappable, and is distinct from the executor. ADR-0002
+splits what is behind it: the *lifecycle runner* runs the steps, a
+*durability backend* decides whether progress between them is checkpointed
+(`none` checkpoints nothing), and a *run controller* advances runs on a
+host. (ADR-0001 D5; ADR-0002 D1, D4; issue #2.)
 
 **Entry point.** A declared, invokable interface of a Cog. Two audiences:
 *usage* entry points (`ask`, `chat`, …) face end users and the Op layer;
@@ -163,12 +172,15 @@ when it stopped, under a backend that cannot resume it (`none`). Recorded
 on the Track when the host next starts. The run is never resumed; retrying
 it is a new attempt. (ADR-0002 D2.)
 
-**Keyed claim.** How a step that is invoked again — after a crash under a
-durable backend, or on retry — avoids repeating a side effect: each
-interaction carries an idempotency key for its step attempt, the first
-writer of a key records its envelope, and a later invocation with the same
-key gets that envelope back instead of acting again. Not a lease: it does
-not decide who runs a step, only that the step acts once. (ADR-0002 D1;
+**Keyed claim.** How a step executed again within the same attempt avoids
+repeating a side effect: each interaction carries an idempotency key for its
+step attempt, the first writer of a key records its envelope, and a later
+invocation with that key gets the envelope back instead of acting again. An
+attempt lasts until its outcome is on the Track, so the claim covers a
+durable backend resuming after a crash, and a retry of a run interrupted
+before that step's outcome was recorded. A step whose failure was recorded
+runs again on retry, as a new attempt with a new key. Not a lease: it does
+not decide who runs a step, only that one attempt acts once. (ADR-0002 D1;
 issue #1.)
 
 **Lifecycle runner.** The one component that runs a Cog's lifecycle —
@@ -198,11 +210,12 @@ through Nebi to an OCI registry the hub indexes. (ADR-0001 D6.)
 Guards check, Gates read, and Tracks record. (The
 [envelope doc](cog-execution/result-envelope.md).)
 
-**Run controller.** The hub process that advances runs: it runs the
-lifecycle runner and owns the executor, so it is the only identity allowed
-to create workloads. The public API records a run's intent and reads its
-Track; it never calls the executor. (ADR-0002 D4; ADR-0001 invariant 2;
-issue #6.)
+**Run controller.** What advances runs on a host: it runs the lifecycle
+runner and owns the executor. On the hub it is its own process and the only
+identity allowed to create workloads; the public API records a run's intent
+and reads its Track, and never calls the executor. On the user's machine,
+the local run host plays the same role. (ADR-0002 D4, D6; ADR-0001
+invariant 2; issue #6.)
 
 **Run pickup.** Under `none`, how exactly one run controller starts a
 submitted run: an atomic pickup record. The run then belongs to that

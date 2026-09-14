@@ -40,10 +40,13 @@ only how those functions are scheduled and whether progress between them is
 checkpointed: `none` calls them in process; `dbos` runs them as the steps of a
 DBOS workflow; `temporal` runs them as activities of a Temporal workflow. A
 backend is selected by configuration and contains no lifecycle logic. Every
-backend passes the same conformance suites. A step invoked again — after a
-crash, or on retry — is kept from repeating its side effect by a *keyed claim*,
-never by a hand-built lease. *(Preserves ADR-0001 D5 and invariants 1–2: one
-lifecycle, engine primitives behind an interface.)*
+backend passes the same conformance suites. A step executed again within the
+same attempt — by a durable backend resuming after a crash, or by a retry of a
+run interrupted before that step's outcome was recorded — is kept from
+repeating its side effect by a *keyed claim*, never by a hand-built lease. A
+step whose failure was recorded runs again on retry, as a new attempt with a
+new key. *(Preserves ADR-0001 D5 and invariants 1–2: one lifecycle, engine
+primitives behind an interface.)*
 
 **D2 — `none` is not durable, and says so.** When a host starts, every run it
 was advancing under `none` and did not finish is recorded `interrupted` on the
@@ -70,14 +73,15 @@ invariant 2; answers #6.)*
 point, result envelope, health probe, catalog card — and never learns which
 harness a Cog uses. An optional *worker SDK* implements the worker side of the
 seam once and hands each interaction to a *harness adapter*. The first adapter
-speaks ACP, an open protocol that Hermes and other agent harnesses implement, so
-it covers any ACP agent rather than one product. The hub never imports the SDK. *(Preserves
+speaks ACP (the Agent Client Protocol), an open protocol that Hermes and other
+agent harnesses implement, so it covers any ACP agent rather than one product. The hub never imports the SDK. *(Preserves
 ADR-0001 D2 and invariant 5.)*
 
 **D6 — Local execution embeds the same package.** Local runs use
 `collab-hub-execution` embedded in a local run host on the user's machine, with
 `none` by default and `dbos` over SQLite available, so a local run can be
-durable without Postgres. `temporal` is hub-only, because it needs a service.
+durable without Postgres; the local run host is that machine's run controller.
+`temporal` is hub-only, because it needs a service.
 Local Tracks stay on the machine. *(Amends ADR-0001 D1: local execution moves
 from deferred to phased after the hub path. The seam is unchanged.)*
 
