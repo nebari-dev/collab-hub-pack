@@ -32,6 +32,7 @@ from ..frames.history import (
 )
 from ..frames.models import (
     ID_PATTERN,
+    MAX_OWNERS,
     ActiveFramesResponse,
     ActiveFramesUpdate,
     EmailBody,
@@ -470,9 +471,23 @@ def add_owner(
     store: StoreDep,
     history_store: HistoryStoreDep,
     frame_id: str = Path(pattern=ID_PATTERN),
-) -> OwnersResponse:
+) -> OwnersResponse | JSONResponse:
     frame = require_manageable_frame(store.get_frame(frame_id), auth)
-    owners = normalize_owners([*frame.owners, payload.email])
+    try:
+        owners = normalize_owners([*frame.owners, payload.email])
+    except ValueError:
+        # A frame already holding MAX_OWNERS owners cannot take another (issue
+        # #43): unguarded, this call raised inside the handler and answered a
+        # bare 500. ``normalize_owners`` also dedupes, so a resubmission of an
+        # existing owner never reaches this branch — only genuine growth past
+        # the cap does. Same envelope and status as the sibling "last_owner"
+        # guard on removal below: a 409, since the request is well-formed but
+        # conflicts with a durable invariant the stored ``Frame`` enforces too.
+        return error_response(
+            status.HTTP_409_CONFLICT,
+            "max_owners",
+            f"A Frame cannot have more than {MAX_OWNERS} owners; remove an owner before adding a new one",
+        )
     updated = store.set_owners(frame_id, owners)
     audit_event("frame_owners_update", request, user=auth.user, frame_id=frame_id)
     record_frame_history(history_store, auth, updated, "owners_changed", list_diff(frame.owners, updated.owners))

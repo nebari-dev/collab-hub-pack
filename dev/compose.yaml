@@ -1,0 +1,175 @@
+# Local development services for the Collab Hub API.
+#
+# Started through dev/Makefile, never by hand:
+#
+#   make services   postgres + minio            (no profile)
+#   make keycloak   + keycloak                  (profile: auth)
+#   make fakes      + fake Google/Slack         (profile: fakes)
+#   make up         all of the above
+#
+# Profiles keep the heavy pieces optional: a contributor working on a router
+# needs none of this, and one working on the web surface needs Keycloak but
+# not the connector fakes.
+
+name: collab-hub-dev
+
+services:
+  # Frame history, groups, orgs, invitations, platform roles, tasks, usage.
+  # Without it those endpoints answer 503 rather than failing loudly, so it is
+  # the first thing to start when something "works but returns nothing".
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: collab
+      POSTGRES_PASSWORD: collab
+      POSTGRES_DB: collab
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collab -d collab"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  # S3-compatible frame content store. The default frame store is the local
+  # filesystem; this is only needed to exercise the S3 code path.
+  minio:
+    image: minio/minio:RELEASE.2024-03-30T09-41-56Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - minio-data:/data
+
+  # One-shot: create the bucket the API expects, then exit.
+  minio-init:
+    image: minio/mc:RELEASE.2024-03-30T15-29-52Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin123
+        mc mb --ignore-existing local/frames
+        echo "bucket 'frames' ready"
+    restart: "no"
+
+  # The identity provider. KC_HOSTNAME is deliberately NOT pinned -- see the
+  # note on KC_PROXY_HEADERS below. Its data lives in a named volume, so a
+  # Google or GitHub identity provider you wire up by hand survives
+  # `make down` the same way Postgres rows do; `make destroy` is what resets.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    profiles: ["auth"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      # From the Makefile's KC_ADMIN / KC_ADMIN_PW, so the console login and
+      # what `kcadm` sends cannot drift apart. Bootstrap credentials are only
+      # read when the database is empty, so changing them takes effect on the
+      # next `make destroy`, not the next restart.
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PW:-admin}
+      # No KC_HOSTNAME pin: the issuer is derived from the request, so the
+      # realm answers correctly both directly (localhost:8080) and through the
+      # desktop front door (keycloak.localhost:9080), each self-consistent.
+      # KC_PROXY_HEADERS lets Caddy's X-Forwarded-* decide the second one.
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+      # start-dev keeps its embedded H2 database under this directory. Without
+      # the volume the realm is recreated from the import file on every `up`,
+      # which silently discards every identity provider and account link
+      # configured since. With it, --import-realm is a no-op once the realm
+      # exists.
+      #
+      # The whole `data` directory, not just `data/h2`: a fresh named volume
+      # is created root-owned unless Docker can seed it from a directory that
+      # exists in the image, and Keycloak runs as uid 1000. `data` exists and
+      # is owned by that user; `data/h2` does not exist until first boot, so
+      # mounting it directly leaves Keycloak unable to write its own database.
+      # The read-only import bind above is nested deeper, so it still wins.
+      - keycloak-data:/opt/keycloak/data
+    healthcheck:
+      # The image ships no curl, so this is Keycloak's own documented probe:
+      # open the management port by hand and read the response. It needs bash
+      # (/dev/tcp is not POSIX), which is named explicitly rather than relying
+      # on this image's /bin/sh happening to be a bash symlink.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  # Single-port front door for Apollo Desktop. See dev/proxy/Caddyfile.
+  hub-proxy:
+    image: caddy:2-alpine
+    profiles: ["desktop"]
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      # The Makefile exports DESKTOP_PORT and API_PORT, so overriding either on
+      # the make command line moves the listener, the published port and the
+      # upstream together. Defaults keep a bare `docker compose` working.
+      DESKTOP_PORT: ${DESKTOP_PORT:-9080}
+      API_UPSTREAM: host.docker.internal:${API_PORT:-8000}
+    ports:
+      - "127.0.0.1:${DESKTOP_PORT:-9080}:${DESKTOP_PORT:-9080}"
+    volumes:
+      - ./proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+    extra_hosts:
+      # Reaches the API running on your machine, not in a container.
+      - "host.docker.internal:host-gateway"
+
+  # Stand-ins for Google and Slack. Same files the kind smoke tests use, so a
+  # smoke that passes here passes there. Stdlib only — no image build.
+  fake-google:
+    image: python:3.14-slim
+    profiles: ["fakes"]
+    command: ["python", "/app/fake_google_drive_app.py"]
+    working_dir: /app
+    ports:
+      - "127.0.0.1:8081:8000"
+    volumes:
+      - ../scripts/testdata:/app:ro
+
+  fake-slack:
+    image: python:3.14-slim
+    profiles: ["fakes"]
+    command: ["python", "/app/fake_slack_app.py"]
+    working_dir: /app
+    ports:
+      - "127.0.0.1:8082:8000"
+    volumes:
+      - ../scripts/testdata:/app:ro
+
+  fake-github:
+    image: python:3.14-slim
+    profiles: ["fakes"]
+    command: ["python", "/app/fake_github_app.py"]
+    working_dir: /app
+    ports:
+      - "127.0.0.1:8083:8000"
+    volumes:
+      - ../scripts/testdata:/app:ro
+
+volumes:
+  postgres-data:
+  minio-data:
+  keycloak-data:
