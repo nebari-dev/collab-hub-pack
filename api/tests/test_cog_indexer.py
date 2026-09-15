@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import threading
 from contextlib import contextmanager
@@ -453,13 +454,52 @@ async def test_one_repository_failing_reconciles_the_rest_but_skips_removal():
     assert store.get("sha256:" + "c" * 64).status == STATUS_INDEXED
 
 
-async def test_per_source_bound_stops_enumeration_and_skips_removal():
-    indexer, store, _ = make(max_artifacts_per_source=1)
+async def test_over_bound_repository_fails_like_a_listing_error_and_the_rest_proceed():
+    # The per-repository bound is a refusal, never a prefix: an over-bound
+    # repository is skipped like a failed listing while every other repository
+    # still reconciles -- so the bound cannot starve the artifacts sorted
+    # behind it, sweep after sweep (round-2 codex finding). Removal stays off
+    # for the source because its picture is incomplete.
+    artifacts = registry()
+    artifacts["cogs/transcriber"].append(entry("c", ["v2"], COMPLETE))
+    indexer, store, _ = make(artifacts, max_artifacts_per_repository=1)
 
-    summary = await indexer.sweep()
+    for _ in range(2):  # the same outcome every sweep: no prefix creep, no removals
+        summary = await indexer.sweep()
+        assert summary.sources_failed == 1 and summary.removed == 0
+        assert summary.errors == [f"{SOURCE_ID}: list_artifacts cogs/transcriber: over the 1-artifact bound"]
 
-    assert summary.indexed == 1 and summary.sources_failed == 1 and summary.removed == 0
-    assert summary.errors == [f"{SOURCE_ID}: enumeration incomplete; removal step skipped"]
+    # cogs/notes (one artifact, under the bound) was fully reconciled.
+    assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED
+    assert store.get("sha256:" + "a" * 64) is None and store.get("sha256:" + "c" * 64) is None
+
+
+async def test_retries_never_starve_new_artifacts_of_the_budget():
+    # Round-2 codex repro: with budget 1, a permanently failing artifact
+    # sorted first used to eat the whole budget every sweep, so the healthy
+    # artifact behind it never indexed. Never-seen artifacts now outrank
+    # retries: the poison is fetched (and fails) on sweep 1, the valid one is
+    # fetched on sweep 2, and from then on the budget goes to the retry.
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    indexer, store, _ = make(
+        {
+            # "cogs/a..." sorts before "cogs/b...": the poison is the prefix.
+            "cogs/a-poison": [entry("e", ["v1"], poison)],
+            "cogs/b-valid": [entry("b", ["v1"], CONTEXT)],
+        },
+        max_new_fetches_per_sweep=1,
+    )
+
+    first = await indexer.sweep()
+    assert (first.failed, first.deferred, first.indexed) == (1, 1, 0)
+
+    second = await indexer.sweep()
+    assert (second.indexed, second.failed, second.deferred) == (1, 0, 1), "the valid artifact landed on sweep 2"
+    assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED
+
+    third = await indexer.sweep()
+    assert (third.skipped, third.failed, third.deferred) == (1, 1, 0), "the leftover budget now retries the poison"
 
 
 async def test_missing_configured_repository_is_empty_not_failed():
@@ -861,6 +901,98 @@ async def test_cancellation_during_unlock_completes_the_unlock():
         assert held
 
 
+async def test_double_cancellation_during_a_write_still_drains_before_unlocking():
+    # Round-2 codex repro: the first drain awaited the worker unshielded, so a
+    # SECOND cancel interrupted the drain and the finally released the lock
+    # while the thread was still writing (entered -> unlocked -> write_done).
+    # The drain now shields and defers repeated cancels until the worker is
+    # done, so the order is write_done before unlocked, however many cancels.
+    indexer, store, _ = evented_indexer()
+    store.release_write.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.write_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()  # lands inside the drain
+    await asyncio.sleep(0.05)
+    task.cancel()  # and again
+    await asyncio.sleep(0.05)
+    store.release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.events == ["entered", "write_done", "unlocked"]
+
+
+async def test_double_cancellation_during_acquisition_still_releases():
+    indexer, store, _ = evented_indexer()
+    store.release_enter.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.enter_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()  # a second cancel must not exit the context before entry finishes
+    await asyncio.sleep(0.05)
+    store.release_enter.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.events == ["entered", "unlocked"]
+    with store.sweep_lock() as held:
+        assert held
+
+
+async def test_double_cancellation_during_unlock_completes_the_unlock():
+    indexer, store, _ = evented_indexer()
+    store.release_exit.clear()
+
+    task = asyncio.create_task(CogIndexer(store, []).sweep())
+    await asyncio.to_thread(store.exit_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.05)
+    store.release_exit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.events == ["entered", "unlocked"]
+
+
+async def test_drain_deadline_abandons_a_worker_that_never_completes(caplog):
+    # The one hang no timeout upstream can break: a thread stuck on a call
+    # that never returns (a dead transport). The drain must give up after its
+    # deadline -- loudly -- so a cancelled sweep, and therefore app shutdown,
+    # is finitely bounded even then.
+    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.3)
+    store.release_write.clear()  # the write never completes until teardown
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.create_task(indexer.sweep())
+    try:
+        await asyncio.to_thread(store.write_started.wait, 10)
+        task.cancel()
+        started = loop.time()
+        with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+        elapsed = loop.time() - started
+        assert elapsed < 3, "the cancelled sweep did not come back within a small multiple of the deadline"
+        messages = [record.message for record in caplog.records]
+        assert "cog_index_worker_drain_abandoned" in messages, "abandonment must be loud"
+        # The abandoned write is still running: the lock was NOT handed out as
+        # if the sweep had finished cleanly -- the release path ran (bounded),
+        # but write_done had not happened when the task returned.
+        assert "write_done" not in store.events
+    finally:
+        # Let the worker thread finish so the process can exit (to_thread
+        # workers are non-daemon and joined at interpreter shutdown).
+        store.release_write.set()
+        await asyncio.sleep(0.05)
+
+
 # ---------------------------------------------------------------------------
 # The fetch budget defers work without starving it or breaking removal
 # ---------------------------------------------------------------------------
@@ -974,6 +1106,22 @@ async def test_unstorable_card_is_one_failed_row_and_the_sweep_continues():
     # Steady state: the poison row is failed, so it is retried -- and fails
     # the same bounded way -- rather than silently forgotten.
     assert (await indexer.sweep()).failed == 1
+
+
+async def test_literal_backslash_u0000_text_indexes_fine():
+    # Round-2 codex finding: the NUL check once searched the serialized JSON
+    # for the substring \\u0000, which also matches documentation that merely
+    # *discusses* NUL. Only an actual NUL character makes a card unstorable.
+    literal = dict(COMPLETE)
+    literal[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\nThe escape sequence \\u0000 denotes NUL.\n"
+    indexer, store, _ = make({"cogs/doc": [entry("d", ["v1"], literal)]})
+
+    summary = await indexer.sweep()
+
+    assert (summary.indexed, summary.failed) == (1, 0)
+    row = store.get("sha256:" + "d" * 64)
+    assert row.status == STATUS_INDEXED
+    assert "\\u0000" in row.card["body"]
 
 
 async def test_store_data_error_falls_back_to_a_failed_row():

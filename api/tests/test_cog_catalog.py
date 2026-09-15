@@ -18,7 +18,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
@@ -37,6 +37,7 @@ from collab_hub_api.cogs.catalog import (
     PostgresCogCatalogStore,
     UnavailableCogCatalogStore,
     card_search_fields,
+    contains_nul,
     json_contains,
 )
 from collab_hub_api.frames.collab_schema import COLLAB_SCHEMA_LOCK_KEY, run_collab_schema_migrations
@@ -388,6 +389,39 @@ def test_naive_datetimes_are_refused(store):
     store.upsert(artifact("a"))
     with pytest.raises(ValueError, match="timezone-aware"):
         store.update_tags(SOURCE, "cogs/cog-a", digest("a"), ("v2",), pushed_at=naive)
+
+
+def test_contains_nul_walks_values_and_keys_but_not_escape_text():
+    assert contains_nul({"a": ["fine", {"b": "bad\x00"}]}) is True
+    assert contains_nul({"bad\x00key": "v"}) is True
+    assert contains_nul({"a": ["fine", {"b": r"literal \u0000 text"}]}) is False
+    assert contains_nul({"n": 1, "b": True, "x": None}) is False
+
+
+def test_cards_that_merely_mention_nul_are_stored(store):
+    document = card()
+    document["body"] = r"The escape sequence \u0000 denotes NUL."
+    store.upsert(artifact("a", document=document))
+    assert store.get(digest("a")).card["body"] == document["body"]
+
+
+class _OffsetlessTz(tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+
+def test_datetimes_with_a_tzinfo_but_no_offset_are_refused(store):
+    # tzinfo present, utcoffset() None: naive in every way that matters
+    # (round-2 codex finding).
+    sneaky = T0.replace(tzinfo=_OffsetlessTz())
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.upsert(artifact("a", pushed_at=sneaky))
+    store.upsert(artifact("a"))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.update_tags(SOURCE, "cogs/cog-a", digest("a"), ("v2",), pushed_at=sneaky)
 
 
 def test_upsert_refuses_a_card_jsonb_cannot_store(store):

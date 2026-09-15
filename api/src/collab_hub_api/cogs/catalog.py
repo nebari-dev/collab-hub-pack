@@ -70,6 +70,19 @@ MAX_LIST_LIMIT = 1000
 # ("fsvrddl1"), so the constant is greppable and distinct from both.
 COG_INDEX_LOCK_KEY = int.from_bytes(b"cogidx_1", "big")
 
+SWEEP_STATEMENT_TIMEOUT_SECONDS = 20.0
+"""Server-side bound on every statement the sweep runs (lock included).
+
+The pool timeout bounds *checkout*; nothing else bounds execution, and a
+sweep's cancelled worker threads are drained before the lock is released --
+so a statement the server never finishes would otherwise stall shutdown for
+the whole drain deadline. Set transaction-locally on the sweep-path methods
+(the connection goes back to the pool unaltered) and session-set/reset on the
+lock connection (which runs in autocommit). Deliberately below the indexer's
+``DRAIN_DEADLINE_SECONDS`` so the server's abort fires first whenever the
+transport still works; a dead transport is what the drain deadline is for.
+"""
+
 
 class CogCatalogUnavailableError(RuntimeError):
     """Raised when the catalog is needed but no backend is configured."""
@@ -315,9 +328,31 @@ def require_aware(value: datetime | None, what: str) -> datetime | None:
     store and ``reindex`` callers.
     """
 
-    if value is not None and value.tzinfo is None:
+    if value is not None and value.utcoffset() is None:
+        # utcoffset() covers both shapes of naivety: tzinfo absent, and a
+        # tzinfo present whose utcoffset() returns None (datetime.tzinfo
+        # allows that, and such a value is naive in every way that matters).
         raise ValueError(f"{what} must be timezone-aware; a naive datetime would be reinterpreted per session")
     return value
+
+
+def contains_nul(value: Any) -> bool:
+    """Whether any string in this JSON tree contains an actual NUL character.
+
+    Walks the PARSED values (keys included). Never implemented by searching
+    the serialized text: ``json.dumps`` escapes a literal backslash, so the
+    substring ``\\u0000`` appears both for a real NUL and for the harmless
+    six characters backslash-u-0-0-0-0 in a document about NUL -- and only the
+    first is something ``jsonb`` refuses.
+    """
+
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(contains_nul(key) or contains_nul(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(contains_nul(item) for item in value)
+    return False
 
 
 def _scalar_eq(a: Any, b: Any) -> bool:
@@ -430,10 +465,11 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             raise ValueError(f"unknown catalog status {artifact.status!r}")
         require_aware(artifact.pushed_at, "pushed_at")
         require_aware(artifact.indexed_at, "indexed_at")
-        if artifact.card is not None and "\\u0000" in json.dumps(artifact.card):
+        if artifact.card is not None and contains_nul(artifact.card):
             # Parity with Postgres, where jsonb refuses NUL: a card this store
             # silently accepted would be a test passing on content production
-            # rejects.
+            # rejects. contains_nul walks the parsed values, so a literal
+            # backslash-u0000 in documentation text is (correctly) accepted.
             raise CogCatalogDataError("card contains NUL (\\u0000), which jsonb cannot store")
         stored = replace(
             artifact,
@@ -584,8 +620,28 @@ class PostgresCogCatalogStore(CogCatalogStore):
     def __init__(self, db):
         self._db = db
 
-    def known(self, source_id: str) -> list[KnownArtifact]:
+    @contextmanager
+    def _sweep_connection(self):
+        """A pooled connection whose statements the server bounds.
+
+        For the sweep-path writes and reads only: the pool timeout bounds
+        checkout, and this transaction-local ``statement_timeout`` bounds
+        execution, so a cancelled sweep's drained worker cannot sit on one
+        statement past :data:`SWEEP_STATEMENT_TIMEOUT_SECONDS` while the
+        transport is alive. Transaction-local, so the connection returns to
+        the pool unaltered. The API reads (get/list) keep the ordinary
+        checkout: they run on the request path, which has its own semantics.
+        """
+
         with self._db.connection() as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (str(int(SWEEP_STATEMENT_TIMEOUT_SECONDS * 1000)),),
+            )
+            yield conn
+
+    def known(self, source_id: str) -> list[KnownArtifact]:
+        with self._sweep_connection() as conn:
             rows = conn.execute(
                 "SELECT repository, digest, tags, status, removed_at IS NOT NULL AS removed"
                 " FROM collab_cog_artifacts WHERE source_id = %s",
@@ -615,7 +671,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
         # preserved -- and `removed_at` is cleared because a row being
         # (re)written was just seen in the registry.
         try:
-            with self._db.connection() as conn:
+            with self._sweep_connection() as conn:
                 conn.execute(
                     """
                 INSERT INTO collab_cog_artifacts (
@@ -670,7 +726,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
         require_aware(pushed_at, "pushed_at")
-        with self._db.connection() as conn:
+        with self._sweep_connection() as conn:
             row = conn.execute(
                 """
                 UPDATE collab_cog_artifacts
@@ -692,7 +748,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
         # is one statement rather than one per repository, and the whole
         # decision is one snapshot.
         document = {repo: sorted(set(digests)) for repo, digests in present.items()}
-        with self._db.connection() as conn:
+        with self._sweep_connection() as conn:
             row = conn.execute(
                 """
                 WITH present AS (
@@ -718,7 +774,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
         return int(row["n"]) if row else 0
 
     def mark_removed_one(self, source_id, repository, digest) -> bool:
-        with self._db.connection() as conn:
+        with self._sweep_connection() as conn:
             row = conn.execute(
                 """
                 UPDATE collab_cog_artifacts SET removed_at = now()
@@ -829,6 +885,13 @@ def _postgres_sweep_lock(db):
         conn.autocommit = True
         acquired = False
         try:
+            # Session-set (autocommit makes a transaction-local set a no-op)
+            # and RESET below before the connection returns: the acquire and
+            # release statements are trivial, so this only matters when the
+            # server itself has stopped answering them promptly -- exactly
+            # when an unbounded statement would stall a cancelled sweep's
+            # drain for its whole deadline.
+            conn.execute(f"SET statement_timeout = '{int(SWEEP_STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
             row = conn.execute("SELECT pg_try_advisory_lock(%s) AS locked", (COG_INDEX_LOCK_KEY,)).fetchone()
             acquired = bool(row and row["locked"])
             yield acquired
@@ -838,6 +901,7 @@ def _postgres_sweep_lock(db):
                     conn.execute("SELECT pg_advisory_unlock(%s)", (COG_INDEX_LOCK_KEY,))
             finally:
                 if not conn.closed:
+                    conn.execute("RESET statement_timeout")
                     conn.autocommit = original_autocommit
 
 

@@ -648,12 +648,14 @@ class OCIClient:
         token = payload.get("token") or payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise OCIProtocolError("token response carries no token")
-        if not token.isascii() or any(ch in token for ch in "\r\n\t"):
-            # A non-ASCII or control-bearing token cannot travel in an
-            # Authorization header: httpx would raise UnicodeEncodeError at
-            # header construction, outside this module's wrapping, and the
-            # caller's `except OCIError` would never see it. Refused here as
-            # the protocol error it is; the token itself is never echoed.
+        if not token.isascii() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in token):
+            # A non-ASCII token cannot travel in an Authorization header
+            # (httpx would raise UnicodeEncodeError at header construction,
+            # outside this module's wrapping, so the caller's `except
+            # OCIError` would never see it), and every ASCII control
+            # character -- not just CR/LF/TAB -- is refused with it: none is
+            # legal in a header value, and CR/LF specifically is header
+            # injection. The token itself is never echoed.
             raise OCIProtocolError("token endpoint returned a token that is not a valid ASCII header value")
         expires_in = payload.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
         if not isinstance(expires_in, (int, float)) or isinstance(expires_in, bool):

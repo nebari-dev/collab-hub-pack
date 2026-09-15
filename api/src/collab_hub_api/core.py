@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
 from .config import (
     BaseConfig,
     build_active_frame_store,
@@ -377,9 +378,15 @@ def make_app(config: BaseConfig) -> FastAPI:
                 # to unwind (its finally releases the lock), then close the
                 # registry clients it was talking to.
                 if cog_index_task is not None:
+                    # Bounded: the indexer's drain already has a deadline, and
+                    # this is the outer wall -- a database that stopped
+                    # answering must not be able to hang app shutdown. Past it
+                    # the task is abandoned to die with the process.
                     cog_index_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await cog_index_task
+                    try:
+                        await asyncio.wait_for(cog_index_task, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
+                    except (TimeoutError, asyncio.CancelledError):
+                        pass
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):

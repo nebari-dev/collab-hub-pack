@@ -1040,8 +1040,20 @@ as present, so removal stays correct. Safety rules operators should know:
   `sources_failed` — a transient registry outage never marks a catalog gone.
   The adapters uphold their half by **raising past their own limits instead of
   truncating** (a repository over the static adapter's tag bound, a Harbor
-  listing over its page bound): a truncated list presented as complete would
-  turn the bound into false removals.
+  listing over its page bound), and the indexer's own artifact bound is
+  per-repository and a refusal, never a prefix: a truncated list presented as
+  complete would turn a bound into false removals, and a prefix cut at the
+  same sorted position every sweep would permanently starve what lies behind
+  it. New (never-seen) artifacts outrank retries of failed ones for the fetch
+  budget, so a prefix of permanent failures cannot starve healthy artifacts
+  either.
+- **Shutdown is finitely bounded.** Sweep-path statements carry a server-side
+  `statement_timeout`; a cancelled sweep waits for its in-flight worker thread
+  (never releasing the lock mid-write, however many times it is cancelled) up
+  to a drain deadline, past which it logs `cog_index_worker_drain_abandoned`
+  and gives up — the session-scoped advisory lock is then released by the
+  server when the dead connection drops; and the app lifespan bounds its own
+  await of the cancelled indexer task.
 - **Indexing needs two pooled connections.** The sweep lock occupies one
   connection of the shared `frames.postgres` pool for the sweep's whole
   duration while reads and writes check out another, so the API refuses to

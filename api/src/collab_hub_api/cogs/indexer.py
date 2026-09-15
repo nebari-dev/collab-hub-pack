@@ -86,6 +86,7 @@ from .catalog import (
     CogCatalogStore,
     KnownArtifact,
     card_search_fields,
+    contains_nul,
 )
 from .frontmatter import read_cog_document
 from .oci import (
@@ -105,14 +106,38 @@ logger = logging.getLogger("frames_server.cogs.indexer")
 
 DEFAULT_INTERVAL_SECONDS = 300
 
-MAX_ARTIFACTS_PER_SOURCE = 10_000
-"""Completeness bound on one source's enumeration.
+DRAIN_DEADLINE_SECONDS = 30.0
+"""How long a cancelled sweep waits for an in-flight worker thread.
+
+A worker thread cannot be interrupted, so a cancelled sweep *drains* -- waits
+for the thread -- before releasing the lock. But an unresponsive established
+connection is not bounded by the pool timeout (which bounds checkout only) or
+by ``statement_timeout`` (which the server cannot enforce if the transport is
+dead), so the wait itself must have a deadline. Past it the drain logs loudly
+and abandons the thread: the session-scoped advisory lock is the backstop,
+released by the server when the dead connection drops. Chosen above
+:data:`..catalog.SWEEP_STATEMENT_TIMEOUT_SECONDS` so the server's own abort
+fires first in every case where the transport still works.
+"""
+
+INDEXER_SHUTDOWN_TIMEOUT_SECONDS = DRAIN_DEADLINE_SECONDS + 15.0
+"""Deadline the app lifespan puts on awaiting the cancelled indexer task.
+
+The drain deadline plus room for the lock release: shutdown must not hang on
+a database that stopped answering. Past it the task is abandoned to die with
+the process; everything it could still touch is process-local.
+"""
+
+MAX_ARTIFACTS_PER_REPOSITORY = 10_000
+"""Bound on one repository's enumerated artifacts.
 
 A registry is somebody else's system: this is what stops a runaway or hostile
-one from turning a sweep into an unbounded loop. A source past the bound is
-treated exactly like one whose listing failed -- reconciled as far as it was
-enumerated, removal skipped, ``sources_failed`` counted -- because a partial
-enumeration must never be mistaken for a complete one.
+one from turning a sweep into an unbounded loop. The bound is per repository
+and an over-bound repository is treated exactly like one whose listing failed
+-- skipped, ``sources_failed`` counted, removal disabled for the source --
+while every *other* repository still reconciles. Deliberately not a
+per-source prefix: a prefix cut at the same sorted position every sweep
+would permanently starve the artifacts behind it (round-2 codex finding).
 """
 
 MAX_NEW_FETCHES_PER_SWEEP = 1_000
@@ -193,14 +218,16 @@ class CogIndexer:
         store: CogCatalogStore,
         sources: Sequence[RegistrySource],
         *,
-        max_artifacts_per_source: int = MAX_ARTIFACTS_PER_SOURCE,
+        max_artifacts_per_repository: int = MAX_ARTIFACTS_PER_REPOSITORY,
         max_new_fetches_per_sweep: int = MAX_NEW_FETCHES_PER_SWEEP,
         max_bytes_per_file: int = DEFAULT_MAX_BUNDLE_FILE_BYTES,
+        drain_deadline_seconds: float = DRAIN_DEADLINE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._sources = list(sources)
-        self._max_artifacts = max_artifacts_per_source
+        self._max_artifacts = max_artifacts_per_repository
+        self._drain_deadline = drain_deadline_seconds
         self._max_new_fetches = max_new_fetches_per_sweep
         self._max_bytes_per_file = max_bytes_per_file
         self._clock = clock
@@ -213,7 +240,7 @@ class CogIndexer:
     # -- threading discipline ---------------------------------------------------
 
     async def _on_thread(self, func, /, *args, **kwargs):
-        """Run a blocking store call on a worker thread; cancellation drains it.
+        """Run a blocking store call on a worker thread; cancellation drains it, bounded.
 
         A worker thread cannot be interrupted, so a plain ``await
         asyncio.to_thread(...)`` cancelled mid-call leaves the call running
@@ -222,20 +249,57 @@ class CogIndexer:
         abandon a lock acquisition that completes a moment later with nobody
         left to release it. So the future is shielded, and on cancellation
         this waits for the thread to finish (its result or error discarded)
-        before propagating. A second cancellation during the drain abandons
-        the wait -- there is no stronger guarantee available -- but the
-        ordinary shutdown path (one ``cancel()`` then ``await``) always
-        drains.
+        before propagating.
+
+        The drain itself is shielded and deadline-bounded (see
+        :meth:`_drain`): repeated cancellations are deferred until the worker
+        completes -- they collapse into the one ``CancelledError`` re-raised
+        here -- and a worker that never completes (a dead connection the
+        server cannot abort) is abandoned after ``drain_deadline_seconds``
+        with a loud log line, so shutdown always has a finite bound.
         """
 
         future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            if not future.done():
-                with suppress(Exception):
-                    await future
+            await self._drain(future)
             raise
+
+    async def _drain(self, future: asyncio.Future) -> None:
+        """Wait for a cancelled call's worker, deferring further cancels, up to the deadline."""
+
+        deadline = self._clock() + self._drain_deadline
+        while not future.done():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                # The thread is stuck on something no timeout reached (a dead
+                # transport, most likely). Abandon it -- the session-scoped
+                # advisory lock is released by the server with the connection,
+                # and hanging shutdown forever helps nobody.
+                logger.error(
+                    "cog_index_worker_drain_abandoned",
+                    extra={"deadline_seconds": self._drain_deadline},
+                )
+                return
+            try:
+                # Shielded: a second cancellation must interrupt this wait
+                # without touching the worker, and then wait again -- the
+                # whole point of the drain is that the lock is not released
+                # while a write is still running, however often the task is
+                # cancelled. The deferred cancellations collapse into the one
+                # CancelledError the caller re-raises.
+                await asyncio.wait_for(asyncio.shield(future), timeout=remaining)
+            except asyncio.CancelledError:
+                continue
+            except TimeoutError:
+                continue
+            except Exception:
+                break  # the worker's own failure: it is done, which is all the drain wants
+        if future.done() and not future.cancelled():
+            # Consume the result/exception so nothing warns about it later.
+            with suppress(Exception):
+                future.exception()
 
     async def _release(self, lock) -> None:
         """Release the sweep lock, tolerating both errors and cancellation.
@@ -311,21 +375,39 @@ class CogIndexer:
                 return
 
         known = {(row.repository, row.digest): row for row in await self._on_thread(self._store.known, source.id)}
-        budget = self._max_new_fetches
+        # Three classes, mirroring _reconcile's decision: bookkeeping (known,
+        # not failed) costs no budget; a fetch happens for digests the catalog
+        # has never seen and for retries of failed rows. Fetches run in two
+        # passes -- never-seen artifacts first, failed retries with whatever
+        # budget remains -- so a prefix of permanent failures at the same
+        # sorted position cannot eat every sweep's budget and starve healthy
+        # new artifacts behind it (round-2 codex finding). Within each class,
+        # enumeration order is kept.
+        unseen: list[tuple[str, ArtifactRef]] = []
+        retries: list[tuple[str, ArtifactRef, KnownArtifact]] = []
         for repository, artifacts in enumeration.present.items():
             for artifact in artifacts:
                 known_row = known.get((repository, artifact.digest))
-                # Mirrors _reconcile's decision: a fetch happens for a digest
-                # the catalog has never indexed, or one whose last attempt
-                # failed. Everything else is bookkeeping and costs no budget.
-                needs_fetch = known_row is None or known_row.status == STATUS_FAILED
-                if needs_fetch and budget <= 0:
-                    _count(summary, OUTCOME_DEFERRED)
-                    continue
-                outcome = await self._reconcile(source, repository, artifact, known_row)
-                if needs_fetch:
-                    budget -= 1
-                _count(summary, outcome)
+                if known_row is None:
+                    unseen.append((repository, artifact))
+                elif known_row.status == STATUS_FAILED:
+                    retries.append((repository, artifact, known_row))
+                else:
+                    outcome = await self._reconcile(source, repository, artifact, known_row)
+                    _count(summary, outcome)
+        budget = self._max_new_fetches
+        for repository, artifact in unseen:
+            if budget <= 0:
+                _count(summary, OUTCOME_DEFERRED)
+                continue
+            budget -= 1
+            _count(summary, await self._reconcile(source, repository, artifact, None))
+        for repository, artifact, known_row in retries:
+            if budget <= 0:
+                _count(summary, OUTCOME_DEFERRED)
+                continue
+            budget -= 1
+            _count(summary, await self._reconcile(source, repository, artifact, known_row))
 
         if not enumeration.complete:
             # Skipping removal is the whole point of tracking completeness:
@@ -355,7 +437,6 @@ class CogIndexer:
             result.complete = False
             result.error = f"list_repositories: {_describe(exc)}"
             return result
-        seen = 0
         for repository in repositories:
             try:
                 artifacts = await source.list_artifacts(repository)
@@ -368,17 +449,21 @@ class CogIndexer:
                 result.complete = False
                 result.error = f"list_artifacts {repository}: {_describe(exc)}"
                 continue
-            if seen + len(artifacts) > self._max_artifacts:
-                keep = max(0, self._max_artifacts - seen)
+            if len(artifacts) > self._max_artifacts:
+                # Treated exactly like a failed listing, and never as a
+                # prefix: enumeration always runs to the end of the
+                # repository list, so the artifacts behind an over-bound
+                # repository are not starved (round-2 codex finding) and the
+                # bound cannot silently misrepresent a partial view as
+                # complete.
                 logger.warning(
-                    "cog_index_source_bounded",
+                    "cog_index_repository_over_bound",
                     extra={"source": source.id, "repository": repository, "bound": self._max_artifacts},
                 )
-                result.present[repository] = artifacts[:keep]
                 result.complete = False
-                break
+                result.error = f"list_artifacts {repository}: over the {self._max_artifacts}-artifact bound"
+                continue
             result.present[repository] = artifacts
-            seen += len(artifacts)
         return result
 
     async def _reconcile(
@@ -630,12 +715,17 @@ def _card_unstorable(document: dict) -> str | None:
     poisons every later sweep.
     """
 
+    if contains_nul(document):
+        # Checked on the PARSED values, never by searching the serialized
+        # text: json.dumps escapes a literal backslash, so the substring
+        # "\\u0000" also appears for the harmless literal backslash-u-0-0-0-0
+        # in a doc -- a card discussing NUL must index; only a card
+        # *containing* one may not (round-2 codex finding).
+        return "card: contains NUL (\\u0000), which jsonb cannot store"
     try:
         dumped = json.dumps(document)
     except (TypeError, ValueError) as exc:
         return f"card: not JSON-serializable ({type(exc).__name__})"
-    if "\\u0000" in dumped:
-        return "card: contains NUL (\\u0000), which jsonb cannot store"
     if len(dumped) > MAX_CARD_BYTES:
         return f"card: {len(dumped)} bytes of JSON exceeds the {MAX_CARD_BYTES}-byte cap"
     return None
