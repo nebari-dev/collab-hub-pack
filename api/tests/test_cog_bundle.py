@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import random
+import re
 from pathlib import Path
 
 import pytest
@@ -298,8 +299,10 @@ def test_prog_bundle_yields_a_minimal_prog_card():
 def test_fixtures_contain_no_private_data():
     for path in FIXTURES.rglob("*"):
         if path.is_file():
-            text = path.read_text()
-            assert "@" not in text.replace("cogs@example.org", ""), path
+            text = path.read_text().replace("cogs@example.org", "")
+            # OCI digest references (name@sha256:...) are not private data.
+            text = re.sub(r"@sha256:[0-9a-f]{64}", "", text)
+            assert "@" not in text, path
 
 
 # ---------------------------------------------------------------------------
