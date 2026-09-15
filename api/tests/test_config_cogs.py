@@ -123,7 +123,8 @@ def test_credentials_and_webhook_resolve_from_named_env_vars(monkeypatch):
     # The model's own strip applies to the resolved value too.
     assert source.credentials.password.get_secret_value() == "robot-secret-value"
     assert source.webhook_secret.get_secret_value() == "hook-secret-value"
-    # Neither the model nor its error text leaks the secret.
+    # The built model's repr masks the secrets (SecretStr); the error-text
+    # guarantee is a separate test below.
     assert "robot-secret-value" not in repr(source)
     assert "hook-secret-value" not in repr(source)
 
@@ -184,6 +185,71 @@ def test_env_password_without_username_still_trips_both_or_neither(monkeypatch):
         parse_cogs(registry_sources=[harbor_source(credentials={"password_env": "PW"})])
 
 
+def _error_text(excinfo: pytest.ExceptionInfo[ValidationError]) -> str:
+    """Every rendering a startup log or a traceback could carry."""
+
+    return "\n".join([str(excinfo.value), repr(excinfo.value), repr(excinfo.value.errors()), excinfo.value.json()])
+
+
+def test_resolved_password_never_appears_in_validation_errors(monkeypatch):
+    # The resolver inserts the password *before* the model's own rules run,
+    # and pydantic quotes the failing input in its error text; a source with
+    # a password but no username must fail without echoing the password.
+    monkeypatch.setenv("PW", "REVIEW_SYNTHETIC_PASSWORD")
+
+    with pytest.raises(ValidationError, match="must be set together") as excinfo:
+        parse_cogs(registry_sources=[harbor_source(credentials={"password_env": "PW"})])
+
+    assert "REVIEW_SYNTHETIC_PASSWORD" not in _error_text(excinfo)
+
+
+def test_resolved_webhook_secret_never_appears_in_validation_errors(monkeypatch):
+    # kind=static refuses a webhook secret; the refusal quotes the source, and
+    # the source now holds the resolved secret.
+    monkeypatch.setenv("WH", "REVIEW_SYNTHETIC_WEBHOOK")
+
+    with pytest.raises(ValidationError, match="has no webhook") as excinfo:
+        parse_cogs(registry_sources=[static_source(webhook_secret_env="WH")])
+
+    assert "REVIEW_SYNTHETIC_WEBHOOK" not in _error_text(excinfo)
+
+
+def test_resolved_secrets_stay_hidden_when_an_unrelated_field_fails(monkeypatch):
+    # A different field's failure on the same source still quotes the whole
+    # source dict; the secrets inside it must be masked there too.
+    monkeypatch.setenv("U", "robot")
+    monkeypatch.setenv("PW", "REVIEW_SYNTHETIC_PASSWORD")
+    monkeypatch.setenv("WH", "REVIEW_SYNTHETIC_WEBHOOK")
+
+    with pytest.raises(ValidationError) as excinfo:
+        parse_cogs(
+            registry_sources=[
+                harbor_source(
+                    projects=[],
+                    credentials={"username_env": "U", "password_env": "PW"},
+                    webhook_secret_env="WH",
+                )
+            ]
+        )
+
+    text = _error_text(excinfo)
+    assert "requires at least one entry in projects" in text
+    assert "REVIEW_SYNTHETIC_PASSWORD" not in text
+    assert "REVIEW_SYNTHETIC_WEBHOOK" not in text
+
+
+def test_config_errors_do_not_echo_inputs_at_all():
+    # Defence in depth behind the SecretStr wrapping: the settings class hides
+    # every input, so a Postgres URL with a password in it is not quoted either.
+    with pytest.raises(ValidationError) as excinfo:
+        postgres = {"url": "postgresql://u:REVIEW_SYNTHETIC_DB_PW@db/x", "pool": {"max_size": 0}}
+        Config.parse({"frames": {"postgres": postgres}})
+
+    assert "max_size" in str(excinfo.value)
+    assert "REVIEW_SYNTHETIC_DB_PW" not in _error_text(excinfo)
+    assert "input_value" not in str(excinfo.value)
+
+
 def test_resolver_passes_non_mappings_through():
     sentinel = object()
 
@@ -196,7 +262,9 @@ def test_resolver_does_not_mutate_its_input():
     resolved = resolve_cogs_source_secrets(raw, 0, {"PW": "pw"})
 
     assert raw["credentials"] == {"username": "u", "password_env": "PW"}
-    assert resolved["credentials"] == {"username": "u", "password": "pw"}
+    assert resolved["credentials"]["username"] == "u"
+    assert resolved["credentials"]["password"].get_secret_value() == "pw"
+    assert "pw" not in repr(resolved)
 
 
 # --- The chart's contract: one JSON env var for the list, plus named Secrets --

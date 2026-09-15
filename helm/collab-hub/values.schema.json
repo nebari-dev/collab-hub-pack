@@ -1215,13 +1215,15 @@
         },
         "url": {
           "type": "string",
-          "pattern": "^https?://"
+          "pattern": "^https?://[^/?#@]+([/?#].*)?$"
         },
         "apiUrl": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
         },
         "tokenUrl": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
         },
         "projects": {
           "type": "array",
@@ -1236,7 +1238,8 @@
           }
         },
         "indexUrl": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
         },
         "caBundlePath": {
           "type": "string"

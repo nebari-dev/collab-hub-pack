@@ -9,6 +9,15 @@ why the registry stays swappable — are documented in
 `api/src/collab_hub_api/cogs/registry.py`; the configuration surface is
 [#87](https://github.com/nebari-dev/collab-hub-pack/issues/87).
 
+> **Status.** This page describes the configuration surface and the chart
+> wiring. Consuming it at runtime — the indexer sweep ([#84]) and the Cog read
+> API ([#85]) — lands separately; today the API validates the block at startup
+> (and refuses to start on the errors described below) but no sweep runs and
+> no registry is contacted.
+
+[#84]: https://github.com/nebari-dev/collab-hub-pack/issues/84
+[#85]: https://github.com/nebari-dev/collab-hub-pack/issues/85
+
 Two rules shape everything below:
 
 - **The chart and the values must land together.** `values.schema.json` has
@@ -124,15 +133,20 @@ cogs:
     runOnStartup: true
 ```
 
-`enabled: false` leaves the Cog read API up and static: it serves whatever the
-index already holds and contacts no registry. Sources may be configured while
-the indexer is off. `enabled: true` with zero sources is refused at render and
-at startup — an indexer with nothing to index is a misconfiguration, not an
-idle worker. The interval is bounded to 10 s..24 h because a sweep lists every
-repository of every source.
+`enabled` is the switch the indexer (#84) will honor: off, no sweep is
+scheduled, so the read API (#85) serves whatever the index already holds.
+Sources may be configured while the indexer is off — and they are still
+rendered and validated: the source JSON, the Secret-backed env vars and the
+CA mount are emitted whenever `registry.sources` is non-empty, regardless of
+`enabled`, and the API still resolves every named Secret at startup. Only
+`intervalSeconds` and `runOnStartup` are suppressed when `enabled` is false.
+`enabled: true` with zero sources is refused at render and at startup — an
+indexer with nothing to index is a misconfiguration, not an idle worker. The
+interval is bounded to 10 s..24 h because a sweep lists every repository of
+every source.
 
-When the indexer is off the chart renders only the `enabled` flag, so a
-deployment without Cogs carries no other `cogs` environment.
+With no sources and the indexer off, the chart renders only the `enabled`
+flag, so a deployment without Cogs carries no other `cogs` environment.
 
 ## Worked example: one Harbor source
 
@@ -176,7 +190,10 @@ no secrets), `COLLAB_HUB_COGS_SOURCE_HARBOR_MAIN_{USERNAME,PASSWORD,WEBHOOK_SECR
 from the two Secrets, and the CA bundle at `/etc/collab-hub/cogs-ca/ca.crt`.
 Nothing inside the pod needs editing. `helm/collab-hub/ci/cogs-values.yaml`
 is this example plus a static source, and `scripts/chart_render_tests.sh`
-renders it (and every refusal above) in the lint workflow.
+renders it (and every refusal above) in the lint workflow. Nothing in the
+manifest is trusted implicitly: a URL that embeds `user:password@` is refused
+by the schema and the render, because the JSON lands in the pod spec and the
+release history.
 
 ## Bare process
 

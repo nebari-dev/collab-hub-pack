@@ -16,6 +16,17 @@ reported to whoever ran helm instead of by a crash-looping pod. */}}
 {{- fail (printf "%s reuses an id already used by an earlier source: the id is stored with every indexed row, so two sources sharing one would make their artifacts indistinguishable." $label) }}
 {{- end }}
 {{- $ids = append $ids $source.id }}
+{{- /* The source list is rendered into the pod spec as plain JSON, and the
+app quotes URLs in its messages: a password embedded as userinfo would be in
+the manifest, the release history and the logs. The app refuses it too
+(registry.py _http_url), but only after the render has already put it there.
+values.schema.json carries the same pattern; this check names the field. */}}
+{{- range $field := list "url" "apiUrl" "tokenUrl" "indexUrl" }}
+{{- $value := toString (index $source $field | default "") }}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*@" $value }}
+{{- fail (printf "%s.%s embeds a username or password in the URL; credentials go in credentials.existingSecret, never in values or the rendered manifest." $label $field) }}
+{{- end }}
+{{- end }}
 {{- $envId := regexReplaceAll "[^A-Z0-9]" (upper $source.id) "_" }}
 {{- if has $envId $envIds }}
 {{- fail (printf "%s maps to the same Secret env var names (COLLAB_HUB_COGS_SOURCE_%s_*) as an earlier source: ids that differ only in '.', '-' or '_' collide once upper-cased for the environment. Rename one of them." $label $envId) }}

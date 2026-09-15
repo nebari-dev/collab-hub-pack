@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from .cogs.registry import CogRegistrySourceConfig
@@ -715,17 +715,27 @@ class CogIndexConfig(BaseModel):
     run_on_startup: bool = True
 
 
-COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str], ...] = (
-    ("username_env", "username"),
-    ("password_env", "password"),
+COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
+    ("username_env", "username", False),
+    ("password_env", "password", True),
 )
-"""``credentials`` indirections: ``<name>_env`` names the environment variable holding ``<name>``."""
+"""``credentials`` indirections: ``<name>_env`` names the environment variable holding ``<name>``.
 
-COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD = ("webhook_secret_env", "webhook_secret")
+The third element says whether the value is a secret (wrapped in ``SecretStr``
+on insertion) or plain data like a robot account name.
+"""
+
+COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD = ("webhook_secret_env", "webhook_secret", True)
 
 
 def _pull_secret_from_env(
-    container: dict[str, Any], env_field: str, field: str, *, label: str, environ: Mapping[str, str]
+    container: dict[str, Any],
+    env_field: str,
+    field: str,
+    *,
+    secret: bool,
+    label: str,
+    environ: Mapping[str, str],
 ) -> None:
     """Replace ``container[env_field]`` (an env var name) with ``container[field]`` (its value).
 
@@ -734,6 +744,14 @@ def _pull_secret_from_env(
     ``key`` in ``existingSecret``, or an empty Secret value looks like from
     inside the pod. Failing here names the variable, so the fix is a values
     change and not a search through adapter 401s on the first sweep.
+
+    A secret is inserted as a ``SecretStr``, never a plain string. Validation
+    runs *after* this and pydantic quotes the offending input in its error
+    text; a source whose username is missing would otherwise put the resolved
+    password into a ValidationError that ``__main__`` lets reach the startup
+    log. ``SecretStr`` reprs as ``**********`` wherever it is echoed, so no
+    downstream error path — this model's, a nested one's, or the settings
+    class's — can carry the value.
     """
 
     if env_field not in container:
@@ -755,7 +773,8 @@ def _pull_secret_from_env(
             f"chart this means the Secret named in the source's existingSecret is missing or has no "
             f"value under the configured key; the API refuses to start rather than run unauthenticated."
         )
-    container[field] = value
+    value = value.strip()
+    container[field] = SecretStr(value) if secret else value
 
 
 def resolve_cogs_source_secrets(raw: Any, index: int, environ: Mapping[str, str]) -> Any:
@@ -785,10 +804,12 @@ def resolve_cogs_source_secrets(raw: Any, index: int, environ: Mapping[str, str]
     if isinstance(credentials, dict):
         credentials = dict(credentials)
         raw["credentials"] = credentials
-        for env_field, field in COGS_SOURCE_SECRET_ENV_FIELDS:
-            _pull_secret_from_env(credentials, env_field, field, label=f"{label}.credentials", environ=environ)
-    env_field, field = COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD
-    _pull_secret_from_env(raw, env_field, field, label=label, environ=environ)
+        for env_field, field, secret in COGS_SOURCE_SECRET_ENV_FIELDS:
+            _pull_secret_from_env(
+                credentials, env_field, field, secret=secret, label=f"{label}.credentials", environ=environ
+            )
+    env_field, field, secret = COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD
+    _pull_secret_from_env(raw, env_field, field, secret=secret, label=label, environ=environ)
     return raw
 
 
@@ -851,7 +872,15 @@ class BaseConfig(BaseSettings):
 
 
 class Config(BaseConfig):
-    model_config = SettingsConfigDict(env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__")
+    # hide_input_in_errors at the outermost model: it is this class's config,
+    # not a nested model's, that decides whether pydantic quotes the offending
+    # input in a ValidationError, and the input here is the whole settings
+    # tree — Postgres URLs with passwords, client secrets, resolved registry
+    # credentials. __main__ lets that error reach the startup log. Field
+    # names and constraint messages remain; only the echoed value goes.
+    model_config = SettingsConfigDict(
+        env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(

@@ -1,0 +1,27 @@
+# Render-test fixture (scripts/chart_render_tests.sh): three sources with
+# distinct Secrets and non-default key names, so the checker can prove each
+# source's credentials are attached to *that* source in the rendered JSON.
+cogs:
+  registry:
+    sources:
+      - id: harbor-main
+        kind: harbor
+        url: https://harbor.example.com
+        projects: [cogs]
+        credentials:
+          existingSecret: robot-a
+      - id: mid.one
+        kind: static
+        url: https://mid.example.com
+        repositories: [cogs/mid]
+        credentials:
+          existingSecret: robot-b
+          usernameKey: user
+          passwordKey: pass
+      - id: tail-two
+        kind: harbor
+        url: https://tail.example.com
+        projects: [cogs]
+        webhook:
+          existingSecret: hook-c
+          secretKey: token

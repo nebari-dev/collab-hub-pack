@@ -117,6 +117,9 @@ jobs:
         # a CA bundle, indexer on: the shape docs/cog-registry.md documents.
         run: helm template helm/collab-hub -f helm/collab-hub/ci/cogs-values.yaml | kubeconform -strict -ignore-missing-schemas -
 
+      - name: Install PyYAML for the render assertions
+        run: python3 -m pip install --quiet pyyaml
+
       - name: Chart render tests
         # Positive renders with assertions on the output, plus every
         # fail-the-render rule in templates/cogs-validations.yaml and the
