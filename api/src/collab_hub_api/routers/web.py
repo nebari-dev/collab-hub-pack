@@ -37,8 +37,6 @@ from ..web.authz import (
     signin_redirect_target,
 )
 from ..web.data_statement import data_statement_page
-from ..web.privacy_statement import privacy_statement_page
-from ..web.terms_of_service import terms_of_service_page
 from ..web.forms import FormRefused
 from ..web.pages import (
     SECURITY_HEADERS,
@@ -53,6 +51,7 @@ from ..web.pages import (
     sign_in_failed_page,
     signed_out_page,
 )
+from ..web.privacy_statement import privacy_statement_page
 from ..web.request_limits import connection_close_headers
 from ..web.session import (
     TRANSIENT_COOKIE,
@@ -79,6 +78,7 @@ from ..web.surface import (
     WebSurface,
     clamped_session_lifetime,
 )
+from ..web.terms_of_service import terms_of_service_page
 
 logger = logging.getLogger("frames_server.web")
 
