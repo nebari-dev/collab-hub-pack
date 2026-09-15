@@ -388,7 +388,7 @@ def stale_csrf_exemptions(
     Only paths that are **actually mounted** are judged. An entry naming a
     path with no route is left alone, and that is a decision rather than an
     omission: :func:`~..core.make_app` mounts the operator router only when
-    ``org_source_is_membership()``, so on a claims-sourced deployment #91's
+    ``org_source_resolves_membership()``, so on a claims-sourced deployment #91's
     ``/admin`` routes are legitimately absent while its entries are correctly
     present. Failing on absence would refuse to start every claims-mode
     deployment. It would also refuse a repository mid-stack, where an entry
