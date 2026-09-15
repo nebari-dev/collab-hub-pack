@@ -6,6 +6,8 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from .db import locked_schema_connection
+
 
 @dataclass(frozen=True)
 class ActiveFrameUsage:
@@ -374,7 +376,10 @@ class PostgresActiveFrameStore(ActiveFrameStore):
         return ActiveFrameUsage(frames=row["frames"], users=row["users"])
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        # Advisory-locked (issue #42): the CREATE and the ALTER/constraint
+        # migration below all race under concurrent replica startup, exactly
+        # like a bare CREATE TABLE IF NOT EXISTS does.
+        with locked_schema_connection(self.db) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS frames_server_active_frames (

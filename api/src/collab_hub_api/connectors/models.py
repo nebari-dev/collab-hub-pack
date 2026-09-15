@@ -478,6 +478,9 @@ class GitHubReview(BaseModel):
     user: str = ""
     # GitHub review state: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING.
     state: str = ""
+    # The reviewer's summary comment (why changes were requested), sanitized and
+    # length-capped. "" when the review carried no body.
+    body: str = ""
 
 
 class GitHubItem(BaseModel):
@@ -494,7 +497,14 @@ class GitHubItem(BaseModel):
     updated_at: datetime | None = None
     # Populated only for pull requests (read via the pulls endpoint).
     requested_reviewers: list[str] = Field(default_factory=list)
+    # Teams (not individuals) requested for review; dropping these would misfile a
+    # PR whose only reviewer is a team.
+    requested_teams: list[str] = Field(default_factory=list)
     reviews: list[GitHubReview] = Field(default_factory=list)
+    is_draft: bool = False
+    # "merged" | "closed_unmerged" | "open" for PRs; "" for issues. Disambiguates
+    # a closed PR (state="closed" alone can't tell merged from abandoned).
+    merge_state: str = ""
 
 
 class GitHubItemReadRequest(BaseModel):
@@ -547,9 +557,46 @@ class GitHubProjectItem(BaseModel):
     title: str = ""
     type: str = ""  # ISSUE | PULL_REQUEST | DRAFT_ISSUE | REDACTED
     status: str = ""
+    # state of the linked issue/PR: "open"/"closed" for issues, plus "merged"
+    # for PRs. Empty for draft/redacted items (no accessible content).
+    state: str = ""
     repo: str = ""  # owner/name, when the item is a linked issue/PR
     number: int = 0  # issue/PR number, when linked
+    # Assignees/labels of the linked issue/PR (bounded), so a board can be triaged
+    # by person or label. Empty for draft/redacted items.
+    assignees: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
     fields: dict[str, str] = Field(default_factory=dict)
+
+
+class GitHubStatusCount(BaseModel):
+    name: str = ""
+    count: int = 0
+
+
+class GitHubProjectCounts(BaseModel):
+    # Exact, non-archived board total. archived_policy records the scope so the
+    # number is never ambiguous ("excluded" = archived items not counted, the
+    # default that matches the live board a human sees).
+    total: int = 0
+    archived_policy: str = "excluded"
+    # Per Status-column counts; no_status is the blank column. When authoritative,
+    # columns are in board-column order and by_status + no_status reconcile to
+    # total. On the sampled fallback the buckets cover only counted_items, in
+    # first-seen order (zero-count columns omitted).
+    by_status: list[GitHubStatusCount] = Field(default_factory=list)
+    no_status: int = 0
+    # Two independent partitions of total — do NOT cross-add. by_type keys:
+    # issue / pull_request / draft / redacted (redacted = total - the other
+    # three). by_state (open/closed) covers only linked issues/PRs, so it need
+    # not sum to total (drafts/redacted have no state).
+    by_type: dict[str, int] = Field(default_factory=dict)
+    by_state: dict[str, int] = Field(default_factory=dict)
+    # True when produced by server-side count queries, OR when the whole board
+    # was enumerated (counted_items == total) so the buckets are exact. False
+    # marks a truncated sample: breakdowns cover only counted_items.
+    authoritative: bool = False
+    counted_items: int = 0
 
 
 class GitHubProjectsListRequest(BaseModel):
@@ -577,6 +624,10 @@ class GitHubProjectReadResponse(UntrustedConnectorResponse):
     # board for the whole thing.
     total_count: int = 0
     truncated: bool = False
+    # Aggregate breakdowns (per status column, by type, open/closed). Accurate
+    # regardless of the item truncation above: computed by server-side count
+    # queries when available, otherwise sampled and flagged non-authoritative.
+    counts: GitHubProjectCounts | None = None
 
 
 class GitHubRepo(BaseModel):
