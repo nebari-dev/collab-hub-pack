@@ -23,7 +23,8 @@ from ..config import WEB_SESSION_LIFETIME_CEILING_SECONDS, BaseConfig
 from ..frames.org_source import (
     ORG_SOURCE_ENV,
     ORG_SOURCE_MEMBERSHIP,
-    org_source_is_membership,
+    ORG_SOURCE_SINGLE,
+    org_source_resolves_membership,
 )
 from ..path_protection import resolve_access
 from .oidc import invalid_realm_url_reason, realm_endpoints
@@ -161,6 +162,17 @@ that, which the router's dependency enforces.
 ORG_INVITATIONS_REVOKE_PATH = "/web/org/invitations/revoke"
 """The owner page's revoke ``POST``. Same session and owner gating."""
 
+ORG_INVITATIONS_NAME_PATH = "/web/org/invitations/name"
+"""The owner page's first-invite naming ``POST`` (#44, the flow #92 specified).
+
+Every organization starts with the neutral placeholder name, and the owner
+page refuses to issue an invitation while it stands — the invitee's email
+would otherwise name "Unnamed organization". This route gives the organization
+its name, once, recorded as ``org.rename``. Same session and owner gating; a
+sub-path of the page rather than a page of its own, so it inherits the
+``/web`` nesting decision recorded on :data:`ORG_INVITATIONS_PATH`.
+"""
+
 DATA_STATEMENT_PATH = "/web/data-statement"
 """The data statement page (#146): what is stored, who can see it, how to ask
 for deletion. The copy itself lives in :mod:`.data_statement`.
@@ -177,7 +189,11 @@ acceptance page is: a static document, rendered from constants, reading
 nothing from the request, with nothing to act on.
 """
 
-ORG_INVITATIONS_PATHS = (ORG_INVITATIONS_PATH, ORG_INVITATIONS_REVOKE_PATH)
+ORG_INVITATIONS_PATHS = (
+    ORG_INVITATIONS_PATH,
+    ORG_INVITATIONS_REVOKE_PATH,
+    ORG_INVITATIONS_NAME_PATH,
+)
 """Every path the owner invitation page serves. Read by
 :data:`CSRF_ENFORCED_IN_ROUTE`, same as :data:`ADMIN_PATHS`."""
 
@@ -464,7 +480,7 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
                 f" {web.public_base_url!r}: set it to this deployment's external"
                 " origin, e.g. https://frames.example.com."
             )
-    elif org_source_is_membership():
+    elif org_source_resolves_membership():
         # The invitation pages (#91, #142) mount on a membership-resolving
         # deployment, and the surface builds absolute URLs — the OIDC
         # `redirect_uri` among them — for every operator and owner who signs
@@ -486,7 +502,8 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         # this when an operator signs in has already been running.
         raise RuntimeError(
             "web.public_base_url is required when the browser surface is enabled on a"
-            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}):"
+            f" membership-resolving deployment ({ORG_SOURCE_ENV}={ORG_SOURCE_MEMBERSHIP}"
+            f" or {ORG_SOURCE_SINGLE}):"
             " the surface builds absolute URLs (the OIDC redirect_uri among them) and must"
             " not take their origin from a request's Host header. Set"
             " COLLAB_HUB_API__WEB__PUBLIC_BASE_URL to this deployment's external origin,"
@@ -525,7 +542,7 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         ACCEPT_REDEEM_PATH,
         # #91's `/admin` paths are deliberately **not** here, and this is the
         # floor's own rule rather than an exception to it. They are mounted
-        # only when `org_source_is_membership()`, so demanding them
+        # only when `org_source_resolves_membership()`, so demanding them
         # unconditionally would refuse every claims-mode rollout over paths
         # that deployment does not serve — and the route-derived check names
         # them precisely, and only, where they exist.

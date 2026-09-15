@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -76,6 +78,9 @@ def readers_after_visibility(visibility: Visibility, current_readers: list[str])
     """
 
     return current_readers if visibility == Visibility.private else []
+
+
+logger = logging.getLogger("frames_server.store")
 
 
 def normalize_metadata(metadata: dict) -> dict:
@@ -524,6 +529,12 @@ class S3FrameStore(FrameStore):
     ServiceAccount identity.
     """
 
+    #: Concurrent metadata reads per list. Each listed Frame costs one GET, so a
+    #: list is latency-bound on round trips rather than bytes -- 96 production
+    #: Frames total under 600 KB. The botocore connection pool is sized to match;
+    #: its default of 10 would serialise the surplus threads.
+    LIST_WORKERS = 16
+
     def __init__(
         self,
         bucket: str,
@@ -540,11 +551,14 @@ class S3FrameStore(FrameStore):
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.client_error = ClientError
+        config_kwargs: dict = {"max_pool_connections": self.LIST_WORKERS}
+        if endpoint_url:
+            config_kwargs["s3"] = {"addressing_style": "path"}
         self.s3 = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
             region_name=region_name,
-            config=Config(s3={"addressing_style": "path"}) if endpoint_url else None,
+            config=Config(**config_kwargs),
         )
 
     def list_frames(
@@ -566,27 +580,65 @@ class S3FrameStore(FrameStore):
                     parts = key.split("/")
                     if len(parts) >= 3:
                         frame_ids.add(parts[-2])
-        metadata = []
-        for frame_id in sorted(frame_ids):
-            frame = self.get_frame(frame_id)
-            item = frame_metadata(frame)
-            if not metadata_matches_filters(
+
+        def read(frame_id: str) -> FrameMetadata | None:
+            try:
+                return self._read_metadata(frame_id)
+            except FrameNotFoundError:
+                # Deleted between the LIST and this GET. Skipping matches the
+                # local backend; raising would fail a whole page for one race.
+                # Logged so the rate is measurable: a steady stream means
+                # something other than ordinary deletes is removing objects.
+                logger.warning(
+                    "Frame %s listed but not readable; omitted from this page",
+                    frame_id,
+                )
+                return None
+
+        ordered = sorted(frame_ids)
+        if not ordered:
+            return []
+        with ThreadPoolExecutor(max_workers=self.LIST_WORKERS) as pool:
+            items = list(pool.map(read, ordered))
+        return [
+            item
+            for item in items
+            if item is not None
+            and metadata_matches_filters(
                 item,
                 org_id,
                 workspace_id,
                 name,
                 tags,
                 owner,
-            ):
-                continue
-            metadata.append(item)
-        return metadata
+            )
+        ]
 
     def get_frame(self, frame_id: str) -> Frame:
         """Read one S3-backed Frame with its Markdown body."""
 
         frame, _metadata_etag = self._read_frame_with_metadata_etag(frame_id)
         return frame
+
+    def _read_metadata(self, frame_id: str) -> FrameMetadata:
+        """Read one Frame's metadata *without* its Markdown body.
+
+        Listing never needs bodies, and fetching them doubles the round trips
+        for data discarded on the next line.
+        """
+
+        try:
+            metadata_obj = self.s3.get_object(
+                Bucket=self.bucket,
+                Key=self._key(frame_id, "metadata.json"),
+            )
+        except self.client_error as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in {"NoSuchKey", "404", "NotFound"}:
+                raise FrameNotFoundError(frame_id) from exc
+            raise
+        metadata = json.loads(metadata_obj["Body"].read().decode("utf-8"))
+        return FrameMetadata(**normalize_metadata(metadata))
 
     def _read_frame_with_metadata_etag(self, frame_id: str) -> tuple[Frame, str]:
         try:

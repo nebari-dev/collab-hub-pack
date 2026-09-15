@@ -1,0 +1,45 @@
+name: Test execution
+
+# Runs the collab-hub-execution package's tests + ruff (in execution/). A Postgres
+# service is provided so the Track adapter tests run (they skip without one).
+# Fork-safe: no secrets, read-only checkout.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "execution/**"
+      - ".github/workflows/test-execution.yaml"
+  pull_request: {}   # runs on every PR so it can be a required status check
+
+jobs:
+  test-execution:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: track
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_POSTGRES_URL: postgresql://postgres:pw@localhost:5432/track
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Lint
+        working-directory: execution
+        run: uv run --with ruff ruff check src tests
+
+      - name: Test
+        working-directory: execution
+        run: uv run --group test pytest
