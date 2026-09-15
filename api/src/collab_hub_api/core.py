@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -16,6 +16,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .config import (
     BaseConfig,
     build_active_frame_store,
+    build_cog_catalog_store,
+    build_cog_indexing,
     build_frames_store,
     build_group_store,
     build_history_store,
@@ -251,6 +253,12 @@ def make_app(config: BaseConfig) -> FastAPI:
     # construction the way the frames_server_ tables' DDL does. Same trigger
     # (frames.postgres.url + auto_migrate), same startup failure semantics.
     migrate_collab_schema(config, postgres_pools)
+    # The Cog catalog (issue #84) rides the same collab_ migration (version
+    # 7) and is always built so the catalog read API is up whether or not
+    # this replica sweeps registries. The indexer -- and the registry
+    # sources it owns -- exist only when cogs.index.enabled (issue #87).
+    cog_catalog_store = build_cog_catalog_store(config, postgres_pools)
+    cog_indexing = build_cog_indexing(config, cog_catalog_store)
     if org_source_resolves_membership():
         # Third membership precondition (the env-only ones are checked above):
         # the organization store must have a real backend. Membership is an
@@ -328,6 +336,25 @@ def make_app(config: BaseConfig) -> FastAPI:
             # mutating it. Logged in the throttle event so a deferred queue-length
             # cap (max_waiting) stays a monitored deferral, not a blind one.
             app.state.github_api_get_waiters = 0
+            # For the catalog API (#85) and the webhook receiver (#86):
+            # the store is always there; the indexer and its sources only
+            # on a sweeping replica.
+            app.state.cog_catalog_store = cog_catalog_store
+            app.state.cog_indexer = cog_indexing.indexer if cog_indexing is not None else None
+            app.state.cog_registry_sources = cog_indexing.indexer.sources if cog_indexing is not None else []
+            cog_index_task: asyncio.Task | None = None
+            if cog_indexing is not None:
+                # After the migration (which ran in make_app) and after the
+                # pools opened: the first sweep may be immediate. The loop
+                # jitters its interval so replicas drift apart, and the
+                # store's advisory lock keeps them from sweeping at once.
+                cog_index_task = asyncio.create_task(
+                    cog_indexing.indexer.run(
+                        interval_seconds=cog_indexing.interval_seconds,
+                        run_on_startup=cog_indexing.run_on_startup,
+                    ),
+                    name="cog-index",
+                )
             if config.web.enabled:
                 # Again at boot, and this is the **last** time either check
                 # runs. make_app verifies what *it* registered; this sees
@@ -345,6 +372,18 @@ def make_app(config: BaseConfig) -> FastAPI:
             try:
                 yield
             finally:
+                # First, before the pools close: a sweep in flight may hold
+                # the lock connection and be mid-write. Cancel, wait for it
+                # to unwind (its finally releases the lock), then close the
+                # registry clients it was talking to.
+                if cog_index_task is not None:
+                    cog_index_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await cog_index_task
+                if cog_indexing is not None:
+                    for source in cog_indexing.indexer.sources:
+                        with suppress(Exception):
+                            await source.aclose()
                 user_directory_client.close()
                 # Same reason as the line above: this granter owns an
                 # `httpx.Client`, so its connection pool outlives the app

@@ -17,7 +17,14 @@ from datetime import UTC, datetime
 
 import httpx
 
-from collab_hub_api.cogs.oci import MEDIA_TYPE_OCI_MANIFEST, BasicCredentials, Descriptor, Manifest, OCINotFound
+from collab_hub_api.cogs.oci import (
+    MEDIA_TYPE_OCI_MANIFEST,
+    BasicCredentials,
+    Descriptor,
+    Manifest,
+    OCINotFound,
+    OCITooLarge,
+)
 
 HOST = "registry.example"
 URL = f"https://{HOST}"
@@ -51,6 +58,8 @@ def _rfc3339(value: datetime | None) -> str | None:
 
 
 def manifest_for(entry: dict) -> Manifest:
+    """The manifest for one canned entry; ``layers`` (a tuple of ``Descriptor``) is optional and defaults to none."""
+
     annotations = {}
     if entry["pushed_at"] is not None:
         annotations["org.opencontainers.image.created"] = _rfc3339(entry["pushed_at"])
@@ -58,7 +67,7 @@ def manifest_for(entry: dict) -> Manifest:
         media_type=entry["media_type"],
         digest=entry["digest"],
         config=Descriptor(media_type="application/vnd.pixi.config.v1+toml", digest="sha256:" + "0" * 64, size=0),
-        layers=(),
+        layers=tuple(entry.get("layers", ())),
         annotations=annotations,
     )
 
@@ -81,6 +90,8 @@ class FakeOCIClient:
     calls: list[tuple[str, ...]] = field(default_factory=list)
 
     def seed(self, artifacts: dict[str, list[dict]]) -> None:
+        """Load canned entries; an entry's optional ``blobs`` ({digest: bytes}) become fetchable layers."""
+
         for repo, entries in artifacts.items():
             self.tags.setdefault(repo, [])
             for entry in entries:
@@ -89,6 +100,7 @@ class FakeOCIClient:
                     self.tags[repo].append(tag)
                     self.manifests[(repo, tag)] = manifest
                 self.manifests[(repo, entry["digest"])] = manifest
+                self.blobs.update(entry.get("blobs", {}))
 
     async def list_tags(self, repo: str) -> list[str]:
         self.calls.append(("list_tags", repo))
@@ -105,6 +117,9 @@ class FakeOCIClient:
 
     async def get_blob(self, repo: str, descriptor: Descriptor | str, *, max_bytes: int) -> bytes:
         digest = descriptor if isinstance(descriptor, str) else descriptor.digest
+        self.calls.append(("get_blob", repo, digest))
+        if isinstance(descriptor, Descriptor) and descriptor.size > max_bytes:
+            raise OCITooLarge(f"blob {digest} is {descriptor.size} bytes, cap is {max_bytes}")
         try:
             return self.blobs[digest]
         except KeyError:

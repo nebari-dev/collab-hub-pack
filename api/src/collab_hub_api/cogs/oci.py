@@ -60,6 +60,10 @@ from typing import Any
 
 import httpx
 
+# The bundle reader owns the entry-file name; this module only selects the
+# layer carrying it. Imported (not redefined) so the two can never drift.
+from .bundle import COG_ENTRY_FILE
+
 TITLE_ANNOTATION = "org.opencontainers.image.title"
 
 MEDIA_TYPE_OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
@@ -79,7 +83,6 @@ DEFAULT_MAX_MANIFEST_BYTES = 5 * 1024 * 1024
 DEFAULT_MAX_BUNDLE_FILE_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
-COG_ENTRY_FILE = "COG.md"
 LOCKFILE_TITLE = "pixi.lock"
 
 # The Accept list a manifest GET advertises. Registries answer with whichever

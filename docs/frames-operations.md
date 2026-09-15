@@ -989,6 +989,59 @@ expired everywhere the API presents it, and no sweeper process exists or is
 needed. `token_hash` is the only trace of the secret; there is no column, and
 no query, that can recover a link.
 
+### The Cog catalog (`collab_cog_artifacts`)
+
+Migration version 7 adds the Cog catalog: one row per artifact the indexer has
+seen in a configured registry source, keyed by `(source_id, repository,
+digest)`. It rides the same shared `frames.postgres.url` and the same
+`autoMigrate` switch as every other `collab_` table.
+
+- **Identity is the digest.** `cog_id`/`name`/`version`/`kind`/`publisher` are
+  search keys read from the Cog's own declarations; the repository path is not
+  identity (published names carry an id suffix, and one Cog may be published to
+  several repositories, each of which is its own row). The pinned install
+  reference `<host>/<repository>@<digest>` is rebuilt from the row.
+- **`card` is the bundle reader's output, verbatim, as `jsonb`** — the whole
+  profile as structured data. A GIN index (`jsonb_path_ops`) on it serves the
+  containment filters (`card @> …`) the catalog API uses for
+  requires/provides/io; plain indexes cover `cog_id`, `kind` and `removed_at`.
+- **`status`** is `indexed` (the reader produced a card — a draft or a Cog with
+  a broken profile is still a Cog and lists with what it declared, its errors
+  mirrored into `read_errors`), `non_cog` (the manifest carries no `COG.md` and
+  no Prog `pixi.toml`; recorded with a reason so a repository full of images is
+  not re-read every sweep) or `failed` (the fetch or read failed; retried on
+  the next sweep).
+- **Rows are never deleted.** An artifact that disappears from its registry is
+  marked `removed_at = now()` and stays readable by digest — installs and runs
+  may reference it long after its publisher removed it. A digest that comes
+  back is restored (and retagged) without a refetch.
+
+The indexer is a reconciliation loop: enumerate each source, skip digests
+already indexed with the same tag set, fetch and read only new digests
+(`COG.md` first, then the profile file it names — never the lockfile), then
+mark this source's rows whose digest is no longer present as removed. Two
+safety rules operators should know:
+
+- **Single flight.** A sweep takes the session-level advisory lock
+  `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its whole
+  duration (outside any transaction, so a minutes-long sweep pins no
+  snapshot). Replicas starting together do not double-index: the loser logs
+  `cog_index_sweep_skipped` and waits for its next interval. That connection
+  is one slot of the shared pool while a sweep runs.
+- **Removal needs a complete picture.** Rows are marked removed only for a
+  source whose enumeration fully succeeded this sweep. A listing API that
+  errors, one repository that fails to list, or an enumeration cut short by the
+  per-source bound leaves that source's removal step skipped and counted in
+  `sources_failed` — a transient registry outage never marks a catalog gone.
+
+Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
+non_cog / failed / removed / sources_failed / duration) and exports the same
+counts as `frames_server_cog_index_artifacts_total{outcome}`,
+`frames_server_cog_index_sweeps_total{result}` and
+`frames_server_cog_index_sweep_duration_seconds`. Per-artifact failures are
+stored in the row's `read_errors` and never abort the sweep. Nothing the
+indexer logs or stores carries a registry credential.
+
 ### Connection pooling
 
 All Postgres-backed stores draw connections from a shared `psycopg_pool`
