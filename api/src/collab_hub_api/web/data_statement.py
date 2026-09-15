@@ -59,7 +59,13 @@ def data_statement_page(*, root_path: str = "") -> str:
     """
 
     from .pages import render_page
+    from .surface import PRIVACY_PATH, TERMS_PATH
 
+    # This page is the short form and links to the long forms.
+    related = (
+        f'<p><a href="{html.escape(root_path)}{TERMS_PATH}">Terms of Service</a></p>'
+        f'<p><a href="{html.escape(root_path)}{PRIVACY_PATH}">Privacy Statement</a></p>'
+    )
     return render_page(
         title="Data statement",
         body=(
@@ -68,6 +74,7 @@ def data_statement_page(*, root_path: str = "") -> str:
             "<p>Questions and deletion requests: "
             f'<a href="mailto:{html.escape(DATA_STATEMENT_CONTACT)}">'
             f"{html.escape(DATA_STATEMENT_CONTACT)}</a></p>"
+            f"<h2>Related</h2>{related}"
         ),
         root_path=root_path,
     )

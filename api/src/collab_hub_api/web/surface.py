@@ -189,6 +189,28 @@ acceptance page is: a static document, rendered from constants, reading
 nothing from the request, with nothing to act on.
 """
 
+TERMS_PATH = "/web/terms"
+"""The Terms of Service (#95). The copy lives in :mod:`.terms_of_service`.
+
+In :data:`PUBLIC_WEB_PATHS` for the same reason as
+:data:`DATA_STATEMENT_PATH`. In addition, the deployment's Keycloak
+terms-acceptance step links here, so the audience is people who have not
+accepted yet. Keycloak will not issue them a token until they do, and this
+surface's session is minted from that token. Requiring a session here
+would mean the document could only be read by someone who had already agreed
+to it. Anonymous *safely* on the same grounds as the data statement: a static
+document rendered from module constants, reading nothing from the request,
+with nothing to act on.
+"""
+
+PRIVACY_PATH = "/web/privacy"
+"""The Privacy Statement (#95). The copy lives in :mod:`.privacy_statement`.
+
+Public on exactly the argument recorded on :data:`TERMS_PATH`; the two
+documents are linked from the same consent line and are reached by the same
+people at the same moment.
+"""
+
 ORG_INVITATIONS_PATHS = (
     ORG_INVITATIONS_PATH,
     ORG_INVITATIONS_REVOKE_PATH,
@@ -216,6 +238,8 @@ PUBLIC_WEB_PATHS = frozenset(
         STYLE_ASSET_PATH,
         ACCEPT_PAGE_PATH,
         DATA_STATEMENT_PATH,
+        TERMS_PATH,
+        PRIVACY_PATH,
     }
 )
 """The **only** routes of this surface that may be served without a session.
@@ -243,6 +267,13 @@ the URL fragment). Everything that *acts* on an invitation is
 its audience is deciding whether to create an account at all, and the page is
 a constant document with nothing to act on. The full reasoning is on the
 constant.
+
+:data:`TERMS_PATH` and :data:`PRIVACY_PATH` (#95) earn it a degree more
+plainly than either. They are linked from the Keycloak terms-acceptance step,
+which runs *before* Keycloak issues a token — and this surface's session is
+minted from that token. Gating them on a session would therefore mean the
+documents could only be read by someone who had already accepted them, which
+is not a stricter policy but an incoherent one.
 """
 
 CSRF_ENFORCED_IN_ROUTE: frozenset[str] = frozenset(

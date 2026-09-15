@@ -1,0 +1,36 @@
+[workspace]
+name = "local-server"
+version = "0.3.0"
+description = "Local inference server"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+python = "3.12.*"
+
+[tool.nebi.bundle]
+include = ["app.py", "serve.py"]
+
+[tool.nebi.capability]
+spec-version = "0.1.0"
+
+[tool.nebi.capability.example.local-server]
+name = "Local Server"
+description = "OpenAI-compatible local inference server.  Serves on port 8080."
+author = { name = "Example Organization", email = "cogs@example.org" }
+tags = ["llm", "inference", "local"]
+default-target = "local"
+
+[tool.nebi.capability.example.local-server.targets.local]
+task = "serve"
+environment = "default"
+runs-in = "background"
+
+[tool.nebi.capability.example.local-server.targets.gpu]
+task = "serve-gpu"
+environment = "gpu"
+runs-in = "background"
+
+[tasks]
+serve = "python serve.py"
+serve-gpu = "python serve.py --gpu"
