@@ -111,3 +111,14 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Validate rendered manifests (Cog registry fixture)
+        # One Harbor source with robot + webhook Secrets, one static source,
+        # a CA bundle, indexer on: the shape docs/cog-registry.md documents.
+        run: helm template helm/collab-hub -f helm/collab-hub/ci/cogs-values.yaml | kubeconform -strict -ignore-missing-schemas -
+
+      - name: Chart render tests
+        # Positive renders with assertions on the output, plus every
+        # fail-the-render rule in templates/cogs-validations.yaml and the
+        # schema's rejection of unknown keys.
+        run: scripts/chart_render_tests.sh
