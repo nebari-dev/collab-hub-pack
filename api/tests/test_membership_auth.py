@@ -40,7 +40,7 @@ from collab_hub_api.frames.org_source import (
     DEFAULT_WORKSPACE_ENV,
     ORG_SOURCE_ENV,
     enforce_membership_org_source_preconditions,
-    org_source_is_membership,
+    org_source_resolves_membership,
 )
 from collab_hub_api.frames.orgs import (
     MEMBERSHIP_ACTIVE,
@@ -211,12 +211,12 @@ def test_unset_or_claims_keeps_the_historical_org_source(monkeypatch, value):
         monkeypatch.delenv(ORG_SOURCE_ENV, raising=False)
     else:
         monkeypatch.setenv(ORG_SOURCE_ENV, value)
-    assert org_source_is_membership() is False
+    assert org_source_resolves_membership() is False
 
 
 def test_membership_selects_membership_resolution(monkeypatch):
     monkeypatch.setenv(ORG_SOURCE_ENV, "membership")
-    assert org_source_is_membership() is True
+    assert org_source_resolves_membership() is True
 
 
 @pytest.mark.parametrize("value", ["Membership", "MEMBERSHIP", " membership ", "org", "true", "collab_org_members"])
@@ -226,7 +226,7 @@ def test_unrecognized_org_source_values_fail_loudly(monkeypatch, value):
     # that has no membership rows.
     monkeypatch.setenv(ORG_SOURCE_ENV, value)
     with pytest.raises(RuntimeError, match=ORG_SOURCE_ENV):
-        org_source_is_membership()
+        org_source_resolves_membership()
 
 
 def test_membership_requires_the_identity_pin(monkeypatch):
