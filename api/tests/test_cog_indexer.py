@@ -12,18 +12,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from cog_registry_fakes import HOST, URL, FakeOCIFactory, manifest_for
 
+from collab_hub_api.cogs.adapters.static import MAX_TAGS_PER_REPOSITORY
 from collab_hub_api.cogs.bundle import COG_ENTRY_FILE, read_cog_bundle
 from collab_hub_api.cogs.catalog import (
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
     CogArtifact,
+    CogCatalogDataError,
     InMemoryCogCatalogStore,
     UnavailableCogCatalogStore,
 )
@@ -42,7 +47,6 @@ from collab_hub_api.cogs.oci import (
     OCIError,
 )
 from collab_hub_api.cogs.registry import (
-    ArtifactRef,
     CogRegistrySourceConfig,
     RegistrySourceError,
     build_registry_sources,
@@ -263,7 +267,7 @@ async def test_removed_artifact_is_marked_not_deleted_and_stays_readable():
     assert store.get("sha256:" + "b" * 64).present
 
 
-async def test_reader_failure_is_recorded_and_the_sweep_continues_then_retries():
+async def test_fetch_failure_is_recorded_and_the_sweep_continues_then_retries():
     artifacts = registry()
     indexer, store, client = make(artifacts)
     # The transcriber's COG.md blob is missing from the registry.
@@ -422,7 +426,8 @@ async def test_source_enumeration_failure_skips_removal_and_continues():
     summary = await broken.sweep()
 
     assert summary.sources_failed == 1 and summary.removed == 0
-    assert summary.errors == [f"{SOURCE_ID}: list_repositories: RegistrySourceError: listing API answered HTTP 502"]
+    # Class name only: adapter error messages may quote configured URLs.
+    assert summary.errors == [f"{SOURCE_ID}: list_repositories: RegistrySourceError"]
     assert all(row.present for row in store.list_current()) and len(store.list_current()) == 2
 
 
@@ -564,6 +569,29 @@ async def test_mark_removed_marks_one_row():
 # ---------------------------------------------------------------------------
 
 
+async def test_run_without_startup_sweep_waits_a_full_interval_first():
+    # The weaker ancestor of this test only counted sweeps; this one proves
+    # run_on_startup=False actually *waits*: the first sweep may not happen
+    # before one whole (unjittered) interval has passed.
+    indexer, _, _ = make()
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    swept_at: list[float] = []
+    real_sweep = indexer.sweep
+
+    async def timed_sweep():
+        swept_at.append(loop.time())
+        stop.set()
+        return await real_sweep()
+
+    indexer.sweep = timed_sweep  # type: ignore[method-assign]
+    started = loop.time()
+    await asyncio.wait_for(indexer.run(interval_seconds=0.2, run_on_startup=False, jitter=0.0, stop=stop), timeout=5)
+
+    assert len(swept_at) == 1
+    assert swept_at[0] - started >= 0.19, "the first sweep ran before the interval elapsed"
+
+
 async def test_run_sweeps_on_startup_then_on_the_interval_until_stopped():
     indexer, _, _ = make()
     sweeps: list[SweepSummary] = []
@@ -618,12 +646,6 @@ async def test_run_is_cancellable():
         await task
 
 
-def test_artifact_ref_tags_are_normalized_in_the_row():
-    # Pure helper behaviour pinned: tags are stored sorted and de-duplicated.
-    ref = ArtifactRef(digest="sha256:" + "a" * 64, tags=("v1", "latest", "v1"))
-    assert tuple(sorted(set(ref.tags))) == ("latest", "v1")
-
-
 # ---------------------------------------------------------------------------
 # App wiring (config builder + lifespan)
 # ---------------------------------------------------------------------------
@@ -656,6 +678,24 @@ def test_build_cog_indexing_builds_sources_and_reads_the_loop_parameters():
     assert indexing is not None
     assert indexing.interval_seconds == 42.0 and indexing.run_on_startup is False
     assert [s.id for s in indexing.indexer.sources] == ["s"]
+
+
+def test_build_cog_indexing_refuses_a_one_connection_pool():
+    from collab_hub_api.config import build_cog_catalog_store, build_cog_indexing, build_postgres_pools
+
+    # The sweep lock occupies one pooled connection for the whole sweep while
+    # reads and writes need a second; with max_size=1 every non-empty sweep
+    # would wait on its own connection and time out, silently, at runtime.
+    config = Config.parse(
+        {
+            "frames": {"postgres": {"url": "postgresql://shared/db", "pool": {"max_size": 1, "min_size": 1}}},
+            "cogs": cogs_block(STATIC_SOURCE),
+        }
+    )
+    pools = build_postgres_pools(config)
+    store = build_cog_catalog_store(config, pools)
+    with pytest.raises(RuntimeError, match="max_size >= 2"):
+        build_cog_indexing(config, store)
 
 
 def test_build_cog_indexing_refuses_the_unavailable_store():
@@ -712,3 +752,340 @@ async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdo
         assert not registry_source._closed
     assert tasks["cog-index"].cancelled()
     assert registry_source._closed, "the lifespan closes the registry clients it built"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation never outlives lock ownership (codex-gate HIGH finding)
+# ---------------------------------------------------------------------------
+
+
+class _EventedStore(InMemoryCogCatalogStore):
+    """An in-memory store whose lock and writes can be held open from the test.
+
+    ``events`` records the order of the operations that matter: a correct
+    cancellation always shows the blocked operation *completing* before
+    ``unlocked``, because worker threads cannot be interrupted and the sweep
+    must drain them before releasing.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.events: list[str] = []
+        self.enter_started = threading.Event()
+        self.release_enter = threading.Event()
+        self.write_started = threading.Event()
+        self.release_write = threading.Event()
+        self.exit_started = threading.Event()
+        self.release_exit = threading.Event()
+        # Default: nothing blocks unless a test arms it.
+        self.release_enter.set()
+        self.release_write.set()
+        self.release_exit.set()
+
+    @contextmanager
+    def sweep_lock(self):
+        self.enter_started.set()
+        assert self.release_enter.wait(timeout=10)
+        self.events.append("entered")
+        try:
+            with super().sweep_lock() as held:
+                yield held
+        finally:
+            self.exit_started.set()
+            assert self.release_exit.wait(timeout=10)
+            self.events.append("unlocked")
+
+    def upsert(self, artifact):
+        self.write_started.set()
+        assert self.release_write.wait(timeout=10)
+        super().upsert(artifact)
+        self.events.append("write_done")
+
+
+def evented_indexer(**kwargs):
+    base, _, client = make(**kwargs)
+    store = _EventedStore()
+    return CogIndexer(store, base.sources, **kwargs), store, client
+
+
+async def test_cancellation_during_lock_acquisition_still_releases():
+    indexer, store, _ = evented_indexer()
+    store.release_enter.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.enter_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)  # cancellation lands while __enter__ is blocked
+    store.release_enter.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The acquisition that completed after the cancel got its matching exit:
+    # nothing holds the lock, and no source was swept.
+    assert store.events == ["entered", "unlocked"]
+    with store.sweep_lock() as held:
+        assert held
+
+
+async def test_cancellation_during_a_write_drains_it_before_unlocking():
+    indexer, store, _ = evented_indexer()
+    store.release_write.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.write_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)  # cancellation lands mid-upsert
+    store.release_write.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The invariant single-flight exists for: the lock is never released
+    # while a write is still mutating rows.
+    assert store.events == ["entered", "write_done", "unlocked"]
+
+
+async def test_cancellation_during_unlock_completes_the_unlock():
+    indexer, store, _ = evented_indexer()
+    store.release_exit.clear()
+
+    task = asyncio.create_task(CogIndexer(store, []).sweep())
+    await asyncio.to_thread(store.exit_started.wait, 10)
+    task.cancel()
+    await asyncio.sleep(0.05)  # cancellation lands during __exit__
+    store.release_exit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.events == ["entered", "unlocked"]
+    with store.sweep_lock() as held:
+        assert held
+
+
+# ---------------------------------------------------------------------------
+# The fetch budget defers work without starving it or breaking removal
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_budget_makes_progress_across_sweeps_and_removal_stays_on():
+    artifacts = {
+        "cogs/a": [entry("1", ["v"], COMPLETE)],
+        "cogs/b": [entry("2", ["v"], CONTEXT)],
+        "cogs/c": [entry("3", ["v"], PROG)],
+    }
+    indexer, store, _ = make(artifacts, max_new_fetches_per_sweep=1)
+    # A stale row for this source: its digest is gone from the registry, and
+    # deferring fetches must NOT defer noticing that -- enumeration was
+    # complete, so removal is still safe and still runs.
+    stale = CogArtifact(
+        source_id=SOURCE_ID,
+        host=HOST,
+        repository="cogs/a",
+        digest="sha256:" + "9" * 64,
+        status=STATUS_INDEXED,
+        tags=("old",),
+        pushed_at=PUSHED,
+    )
+    store.upsert(stale)
+
+    first = await indexer.sweep()
+    assert (first.indexed, first.deferred, first.removed, first.sources_failed) == (1, 2, 1, 0)
+    assert store.get(stale.digest).removed_at is not None
+
+    second = await indexer.sweep()
+    assert (second.indexed, second.deferred, second.skipped) == (1, 1, 1), "the second sweep reached the next artifact"
+
+    third = await indexer.sweep()
+    assert (third.indexed, third.deferred, third.skipped) == (1, 0, 2)
+    assert (await indexer.sweep()).skipped == 3, "steady state: everything known, nothing deferred"
+
+
+# ---------------------------------------------------------------------------
+# A truncated enumeration must never remove (codex-gate HIGH finding)
+# ---------------------------------------------------------------------------
+
+
+async def test_over_bound_tag_list_fails_the_source_instead_of_removing():
+    indexer, store, client = make()
+    await indexer.sweep()
+
+    # The registry sprouts more tags than the static adapter's bound in one
+    # repository. Before the fix the adapter silently kept a sorted prefix,
+    # the sweep treated it as complete, and artifacts displaced past the
+    # window were marked removed.
+    manifest = client.manifests[("cogs/notes", "v1")]
+    extra = [f"t{i:03d}" for i in range(MAX_TAGS_PER_REPOSITORY)]
+    client.tags["cogs/notes"] = ["v1", *extra]
+    for tag in extra:
+        client.manifests[("cogs/notes", tag)] = manifest
+
+    summary = await indexer.sweep()
+
+    assert summary.sources_failed == 1 and summary.removed == 0
+    assert "RegistrySourceProtocolError" in summary.errors[0]
+    assert store.get("sha256:" + "b" * 64).present, "nothing was removed off a truncated view"
+    assert store.get("sha256:" + "a" * 64).present
+
+
+# ---------------------------------------------------------------------------
+# Failure isolation is broader than the OCI hierarchy
+# ---------------------------------------------------------------------------
+
+
+async def test_unexpected_reader_exception_is_one_failed_row_with_class_only(monkeypatch):
+    # A genuine reader-side failure (the previous test of this name deleted a
+    # blob, which is a *fetch* failure): the read/convert boundary must catch
+    # anything, record the class -- never the message, whose content is not
+    # known to be safe -- and keep sweeping.
+    indexer, store, _ = make()
+
+    def boom(files, *, bundle_paths=None):
+        raise RuntimeError("message that could quote anything, even a token")
+
+    monkeypatch.setattr("collab_hub_api.cogs.indexer.read_cog_bundle", boom)
+
+    summary = await indexer.sweep()
+
+    assert summary.failed == 2 and summary.indexed == 0
+    row = store.get("sha256:" + "a" * 64)
+    assert row.status == STATUS_FAILED
+    assert row.read_errors == ("read: RuntimeError",)
+
+
+async def test_unstorable_card_is_one_failed_row_and_the_sweep_continues():
+    # A COG.md whose body carries NUL reads fine but cannot live in jsonb;
+    # it must become a failed row with a reason, not a sweep-aborting (and
+    # every-sweep-repeating) database error.
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    indexer, store, _ = make(
+        {
+            "cogs/poison": [entry("e", ["v1"], poison)],
+            "cogs/notes": [entry("b", ["v1"], CONTEXT)],
+        }
+    )
+
+    summary = await indexer.sweep()
+
+    assert (summary.failed, summary.indexed) == (1, 1)
+    row = store.get("sha256:" + "e" * 64)
+    assert row.status == STATUS_FAILED and row.card is None
+    assert row.read_errors[0] == "card: contains NUL (\\u0000), which jsonb cannot store"
+    assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED
+    # Steady state: the poison row is failed, so it is retried -- and fails
+    # the same bounded way -- rather than silently forgotten.
+    assert (await indexer.sweep()).failed == 1
+
+
+async def test_store_data_error_falls_back_to_a_failed_row():
+    # Second line of defense behind the pre-validation: whatever
+    # representability rule the store enforces that the validation did not
+    # anticipate becomes a failed row, while outages still propagate.
+    class PickyStore(InMemoryCogCatalogStore):
+        def upsert(self, artifact):
+            if artifact.card is not None:
+                raise CogCatalogDataError("UntranslatableCharacter")
+            super().upsert(artifact)
+
+    base, _, _ = make()
+    store = PickyStore()
+    summary = await CogIndexer(store, base.sources).sweep()
+
+    assert summary.failed == 2 and summary.indexed == 0
+    row = store.get("sha256:" + "a" * 64)
+    assert row.status == STATUS_FAILED and row.card is None
+    assert row.read_errors == ("store: CogCatalogDataError",)
+
+
+# ---------------------------------------------------------------------------
+# The lockfile is excluded by media type even on direct fetches
+# ---------------------------------------------------------------------------
+
+
+def lock_disguised_as(title: str) -> Descriptor:
+    data = b"lock: contents\n"
+    return Descriptor(
+        media_type=MEDIA_TYPE_PIXI_LOCK,
+        digest=blob_digest(data),
+        size=len(data),
+        annotations={TITLE_ANNOTATION: title},
+    )
+
+
+async def test_lockfile_disguised_as_cog_md_is_not_fetched():
+    disguised = lock_disguised_as(COG_ENTRY_FILE)
+    indexer, store, client = make({"images/sneaky": [entry("e", ["v1"], {}, extra_layers=(disguised,))]})
+    client.blobs[disguised.digest] = b"lock: contents\n"
+
+    summary = await indexer.sweep()
+
+    assert summary.non_cog == 1
+    assert blob_calls(client) == [], "the disguised lockfile was never fetched"
+    assert store.get("sha256:" + "e" * 64).status == STATUS_NON_COG
+
+
+async def test_lockfile_disguised_as_pixi_toml_is_not_fetched():
+    disguised = lock_disguised_as("pixi.toml")
+    indexer, store, client = make({"images/sneaky": [entry("e", ["v1"], {}, extra_layers=(disguised,))]})
+    client.blobs[disguised.digest] = b"lock: contents\n"
+
+    summary = await indexer.sweep()
+
+    assert summary.non_cog == 1
+    assert blob_calls(client) == []
+    assert store.get("sha256:" + "e" * 64).status == STATUS_NON_COG
+
+
+# ---------------------------------------------------------------------------
+# Live-Postgres: a poison card and a valid card in the same sweep
+# ---------------------------------------------------------------------------
+
+POSTGRES_URL = os.environ.get("COLLAB_HUB_TEST_POSTGRES_URL", "")
+
+live_postgres = pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set COLLAB_HUB_TEST_POSTGRES_URL to a disposable database to run the live-Postgres indexer tests",
+)
+
+
+@live_postgres
+async def test_live_poison_card_fails_one_row_and_the_valid_one_indexes():
+    from test_collab_schema import COLLAB_TABLES
+
+    from collab_hub_api.cogs.catalog import PostgresCogCatalogStore
+    from collab_hub_api.frames.collab_schema import run_collab_schema_migrations
+    from collab_hub_api.frames.db import PostgresDatabase
+
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    base, _, _ = make(
+        {
+            "cogs/poison": [entry("e", ["v1"], poison)],
+            "cogs/notes": [entry("b", ["v1"], CONTEXT)],
+        }
+    )
+
+    database = PostgresDatabase(POSTGRES_URL, min_size=0, max_size=10, timeout_seconds=10.0)
+
+    def drop_all() -> None:
+        with database.connection() as conn:
+            for table in COLLAB_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+    try:
+        drop_all()
+        run_collab_schema_migrations(database)
+        store = PostgresCogCatalogStore(database)
+        indexer = CogIndexer(store, base.sources)
+
+        summary = await indexer.sweep()
+
+        assert (summary.failed, summary.indexed) == (1, 1)
+        row = store.get("sha256:" + "e" * 64)
+        assert row.status == STATUS_FAILED and row.card is None
+        assert row.read_errors[0].startswith("card: contains NUL")
+        assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED
+        # And a second sweep is not poisoned either.
+        assert (await indexer.sweep()).failed == 1
+        drop_all()
+    finally:
+        database.close()

@@ -514,7 +514,14 @@ class OCIClient:
 
     async def _dispatch(self, url: httpx.URL, headers: Mapping[str, str], *, what: str) -> httpx.Response:
         """One streamed GET; the only place httpx transport errors are raised."""
-        request = self._http.build_request("GET", url, headers=dict(headers))
+        try:
+            request = self._http.build_request("GET", url, headers=dict(headers))
+        except (UnicodeError, ValueError, TypeError) as exc:
+            # A header or URL that cannot be encoded (e.g. a hostile token
+            # that slipped past validation) is a protocol failure of the
+            # registry conversation, and it must surface as one -- callers
+            # guard with `except OCIError`, not `except UnicodeEncodeError`.
+            raise OCIProtocolError(f"{what}: request could not be constructed: {type(exc).__name__}") from exc
         try:
             return await self._http.send(request, stream=True, follow_redirects=False)
         except httpx.HTTPError as exc:
@@ -620,7 +627,10 @@ class OCIClient:
         headers: dict[str, str] = {"Accept": "application/json"}
         if self._credentials is not None:
             headers["Authorization"] = self._credentials.header()
-        request = self._http.build_request("GET", realm, params=query, headers=headers)
+        try:
+            request = self._http.build_request("GET", realm, params=query, headers=headers)
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise OCIProtocolError(f"token endpoint: request could not be constructed: {type(exc).__name__}") from exc
         try:
             response = await self._http.send(request, stream=True, follow_redirects=False)
         except httpx.HTTPError as exc:
@@ -638,6 +648,13 @@ class OCIClient:
         token = payload.get("token") or payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise OCIProtocolError("token response carries no token")
+        if not token.isascii() or any(ch in token for ch in "\r\n\t"):
+            # A non-ASCII or control-bearing token cannot travel in an
+            # Authorization header: httpx would raise UnicodeEncodeError at
+            # header construction, outside this module's wrapping, and the
+            # caller's `except OCIError` would never see it. Refused here as
+            # the protocol error it is; the token itself is never echoed.
+            raise OCIProtocolError("token endpoint returned a token that is not a valid ASCII header value")
         expires_in = payload.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
         if not isinstance(expires_in, (int, float)) or isinstance(expires_in, bool):
             expires_in = DEFAULT_TOKEN_TTL_SECONDS

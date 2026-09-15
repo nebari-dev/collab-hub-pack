@@ -1073,6 +1073,18 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
             "cogs.index.enabled requires the Cog catalog store: set the shared "
             "COLLAB_HUB_API__FRAMES__POSTGRES__URL (frames.postgres.url), or disable indexing."
         )
+    pool = config.frames.postgres.pool
+    if pool.max_size < 2:
+        # A sweep holds one pooled connection for its session-level advisory
+        # lock for the sweep's whole duration and checks out a second for
+        # every read and write. With max_size=1 the sweep would wait on its
+        # own occupied connection and time out -- every time, silently, at
+        # runtime. Refuse the rollout instead.
+        raise RuntimeError(
+            "cogs.index.enabled requires frames.postgres.pool.max_size >= 2 "
+            f"(configured: {pool.max_size}): the indexer's sweep lock occupies one pooled "
+            "connection for the whole sweep while its reads and writes need another."
+        )
     sources = build_registry_sources(list(cogs.registry_sources))
     return CogIndexing(
         CogIndexer(store, sources),

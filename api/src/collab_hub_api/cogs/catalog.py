@@ -15,6 +15,14 @@ Three backends, following the house pattern of the other relational stores:
   raises :class:`CogCatalogUnavailableError` (-> 503 at the API) rather than
   answering an empty catalog as if it were the truth.
 
+**Content policy.** ``card`` is the published bundle's own declarations,
+stored verbatim (parent-issue acceptance: the reader's output, structure
+preserved) -- so whatever a publisher writes there is what the catalog holds.
+The guarantee is narrower and absolute: *configured registry credentials*
+never reach cards, ``read_errors``, or logs. The store additionally refuses
+content ``jsonb`` cannot represent (:class:`CogCatalogDataError`), so one
+pathological card can be recorded as failed instead of poisoning writes.
+
 The write surface is exactly what the reconciliation indexer needs
 (:meth:`~CogCatalogStore.known`, :meth:`~CogCatalogStore.upsert`,
 :meth:`~CogCatalogStore.update_tags`, :meth:`~CogCatalogStore.mark_removed`);
@@ -65,6 +73,16 @@ COG_INDEX_LOCK_KEY = int.from_bytes(b"cogidx_1", "big")
 
 class CogCatalogUnavailableError(RuntimeError):
     """Raised when the catalog is needed but no backend is configured."""
+
+
+class CogCatalogDataError(ValueError):
+    """This one row's content cannot be stored (e.g. NUL in the card's JSON).
+
+    Deliberately distinct from the store's availability/outage errors: the
+    indexer records a row raising this as ``failed`` and continues the sweep,
+    while an outage aborts the sweep. Both backends raise it for the same
+    content so tests against the in-memory store see the production behavior.
+    """
 
 
 @dataclass(frozen=True)
@@ -273,25 +291,72 @@ def _sort_key(artifact: CogArtifact) -> tuple:
     )
 
 
-def json_contains(document: Any, needle: Any) -> bool:
-    """Postgres ``jsonb @>`` containment, for the in-memory store.
+def _get_key(artifact: CogArtifact) -> tuple:
+    # get()'s documented order: present rows first, then the most recently
+    # INDEXED location -- pushed_at deliberately plays no part here, because
+    # every location of one digest shares the artifact's push time while
+    # indexed_at says which row this catalog wrote about it last.
+    floor = datetime.min.replace(tzinfo=UTC)
+    return (
+        artifact.removed_at is not None,
+        -(artifact.indexed_at or floor).timestamp(),
+        artifact.source_id,
+        artifact.repository,
+    )
+
+
+def require_aware(value: datetime | None, what: str) -> datetime | None:
+    """Refuse a naive datetime at the store boundary.
+
+    ``timestamptz`` interprets a naive value in the session's timezone and the
+    in-memory store would compare it against aware ones (a ``TypeError`` at
+    sort time, far from the caller) -- both are the wrong place to discover
+    the mistake. Adapters already normalize to aware UTC; this guards direct
+    store and ``reindex`` callers.
+    """
+
+    if value is not None and value.tzinfo is None:
+        raise ValueError(f"{what} must be timezone-aware; a naive datetime would be reinterpreted per session")
+    return value
+
+
+def _scalar_eq(a: Any, b: Any) -> bool:
+    # jsonb: true/false and numbers are different types (1 does not contain
+    # true), while Python's `1 == True`. Numbers compare numerically across
+    # int/float, matching jsonb's numeric comparison.
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return a == b
+
+
+def json_contains(document: Any, needle: Any, *, _top: bool = True) -> bool:
+    """Postgres ``jsonb @>`` containment, mirrored exactly for the in-memory store.
 
     Objects: every key of ``needle`` is in ``document`` with a contained value.
     Arrays: every element of ``needle`` is contained by *some* element of
-    ``document`` (a scalar needle element matches a scalar document element).
-    Scalars: equality.
+    ``document``; an array needle never matches a scalar document. Scalars:
+    equality, with booleans distinct from numbers. The one asymmetry jsonb
+    grants -- an array contains a bare scalar -- applies at the **top level
+    only**, exactly as documented for ``@>``.
+
+    Pinned against a live server by a shared case table in
+    ``test_cog_catalog.py``, so a divergence fails a test rather than making
+    a filter answer differently in dev and production.
     """
 
     if isinstance(needle, dict):
         return isinstance(document, dict) and all(
-            k in document and json_contains(document[k], v) for k, v in needle.items()
+            k in document and json_contains(document[k], v, _top=False) for k, v in needle.items()
         )
     if isinstance(needle, list):
         if not isinstance(document, list):
-            # Postgres: a scalar array-contains a scalar, but not an array.
-            return len(needle) == 1 and not isinstance(needle[0], (dict, list)) and document == needle[0]
-        return all(any(json_contains(item, wanted) for item in document) for wanted in needle)
-    return document == needle
+            return False
+        return all(any(json_contains(item, wanted, _top=False) for item in document) for wanted in needle)
+    if isinstance(document, list):
+        return _top and any(_scalar_eq(item, needle) for item in document if not isinstance(item, (dict, list)))
+    if isinstance(document, dict):
+        return False
+    return _scalar_eq(document, needle)
 
 
 class UnavailableCogCatalogStore(CogCatalogStore):
@@ -363,6 +428,13 @@ class InMemoryCogCatalogStore(CogCatalogStore):
     def upsert(self, artifact: CogArtifact) -> None:
         if artifact.status not in STATUSES:
             raise ValueError(f"unknown catalog status {artifact.status!r}")
+        require_aware(artifact.pushed_at, "pushed_at")
+        require_aware(artifact.indexed_at, "indexed_at")
+        if artifact.card is not None and "\\u0000" in json.dumps(artifact.card):
+            # Parity with Postgres, where jsonb refuses NUL: a card this store
+            # silently accepted would be a test passing on content production
+            # rejects.
+            raise CogCatalogDataError("card contains NUL (\\u0000), which jsonb cannot store")
         stored = replace(
             artifact,
             tags=tuple(sorted(set(artifact.tags))),
@@ -374,6 +446,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             self._rows[self._key(stored)] = stored
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
+        require_aware(pushed_at, "pushed_at")
         with self._lock:
             row = self._rows.get((source_id, repository, digest))
             if row is None:
@@ -426,8 +499,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
         ]
         if not candidates:
             return None
-        # Present rows first, then most recently indexed.
-        candidates.sort(key=lambda row: (row.removed_at is not None, _sort_key(row)))
+        candidates.sort(key=_get_key)
         return candidates[0]
 
     def locations(self, digest) -> list[CogArtifact]:
@@ -531,17 +603,21 @@ class PostgresCogCatalogStore(CogCatalogStore):
         ]
 
     def upsert(self, artifact: CogArtifact) -> None:
+        import psycopg
         from psycopg.types.json import Jsonb
 
         if artifact.status not in STATUSES:
             raise ValueError(f"unknown catalog status {artifact.status!r}")
+        require_aware(artifact.pushed_at, "pushed_at")
+        require_aware(artifact.indexed_at, "indexed_at")
         # `indexed_at` is the server's clock: rows compare across replicas.
         # The card goes in as jsonb verbatim -- the reader's dict, structure
         # preserved -- and `removed_at` is cleared because a row being
         # (re)written was just seen in the registry.
-        with self._db.connection() as conn:
-            conn.execute(
-                """
+        try:
+            with self._db.connection() as conn:
+                conn.execute(
+                    """
                 INSERT INTO collab_cog_artifacts (
                     source_id, host, repository, digest, tags, pushed_at, indexed_at, manifest_media_type,
                     status, card, cog_id, name, version, kind, publisher, manifest_schema, read_errors, removed_at
@@ -563,28 +639,37 @@ class PostgresCogCatalogStore(CogCatalogStore):
                     manifest_schema = EXCLUDED.manifest_schema,
                     read_errors = EXCLUDED.read_errors,
                     removed_at = NULL
-                """,
-                (
-                    artifact.source_id,
-                    artifact.host,
-                    artifact.repository,
-                    artifact.digest,
-                    sorted(set(artifact.tags)),
-                    artifact.pushed_at,
-                    artifact.manifest_media_type,
-                    artifact.status,
-                    Jsonb(artifact.card) if artifact.card is not None else None,
-                    artifact.cog_id,
-                    artifact.name,
-                    artifact.version,
-                    artifact.kind,
-                    artifact.publisher,
-                    artifact.manifest_schema,
-                    Jsonb(list(artifact.read_errors)),
-                ),
-            )
+                    """,
+                    (
+                        artifact.source_id,
+                        artifact.host,
+                        artifact.repository,
+                        artifact.digest,
+                        sorted(set(artifact.tags)),
+                        artifact.pushed_at,
+                        artifact.manifest_media_type,
+                        artifact.status,
+                        Jsonb(artifact.card) if artifact.card is not None else None,
+                        artifact.cog_id,
+                        artifact.name,
+                        artifact.version,
+                        artifact.kind,
+                        artifact.publisher,
+                        artifact.manifest_schema,
+                        Jsonb(list(artifact.read_errors)),
+                    ),
+                )
+        except psycopg.DataError as exc:
+            # This row's *content* is what the server refused (NUL in a jsonb
+            # string is the known case) -- an availability problem it is not,
+            # and the two must fail differently: the indexer records a data
+            # error against the artifact and continues, while an outage
+            # aborts its sweep. Class name only; the server's message quotes
+            # the offending value.
+            raise CogCatalogDataError(type(exc).__name__) from exc
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
+        require_aware(pushed_at, "pushed_at")
         with self._db.connection() as conn:
             row = conn.execute(
                 """
@@ -655,8 +740,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 WHERE digest = %s
                   AND (%s::text IS NULL OR source_id = %s)
                   AND (%s::text IS NULL OR repository = %s)
-                ORDER BY (removed_at IS NOT NULL), pushed_at DESC NULLS LAST, indexed_at DESC,
-                         source_id, repository
+                ORDER BY (removed_at IS NOT NULL), indexed_at DESC, source_id, repository
                 LIMIT 1
                 """,
                 (digest, source_id, source_id, repository, repository),

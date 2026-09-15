@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -28,6 +30,7 @@ from collab_hub_api.cogs.catalog import (
     STATUS_NON_COG,
     CatalogFilter,
     CogArtifact,
+    CogCatalogDataError,
     CogCatalogUnavailableError,
     InMemoryCogCatalogStore,
     KnownArtifact,
@@ -272,11 +275,14 @@ def test_list_current_filters(store):
     assert ids(kind="model", requires="model-registry/example") == []
 
 
-def test_list_current_limit_is_bounded(store):
-    for index in range(5):
-        store.upsert(artifact(str(index), repository=f"cogs/c{index}", document=card(f"example/c{index}")))
+def test_list_current_limit_is_bounded_at_the_boundary(store):
+    # MAX_LIST_LIMIT + 5 distinct cog_ids, so the cap is proven at its actual
+    # boundary rather than inferred from a five-row set.
+    for index in range(MAX_LIST_LIMIT + 5):
+        store.upsert(artifact(f"{index:x}", repository=f"cogs/c{index}", document=card(f"example/c{index:04d}")))
     assert len(store.list_current(limit=2)) == 2
-    assert len(store.list_current(limit=MAX_LIST_LIMIT + 5)) == 5
+    listed = store.list_current(limit=MAX_LIST_LIMIT + 5)
+    assert len(listed) == MAX_LIST_LIMIT
     with pytest.raises(ValueError):
         store.list_current(limit=0)
 
@@ -313,30 +319,86 @@ def test_unavailable_store_refuses_every_call():
             call()
 
 
-@pytest.mark.parametrize(
-    ("document", "needle", "expected"),
-    [
-        ({"a": 1, "b": 2}, {"a": 1}, True),
-        ({"a": 1}, {"a": 2}, False),
-        ({"a": 1}, {"b": 1}, False),
-        (
-            {"requires": [{"capability": "x", "locality": "any"}, {"capability": "y"}]},
-            {"requires": [{"capability": "y"}]},
-            True,
-        ),
-        ({"requires": [{"capability": "x"}]}, {"requires": [{"capability": "y"}]}, False),
-        ({"provides": ["a", "b"]}, {"provides": ["b"]}, True),
-        ({"provides": ["a", "b"]}, {"provides": ["b", "c"]}, False),
-        ({"provides": []}, {"provides": []}, True),
-        # Postgres: a scalar contains a one-element array of itself, not the reverse.
-        ({"k": "v"}, {"k": ["v"]}, True),
-        ({"k": ["v"]}, {"k": "v"}, False),
-        ({"io": {"accepts": ["x"]}}, {"io": {"accepts": ["x"]}}, True),
-        ({"io": None}, {"io": {"accepts": ["x"]}}, False),
-    ],
-)
+CONTAINMENT_CASES = [
+    # (document, needle, expected `document @> needle`). One shared table: the
+    # in-memory helper is asserted against these expectations here, and the
+    # live layer runs every case through a real server's `@>` so the two can
+    # never quietly disagree (the codex gate caught exactly that: the helper
+    # once let a scalar match a singleton array, which Postgres refuses).
+    ({"a": 1, "b": 2}, {"a": 1}, True),
+    ({"a": 1}, {"a": 2}, False),
+    ({"a": 1}, {"b": 1}, False),
+    (
+        {"requires": [{"capability": "x", "locality": "any"}, {"capability": "y"}]},
+        {"requires": [{"capability": "y"}]},
+        True,
+    ),
+    ({"requires": [{"capability": "x"}]}, {"requires": [{"capability": "y"}]}, False),
+    ({"provides": ["a", "b"]}, {"provides": ["b"]}, True),
+    ({"provides": ["a", "b"]}, {"provides": ["b", "c"]}, False),
+    ({"provides": []}, {"provides": []}, True),
+    # Scalar/array asymmetry: below the top level, neither direction matches.
+    ({"k": "v"}, {"k": ["v"]}, False),
+    ({"k": ["v"]}, {"k": "v"}, False),
+    # ... but a top-level array does contain a bare scalar (and not vice versa).
+    (["v", "w"], "v", True),
+    ("v", ["v"], False),
+    # Booleans are not numbers, while numbers compare numerically.
+    ({"k": 1}, {"k": True}, False),
+    ({"k": True}, {"k": 1}, False),
+    ({"k": 1}, {"k": 1.0}, True),
+    # Nested arrays: an array element only matches an array element.
+    ({"a": [[1, 2]]}, {"a": [[1]]}, True),
+    ({"a": [[1]]}, {"a": [1]}, False),
+    ({"a": [1, 2]}, {"a": [[1]]}, False),
+    # Empty object/array and null.
+    ({"a": [{"x": 1}]}, {"a": [{}]}, True),
+    ({"a": None}, {"a": None}, True),
+    ({"a": "x"}, {}, True),
+    ({"io": {"accepts": ["x"]}}, {"io": {"accepts": ["x"]}}, True),
+    ({"io": None}, {"io": {"accepts": ["x"]}}, False),
+]
+
+
+@pytest.mark.parametrize(("document", "needle", "expected"), CONTAINMENT_CASES)
 def test_json_contains_mirrors_jsonb_containment(document, needle, expected):
     assert json_contains(document, needle) is expected
+
+
+def test_get_prefers_the_most_recently_indexed_present_location(store):
+    # Conflicting timestamps on purpose: the OLDER-pushed location was indexed
+    # more recently, and get()'s documented order is by indexing recency --
+    # every location of one digest shares the artifact's push time in
+    # practice, so pushed_at cannot be the tiebreak.
+    early, late = T0 - timedelta(days=1), T0 + timedelta(days=1)
+    store.upsert(replace(artifact("a", repository="cogs/first", pushed_at=late), indexed_at=early))
+    store.upsert(replace(artifact("a", repository="mirror/second", pushed_at=early), indexed_at=late))
+
+    assert store.get(digest("a")).repository == "mirror/second"
+
+    # A removed row loses to any present one, whatever its indexing recency.
+    store.mark_removed_one(SOURCE, "mirror/second", digest("a"))
+    assert store.get(digest("a")).repository == "cogs/first"
+
+
+def test_naive_datetimes_are_refused(store):
+    naive = T0.replace(tzinfo=None)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.upsert(artifact("a", pushed_at=naive))
+    store.upsert(artifact("a"))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.update_tags(SOURCE, "cogs/cog-a", digest("a"), ("v2",), pushed_at=naive)
+
+
+def test_upsert_refuses_a_card_jsonb_cannot_store(store):
+    # Parity with Postgres, where a NUL in any jsonb string is refused: the
+    # in-memory store must fail the same way or tests would pass on content
+    # production rejects (the codex gate's poison-card finding).
+    poison = card()
+    poison["summary"] = "before\x00after"
+    with pytest.raises(CogCatalogDataError):
+        store.upsert(artifact("a", document=poison))
+    assert store.get(digest("a")) is None
 
 
 def test_card_search_fields_stringify_scalars_and_drop_structures():
@@ -542,17 +604,102 @@ def test_live_sweep_lock_is_single_flight_across_connections_and_restores_autoco
             assert after is True
     finally:
         other._db.close()
+    # Autocommit restoration is asserted with connection identity in
+    # test_live_lock_connection_returns_with_autocommit_restored below; a
+    # checkout from a many-connection pool here would not have proven it was
+    # the lock's connection being inspected.
 
-    # The connection that held the lock went back to the pool with autocommit
-    # restored: a failed transaction on it must roll back as every other
-    # store expects.
-    with pytest.raises(RuntimeError):
-        with database.connection() as conn:
-            conn.execute("INSERT INTO collab_orgs (id, created_by) VALUES ('rolled-back', 'sub')")
-            assert conn.autocommit is False
-            raise RuntimeError("abort")
+
+@live_postgres
+def test_live_lock_connection_returns_with_autocommit_restored(live_store):
+    """The very connection that held the lock goes back with autocommit off.
+
+    A one-connection pool makes the identity provable: the next checkout MUST
+    be the connection that held the lock (the pid, read out of pg_locks while
+    it was held, pins that), so the transaction semantics asserted afterwards
+    are asserted on the right connection rather than on whichever one a larger
+    pool happened to hand out.
+    """
+
+    _, database = live_store
+    single = _database(max_size=1)
+    store = PostgresCogCatalogStore(single)
+    try:
+        with store.sweep_lock() as held:
+            assert held is True
+            with database.connection() as conn:
+                row = conn.execute(
+                    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = %s AND objid = %s",
+                    (COG_INDEX_LOCK_KEY >> 32, COG_INDEX_LOCK_KEY & 0xFFFFFFFF),
+                ).fetchone()
+            assert row is not None
+            holder_pid = row["pid"]
+
+        with pytest.raises(RuntimeError):
+            with single.connection() as conn:
+                assert conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"] == holder_pid
+                assert conn.autocommit is False
+                conn.execute("INSERT INTO collab_orgs (id, created_by) VALUES ('rolled-back', 'sub')")
+                raise RuntimeError("abort")
+        with single.connection() as conn:
+            assert conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"] == holder_pid
+            assert conn.execute("SELECT count(*) AS n FROM collab_orgs").fetchone()["n"] == 0
+    finally:
+        single.close()
+
+
+@live_postgres
+def test_live_jsonb_containment_agrees_with_the_helper(live_store):
+    """Every shared containment case, asked of a real server and of the helper.
+
+    Agreement is the property (the in-memory store must answer filters exactly
+    as production does); the expected values in the table are additionally
+    pinned so a wrong expectation cannot hide a double failure.
+    """
+
+    from psycopg.types.json import Jsonb
+
+    _, database = live_store
     with database.connection() as conn:
-        assert conn.execute("SELECT count(*) AS n FROM collab_orgs").fetchone()["n"] == 0
+        for document, needle, expected in CONTAINMENT_CASES:
+            row = conn.execute("SELECT %s::jsonb @> %s::jsonb AS contains", (Jsonb(document), Jsonb(needle))).fetchone()
+            assert row["contains"] is expected, f"server disagrees with the table for {document!r} @> {needle!r}"
+            assert json_contains(document, needle) is expected, f"helper disagrees for {document!r} @> {needle!r}"
+
+
+@live_postgres
+def test_live_poison_card_is_a_data_error_not_an_outage(live_store):
+    """psycopg's DataError for NUL-in-jsonb surfaces as CogCatalogDataError.
+
+    This is the second line behind the indexer's pre-validation: bypass the
+    validation (write straight to the store) and the translation still lets a
+    caller distinguish "this row's content" from "the database is down".
+    """
+
+    store, _ = live_store
+    poison = card()
+    poison["summary"] = "nul\x00nul"
+    with pytest.raises(CogCatalogDataError):
+        store.upsert(artifact("f", repository="cogs/poison", document=poison))
+    assert store.get(digest("f")) is None
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.upsert(artifact("f", pushed_at=T0.replace(tzinfo=None)))
+
+
+@live_postgres
+def test_live_get_orders_by_indexing_recency_not_push_time(live_store):
+    store, _ = live_store
+    # The later-pushed location is indexed FIRST; the earlier-pushed one is
+    # indexed second and must win, because get() is about this catalog's own
+    # recency, not the artifact's shared push time.
+    store.upsert(artifact("a", repository="cogs/first", pushed_at=T0 + timedelta(days=1)))
+    time.sleep(0.01)  # separate the two server-side indexed_at values
+    store.upsert(artifact("a", repository="mirror/second", pushed_at=T0 - timedelta(days=1)))
+
+    assert store.get(digest("a")).repository == "mirror/second"
+    store.mark_removed_one(SOURCE, "mirror/second", digest("a"))
+    assert store.get(digest("a")).repository == "cogs/first", "a present row beats a removed one"
 
 
 @live_postgres

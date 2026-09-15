@@ -450,6 +450,26 @@ async def test_token_response_without_token_is_protocol_error():
             await client.list_tags(REPO)
 
 
+@pytest.mark.parametrize("bad_token", ["caf\u00e9-token", "tok\r\nInjected: header", "tok\ttab"])
+async def test_non_header_safe_token_is_a_protocol_error(bad_token):
+    # Codex-gate MEDIUM finding, reproduced with the real client: a token the
+    # endpoint returns with non-ASCII (or control) characters used to blow up
+    # as UnicodeEncodeError inside httpx's header construction -- outside this
+    # module's wrapping, so an indexer guarding with `except OCIError` never
+    # recorded the artifact and the sweep died. It must be refused as the
+    # protocol error it is, before any header is built.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "auth.example":
+            return httpx.Response(200, json={"token": bad_token})
+        return httpx.Response(401, headers={"WWW-Authenticate": f'Bearer realm="{REALM}"'})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(OCIProtocolError, match="not a valid ASCII header value") as info:
+            await client.list_tags(REPO)
+        # The token itself is a credential; it is never echoed.
+        assert bad_token not in str(info.value)
+
+
 async def test_token_endpoint_server_error_is_protocol_error():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "auth.example":

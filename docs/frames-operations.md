@@ -1018,9 +1018,14 @@ digest)`. It rides the same shared `frames.postgres.url` and the same
 
 The indexer is a reconciliation loop: enumerate each source, skip digests
 already indexed with the same tag set, fetch and read only new digests
-(`COG.md` first, then the profile file it names — never the lockfile), then
-mark this source's rows whose digest is no longer present as removed. Two
-safety rules operators should know:
+(`COG.md` first, then the profile file it names — never the lockfile, by
+title **or** media type), then mark this source's rows whose digest is no
+longer present as removed. A card the database cannot store (a NUL character
+anywhere in its JSON, or an oversized card) becomes a `failed` row with a
+reason instead of a sweep-aborting error. Fetching is budgeted per sweep
+(already-known digests cost nothing), so a large registry's tail is reached
+across successive sweeps rather than starved; deferred artifacts still count
+as present, so removal stays correct. Safety rules operators should know:
 
 - **Single flight.** A sweep takes the session-level advisory lock
   `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its whole
@@ -1033,14 +1038,29 @@ safety rules operators should know:
   errors, one repository that fails to list, or an enumeration cut short by the
   per-source bound leaves that source's removal step skipped and counted in
   `sources_failed` — a transient registry outage never marks a catalog gone.
+  The adapters uphold their half by **raising past their own limits instead of
+  truncating** (a repository over the static adapter's tag bound, a Harbor
+  listing over its page bound): a truncated list presented as complete would
+  turn the bound into false removals.
+- **Indexing needs two pooled connections.** The sweep lock occupies one
+  connection of the shared `frames.postgres` pool for the sweep's whole
+  duration while reads and writes check out another, so the API refuses to
+  start with `cogs.index.enabled` and `frames.postgres.pool.max_size < 2`.
 
 Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
 non_cog / failed / removed / sources_failed / duration) and exports the same
 counts as `frames_server_cog_index_artifacts_total{outcome}`,
 `frames_server_cog_index_sweeps_total{result}` and
 `frames_server_cog_index_sweep_duration_seconds`. Per-artifact failures are
-stored in the row's `read_errors` and never abort the sweep. Nothing the
-indexer logs or stores carries a registry credential.
+stored in the row's `read_errors` and never abort the sweep.
+
+On content and secrecy, precisely: the `card` is the published bundle's own
+declarations, stored verbatim — whatever a publisher writes in `COG.md` or the
+profile is what the catalog holds. The guarantee is narrower and absolute:
+*configured registry credentials* never reach cards, `read_errors`, or logs;
+`read_errors` and log lines carry exception class names (plus the message only
+for the OCI client's own errors, whose contract is that messages name neither
+URLs nor headers), never raw URLs or exception chains.
 
 ### Connection pooling
 

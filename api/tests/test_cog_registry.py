@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from datetime import UTC, datetime, timedelta, timezone
 
 import httpx
@@ -485,20 +484,35 @@ def static_source(handler=None, **overrides):
     return source, factory.clients[0]
 
 
-async def test_static_list_artifacts_bounds_tags_and_skips_vanished_ones(caplog) -> None:
+async def test_static_list_artifacts_refuses_a_truncated_tag_list() -> None:
+    # Regression for the codex-gate HIGH finding: 200 tags were once silently
+    # kept and the rest dropped, so the indexer treated the truncated list as
+    # complete -- and a lexicographically early new tag displaced a real
+    # artifact out of the window, which the next sweep then marked removed.
+    # Past the bound the adapter must refuse, so the indexer counts the
+    # source as failed and its removal step never runs.
     source, client = static_source()
-    client.tags["cogs/alpha"] = [f"tag-{i:03d}" for i in range(MAX_TAGS_PER_REPOSITORY + 50)] + ["gone", "v1"]
-    for i in range(MAX_TAGS_PER_REPOSITORY + 50):
+    client.tags["cogs/alpha"] = [f"tag-{i:03d}" for i in range(MAX_TAGS_PER_REPOSITORY + 1)]
+    for i in range(MAX_TAGS_PER_REPOSITORY + 1):
         client.manifests[("cogs/alpha", f"tag-{i:03d}")] = client.manifests[("cogs/alpha", "v1")]
-    with caplog.at_level(logging.WARNING):
-        refs = await source.list_artifacts("cogs/alpha")
-    fetched = [call for call in client.calls if call[0] == "get_manifest"]
-    assert len(fetched) == MAX_TAGS_PER_REPOSITORY
-    assert ("get_manifest", "cogs/alpha", "gone") in fetched  # sorted: "gone" precedes "tag-*"; no manifest → skipped
-    assert any("enumerating the first 200" in record.message for record in caplog.records)
+
+    with pytest.raises(RegistrySourceProtocolError, match="refusing to enumerate a truncated view"):
+        await source.list_artifacts("cogs/alpha")
+
+    # Refused before any manifest was fetched: a partial fetch would be waste.
+    assert not [call for call in client.calls if call[0] == "get_manifest"]
+
+
+async def test_static_list_artifacts_at_the_bound_is_complete() -> None:
+    source, client = static_source()
+    client.tags["cogs/alpha"] = [f"tag-{i:03d}" for i in range(MAX_TAGS_PER_REPOSITORY)]
+    for i in range(MAX_TAGS_PER_REPOSITORY):
+        client.manifests[("cogs/alpha", f"tag-{i:03d}")] = client.manifests[("cogs/alpha", "v1")]
+
+    refs = await source.list_artifacts("cogs/alpha")
+
     assert [ref.digest for ref in refs] == [DIGEST_A]
-    assert "gone" not in refs[0].tags and "v1" not in refs[0].tags  # v1 sorted past the cap
-    assert len(refs[0].tags) == MAX_TAGS_PER_REPOSITORY - 1
+    assert len(refs[0].tags) == MAX_TAGS_PER_REPOSITORY
 
 
 async def test_static_list_artifacts_propagates_other_oci_errors() -> None:
@@ -557,8 +571,10 @@ async def test_static_index_transport_failure() -> None:
         raise httpx.ConnectTimeout("timed out", request=request)
 
     source, _ = static_source(handler, repositories=[], index_url=INDEX_URL)
-    with pytest.raises(RegistrySourceError, match="fetching index .* failed"):
+    with pytest.raises(RegistrySourceError, match="fetching the configured index_url failed: ConnectTimeout") as info:
         await source.list_repositories()
+    # The URL (which may carry a token in its path) is never echoed.
+    assert INDEX_URL not in str(info.value)
 
 
 def test_parse_index_document_accepts_the_live_shape() -> None:

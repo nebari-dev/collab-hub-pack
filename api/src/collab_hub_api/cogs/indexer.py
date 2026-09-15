@@ -15,24 +15,47 @@ One sweep, per configured source:
 5. record per-artifact failures in ``read_errors`` and carry on; log a
    summary and export it as metrics.
 
-Two things keep a sweep from doing damage:
+Three things keep a sweep from doing damage:
 
-- **Single flight.** A sweep runs under the store's sweep lock (a
-  session-level Postgres advisory lock on the shared pool), so replicas
-  starting together do not double-index; the loser logs and waits for the
-  next interval.
+- **Single flight, cancellation included.** A sweep runs under the store's
+  sweep lock (a session-level Postgres advisory lock on the shared pool), so
+  replicas starting together do not double-index; the loser logs and waits
+  for the next interval. Store calls run on worker threads, and a worker
+  thread cannot be interrupted -- so cancellation *drains*: a cancelled sweep
+  first waits out whatever store call is in flight, then releases the lock,
+  then propagates. The lock is never released while a write is still running,
+  and a cancellation that lands mid-acquisition still gets a matching release.
 - **Removal needs a complete picture.** Rows are only marked removed for a
   source whose enumeration fully succeeded this sweep. A registry that
-  answers ``list_repositories`` with an error, or one repository's listing
-  that fails, or an enumeration cut short by the per-source bound, leaves
-  that source's removal step skipped -- a transient outage must not mark a
-  whole catalog gone.
+  answers ``list_repositories`` with an error, one repository's listing that
+  fails, or an enumeration past the per-source bound leaves that source's
+  removal step skipped -- a transient outage must not mark a whole catalog
+  gone. The adapters uphold their half: past their own limits they *raise*
+  rather than silently truncate, because a truncated list presented as
+  complete is exactly what turns a bound into false removals.
+- **One artifact cannot poison the sweep.** The whole per-artifact read
+  is guarded (any exception, not just the OCI hierarchy -- a client bug must
+  cost one row, not the sweep), and a card Postgres cannot store (NUL in a
+  string, or oversized) is recorded as ``failed`` with a reason instead of
+  aborting. Database *outages* still abort the sweep on purpose: retrying
+  per artifact against a dead database would spend the whole budget learning
+  the same fact.
 
-The store is synchronous psycopg; every store call here goes through
-``asyncio.to_thread`` so the event loop is never blocked on the database, and
-every registry call is the async OCI client. Credentials never appear in
-anything this module logs or stores: failures are recorded by exception class
-and message, and the OCI client's messages carry neither URLs nor headers.
+**What is and is not kept out of storage and logs.** Cards are the published
+bundle's own content, stored verbatim -- that is the contract (parent issue
+acceptance: the reader's output, structure preserved), so anything a
+publisher writes into ``COG.md`` or the profile lands in the catalog as-is.
+The guarantee this module makes is narrower and absolute: *configured
+registry credentials* never reach cards, ``read_errors``, or logs.
+``read_errors`` and log lines therefore carry exception class names -- plus
+the message only for the OCI hierarchy, whose contract is that messages name
+neither URLs nor headers -- never raw URLs, tokens, or exception chains.
+
+Fairness under bounds: enumeration is complete (or the source is marked
+failed), while *fetching* is budgeted per sweep. Already-known digests cost
+nothing, so successive sweeps walk past what earlier sweeps indexed and the
+tail of a large registry is reached instead of starved; deferred artifacts
+are still part of the present set, so removal stays correct.
 
 Targeted entry points for the webhook receiver (#86): :meth:`CogIndexer.reindex`
 for one ``(source_id, repository, digest)`` and :meth:`CogIndexer.mark_removed`
@@ -43,10 +66,12 @@ writes, and a sweep running at the same time converges to the same state.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
@@ -57,6 +82,7 @@ from .catalog import (
     STATUS_INDEXED,
     STATUS_NON_COG,
     CogArtifact,
+    CogCatalogDataError,
     CogCatalogStore,
     KnownArtifact,
     card_search_fields,
@@ -65,25 +91,50 @@ from .frontmatter import read_cog_document
 from .oci import (
     DEFAULT_MAX_BUNDLE_FILE_BYTES,
     LOCKFILE_TITLE,
+    MEDIA_TYPE_PIXI_LOCK,
+    Descriptor,
     Manifest,
     OCIError,
     OCINotFound,
     select_bundle_layers,
 )
 from .profile import PIXI_MANIFEST, PROFILE_PARSED
-from .registry import ArtifactRef, RegistrySource, RegistrySourceError
+from .registry import ArtifactRef, RegistrySource
 
 logger = logging.getLogger("frames_server.cogs.indexer")
 
 DEFAULT_INTERVAL_SECONDS = 300
+
 MAX_ARTIFACTS_PER_SOURCE = 10_000
-"""Upper bound on artifacts one sweep will consider for one source.
+"""Completeness bound on one source's enumeration.
 
 A registry is somebody else's system: this is what stops a runaway or hostile
-one from turning a sweep into an unbounded loop. Past the bound the rest of
-the source is left for the next sweep and its removal step is skipped, since
-what was not enumerated cannot be declared gone.
+one from turning a sweep into an unbounded loop. A source past the bound is
+treated exactly like one whose listing failed -- reconciled as far as it was
+enumerated, removal skipped, ``sources_failed`` counted -- because a partial
+enumeration must never be mistaken for a complete one.
 """
+
+MAX_NEW_FETCHES_PER_SWEEP = 1_000
+"""Fetch budget: how many *new* artifacts one sweep will read per source.
+
+Distinct from the enumeration bound above, and the reason a big source makes
+progress instead of starving its tail: enumeration stays complete (so removal
+and tag reconciliation stay correct for every artifact), while fetching --
+the expensive part, one manifest plus up to three blobs each -- is capped.
+Digests already in the catalog cost nothing against the budget, so each sweep
+fetches the next batch beyond what earlier sweeps indexed. Artifacts past the
+budget are counted as ``deferred`` and picked up next sweep.
+"""
+
+MAX_CARD_BYTES = 8 * 1024 * 1024
+"""Cap on one card's JSON text. Bundle files are capped at 256 KiB each and a
+card embeds at most a few of them; a card past this is not a Cog description,
+it is a payload, and it is recorded as ``failed`` rather than stored."""
+
+MAX_ERROR_CHARS = 500
+"""Cap on one ``read_errors`` entry; the row is a diagnosis, not a dump."""
+
 MAX_TITLES_IN_REASON = 8
 """How many layer titles a non-Cog reason names before it says "and N more"."""
 
@@ -95,6 +146,7 @@ OUTCOME_RETAGGED = "retagged"
 OUTCOME_NON_COG = "non_cog"
 OUTCOME_FAILED = "failed"
 OUTCOME_REMOVED = "removed"
+OUTCOME_DEFERRED = "deferred"
 
 
 @dataclass
@@ -107,6 +159,8 @@ class SweepSummary:
     non_cog: int = 0
     failed: int = 0
     removed: int = 0
+    deferred: int = 0
+    """New artifacts past this sweep's fetch budget; next sweep's work."""
     sources: int = 0
     sources_failed: int = 0
     """Sources whose enumeration did not complete; their removal step was skipped."""
@@ -114,7 +168,7 @@ class SweepSummary:
     """Another replica held the sweep lock; nothing was done."""
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
-    """Source-level (not per-artifact) failure messages, bounded to one per source."""
+    """Source-level (not per-artifact) failures: stage + exception class, never URLs."""
 
     def as_log_fields(self) -> dict[str, object]:
         fields = asdict(self)
@@ -140,12 +194,14 @@ class CogIndexer:
         sources: Sequence[RegistrySource],
         *,
         max_artifacts_per_source: int = MAX_ARTIFACTS_PER_SOURCE,
+        max_new_fetches_per_sweep: int = MAX_NEW_FETCHES_PER_SWEEP,
         max_bytes_per_file: int = DEFAULT_MAX_BUNDLE_FILE_BYTES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._sources = list(sources)
         self._max_artifacts = max_artifacts_per_source
+        self._max_new_fetches = max_new_fetches_per_sweep
         self._max_bytes_per_file = max_bytes_per_file
         self._clock = clock
         self.last_summary: SweepSummary | None = None
@@ -154,10 +210,58 @@ class CogIndexer:
     def sources(self) -> list[RegistrySource]:
         return list(self._sources)
 
+    # -- threading discipline ---------------------------------------------------
+
+    async def _on_thread(self, func, /, *args, **kwargs):
+        """Run a blocking store call on a worker thread; cancellation drains it.
+
+        A worker thread cannot be interrupted, so a plain ``await
+        asyncio.to_thread(...)`` cancelled mid-call leaves the call running
+        after the coroutine has moved on -- which for this module means a
+        sweep could release its lock while a write is still mutating rows, or
+        abandon a lock acquisition that completes a moment later with nobody
+        left to release it. So the future is shielded, and on cancellation
+        this waits for the thread to finish (its result or error discarded)
+        before propagating. A second cancellation during the drain abandons
+        the wait -- there is no stronger guarantee available -- but the
+        ordinary shutdown path (one ``cancel()`` then ``await``) always
+        drains.
+        """
+
+        future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            if not future.done():
+                with suppress(Exception):
+                    await future
+            raise
+
+    async def _release(self, lock) -> None:
+        """Release the sweep lock, tolerating both errors and cancellation.
+
+        Runs in ``finally`` blocks, where raising would mask whatever ended
+        the sweep; an exit failure is logged by class name only. Cancellation
+        during the release drains like every other store call, so the unlock
+        (and the pooled connection's return) always completes.
+        """
+
+        try:
+            await self._on_thread(lock.__exit__, None, None, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__})
+
     # -- the sweep ------------------------------------------------------------
 
     async def sweep(self) -> SweepSummary:
-        """Reconcile every source once, under the sweep lock. Never raises for a per-artifact or per-source failure."""
+        """Reconcile every source once, under the sweep lock.
+
+        Never raises for a per-artifact or per-source failure; does raise for
+        a database outage (the store's own errors) and propagates cancellation
+        -- in both cases after the lock is released.
+        """
 
         started = self._clock()
         summary = SweepSummary(sources=len(self._sources))
@@ -165,21 +269,32 @@ class CogIndexer:
         # database call, and the connection it occupies stays checked out for
         # the whole sweep (see the store's sweep_lock contract).
         lock = self._store.sweep_lock()
-        acquired = await asyncio.to_thread(lock.__enter__)
         try:
-            if not acquired:
-                summary.locked_out = True
-                COG_INDEX_SWEEPS.labels(result="locked_out").inc()
-                logger.info("cog_index_sweep_skipped", extra={"reason": "another replica holds the sweep lock"})
-                return summary
-            for source in self._sources:
-                await self._sweep_source(source, summary)
-            COG_INDEX_SWEEPS.labels(result="completed").inc()
-        except BaseException:
-            COG_INDEX_SWEEPS.labels(result="failed").inc()
-            raise
+            try:
+                acquired = await self._on_thread(lock.__enter__)
+            except asyncio.CancelledError:
+                # _on_thread drained the worker, so __enter__ finished on its
+                # thread even though this coroutine was cancelled. Whatever it
+                # entered gets its matching exit before the cancellation
+                # propagates; if __enter__ itself failed there is nothing
+                # held and _release swallows the mismatched exit.
+                await self._release(lock)
+                raise
+            try:
+                if not acquired:
+                    summary.locked_out = True
+                    COG_INDEX_SWEEPS.labels(result="locked_out").inc()
+                    logger.info("cog_index_sweep_skipped", extra={"reason": "another replica holds the sweep lock"})
+                    return summary
+                for source in self._sources:
+                    await self._sweep_source(source, summary)
+                COG_INDEX_SWEEPS.labels(result="completed").inc()
+            except BaseException:
+                COG_INDEX_SWEEPS.labels(result="failed").inc()
+                raise
+            finally:
+                await self._release(lock)
         finally:
-            await asyncio.to_thread(lock.__exit__, None, None, None)
             summary.duration_seconds = self._clock() - started
             COG_INDEX_SWEEP_DURATION.observe(summary.duration_seconds)
             self.last_summary = summary
@@ -195,30 +310,48 @@ class CogIndexer:
             if not enumeration.present:
                 return
 
-        known = {(row.repository, row.digest): row for row in await asyncio.to_thread(self._store.known, source.id)}
+        known = {(row.repository, row.digest): row for row in await self._on_thread(self._store.known, source.id)}
+        budget = self._max_new_fetches
         for repository, artifacts in enumeration.present.items():
             for artifact in artifacts:
-                outcome = await self._reconcile(source, repository, artifact, known.get((repository, artifact.digest)))
+                known_row = known.get((repository, artifact.digest))
+                # Mirrors _reconcile's decision: a fetch happens for a digest
+                # the catalog has never indexed, or one whose last attempt
+                # failed. Everything else is bookkeeping and costs no budget.
+                needs_fetch = known_row is None or known_row.status == STATUS_FAILED
+                if needs_fetch and budget <= 0:
+                    _count(summary, OUTCOME_DEFERRED)
+                    continue
+                outcome = await self._reconcile(source, repository, artifact, known_row)
+                if needs_fetch:
+                    budget -= 1
                 _count(summary, outcome)
 
         if not enumeration.complete:
             # Skipping removal is the whole point of tracking completeness:
-            # what was not enumerated cannot be declared gone.
+            # what was not enumerated cannot be declared gone. Deferred
+            # fetches do NOT skip removal -- those artifacts were enumerated
+            # and stand in the present set below.
             if enumeration.error is None:
                 summary.sources_failed += 1
                 summary.errors.append(f"{source.id}: enumeration incomplete; removal step skipped")
             return
         present = {repo: [artifact.digest for artifact in artifacts] for repo, artifacts in enumeration.present.items()}
-        removed = await asyncio.to_thread(self._store.mark_removed, source.id, present)
+        removed = await self._on_thread(self._store.mark_removed, source.id, present)
         summary.removed += removed
         if removed:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc(removed)
 
     async def _enumerate(self, source: RegistrySource) -> _Enumeration:
+        # Broad excepts on purpose: adapters talk to third-party systems and
+        # this seam is the isolation boundary -- an unexpected exception from
+        # one source (a client bug, a malformed response nobody anticipated)
+        # must cost that source's sweep, not the other sources'. Store errors
+        # never pass through here, so a database outage still aborts.
         result = _Enumeration()
         try:
             repositories = await source.list_repositories()
-        except (RegistrySourceError, OCIError) as exc:
+        except Exception as exc:
             result.complete = False
             result.error = f"list_repositories: {_describe(exc)}"
             return result
@@ -231,7 +364,7 @@ class CogIndexer:
                 # artifacts; that is an answer, not a failure, and its rows
                 # -- if it ever had any -- are correctly marked removed.
                 artifacts = []
-            except (RegistrySourceError, OCIError) as exc:
+            except Exception as exc:
                 result.complete = False
                 result.error = f"list_artifacts {repository}: {_describe(exc)}"
                 continue
@@ -262,17 +395,35 @@ class CogIndexer:
             # Tag change, or a digest that is back after being marked removed:
             # the card is the digest's and cannot have changed. Write the tags
             # (which also clears removed_at) and move on without a fetch.
-            await asyncio.to_thread(
+            await self._on_thread(
                 self._store.update_tags, source.id, repository, artifact.digest, tags, pushed_at=artifact.pushed_at
             )
             return OUTCOME_RETAGGED
         row = await self._read_artifact(source, repository, artifact)
-        await asyncio.to_thread(self._store.upsert, row)
+        row = await self._store_row(row)
         if row.status == STATUS_INDEXED:
             return OUTCOME_INDEXED
         if row.status == STATUS_NON_COG:
             return OUTCOME_NON_COG
         return OUTCOME_FAILED
+
+    async def _store_row(self, row: CogArtifact) -> CogArtifact:
+        """Upsert the row; a card the database refuses becomes a ``failed`` row, not a poisoned sweep.
+
+        The card is pre-validated (:func:`_card_unstorable`), so this catch is
+        the second line: whatever representability rule the database enforces
+        that the validation did not anticipate. Only the store's *data* error
+        is caught -- an outage raises through, because retrying every artifact
+        against a dead database is not resilience.
+        """
+
+        try:
+            await self._on_thread(self._store.upsert, row)
+            return row
+        except CogCatalogDataError as exc:
+            fallback = _with(row, status=STATUS_FAILED, card=None, read_errors=_errors(f"store: {type(exc).__name__}"))
+            await self._on_thread(self._store.upsert, fallback)
+            return fallback
 
     # -- targeted entry points (webhook receiver, #86) --------------------------
 
@@ -295,14 +446,13 @@ class CogIndexer:
         source = self._source(source_id)
         ref = ArtifactRef(digest=digest, tags=tuple(sorted(set(tags))), pushed_at=pushed_at)
         row = await self._read_artifact(source, repository, ref)
-        await asyncio.to_thread(self._store.upsert, row)
-        return row
+        return await self._store_row(row)
 
     async def mark_removed(self, source_id: str, repository: str, digest: str) -> bool:
         """Mark one artifact removed (a delete event). Returns whether a present row was marked."""
 
         self._source(source_id)
-        marked = await asyncio.to_thread(self._store.mark_removed_one, source_id, repository, digest)
+        marked = await self._on_thread(self._store.mark_removed_one, source_id, repository, digest)
         if marked:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc()
         return marked
@@ -316,7 +466,16 @@ class CogIndexer:
     # -- reading one artifact ---------------------------------------------------
 
     async def _read_artifact(self, source: RegistrySource, repository: str, artifact: ArtifactRef) -> CogArtifact:
-        """Turn one enumerated artifact into the row to store. Never raises for a registry or reader failure."""
+        """Turn one enumerated artifact into the row to store. Never raises except for cancellation.
+
+        The guard is deliberately broader than the OCI hierarchy: the client's
+        contract is to wrap its failures, but a contract is not a proof, and a
+        failure it missed (a header-encoding bug, an unanticipated response
+        shape) must cost this one row -- recorded by class name only, since an
+        unknown exception's message is not known to be safe -- never the sweep.
+        ``except Exception`` does not catch ``CancelledError``, so cancellation
+        still propagates.
+        """
 
         base = CogArtifact(
             source_id=source.id,
@@ -332,26 +491,31 @@ class CogIndexer:
         try:
             manifest = await client.get_manifest(repository, artifact.digest)
             base = _with(base, manifest_media_type=manifest.media_type or artifact.media_type)
-            if manifest.layer_by_title(COG_ENTRY_FILE) is None:
+            if _bundle_layer(manifest, COG_ENTRY_FILE) is None:
                 return await self._read_without_entry(client, repository, manifest, base)
             files = await self._fetch_cog_files(client, repository, manifest)
+            card = read_cog_bundle(files, bundle_paths=_titles(manifest))
+            return _indexed(base, card)
         except OCIError as exc:
             # Recorded, not raised: one broken artifact must not stop a sweep.
-            # The class name is the diagnosis; the message never carries a URL
-            # or a header (the OCI client's contract).
-            return _with(base, status=STATUS_FAILED, read_errors=(f"fetch: {_describe(exc)}",))
-        card = read_cog_bundle(files, bundle_paths=_titles(manifest))
-        return _indexed(base, card)
+            # OCI messages are kept -- the client's contract is that they name
+            # neither URLs nor headers.
+            return _with(base, status=STATUS_FAILED, read_errors=_errors(f"fetch: {_describe(exc)}"))
+        except Exception as exc:
+            return _with(base, status=STATUS_FAILED, read_errors=_errors(f"read: {type(exc).__name__}"))
 
     async def _fetch_cog_files(self, client, repository: str, manifest: Manifest) -> dict[str, bytes]:
         """``COG.md`` first, then the profile file its frontmatter names (plus ``pixi.toml`` for tasks).
 
         The manifest pointer is only known after ``COG.md`` is parsed, so this
         is two rounds of fetching rather than one guess at a file name. Never
-        the lockfile: ``select_bundle_layers`` drops it even when named.
+        the lockfile: ``select_bundle_layers`` drops it by title *and* media
+        type, and the direct entry fetch applies the same media-type exclusion
+        (:func:`_bundle_layer`) so a layer titled ``COG.md`` that is really
+        the lockfile is not fetched either.
         """
 
-        entry_layer = manifest.layer_by_title(COG_ENTRY_FILE)
+        entry_layer = _bundle_layer(manifest, COG_ENTRY_FILE)
         assert entry_layer is not None
         entry = await client.get_blob(repository, entry_layer, max_bytes=self._max_bytes_per_file)
         files = {COG_ENTRY_FILE: entry}
@@ -366,13 +530,13 @@ class CogIndexer:
     async def _read_without_entry(self, client, repository: str, manifest: Manifest, base: CogArtifact) -> CogArtifact:
         """No ``COG.md``: a Prog if ``pixi.toml`` declares a capability, otherwise a non-Cog with a reason."""
 
-        pixi = manifest.layer_by_title(PIXI_MANIFEST)
+        pixi = _bundle_layer(manifest, PIXI_MANIFEST)
         if pixi is None:
             return _with(
                 base,
                 status=STATUS_NON_COG,
-                read_errors=(
-                    f"manifest carries no {COG_ENTRY_FILE} or {PIXI_MANIFEST} layer; {_layer_summary(manifest)}",
+                read_errors=_errors(
+                    f"manifest carries no {COG_ENTRY_FILE} or {PIXI_MANIFEST} layer; {_layer_summary(manifest)}"
                 ),
             )
         files = {PIXI_MANIFEST: await client.get_blob(repository, pixi, max_bytes=self._max_bytes_per_file)}
@@ -382,7 +546,7 @@ class CogIndexer:
         return _with(
             base,
             status=STATUS_NON_COG,
-            read_errors=tuple(card.errors) or (f"manifest carries no {COG_ENTRY_FILE} layer",),
+            read_errors=_errors(*card.errors) or _errors(f"manifest carries no {COG_ENTRY_FILE} layer"),
         )
 
     # -- the loop -----------------------------------------------------------------
@@ -397,8 +561,9 @@ class CogIndexer:
     ) -> None:
         """Sweep on startup (unless told not to) and then every ``interval_seconds``, jittered, until cancelled.
 
-        A sweep that raises (a store outage, a bug) is logged and the loop
-        continues: the next interval retries. Cancellation propagates.
+        A sweep that raises (a store outage, a bug) is logged -- by exception
+        class, never with a chain that could echo somebody's URL -- and the
+        loop continues: the next interval retries. Cancellation propagates.
         ``jitter`` is a fraction of the interval added or removed at random so
         replicas that start together drift apart instead of contending for
         the lock at the same instant every cycle.
@@ -413,8 +578,8 @@ class CogIndexer:
                     await self.sweep()
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    logger.exception("cog_index_sweep_failed")
+                except Exception as exc:
+                    logger.error("cog_index_sweep_failed", extra={"error": type(exc).__name__})
             first = False
             delay = interval_seconds * (1 + random.uniform(-jitter, jitter))  # noqa: S311 - scheduling jitter
             if stop is None:
@@ -438,15 +603,71 @@ def _with(artifact: CogArtifact, **changes) -> CogArtifact:
     return replace(artifact, **changes)
 
 
+def _errors(*items: str) -> tuple[str, ...]:
+    """Bound and sanitize ``read_errors`` entries.
+
+    Reader errors can embed published content (a conflicting name, a layer
+    title), which may carry NUL -- the one character ``jsonb`` refuses -- and
+    can be arbitrarily long. Each entry is NUL-escaped and capped so the error
+    column can always be stored, whatever the card contained.
+    """
+
+    cleaned = []
+    for item in items:
+        item = item.replace("\x00", "\\x00")
+        if len(item) > MAX_ERROR_CHARS:
+            item = item[: MAX_ERROR_CHARS - 1] + "…"
+        cleaned.append(item)
+    return tuple(cleaned)
+
+
+def _card_unstorable(document: dict) -> str | None:
+    """Why this card cannot go into ``jsonb``, or ``None`` when it can.
+
+    Postgres ``jsonb`` refuses ``\\u0000`` anywhere in a string, and the
+    catalog refuses to be a blob store. Checked *before* the insert so one
+    unstorable card is one ``failed`` row instead of a database error that
+    poisons every later sweep.
+    """
+
+    try:
+        dumped = json.dumps(document)
+    except (TypeError, ValueError) as exc:
+        return f"card: not JSON-serializable ({type(exc).__name__})"
+    if "\\u0000" in dumped:
+        return "card: contains NUL (\\u0000), which jsonb cannot store"
+    if len(dumped) > MAX_CARD_BYTES:
+        return f"card: {len(dumped)} bytes of JSON exceeds the {MAX_CARD_BYTES}-byte cap"
+    return None
+
+
 def _indexed(base: CogArtifact, card: CogCard) -> CogArtifact:
     document = card.to_dict()
+    issue = _card_unstorable(document)
+    if issue is not None:
+        return _with(base, status=STATUS_FAILED, card=None, read_errors=_errors(issue, *card.errors))
     return _with(
         base,
         status=STATUS_INDEXED,
         card=document,
-        read_errors=tuple(card.errors),
+        read_errors=_errors(*card.errors),
         **card_search_fields(document),
     )
+
+
+def _bundle_layer(manifest: Manifest, title: str) -> Descriptor | None:
+    """The layer carrying ``title``, unless it is really the lockfile.
+
+    The same media-type exclusion ``select_bundle_layers`` applies, enforced
+    on the direct fetches too: a descriptor *titled* ``COG.md`` or
+    ``pixi.toml`` but carrying the lockfile media type is the one large layer
+    the card never needs, whatever its title claims.
+    """
+
+    layer = manifest.layer_by_title(title)
+    if layer is None or layer.media_type == MEDIA_TYPE_PIXI_LOCK:
+        return None
+    return layer
 
 
 def _titles(manifest: Manifest) -> list[str]:
@@ -463,5 +684,15 @@ def _layer_summary(manifest: Manifest) -> str:
 
 
 def _describe(exc: BaseException) -> str:
-    message = str(exc)
-    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    """One failure as ``read_errors``/log text: class name, plus the message only when it is known safe.
+
+    The OCI hierarchy's contract is that messages carry neither URLs nor
+    headers, so those messages are diagnostic and kept. Anything else --
+    adapter errors whose text may quote a configured URL, unexpected
+    exceptions whose text may quote anything -- is recorded by class alone.
+    """
+
+    if isinstance(exc, OCIError):
+        message = str(exc)
+        return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    return type(exc).__name__
