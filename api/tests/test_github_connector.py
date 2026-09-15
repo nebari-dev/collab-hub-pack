@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config
+from collab_hub_api.connectors.github_client import _project_filter_value
 from collab_hub_api.connectors.models import GITHUB_READONLY_SCOPES, GitHubSearchRequest
 from collab_hub_api.core import make_app
 
@@ -379,10 +380,72 @@ async def test_github_item_read_returns_bounded_body_and_comments(tmp_path, monk
     assert body["item"]["labels"] == ["bug", "priority:high"]
     # PR-only fields sourced from the pulls endpoint, not the issues endpoint.
     assert body["item"]["requested_reviewers"] == ["reviewer1"]
-    assert body["item"]["reviews"] == [{"user": "hubot", "state": "APPROVED"}]
+    assert body["item"]["reviews"] == [{"user": "hubot", "state": "APPROVED", "body": ""}]
     assert "login flow breaks" in body["text"]
     assert "repro this" in body["text"]
     assert body["truncated"] is False
+
+
+async def test_github_item_read_pr_draft_and_merge_state(tmp_path, monkeypatch):
+    # is_draft and merge_state come from the pulls payload already fetched for
+    # requested_reviewers; state="closed" alone can't tell merged from abandoned.
+    pulls = {
+        1: {"draft": True, "state": "open", "merged": False},
+        2: {"draft": False, "state": "closed", "merged": True},
+        3: {"draft": False, "state": "closed", "merged": False},
+        4: {"draft": False, "state": "open", "merged": False},
+    }
+
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        for n in pulls:
+            if path.endswith(f"/repos/acme/widgets/issues/{n}"):
+                return Response(
+                    200,
+                    json={
+                        "number": n,
+                        "title": "A PR",
+                        "state": pulls[n]["state"],
+                        "user": {"login": "octocat"},
+                        "comments": 0,
+                        "body": "b",
+                        "pull_request": {"url": "x"},
+                    },
+                )
+            if path.endswith(f"/repos/acme/widgets/pulls/{n}/reviews"):
+                return Response(200, json=[])
+            if path.endswith(f"/repos/acme/widgets/pulls/{n}"):
+                return Response(200, json={"requested_reviewers": [], **pulls[n]})
+        if path.endswith("/repos/acme/widgets/issues/8"):
+            return Response(
+                200,
+                json={"number": 8, "title": "An issue", "state": "open",
+                      "user": {"login": "octocat"}, "comments": 0, "body": "b"},
+            )
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    expected = {1: (True, "open"), 2: (False, "merged"), 3: (False, "closed_unmerged"), 4: (False, "open")}
+    async with _client(app) as client:
+        for n, (want_draft, want_merge) in expected.items():
+            response = await client.post(
+                f"/v1/connectors/github/items/{n}/read",
+                headers=_auth_header(),
+                json={"repo": "acme/widgets", "max_chars": 5000},
+            )
+            item = response.json()["item"]
+            assert item["is_draft"] is want_draft, n
+            assert item["merge_state"] == want_merge, n
+        # A plain issue leaves both fields defaulted (never fetches pulls).
+        response = await client.post(
+            "/v1/connectors/github/items/8/read",
+            headers=_auth_header(),
+            json={"repo": "acme/widgets", "max_chars": 5000},
+        )
+        item = response.json()["item"]
+        assert item["is_draft"] is False
+        assert item["merge_state"] == ""
 
 
 async def test_github_item_read_fetches_most_recent_comments(tmp_path, monkeypatch):
@@ -455,7 +518,75 @@ async def test_github_item_read_pr_reviews_keep_newest_tail(tmp_path, monkeypatc
     assert seen["per_page"] == "100"
     assert len(returned) <= 30
     # The newest review is kept (last); the early stale state fell off the tail.
-    assert returned[-1] == {"user": "alice", "state": "APPROVED"}
+    assert returned[-1] == {"user": "alice", "state": "APPROVED", "body": ""}
+
+
+async def test_github_item_read_pr_review_body(tmp_path, monkeypatch):
+    # The reviewer's rationale is returned, link-sanitized, and length-capped so a
+    # long review can't blow the response, while an empty body stays empty.
+    reviews = [
+        {"user": {"login": "alice"}, "state": "CHANGES_REQUESTED", "body": "Fix the null check http://evil.test/x"},
+        {"user": {"login": "bob"}, "state": "APPROVED", "body": "y" * 900},
+        {"user": {"login": "carol"}, "state": "COMMENTED", "body": ""},
+    ]
+
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if path.endswith("/repos/acme/widgets/issues/7"):
+            return Response(200, json={"number": 7, "title": "PR", "state": "open",
+                                       "user": {"login": "octocat"}, "comments": 0, "body": "b",
+                                       "pull_request": {"url": "x"}})
+        if path.endswith("/repos/acme/widgets/pulls/7/reviews"):
+            return Response(200, json=reviews)
+        if path.endswith("/repos/acme/widgets/pulls/7"):
+            return Response(200, json={"requested_reviewers": []})
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/items/7/read",
+            headers=_auth_header(),
+            json={"repo": "acme/widgets", "max_chars": 5000},
+        )
+    out = response.json()["item"]["reviews"]
+    assert out[0]["body"].startswith("Fix the null check")
+    assert "http://" not in out[0]["body"]  # link-sanitized, no raw URL leak
+    assert len(out[1]["body"]) <= 501 and out[1]["body"].endswith("…")  # capped
+    assert out[2]["body"] == ""
+
+
+async def test_github_item_read_pr_requested_teams(tmp_path, monkeypatch):
+    # A team requested for review is surfaced alongside individual reviewers, so a
+    # reviewer-grouping report doesn't silently drop team requests.
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if path.endswith("/repos/acme/widgets/issues/7"):
+            return Response(200, json={"number": 7, "title": "PR", "state": "open",
+                                       "user": {"login": "octocat"}, "comments": 0, "body": "b",
+                                       "pull_request": {"url": "x"}})
+        if path.endswith("/repos/acme/widgets/pulls/7/reviews"):
+            return Response(200, json=[])
+        if path.endswith("/repos/acme/widgets/pulls/7"):
+            return Response(200, json={
+                "requested_reviewers": [{"login": "alice"}],
+                "requested_teams": [{"name": "Platform", "slug": "platform"},
+                                    {"name": "Security", "slug": "security"}],
+            })
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/items/7/read",
+            headers=_auth_header(),
+            json={"repo": "acme/widgets", "max_chars": 5000},
+        )
+    item = response.json()["item"]
+    assert item["requested_reviewers"] == ["alice"]
+    assert item["requested_teams"] == ["Platform", "Security"]
 
 
 async def test_github_item_read_truncates_to_max_chars(tmp_path, monkeypatch):
@@ -880,6 +1011,408 @@ async def test_github_projects_reject_bad_owner(tmp_path, monkeypatch):
             "/v1/connectors/github/projects/list", headers=_auth_header(), json={"owner": "bad/owner"}
         )
     assert response.status_code == 422
+
+
+def _read_node_states():
+    """A board whose items exercise state (open/closed) and a REDACTED node
+    (content the viewer cannot access)."""
+    return {
+        "projectV2": {
+            "number": 1,
+            "title": "Roadmap",
+            "shortDescription": "",
+            "closed": False,
+            "items": {
+                "totalCount": 3,
+                "nodes": [
+                    {
+                        "type": "ISSUE",
+                        "content": {
+                            "__typename": "Issue",
+                            "number": 7,
+                            "title": "A bug",
+                            "state": "CLOSED",
+                            "repository": {"nameWithOwner": "acme/widgets"},
+                        },
+                        "fieldValues": {"nodes": []},
+                    },
+                    {
+                        "type": "ISSUE",
+                        "content": {
+                            "__typename": "Issue",
+                            "number": 8,
+                            "title": "Another bug",
+                            "state": "OPEN",
+                            "repository": {"nameWithOwner": "acme/widgets"},
+                        },
+                        "fieldValues": {"nodes": []},
+                    },
+                    {
+                        "type": "REDACTED",
+                        "content": None,
+                        "fieldValues": {"nodes": []},
+                    },
+                ],
+            },
+        }
+    }
+
+
+async def test_github_read_project_item_state_and_redacted(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _graphql_handler(org=_read_node_states(), user=None))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    # A linked issue carries its open/closed state.
+    assert items[0]["state"] == "closed"
+    assert items[1]["state"] == "open"
+    # A redacted item is marked as such and leaks no content.
+    assert items[2]["type"] == "REDACTED"
+    assert items[2]["repo"] == "" and items[2]["number"] == 0
+    assert items[2]["state"] == ""
+
+
+async def test_github_read_project_item_assignees_and_labels(tmp_path, monkeypatch):
+    # Linked issues/PRs carry their real assignees and labels, so a caller can
+    # triage a board by person or label (the capability the docs advertise).
+    node = {
+        "projectV2": {
+            "number": 1,
+            "title": "Roadmap",
+            "shortDescription": "",
+            "closed": False,
+            "items": {
+                "totalCount": 2,
+                "nodes": [
+                    {
+                        "type": "ISSUE",
+                        "content": {
+                            "__typename": "Issue",
+                            "number": 7,
+                            "title": "Bug",
+                            "state": "OPEN",
+                            "repository": {"nameWithOwner": "acme/widgets"},
+                            "assignees": {"nodes": [{"login": "octocat"}, {"login": "hubot"}]},
+                            "labels": {"nodes": [{"name": "bug"}, {"name": "priority:high"}]},
+                        },
+                        "fieldValues": {"nodes": []},
+                    },
+                    {
+                        "type": "DRAFT_ISSUE",
+                        "content": {"__typename": "DraftIssue", "title": "An idea"},
+                        "fieldValues": {"nodes": []},
+                    },
+                ],
+            },
+        }
+    }
+    _install_mock_client(monkeypatch, _graphql_handler(org=node, user=None))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    items = response.json()["items"]
+    assert items[0]["assignees"] == ["octocat", "hubot"]
+    assert items[0]["labels"] == ["bug", "priority:high"]
+    # A draft item has no linked issue/PR, so both lists stay empty.
+    assert items[1]["assignees"] == [] and items[1]["labels"] == []
+
+
+def _counts_handler(*, read_node, options, aggregates, status_counts, fail_dsl=False, captured_variables=None):
+    """Route POST /graphql three ways by GraphQL operation name: the enumeration
+    read (ProjectRead), the aggregate count query (ProjectCounts), and the
+    per-status column query (ProjectStatusCounts). fail_dsl simulates the
+    board-filter DSL being rejected by the API, so the count path falls back to
+    sampling the enumerated items."""
+
+    def handler(request: httpx.Request) -> Response:
+        if not request.url.path.endswith("/graphql"):
+            return Response(404, json={"message": "Not Found"})
+        payload = json.loads(request.content.decode("utf-8"))
+        query = payload["query"]
+        if "ProjectStatusCounts" in query:
+            if captured_variables is not None:
+                captured_variables.update(payload["variables"])
+            node = {"projectV2": {f"s{i}": {"totalCount": c} for i, c in enumerate(status_counts)}}
+            return Response(200, json={"data": {"organization": node, "user": None}})
+        if "ProjectCounts" in query:
+            if fail_dsl:
+                return Response(200, json={"errors": [{"message": "unknown query filter"}]})
+            node = {
+                "projectV2": {
+                    "statusField": {"options": [{"name": o} for o in options]},
+                    **{alias: {"totalCount": n} for alias, n in aggregates.items()},
+                }
+            }
+            return Response(200, json={"data": {"organization": node, "user": None}})
+        return Response(200, json={"data": {"organization": read_node, "user": None}})
+
+    return handler
+
+
+async def test_github_read_project_authoritative_counts(tmp_path, monkeypatch):
+    # Server-side count queries succeed -> exact, authoritative breakdowns whose
+    # status columns reconcile to the total.
+    handler = _counts_handler(
+        read_node=_read_node(),  # totalCount 2 -> matches the authoritative total
+        options=["Backlog", "In progress", "Done"],
+        # A board draft matches is:issue too, so is:issue counts the draft (1) and
+        # board_draft (is:draft is:issue) isolates it; issue = 1 - 1 = 0 real
+        # issues, the draft lands in the draft bucket, and the PR under is:pr.
+        aggregates={
+            "total": 2,
+            "issue": 1,
+            "pull_request": 1,
+            "board_draft": 1,
+            "opened": 1,
+            "closed": 1,
+            "no_status": 0,
+        },
+        status_counts=[1, 1, 0],
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    assert response.status_code == 200
+    body = response.json()
+    counts = body["counts"]
+    assert counts["authoritative"] is True
+    assert counts["total"] == 2
+    assert counts["archived_policy"] == "excluded"
+    # The authoritative total agrees with the legacy total_count (same board scalar) —
+    # only true because both exclude archived items by default. If archived_policy
+    # ever changes to include archived items, this assertion will start failing on
+    # boards that actually have archived items.
+    assert counts["total"] == body["total_count"]
+    assert counts["by_status"] == [
+        {"name": "Backlog", "count": 1},
+        {"name": "In progress", "count": 1},
+        {"name": "Done", "count": 0},
+    ]
+    assert counts["no_status"] == 0
+    # The status columns plus the blank column reconcile to the total.
+    assert sum(c["count"] for c in counts["by_status"]) + counts["no_status"] == counts["total"]
+    # by_type partitions the total; redacted is derived (total - issue - pr - draft).
+    assert counts["by_type"] == {"issue": 0, "pull_request": 1, "draft": 1, "redacted": 0}
+    assert sum(counts["by_type"].values()) == counts["total"]
+    assert counts["by_state"] == {"open": 1, "closed": 1}
+
+
+async def test_github_authoritative_by_type_partitions_despite_draft_overlap(tmp_path, monkeypatch):
+    # A board of {board draft, draft PR, issue, merged PR}: is:issue counts the
+    # real issue AND the board draft (2), is:pr counts both PRs (2), is:draft
+    # counts the board draft AND the draft PR. Naively summing is:issue + is:pr +
+    # is:draft overcounts (6 > total 4). board_draft (is:draft is:issue) isolates
+    # the board draft so the buckets partition the total exactly.
+    handler = _counts_handler(
+        read_node=_read_node(),
+        options=["Todo", "Done"],
+        aggregates={
+            "total": 4,
+            "issue": 2,  # real issue + board draft (a board draft matches is:issue)
+            "pull_request": 2,  # merged PR + draft PR
+            "board_draft": 1,  # is:draft is:issue -> just the board draft
+            "opened": 2,
+            "closed": 2,
+            "no_status": 0,
+        },
+        status_counts=[3, 1],
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is True
+    # issue = is:issue(2) - board_draft(1); pr = is:pr(2); draft = board_draft(1).
+    assert counts["by_type"] == {"issue": 1, "pull_request": 2, "draft": 1, "redacted": 0}
+    assert sum(counts["by_type"].values()) == counts["total"] == 4
+
+
+async def test_github_authoritative_counts_downgrade_when_status_does_not_reconcile(tmp_path, monkeypatch):
+    # Both count queries "succeed", but the status columns + no_status (2) don't
+    # reconcile to the total (91) -- exactly what a non-"Status" single-select or
+    # a `"`-in-name option can silently produce. The self-check must refuse the
+    # authoritative stamp and degrade to the sampled fallback rather than ship
+    # wrong numbers with full authority.
+    node = _read_node_states()
+    node["projectV2"]["items"]["totalCount"] = 91
+    handler = _counts_handler(
+        read_node=node,
+        options=["Todo", "Done"],
+        aggregates={
+            "total": 91,
+            "issue": 91,
+            "pull_request": 0,
+            "board_draft": 0,
+            "opened": 4,
+            "closed": 6,
+            "no_status": 0,
+        },
+        status_counts=[1, 1],  # 1 + 1 + no_status(0) = 2, not 91
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False
+    assert counts["counted_items"] == 3  # bucketed from the enumerated sample, not the bogus server counts
+
+
+def test_project_filter_value_escapes_status_option_delimiters():
+    # Status names are board-controlled. They are GraphQL variables, but their
+    # contents are parsed by GitHub's Projects filter DSL before being counted.
+    assert _project_filter_value('Ready "for QA"') == r'Ready \"for QA\"'
+    assert _project_filter_value(r"Needs \ review") == r"Needs \\ review"
+
+
+async def test_github_project_status_count_escapes_filter_values(tmp_path, monkeypatch):
+    captured_variables = {}
+    handler = _counts_handler(
+        read_node=_read_node(),
+        options=['Ready "for QA"', r"Needs \ review"],
+        aggregates={
+            "total": 2,
+            "issue": 1,
+            "pull_request": 1,
+            "board_draft": 0,
+            "opened": 2,
+            "closed": 0,
+            "no_status": 0,
+        },
+        status_counts=[1, 1],
+        captured_variables=captured_variables,
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    assert response.status_code == 200
+    assert captured_variables["q0"] == r'status:"Ready \"for QA\""'
+    assert captured_variables["q1"] == r'status:"Needs \\ review"'
+
+
+async def test_github_status_counts_null_project_falls_back_instead_of_zeroing(tmp_path, monkeypatch):
+    # A1 (aggregates) succeeds, but A2 (per-status counts) comes back with
+    # projectV2: null -- exactly what GraphQL non-null bubbling produces when a
+    # single s{i} alias errors. This must drop the whole count attempt to the
+    # sampled fallback, not report every status column as 0 while still claiming
+    # authoritative: true.
+    # totalCount raised well above what's actually enumerated so a fallback to
+    # sampling is unambiguously non-authoritative (mirrors the truncated-board
+    # fallback test below), isolating this test to the null-projectV2 defect.
+    node = _read_node_states()
+    node["projectV2"]["items"]["totalCount"] = 91
+
+    def handler(request: httpx.Request) -> Response:
+        if not request.url.path.endswith("/graphql"):
+            return Response(404, json={"message": "Not Found"})
+        payload = json.loads(request.content.decode("utf-8"))
+        query = payload["query"]
+        if "ProjectStatusCounts" in query:
+            return Response(
+                200,
+                json={
+                    "data": {"organization": {"projectV2": None}, "user": None},
+                    "errors": [{"message": "something went wrong resolving Query.organization.projectV2"}],
+                },
+            )
+        if "ProjectCounts" in query:
+            agg_node = {
+                "projectV2": {
+                    "statusField": {"options": [{"name": "Todo"}, {"name": "Done"}]},
+                    "total": {"totalCount": 91},
+                    "issue": {"totalCount": 91},
+                    "pull_request": {"totalCount": 0},
+                    "board_draft": {"totalCount": 0},
+                    "opened": {"totalCount": 4},
+                    "closed": {"totalCount": 6},
+                    "no_status": {"totalCount": 0},
+                }
+            }
+            return Response(200, json={"data": {"organization": agg_node, "user": None}})
+        return Response(200, json={"data": {"organization": node, "user": None}})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False
+    assert counts["by_status"] != [
+        {"name": "Todo", "count": 0},
+        {"name": "Done", "count": 0},
+    ]
+
+
+async def test_github_read_project_counts_fall_back_to_sample(tmp_path, monkeypatch):
+    # The board reports 91 items but only a page enumerated, and the count DSL is
+    # rejected -> counts fall back to bucketing the returned items, flagged as a
+    # non-authoritative sample so the caller never mistakes it for a full count.
+    node = _read_node_states()
+    node["projectV2"]["items"]["totalCount"] = 91
+    handler = _counts_handler(
+        read_node=node, options=[], aggregates={}, status_counts=[], fail_dsl=True
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai"},
+        )
+    counts = response.json()["counts"]
+    assert counts["authoritative"] is False
+    assert counts["total"] == 91
+    assert counts["counted_items"] == 3
+    # Bucketed from the 3 enumerated items: issue(closed), issue(open), redacted.
+    assert counts["by_state"] == {"open": 1, "closed": 1}
+    assert counts["by_type"]["issue"] == 2
+    assert counts["by_type"]["redacted"] == 1
+
+
+def test_sampled_counts_counts_merged_pr_as_closed():
+    # In the sampled fallback a merged PR (state="merged") must count as closed,
+    # matching the authoritative is:closed bucket — not fall through to neither.
+    from collab_hub_api.connectors.github_client import _sampled_counts
+    from collab_hub_api.connectors.models import GitHubProjectItem
+
+    items = [
+        GitHubProjectItem(type="PULL_REQUEST", status="Done", state="merged"),
+        GitHubProjectItem(type="PULL_REQUEST", status="Review", state="open"),
+        GitHubProjectItem(type="ISSUE", status="Done", state="closed"),
+    ]
+    counts = _sampled_counts(total=3, items=items)
+    assert counts.by_state == {"open": 1, "closed": 2}  # merged PR + closed issue
+    assert counts.authoritative is True  # whole board enumerated (counted == total)
 
 
 async def test_github_projects_do_not_expose_token(tmp_path, monkeypatch):
