@@ -56,6 +56,10 @@ answers render:
 
 - `frames.auth.orgSource: membership` — organizations come from the server's
   `collab_org_members` table, and `frames.auth.defaults` must be cleared.
+- `frames.auth.orgSource: single` — membership resolution for a hub that
+  declares it hosts exactly one organization: sign-ins from the identity
+  providers named in `frames.auth.singleOrg.memberSources` are auto-admitted
+  as members, and `frames.auth.defaults` must likewise be cleared.
 - `frames.auth.orgSource: claims` — the shared-organization behavior is
   intended and stated.
 

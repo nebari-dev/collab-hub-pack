@@ -37,6 +37,8 @@ from ..web.authz import (
     signin_redirect_target,
 )
 from ..web.data_statement import data_statement_page
+from ..web.privacy_statement import privacy_statement_page
+from ..web.terms_of_service import terms_of_service_page
 from ..web.forms import FormRefused
 from ..web.pages import (
     SECURITY_HEADERS,
@@ -68,10 +70,12 @@ from ..web.surface import (
     DATA_STATEMENT_PATH,
     LANDING_PATH,
     ORG_INVITATIONS_PATH,
+    PRIVACY_PATH,
     PUBLIC_WEB_PATHS,
     SIGNED_OUT_PATH,
     SIGNIN_PATH,
     SIGNOUT_PATH,
+    TERMS_PATH,
     WebSurface,
     clamped_session_lifetime,
 )
@@ -583,6 +587,28 @@ def make_router(
         return page_response(
             data_statement_page(root_path=_root_path(request)),
             path=DATA_STATEMENT_PATH,
+        )
+
+    @public_router.get(TERMS_PATH)
+    async def terms_of_service(request: Request) -> Response:
+        """The Terms of Service (#95) is anonymous by design. The Keycloak
+        acceptance step links here *before* it issues a token so people who
+        have yet to accept can read the text. The argument lives on the path's
+        PUBLIC_WEB_PATHS entry."""
+
+        return page_response(
+            terms_of_service_page(root_path=_root_path(request)),
+            path=TERMS_PATH,
+        )
+
+    @public_router.get(PRIVACY_PATH)
+    async def privacy_statement(request: Request) -> Response:
+        """The Privacy Statement (#95). Anonymous on the same argument as the
+        Terms of Service; the two are linked from the same consent line."""
+
+        return page_response(
+            privacy_statement_page(root_path=_root_path(request)),
+            path=PRIVACY_PATH,
         )
 
     @public_router.get(STYLE_PATH)

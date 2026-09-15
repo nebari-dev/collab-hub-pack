@@ -226,6 +226,7 @@ from .audit import (
 from .auth import WORKSPACE_DEFAULT, AuthContext, DisplayIdentity
 from .credentials import REDACTED, InvitationSecret, refuse_to_serialize
 from .invitation_email import validate_mailbox
+from .org_source import org_source_is_single
 from .orgs import ROLE_MEMBER, ROLE_OWNER
 from .service_access_state import OutstandingGrant, ServiceAccessStateStore, claim_pending
 
@@ -348,6 +349,40 @@ class OrganizationAlreadyNamedError(Exception):
 
 class OrgNotFoundError(InvitationError):
     """The invitation names an organization that does not exist."""
+
+
+class OrganizationCreationRefusedError(InvitationError):
+    """An org-creating invitation on a deployment that declares a single organization.
+
+    ``frames.auth.orgSource=single`` (issue #91) is a declaration that this hub
+    hosts exactly one organization, and an invitation with no ``org_id`` mints
+    a new one on acceptance — the one write that would make the declaration
+    false. Refused at **both** ends: at issuance, so the operator hears it
+    while they can still act on it, and at acceptance, because an invitation
+    issued before the deployment flipped to ``single`` is still live and
+    acceptance is where the organization row is actually created. The
+    acceptance-side refusal consumes nothing: the token stays live, exactly
+    like the other fixable refusals, because the state is the deployment's
+    configuration and not the invitation's.
+
+    Invitations *into* an existing organization are untouched — they are how a
+    single-organization hub grants the ``owner`` role, which auto-admission
+    never does.
+    """
+
+
+_ORGANIZATION_CREATION_REFUSED_MESSAGE = (
+    "This deployment declares a single organization (orgSource=single), so an invitation that"
+    " would create another organization is refused. Invite into the declared organization, or"
+    " move the deployment to orgSource=membership first."
+)
+
+
+def _refuse_org_creation_under_single_org(org_id: str | None) -> None:
+    """The single-organization guard, shared by issuance and acceptance."""
+
+    if org_id is None and org_source_is_single():
+        raise OrganizationCreationRefusedError(_ORGANIZATION_CREATION_REFUSED_MESSAGE)
 
 
 class InvitationsUnavailableError(RuntimeError):
@@ -1123,6 +1158,7 @@ class PostgresInvitationService:
         is unrecoverable and must happen after this transaction commits.
         """
 
+        _refuse_org_creation_under_single_org(org_id)
         return _retrying(lambda: self._create_once(ctx, email=email, org_id=org_id))
 
     def _create_once(self, ctx: AuthContext, *, email: str, org_id: str | None) -> IssuedInvitation:
@@ -1201,6 +1237,7 @@ class PostgresInvitationService:
         rather than belt-and-braces.
         """
 
+        _refuse_org_creation_under_single_org(org_id)
         return _retrying(lambda: self._create_unless_live_once(ctx, email=email, org_id=org_id))
 
     def _create_unless_live_once(
@@ -1567,6 +1604,12 @@ class PostgresInvitationService:
 
         org_id = invitation.org_id
         if org_id is None:
+            # The guard runs at issuance too, but acceptance is where the
+            # organization row is actually created — and an org-creating
+            # invitation issued before the deployment flipped to
+            # orgSource=single is still live. Raising here rolls the whole
+            # transaction back: nothing is created, nothing is consumed.
+            _refuse_org_creation_under_single_org(org_id)
             org_id = new_org_id
             # `name` is deliberately not supplied: the column's schema default
             # is the neutral placeholder, and a name derived from the
