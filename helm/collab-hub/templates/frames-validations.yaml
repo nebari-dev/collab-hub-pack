@@ -241,24 +241,53 @@ could select membership resolution while bypassing every precondition below, or
 leave a retired default in place where nothing reviews it.
 */}}
 {{- range .Values.api.deployment.extraEnv }}
-{{- if has (toString .name) (list "FRAMES_AUTH_ORG_SOURCE" "FRAMES_AUTH_DEFAULT_ORG" "FRAMES_AUTH_DEFAULT_WORKSPACE") }}
-{{- fail "Set frames.auth.orgSource / frames.auth.defaults instead of FRAMES_AUTH_ORG_SOURCE, FRAMES_AUTH_DEFAULT_ORG or FRAMES_AUTH_DEFAULT_WORKSPACE in api.deployment.extraEnv: the chart validates the preconditions that resolving organizations from membership depends on." }}
+{{- if has (toString .name) (list "FRAMES_AUTH_ORG_SOURCE" "FRAMES_AUTH_DEFAULT_ORG" "FRAMES_AUTH_DEFAULT_WORKSPACE" "FRAMES_AUTH_SINGLE_ORG_ID" "FRAMES_AUTH_SINGLE_ORG_NAME" "FRAMES_AUTH_SINGLE_ORG_MEMBER_SOURCES") }}
+{{- fail "Set frames.auth.orgSource / frames.auth.defaults / frames.auth.singleOrg instead of the FRAMES_AUTH_ORG_SOURCE, FRAMES_AUTH_DEFAULT_* or FRAMES_AUTH_SINGLE_ORG_* variables in api.deployment.extraEnv: the chart validates the preconditions that resolving organizations from membership depends on." }}
 {{- end }}
 {{- end }}
-{{- if eq .Values.frames.auth.orgSource "membership" }}
+{{- $orgSource := toString .Values.frames.auth.orgSource }}
+{{- if or (eq $orgSource "membership") (eq $orgSource "single") }}
 {{- /*
 Each of these mirrors a startup check in the app (frames.org_source and
 make_app), so the misconfiguration is caught at render time instead of by a
-crash-looping pod.
+crash-looping pod. "single" is membership resolution plus auto-admission
+(issue #91), so it inherits every membership precondition unchanged.
 */}}
 {{- if ne .Values.frames.auth.identityClaim "sub" }}
-{{- fail "frames.auth.orgSource=membership requires frames.auth.identityClaim=sub: membership rows are keyed by the OIDC subject, so a legacy (username/email) principal would be resolved against the wrong key." }}
+{{- fail (printf "frames.auth.orgSource=%s requires frames.auth.identityClaim=sub: membership rows are keyed by the OIDC subject, so a legacy (username/email) principal would be resolved against the wrong key." $orgSource) }}
 {{- end }}
 {{- if or .Values.frames.auth.defaults.orgId .Values.frames.auth.defaults.workspaceId }}
-{{- fail "frames.auth.orgSource=membership requires frames.auth.defaults.orgId and frames.auth.defaults.workspaceId to be empty: the default-org fallback is retired there, and a value left set would spring back the moment orgSource is flipped to \"claims\", collapsing every user into one organization." }}
+{{- fail (printf "frames.auth.orgSource=%s requires frames.auth.defaults.orgId and frames.auth.defaults.workspaceId to be empty: the default-org fallback is retired there, and a value left set would spring back the moment orgSource is flipped to \"claims\", collapsing every user into one organization." $orgSource) }}
 {{- end }}
 {{- if not (or .Values.frames.postgres.url .Values.frames.postgres.existingSecret) }}
-{{- fail "frames.auth.orgSource=membership requires the shared frames.postgres.url (or frames.postgres.existingSecret): membership is an authorization input, so with no database every authenticated request would answer 503." }}
+{{- fail (printf "frames.auth.orgSource=%s requires the shared frames.postgres.url (or frames.postgres.existingSecret): membership is an authorization input, so with no database every authenticated request would answer 503." $orgSource) }}
+{{- end }}
+{{- end }}
+{{- /*
+The single-organization declaration (issue #91). Complete when the mode is on,
+absent otherwise — a filled-in singleOrg under any other orgSource is a
+declaration nothing reads, which is exactly the half-armed state that would
+spring to life the moment someone flips the source during an incident.
+*/}}
+{{- if eq $orgSource "single" }}
+{{- if not .Values.frames.auth.singleOrg.id }}
+{{- fail "frames.auth.orgSource=single requires frames.auth.singleOrg.id: the mode is a declaration that this hub hosts exactly one organization, and a declaration names it." }}
+{{- end }}
+{{- if not .Values.frames.auth.singleOrg.name }}
+{{- fail "frames.auth.orgSource=single requires frames.auth.singleOrg.name: the name is used if the organization row is created, and 'Unnamed organization' on every member's screen is a misconfiguration nobody reports." }}
+{{- end }}
+{{- if not .Values.frames.auth.singleOrg.memberSources }}
+{{- fail "frames.auth.orgSource=single requires frames.auth.singleOrg.memberSources: auto-admission is gated on the identity-provider alias a sign-in arrived through, so the deployment must name at least one. 'Every authenticated user' is deliberately not an option — it admits hand-created realm accounts, the one door with no policy on it." }}
+{{- end }}
+{{- range .Values.frames.auth.singleOrg.memberSources }}
+{{- $alias := toString . }}
+{{- if or (not $alias) (contains "," $alias) (eq $alias "*") }}
+{{- fail (printf "frames.auth.singleOrg.memberSources entry %q must be one exact Keycloak identity-provider alias: no empty entries, no commas (the list is passed comma-separated), and no '*' — aliases are matched exactly, and a wildcard would be every door into the realm." $alias) }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- if or .Values.frames.auth.singleOrg.id .Values.frames.auth.singleOrg.name .Values.frames.auth.singleOrg.memberSources }}
+{{- fail (printf "frames.auth.singleOrg is set but frames.auth.orgSource is %q: the declaration is read only under orgSource=single. Set orgSource=single, or clear frames.auth.singleOrg — a declaration nothing reads today is one config flip away from admitting every listed provider's users unreviewed." $orgSource) }}
 {{- end }}
 {{- end }}
 {{- $externallyExposed := or .Values.api.ingress.enabled .Values.api.nebariapp.enabled (has (toString .Values.api.service.type) (list "LoadBalancer" "NodePort")) }}
