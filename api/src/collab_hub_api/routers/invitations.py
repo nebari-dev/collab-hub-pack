@@ -95,6 +95,7 @@ from ..frames.invitations import (
     InvitationRevokedError,
     InvitationService,
     InvitationsUnavailableError,
+    OrganizationCreationRefusedError,
     OrgNotFoundError,
     effective_status,
     hash_invitation_secret,
@@ -983,6 +984,11 @@ def register_exception_handlers(app) -> None:
         (EmailNotVerifiedError, status.HTTP_403_FORBIDDEN, error_codes.EMAIL_NOT_VERIFIED),
         (InvitationEmailMismatchError, status.HTTP_403_FORBIDDEN, error_codes.INVITATION_EMAIL_MISMATCH),
         (AlreadyInOrganizationError, status.HTTP_409_CONFLICT, error_codes.ALREADY_IN_ORGANIZATION),
+        (
+            OrganizationCreationRefusedError,
+            status.HTTP_409_CONFLICT,
+            error_codes.ORGANIZATION_CREATION_REFUSED,
+        ),
         (
             InvitationsUnavailableError,
             status.HTTP_503_SERVICE_UNAVAILABLE,

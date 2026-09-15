@@ -512,8 +512,27 @@
               "enum": [
                 "",
                 "claims",
-                "membership"
+                "membership",
+                "single"
               ]
+            },
+            "singleOrg": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "memberSources": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
             },
             "defaults": {
               "type": "object",
