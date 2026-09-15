@@ -61,7 +61,19 @@ to prevent. So each mutation here declares one action:
 - accepting into an **existing** organization → ``invitation.redeem``;
 - accepting an org-creating invitation → ``org.create``, with the accepter as
   actor, in the same transaction that creates the organization and the
-  membership — the ratified requirement.
+  membership — the ratified requirement;
+- an owner giving their placeholder-named organization its name →
+  ``org.rename`` (:meth:`PostgresInvitationService.name_organization`, the
+  first-invite naming flow of #92, reopened as #44). It lives on this
+  service because it is the write half of
+  :meth:`~PostgresInvitationService.organization_name` and exists for one
+  caller: the owner invitation page, which refuses to issue while the
+  placeholder stands, so an owner has identified the organization they are
+  inviting people into before the first invitation leaves. The invitation
+  email itself is organization-neutral by decision
+  (:func:`.invitation_email.render_invitation_email` discards the name, and
+  a regression pins that); the name is for the owner's page, the
+  organization's record, and the audit row.
 
 That last case therefore produces no ``invitation.redeem`` row, which is a
 real asymmetry and is stated rather than hidden: both acceptance rows carry
@@ -196,6 +208,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -206,6 +219,7 @@ from .audit import (
     AUDIT_ACTION_INVITATION_REVOKE,
     AUDIT_ACTION_INVITATION_SEND,
     AUDIT_ACTION_ORG_CREATE,
+    AUDIT_ACTION_ORG_RENAME,
     AUDIT_ACTION_SERVICE_ACCESS_GRANT,
     audited,
 )
@@ -312,6 +326,23 @@ class AlreadyInOrganizationError(InvitationError):
     ``collab_org_members`` primary key, and a *removed* row still binds the
     login to its organization — restoring it is an explicit owner action, not
     something a new invitation may do behind the owner's back.
+    """
+
+
+class OrganizationAlreadyNamedError(Exception):
+    """The organization already carries a real name, so naming it is refused.
+
+    :meth:`PostgresInvitationService.name_organization` is the *first* naming
+    only — the step #92 specified so an owner names their organization before
+    inviting anyone into it. Changing a name that was already chosen
+    is a different action with a different audience (an operator, or a future
+    owner settings page) and is not reachable through this one.
+
+    Deliberately **not** an :class:`InvitationError`: that hierarchy is the set
+    of acceptance outcomes the wire distinguishes, and the acceptance page's
+    test enumerates it to prove every member has a page outcome. Naming is
+    not an acceptance state and never reaches that page; the owner page
+    catches this class by name.
     """
 
 
@@ -600,6 +631,103 @@ def validate_invited_email(value: str) -> str:
     return ascii_folded_bytes(validated).decode("ascii")
 
 
+MAX_ORGANIZATION_NAME_LENGTH = 120
+"""Bound on an organization's display name, in characters.
+
+Long enough for any real organization, short enough that the name fits the
+audit row's ``target_label`` (bounded at :data:`~.audit.AUDIT_LABEL_MAX_CHARS`)
+and the page's intro sentence without wrapping into a paragraph. The page's
+``maxlength`` restates it as a hint; the bound is enforced here.
+"""
+
+
+def is_placeholder_organization_name(name: str | None) -> bool:
+    """Whether *name* is the neutral placeholder every organization starts with.
+
+    ``NULL``, blank, and the placeholder string itself (compared without
+    regard to ASCII case) all count: the column is nullable and defaults to
+    the placeholder, and :meth:`PostgresInvitationService.organization_name`
+    already words all three the same way. This is the predicate the owner page
+    branches on — an organization for which it holds has never been named by
+    anyone, and an owner inviting into it has never seen it identified as
+    anything but the placeholder.
+
+    The comparison is :func:`ascii_folded_bytes`, this module's one fold: the
+    placeholder is ASCII, so an ASCII fold catches every capitalization of it,
+    and no wider equivalence is introduced here any more than for addresses.
+    """
+
+    from .collab_schema import NEUTRAL_ORG_NAME
+
+    if name is None:
+        return True
+    stripped = name.strip()
+    return not stripped or ascii_folded_bytes(stripped) == ascii_folded_bytes(NEUTRAL_ORG_NAME)
+
+
+def validate_organization_name(value: str) -> str:
+    """Validate a display name an owner typed, returning it normalized.
+
+    Display-only text, so the rule is deliberately thin: one line, between 1
+    and :data:`MAX_ORGANIZATION_NAME_LENGTH` characters once whitespace is
+    normalized, containing at least one letter or digit, and not the
+    placeholder itself in any capitalization — "Unnamed organization" typed
+    by hand is not a name, and accepting it would satisfy the page's check
+    while leaving the owner exactly as uninformed as before.
+
+    Whitespace is normalized rather than merely stripped: every Unicode space
+    separator (``Zs`` — NBSP, ideographic space, and the rest) becomes an
+    ASCII space and runs collapse to one, so ``Unnamed\u00a0organization`` is
+    the placeholder, and a name cannot differ from another only in invisible
+    spacing. "At least one letter or digit" (categories ``L*``/``N*``) is what
+    rules out the visually blank: a Braille blank (U+2800), a string of
+    combining marks, or punctuation alone renders as nothing an owner could
+    recognize their organization by, and naming is one shot.
+
+    "One line" is decided by Unicode category, not by the ASCII range: every
+    control character (``Cc`` — C0, DEL, and the C1 block including NEL), the
+    line and paragraph separators (``Zl``/``Zp``, U+2028/U+2029), and the
+    format characters (``Cf`` — among them the bidirectional overrides that
+    make text render as something other than what it is) are refused. The
+    name becomes an audit ``target_label`` and a heading on the owner page,
+    and a value that can forge a line break or reorder its own rendering in
+    either is not a name. The audit primitive's own check
+    covers only the ASCII controls; this rule is deliberately wider than
+    that, so nothing this function accepts is later refused there. No other
+    normalization — the owner's spelling is stored.
+
+    Raises :class:`ValueError`; the page words that as its own fixed notice.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("organization name must be a string")
+    if any(unicodedata.category(ch) in _NOT_A_NAME_CATEGORIES for ch in value):
+        raise ValueError("organization name contains control, separator, or format characters")
+    spaced = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in value)
+    name = " ".join(spaced.split())
+    if not name:
+        raise ValueError("organization name is empty")
+    if len(name) > MAX_ORGANIZATION_NAME_LENGTH:
+        raise ValueError(f"organization name exceeds {MAX_ORGANIZATION_NAME_LENGTH} characters")
+    if not any(unicodedata.category(ch)[0] in "LN" for ch in name):
+        raise ValueError("organization name has no letter or digit")
+    if is_placeholder_organization_name(name):
+        raise ValueError("organization name is the placeholder")
+    return name
+
+
+_NOT_A_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+"""Unicode general categories :func:`validate_organization_name` refuses.
+
+``Cc`` is every control character (ASCII C0 and DEL, and the C1 block —
+U+0085 NEL is a line break to many renderers); ``Zl``/``Zp`` are the line and
+paragraph separators; ``Cf`` the format characters, which include the bidi
+overrides (U+202E and kin) and the zero-width joiners a display name has no
+honest use for. Everything else — letters, marks, digits, punctuation, symbols,
+ordinary spaces — is a name's business.
+"""
+
+
 def verified_claim_email(email: object, email_verified: object) -> str:
     """The caller's verified email, or raise :class:`EmailNotVerifiedError`.
 
@@ -780,6 +908,9 @@ class UnavailableInvitationService:
     def organization_name(self, *args, **kwargs) -> str | None:
         raise self._unavailable()
 
+    def name_organization(self, *args, **kwargs) -> str:
+        raise self._unavailable()
+
     def record_service_access_grant(self, *args, **kwargs) -> None:
         raise self._unavailable()
 
@@ -871,6 +1002,61 @@ class PostgresInvitationService:
         if row is None or not row["name"]:
             return NEUTRAL_ORG_NAME
         return row["name"]
+
+    # --- Naming -------------------------------------------------------------
+
+    def name_organization(self, ctx: AuthContext, *, org_id: str, name: str) -> str:
+        """Give a placeholder-named organization its name, recorded as ``org.rename``.
+
+        The first-invite naming flow (#92 criterion 4, observed missing live
+        on #44): every organization starts as ``NEUTRAL_ORG_NAME`` —
+        acceptance of an org-creating invitation never supplies a name — and
+        the owner page refuses to issue while that placeholder stands. This
+        is the step that clears it.
+
+        Same authorization contract as every other mutation here: the caller
+        has already been authorized by :func:`~.authorization.requires_org_role`
+        pinned to *org_id*, and the row is written inside :func:`~.audit.audited`
+        with the owner as actor, the organization as target, and the new name
+        as ``target_label`` — so the log answers "who named it, and what" from
+        one row.
+
+        **One shot.** The organization's current name is read ``FOR UPDATE``
+        inside the transaction, and if it is not the placeholder the call
+        raises :class:`OrganizationAlreadyNamedError` and writes nothing: two
+        owners naming at once resolve to one ``org.rename`` row and one
+        refusal, and a stale page cannot silently overwrite a name that was
+        already chosen. Renaming a named organization is not this method's
+        job (see the error's docstring).
+
+        *name* goes through :func:`validate_organization_name`; the page has
+        already applied it and worded a failure, so a :class:`ValueError`
+        here is a programming error rather than the owner's typo.
+        """
+
+        return _retrying(lambda: self._name_organization_once(ctx, org_id=org_id, name=name))
+
+    def _name_organization_once(self, ctx: AuthContext, *, org_id: str, name: str) -> str:
+        new_name = validate_organization_name(name)
+        with audited(
+            self._db,
+            ctx,
+            AUDIT_ACTION_ORG_RENAME,
+            target_type="org",
+            target_id=org_id,
+            target_label=new_name,
+            org_id=org_id,
+            detail={"replaced_placeholder": True},
+        ) as event:
+            row = event.conn.execute(
+                "SELECT name FROM collab_orgs WHERE id = %s FOR UPDATE", (org_id,)
+            ).fetchone()
+            if row is None:
+                raise OrgNotFoundError("Organization not found")
+            if not is_placeholder_organization_name(row["name"]):
+                raise OrganizationAlreadyNamedError("Organization already has a name")
+            event.conn.execute("UPDATE collab_orgs SET name = %s WHERE id = %s", (new_name, org_id))
+        return new_name
 
     def get(self, invitation_id: str) -> Invitation | None:
         with self._db.connection() as conn:
