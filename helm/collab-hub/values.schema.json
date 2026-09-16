@@ -473,7 +473,9 @@
               "type": "object",
               "properties": {
                 "jwksUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^$|^https://",
+                  "description": "Must be https:// (or empty to leave the verifier unconfigured): signing keys fetched over cleartext http can be substituted by an on-path attacker."
                 },
                 "issuer": {
                   "type": "string"
@@ -488,7 +490,9 @@
               "type": "object",
               "properties": {
                 "jwksUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^$|^https://",
+                  "description": "Must be https:// (or empty to leave the verifier unconfigured): signing keys fetched over cleartext http can be substituted by an on-path attacker."
                 },
                 "issuer": {
                   "type": "string"

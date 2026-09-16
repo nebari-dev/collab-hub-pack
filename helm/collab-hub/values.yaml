@@ -337,6 +337,9 @@ frames:
       # issuer, and audience are all inherited from frames.auth.bearer.* as a
       # whole (a dedicated idToken.issuer or idToken.audience below still wins
       # over the inherited bearer value when set).
+      # Must be an https:// URL: signing keys fetched over cleartext http can be
+      # substituted by an on-path attacker. The schema rejects http here, and the
+      # API refuses to start on a non-https URL (issue #77).
       jwksUrl: ""
       # -- Expected IdToken issuer. Leave empty to fall back to bearer issuer or skip issuer validation.
       issuer: ""
@@ -346,6 +349,9 @@ frames:
       audience: ""
     bearer:
       # -- JWKS URL used to verify native-client bearer tokens.
+      # Must be an https:// URL: signing keys fetched over cleartext http can be
+      # substituted by an on-path attacker. The schema rejects http here, and the
+      # API refuses to start on a non-https URL (issue #77).
       jwksUrl: ""
       # -- Expected token issuer. Leave empty to skip issuer validation.
       issuer: ""

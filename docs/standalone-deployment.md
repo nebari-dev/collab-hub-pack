@@ -402,3 +402,13 @@ Any path marked `authenticated` needs a verifiable token: set
 `frames.auth.idToken.jwksUrl` (browsers) and `frames.auth.bearer.jwksUrl`
 (native clients). Without them the app cannot verify anything and every
 protected path answers 401.
+
+Both JWKS URLs **must be `https://`**. Signing keys fetched over cleartext
+`http` can be substituted by an on-path attacker, who can then mint tokens the
+deployment accepts, so the chart's values schema rejects an `http` URL and the
+API refuses to start on one (the failure is in the pod's events, not a stream
+of 401s). URLs carrying userinfo (`user:pass@host`) or a fragment are refused
+too. The only exception is local development with
+`FRAMES_UNSAFE_AUTH_ENABLED=true`, where `http` is permitted and logged
+loudly. Internal or cluster-local hostnames are fine — the rule is about the
+scheme, not the host.
