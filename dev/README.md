@@ -28,8 +28,10 @@ one, and only matters once you reach level 3.
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
 
-You do **not** need a local Python 3.14: `uv` provisions the pinned interpreter
-from `api/.python-version` on first run.
+You do **not** need a local Python: `uv` provisions the interpreter pinned in
+`api/.python-version` (3.14, the one the image runs) on first run. The API
+supports Python 3.13 and later; prefix any target with `UV_PYTHON=3.13` to run
+it on 3.13, the version CI also tests.
 
 One thing is not a tool. Connecting the Collab desktop client needs three
 hostnames pointed at your own machine, once per machine:
@@ -426,11 +428,18 @@ The dev-auth shortcut is **off**. The API verifies real RS256 tokens against
 the realm's JWKS, checking issuer and audience:
 
 ```sh
+FRAMES_UNSAFE_AUTH_ENABLED=true
 FRAMES_BEARER_JWKS_URL=http://localhost:8080/realms/nebari/protocol/openid-connect/certs
 FRAMES_BEARER_ISSUER=http://localhost:8080/realms/nebari
 FRAMES_BEARER_AUDIENCE=apollo-desktop
 FRAMES_AUTH_IDENTITY_CLAIM=sub
 ```
+
+`FRAMES_UNSAFE_AUTH_ENABLED=true` is there only because the local Keycloak's
+JWKS URL is plain `http`, which the API otherwise refuses at startup — JWKS
+URLs must be `https` outside local development (issue #77). It does not turn
+the dev-auth shortcut on (that also needs `DEV_AUTH_ENABLED`), and it does not
+accept unsigned tokens (that also needs `FRAMES_BEARER_ALLOW_UNSIGNED`).
 
 Get a token and use it:
 
@@ -803,6 +812,7 @@ No target sets these, so run the API by hand with the one you want — the
 ```sh
 cd ../api && env \
   COLLAB_HUB_API__SERVER__PORT=8000 \
+  FRAMES_UNSAFE_AUTH_ENABLED=true \
   FRAMES_BEARER_JWKS_URL=http://localhost:8080/realms/nebari/protocol/openid-connect/certs \
   FRAMES_BEARER_ISSUER=http://localhost:8080/realms/nebari \
   FRAMES_BEARER_AUDIENCE=apollo-desktop \

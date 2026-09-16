@@ -8,7 +8,7 @@ authors = [
     { name = "OpenTeams", email = "info@openteams.com" },
 ]
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.35.0",
     "fastapi>=0.136.3",
@@ -19,6 +19,7 @@ dependencies = [
     "psycopg[binary,pool]>=3.2.0",
     "pydantic-settings>=2.14.1",
     "pyjwt[crypto]>=2.10.0",
+    "pyyaml>=6.0",
     "uvicorn>=0.48.0",
     "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
@@ -40,7 +41,9 @@ build-backend = "uv_build"
 Repository = "https://github.com/nebari-dev/collab-hub-pack"
 
 [tool.ruff]
-target-version = "py314"
+# The floor of requires-python, not the newest version: with a newer target,
+# `ruff format` rewrites `except (A, B):` into syntax 3.13 cannot parse.
+target-version = "py313"
 line-length = 120
 
 [tool.ruff.lint]

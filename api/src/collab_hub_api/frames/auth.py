@@ -11,6 +11,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cache
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, status
 
@@ -32,6 +33,7 @@ from .orgs import OrgStore, OrgsUnavailableError
 auth_logger = logging.getLogger("frames_server.auth")
 
 usage_logger = logging.getLogger("frames_server.usage")
+logger = logging.getLogger("frames_server.auth")
 
 WORKSPACE_DEFAULT = "default"
 """The only workspace id on a membership-resolving deployment.
@@ -237,6 +239,79 @@ def unsafe_auth_enabled() -> bool:
     """Return whether local/test-only auth shortcuts may be used."""
 
     return os.environ.get("FRAMES_UNSAFE_AUTH_ENABLED") == "true"
+
+
+JWKS_URL_ENVS = ("FRAMES_BEARER_JWKS_URL", "FRAMES_IDTOKEN_JWKS_URL")
+"""The two JWKS URLs the verifiers fetch signing keys from.
+
+Chart values ``frames.auth.bearer.jwksUrl`` and ``frames.auth.idToken.jwksUrl``.
+"""
+
+
+def enforce_https_jwks_urls() -> None:
+    """Refuse to start with a JWKS URL that fetches signing keys over cleartext (issue #77).
+
+    Both URLs are handed straight to PyJWT's ``PyJWKClient``, which will
+    happily fetch over plain ``http`` — and a key set fetched over cleartext
+    can be substituted by an on-path attacker, who then mints tokens the
+    verifiers accept. A *malformed* URL already fails closed (every fetch
+    fails, every token is rejected), but a well-formed ``http`` URL would be
+    accepted silently, so the scheme is checked here, at startup, where the
+    misconfiguration surfaces in the pod's events rather than as unexplained
+    401s on the first authenticated request.
+
+    ``http`` is allowed only when :func:`unsafe_auth_enabled` is on — the same
+    local-development door the unsigned-token shortcuts sit behind — and using
+    it is logged loudly. URLs carrying userinfo (``user:pass@host``) or a
+    fragment are refused unconditionally: no JWKS endpoint is addressed that
+    way, so their only appearance here is a mistake or something trying to
+    confuse a parser.
+
+    An unset or empty URL passes: that verifier is simply not configured, and
+    ``decode_verified_jwt`` already fails closed on every token it is asked to
+    check. Hostname allowlists are deliberately out of scope — internal
+    Keycloak hostnames and cluster-local service URLs are legitimate here.
+    """
+
+    for env_name in JWKS_URL_ENVS:
+        url = os.environ.get(env_name, "").strip()
+        if not url:
+            continue
+        try:
+            parts = urlsplit(url)
+            parts.port  # noqa: B018 — validated lazily; raises ValueError on a bad port
+        except ValueError as exc:
+            raise RuntimeError(f"{env_name} is not a valid URL: {url!r} ({exc})") from exc
+        if parts.username is not None or parts.password is not None:
+            raise RuntimeError(
+                f"{env_name} must not carry userinfo (user:password@): got {url!r}. "
+                "JWKS endpoints are not addressed with credentials in the URL."
+            )
+        if parts.fragment:
+            raise RuntimeError(
+                f"{env_name} must not carry a fragment: got {url!r}. "
+                "A fragment is never sent to the server, so it can only be a mistake."
+            )
+        if not parts.hostname:
+            raise RuntimeError(f"{env_name} has no hostname: got {url!r}.")
+        if parts.scheme == "https":
+            continue
+        if parts.scheme == "http" and unsafe_auth_enabled():
+            logger.warning(
+                "UNSAFE: %s uses cleartext http (%s). Signing keys fetched over http can be "
+                "substituted by an on-path attacker. This is permitted only because "
+                "FRAMES_UNSAFE_AUTH_ENABLED=true (local development); production deployments "
+                "must use https.",
+                env_name,
+                url,
+            )
+            continue
+        raise RuntimeError(
+            f"{env_name} must be an https:// URL: got {url!r}. Signing keys fetched over "
+            "cleartext http can be substituted by an on-path attacker, who can then mint "
+            "tokens this deployment accepts. For local development only, http is permitted "
+            "when FRAMES_UNSAFE_AUTH_ENABLED=true."
+        )
 
 
 def decode_bearer_payload(token: str) -> dict:

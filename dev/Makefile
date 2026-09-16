@@ -122,7 +122,13 @@ DEV_AUTH_ENV := \
 # subject is the ACL principal. Without the pin the legacy precedence applies
 # (preferred_username, then email, then sub), so frames would be owned by a
 # mutable username and `make seed-org SUB=...` would key rows nobody matches.
+#
+# FRAMES_UNSAFE_AUTH_ENABLED=true is here because the local Keycloak's JWKS
+# URL is plain http, which the API refuses at startup otherwise (issue #77).
+# On its own it enables nothing else: the dev-auth shortcut still needs
+# DEV_AUTH_ENABLED, and unsigned tokens still need FRAMES_BEARER_ALLOW_UNSIGNED.
 OIDC_BASE_ENV := \
+  FRAMES_UNSAFE_AUTH_ENABLED=true \
   FRAMES_BEARER_JWKS_URL=$(KC_URL)/realms/$(REALM)/protocol/openid-connect/certs \
   FRAMES_BEARER_ISSUER=$(KC_URL)/realms/$(REALM) \
   FRAMES_BEARER_AUDIENCE=apollo-desktop \
@@ -179,7 +185,9 @@ FAKE_CONNECTOR_ENV := \
 # issuer must be the origin the token was ACTUALLY minted on -- the desktop
 # reaches Keycloak at keycloak.localhost:$(DESKTOP_PORT), so that is the `iss`
 # its tokens carry, and the API compares it exactly.
+# FRAMES_UNSAFE_AUTH_ENABLED: same http-JWKS allowance as OIDC_BASE_ENV.
 DESKTOP_OIDC_ENV := \
+  FRAMES_UNSAFE_AUTH_ENABLED=true \
   FRAMES_BEARER_JWKS_URL=$(DESKTOP_KC)/realms/$(REALM)/protocol/openid-connect/certs \
   FRAMES_BEARER_ISSUER=$(DESKTOP_KC)/realms/$(REALM) \
   FRAMES_BEARER_AUDIENCE=apollo-desktop \

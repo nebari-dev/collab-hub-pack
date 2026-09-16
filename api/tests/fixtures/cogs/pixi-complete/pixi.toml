@@ -1,0 +1,61 @@
+[workspace]
+name = "cog-audio-transcriber"
+version = "0.1.0"
+description = "Extracts audio from local media and emits   timestamped\ntranscript artifacts."
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+python = ">=3.11,<3.14"
+ffmpeg = ">=7,<9"
+
+[tasks]
+transcribe = "python src/cog_cli.py"
+check = "python src/cog_cli.py --check"
+test = "python -m unittest discover -s tests -v"
+
+[tool.cog]
+schema = "openteams/cog-manifest [0.1]"
+id = "example/cog-audio-transcriber"
+license = "BSD-3-Clause"
+owner = "cogs@example.org"
+kind = "complete"
+memory = "none"
+prohibits = ["fetch_remote_media", "modify_source_media"]
+
+[tool.cog.context]
+input_schema = "context/input-schema.json"
+output_schema = "context/output-schema.json"
+
+[tool.cog.model]
+name = "whisper-small"
+runtime = "example-runtime"
+source = "example/whisper-small"
+revision = "abc1234"
+
+[tool.cog.io]
+accepts = ["media_transcription_request"]
+produces = ["timestamped_transcript_bundle"]
+
+[tool.cog.evaluation]
+tests = ["tests/test_transcriber.py"]
+
+[[tool.cog.requires]]
+capability = "model-registry/example"
+credential = { api_key_env = "EXAMPLE_TOKEN" }
+
+[[tool.cog.requires]]
+capability = "media/ffmpeg"
+
+[[tool.cog.interfaces]]
+name = "cli"
+kind = "command"
+task = "transcribe"
+audience = "usage"
+default = true
+
+[[tool.cog.interfaces]]
+name = "health"
+kind = "command"
+task = "check"
+audience = "lifecycle"

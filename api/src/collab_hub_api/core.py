@@ -30,7 +30,13 @@ from .config import (
     preflight_collab_schema,
 )
 from .frames import error_codes
-from .frames.auth import NoOrganizationError, current_auth_context, get_auth_context, get_caller_identity
+from .frames.auth import (
+    NoOrganizationError,
+    current_auth_context,
+    enforce_https_jwks_urls,
+    get_auth_context,
+    get_caller_identity,
+)
 from .frames.authorization import verify_protected_routes
 from .frames.db import postgres_error_classes
 from .frames.identity import enforce_single_issuer_for_pin, identity_pinned_to_sub
@@ -201,6 +207,11 @@ def make_app(config: BaseConfig) -> FastAPI:
     # has to collapse to one (a bare 'sub' is unique only within an issuer).
     identity_pinned_to_sub()
     enforce_single_issuer_for_pin()
+    # Same fail-fast contract for the JWKS URLs both verifiers fetch signing
+    # keys from (issue #77): a cleartext http URL would let an on-path attacker
+    # substitute the key set, so it fails the rollout here — visible in the
+    # pod's events — rather than silently fetching keys over http.
+    enforce_https_jwks_urls()
     # Same fail-fast contract for where the caller's organization comes from
     # (issue #63): a mistyped FRAMES_AUTH_ORG_SOURCE, membership resolution
     # without the identity pin it is keyed on, a leftover retired
