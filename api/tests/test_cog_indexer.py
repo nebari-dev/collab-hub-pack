@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1161,13 +1162,16 @@ async def test_drain_deadline_during_acquisition_exits_the_lock_only_after_entry
         assert held is True
 
 
-async def test_the_hand_off_survives_cancellation_of_every_asyncio_task():
+async def test_the_hand_off_is_owned_by_a_thread_and_survives_collection():
     # Round-4 codex repro: the hand-off used to be an asyncio task. At loop
     # shutdown every task is cancelled, the task stopped mid-wait, the last
     # reference to the lock context went with it, and finalizing the context
     # manager ran its unlock -- while the write was still in flight
-    # (entered -> unlocked -> second sweeper acquired -> write_done). The
-    # hand-off is a thread now, so cancelling every task cannot disturb it.
+    # (entered -> unlocked -> second sweeper acquired -> write_done).
+    #
+    # This asserts the structural half: the owner is a thread, and collecting
+    # the sweep's own objects does not unlock. The loop actually going away is
+    # covered by test_the_hand_off_outlives_a_closed_event_loop.
     import gc
 
     indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
@@ -1200,6 +1204,73 @@ async def test_the_hand_off_survives_cancellation_of_every_asyncio_task():
         if indexer.pending_late_releases == 0:
             break
         await asyncio.sleep(0.02)
+    assert store.events == ["entered", "write_done", "unlocked"]
+
+
+def test_the_hand_off_outlives_a_closed_event_loop():
+    # The scenario the hand-off exists for, with the loop really gone: run a
+    # sweep on its own event loop, cancel it, let the drain expire, then CLOSE
+    # that loop while the store worker is still blocked. Nothing asyncio owns
+    # survives that. The unlock must still happen -- once -- and only after
+    # the write completes.
+    import gc
+
+    store = _EventedStore()
+    store.release_write.clear()
+    base, _, _ = make()
+    indexer = CogIndexer(store, base.sources, drain_deadline_seconds=0.2)
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(indexer.sweep())
+        loop.run_until_complete(asyncio.to_thread(store.write_started.wait, 10))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(asyncio.wait_for(task, timeout=5))
+        assert indexer.pending_late_releases == 1
+        del task
+    finally:
+        loop.close()
+    gc.collect()
+
+    assert store.events == ["entered"], "a closed loop must not have unlocked anything"
+
+    store.release_write.set()
+    for _ in range(200):
+        if indexer.pending_late_releases == 0:
+            break
+        time.sleep(0.02)
+    assert store.events == ["entered", "write_done", "unlocked"], "exactly one unlock, after the write"
+    with InMemoryCogCatalogStore.sweep_lock(store) as held:
+        assert held is True
+    indexer.close()
+
+
+def test_closing_the_indexer_does_not_strand_a_hand_off_in_flight():
+    # close() shuts the executor down; the hand-off calls lock.__exit__
+    # directly rather than through it, so an unlock already handed over still
+    # happens.
+    store = _EventedStore()
+    store.release_write.clear()
+    base, _, _ = make()
+    indexer = CogIndexer(store, base.sources, drain_deadline_seconds=0.2)
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(indexer.sweep())
+        loop.run_until_complete(asyncio.to_thread(store.write_started.wait, 10))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(asyncio.wait_for(task, timeout=5))
+    finally:
+        loop.close()
+
+    indexer.close()  # while the hand-off is still waiting
+    store.release_write.set()
+    for _ in range(200):
+        if indexer.pending_late_releases == 0:
+            break
+        time.sleep(0.02)
     assert store.events == ["entered", "write_done", "unlocked"]
 
 

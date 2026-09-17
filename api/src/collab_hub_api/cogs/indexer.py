@@ -460,11 +460,20 @@ class CogIndexer:
         thread then only holds the reference and waits, so nothing finalizes
         the context manager underneath it.
 
-        Daemon, so the process can still exit: if it does, the write and the
-        session-scoped lock die together with the connection, which is the
-        same reason abandoning is safe at all. What bounds the wait is the
-        worker: ``statement_timeout`` where the transport works, keepalives
-        where the peer is gone, the process otherwise.
+        The thread itself is a daemon, but that does **not** mean the process
+        can always leave: the blocked call is running on a
+        ``ThreadPoolExecutor`` worker, and those are joined at interpreter
+        exit. A worker blocked forever therefore needs the process killed from
+        outside. What bounds the wait in every lesser case is the worker:
+        ``statement_timeout`` where the transport works, keepalives where the
+        peer is gone.
+
+        **Known gap (issue #128).** If the process does die here, the
+        lock and the in-flight write are on *different* pooled connections, so
+        the server can drop the lock session first and let another replica in
+        while the old write is still landing. Nothing in this module orders
+        those two sessions; closing it needs the sweep's writes to run on the
+        session that holds the lock, or a fencing token they carry.
         """
 
         def run() -> None:

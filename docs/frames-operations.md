@@ -1082,9 +1082,18 @@ as present, so removal stays correct. Safety rules operators should know:
   `statement_timeout` and every pooled connection sets TCP keepalives (a dead
   peer is noticed in about 90 s), which covers the ordinary partition; neither
   ends a call to a peer whose kernel still answers probes while the database
-  process is stopped. Such a thread is a daemon and goes when the process does,
-  taking the connection — and with it the session-scoped advisory lock — along.
-  That is why abandoning is safe at all.
+  process is stopped. The hand-off thread is a daemon, but the blocked call
+  itself runs on a pool worker, and those are joined at interpreter exit — so a
+  permanently blocked store call means the pod needs its `SIGKILL` (the
+  `terminationGracePeriodSeconds` deadline) rather than exiting on its own.
+- **One crash window is not yet closed.** The sweep lock is held on one pooled
+  connection while the sweep's reads and writes use another. If the process
+  dies mid-write, the server can drop the lock session before the write session
+  finishes, letting another replica start sweeping while the previous write is
+  still landing. Both sweeps write the same rows from the same registry, so the
+  visible effect is limited to a stale `mark_removed` set; it is nonetheless a
+  real gap, and closing it means running the sweep's writes on the session that
+  holds the lock (or fencing them with a token). Tracked as issue #128.
 - **A doubtful lock connection is discarded, not returned.** If any step of
   taking or giving back the lock fails (setting autocommit, the acquire, the
   unlock, `RESET statement_timeout`, restoring autocommit), the connection is
