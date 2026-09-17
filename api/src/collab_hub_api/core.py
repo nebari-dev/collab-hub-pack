@@ -373,7 +373,13 @@ def make_app(config: BaseConfig) -> FastAPI:
                         # the abandoned task may yet come back and need to
                         # submit its lock release, and a shut-down executor
                         # would turn that into an exception -- losing the
-                        # unlock this whole path exists to protect.
+                        # unlock this whole path exists to protect. Close it
+                        # when the task does finish, whenever that is, so a
+                        # process that outlives this lifespan (a reload, a
+                        # test holding the app) does not keep idle workers.
+                        if cog_indexing is not None:
+                            indexer = cog_indexing.indexer
+                            cog_index_task.add_done_callback(lambda _task: indexer.close())
                         logger.error(
                             "cog_indexer_shutdown_abandoned",
                             extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
