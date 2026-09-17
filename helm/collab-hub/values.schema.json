@@ -878,6 +878,22 @@
             "requestTimeoutSeconds": {
               "type": "number",
               "minimum": 1
+            },
+            "allowedOrgs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 39,
+                "pattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"
+              }
+            },
+            "apiGetEnabled": {
+              "type": "boolean"
+            },
+            "apiGetMaxConcurrency": {
+              "type": "integer",
+              "minimum": 1
             }
           },
           "additionalProperties": false

@@ -581,6 +581,19 @@ connectors:
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
     requestTimeoutSeconds: 10
+    # -- GitHub org logins to restrict search and the generic api/get read to.
+    # Empty = the token's full visibility (personal repos + every approved org).
+    # Set this so agent searches do not interleave personal and work results and
+    # the generic read cannot reach outside the allowlist.
+    allowedOrgs: []
+    # -- Enable the generic GitHub read (api/get). Off by default (fail-closed):
+    # a hub opts in explicitly, ideally alongside allowedOrgs. Read once at
+    # startup, so toggling it is a redeploy/restart, not a live config reload —
+    # which is also the incident containment path.
+    apiGetEnabled: false
+    # -- Max concurrent generic GitHub reads per API process. The throttle short
+    # of the full kill switch during an abuse incident (read once at startup).
+    apiGetMaxConcurrency: 8
   notion:
     # -- Keycloak broker token endpoint for the linked Notion workspace (Option A).
     # Normal hub users must also receive the broker client role `read-token`
