@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from collab_hub_api.config import Config
 from collab_hub_api.core import make_app
+from collab_hub_api.frames.db import PostgresDatabase
+from collab_hub_api.frames.groups import PostgresFrameGroupStore
+from collab_hub_api.frames.models import Visibility
 
 
 def _jwt(payload: dict) -> str:
@@ -968,3 +973,230 @@ async def test_no_db_frame_delete_still_succeeds(no_db_groups_client):
     assert created.status_code == 201
     deleted = await client.delete(f"/v1/frames/{created.json()['id']}", cookies=auth_cookie("alice"))
     assert deleted.status_code == 204
+
+
+# --- Live Postgres ----------------------------------------------------------
+
+POSTGRES_URL = os.environ.get("COLLAB_HUB_TEST_POSTGRES_URL", "")
+
+live_postgres = pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set COLLAB_HUB_TEST_POSTGRES_URL to a disposable database to run the live frame-group tests",
+)
+
+FRAME_GROUP_TABLES = (
+    "frames_server_history",
+    "frames_server_groups",
+)
+
+
+def _drop_frame_group_tables(database: PostgresDatabase) -> None:
+    with database.connection() as conn:
+        for table in FRAME_GROUP_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+
+@pytest.fixture
+def clean_live_group_database():
+    """A live database with the group and group-history tables reset."""
+
+    database = PostgresDatabase(POSTGRES_URL, min_size=0, max_size=4, timeout_seconds=10.0)
+    try:
+        _drop_frame_group_tables(database)
+        yield database
+    finally:
+        _drop_frame_group_tables(database)
+        database.close()
+
+
+def _live_postgres_config(tmp_path) -> Config:
+    return Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {
+                "postgres": {
+                    "url": POSTGRES_URL,
+                    "auto_migrate": True,
+                    "pool": {"min_size": 0, "max_size": 4, "timeout_seconds": 10.0},
+                },
+                "active_state": {"backend": "memory"},
+                "usage": {"backend": "memory"},
+                "orgs": {"backend": "memory"},
+                "mcp_session_manager_enabled": False,
+            },
+        }
+    )
+
+
+@pytest_asyncio.fixture
+async def live_groups_app(tmp_path, monkeypatch, clean_live_group_database):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
+    app = make_app(_live_postgres_config(tmp_path))
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client, app
+
+
+def _create_postgres_group(
+    store: PostgresFrameGroupStore,
+    *,
+    org_id: str,
+    workspace_id: str,
+    name: str,
+    frame_ids: list[str],
+):
+    return store.create_group(
+        org_id=org_id,
+        workspace_id=workspace_id,
+        created_by="owner",
+        owners=["owner"],
+        name=name,
+        description="",
+        visibility=Visibility.private,
+        frame_ids=frame_ids,
+    )
+
+
+@live_postgres
+def test_live_postgres_auto_migration_creates_jsonb_column_and_gin_index(clean_live_group_database):
+    PostgresFrameGroupStore(clean_live_group_database, auto_migrate=True)
+    # A second startup must leave the existing schema intact.
+    PostgresFrameGroupStore(clean_live_group_database, auto_migrate=True)
+
+    with clean_live_group_database.connection() as conn:
+        column = conn.execute(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'frames_server_groups'
+              AND column_name = 'frame_ids'
+            """
+        ).fetchone()
+        index = conn.execute(
+            """
+            SELECT access_method.amname AS access_method,
+                   catalog_index.indisready,
+                   catalog_index.indisvalid,
+                   pg_get_indexdef(index_class.oid) AS definition
+            FROM pg_class AS index_class
+            JOIN pg_namespace AS namespace ON namespace.oid = index_class.relnamespace
+            JOIN pg_am AS access_method ON access_method.oid = index_class.relam
+            JOIN pg_index AS catalog_index ON catalog_index.indexrelid = index_class.oid
+            WHERE namespace.nspname = current_schema()
+              AND index_class.relname = 'frames_server_groups_frame_ids'
+            """
+        ).fetchone()
+
+    assert column == {"data_type": "jsonb"}
+    assert index is not None
+    assert index["access_method"] == "gin"
+    assert index["indisready"] is True
+    assert index["indisvalid"] is True
+    assert "(frame_ids)" in index["definition"]
+
+
+@live_postgres
+def test_live_postgres_find_groups_containing_matches_exact_jsonb_members_across_tenants(clean_live_group_database):
+    store = PostgresFrameGroupStore(clean_live_group_database, auto_migrate=True)
+    target_id = "a" * 32
+    other_id = "b" * 32
+    near_match_id = f"{'a' * 31}b"
+
+    first_match = _create_postgres_group(
+        store,
+        org_id="org-a",
+        workspace_id="workspace-a",
+        name="First match",
+        frame_ids=[target_id],
+    )
+    second_match = _create_postgres_group(
+        store,
+        org_id="org-z",
+        workspace_id="workspace-z",
+        name="Cross-tenant match",
+        frame_ids=[other_id, target_id],
+    )
+    _create_postgres_group(
+        store,
+        org_id="org-a",
+        workspace_id="workspace-a",
+        name="Near match",
+        frame_ids=[near_match_id],
+    )
+
+    matches = store.find_groups_containing(target_id)
+
+    assert {group.id for group in matches} == {first_match.id, second_match.id}
+    assert {(group.org_id, group.workspace_id) for group in matches} == {
+        ("org-a", "workspace-a"),
+        ("org-z", "workspace-z"),
+    }
+
+
+@live_postgres
+async def test_live_postgres_cross_tenant_sole_member_deletion_cascades_group(live_groups_app):
+    client, _ = live_groups_app
+    alice_frame = await create_frame(client, user="alice", visibility="public")
+    await publish(client, alice_frame["id"])
+
+    outsider = auth_cookie("zoe", org="org-z", workspace="workspace-z")
+    created = await client.post(
+        "/v1/frame-groups",
+        cookies=outsider,
+        json={"name": "Zoe's Bundle", "visibility": "private", "frame_ids": [alice_frame["id"]]},
+    )
+    assert created.status_code == 201, created.text
+    group = created.json()
+
+    deleted = await client.delete(f"/v1/frames/{alice_frame['id']}", cookies=auth_cookie("alice"))
+
+    assert deleted.status_code == 204
+    group_response = await client.get(f"/v1/frame-groups/{group['id']}", cookies=outsider)
+    assert group_response.status_code == 404
+    assert group_response.json()["error"]["code"] == "group_not_found"
+
+
+@live_postgres
+async def test_live_postgres_cross_tenant_member_deletion_prunes_and_records_history(live_groups_app):
+    client, app = live_groups_app
+    alice_frame = await create_frame(client, user="alice", visibility="public")
+    await publish(client, alice_frame["id"])
+
+    outsider = auth_cookie("zoe", org="org-z", workspace="workspace-z")
+    zoe_frame = await create_frame(
+        client,
+        user="zoe",
+        name="Zoe's Frame",
+        org="org-z",
+        workspace="workspace-z",
+    )
+    created = await client.post(
+        "/v1/frame-groups",
+        cookies=outsider,
+        json={
+            "name": "Zoe's Bundle",
+            "visibility": "private",
+            "frame_ids": [zoe_frame["id"], alice_frame["id"]],
+        },
+    )
+    assert created.status_code == 201, created.text
+    group = created.json()
+
+    deleted = await client.delete(f"/v1/frames/{alice_frame['id']}", cookies=auth_cookie("alice"))
+
+    assert deleted.status_code == 204
+    group_response = await client.get(f"/v1/frame-groups/{group['id']}", cookies=outsider)
+    assert group_response.status_code == 200
+    assert group_response.json()["frame_ids"] == [zoe_frame["id"]]
+
+    history = app.state.history_store.query("org-z", "workspace-z", "group", group["id"], 50)
+    removal_events = [entry for entry in history if entry.event == "frame_removed"]
+    assert len(removal_events) == 1
+    assert removal_events[0].actor == "alice"
+    assert removal_events[0].detail == {
+        "reason": "member_frame_deleted",
+        "frame_id": alice_frame["id"],
+    }

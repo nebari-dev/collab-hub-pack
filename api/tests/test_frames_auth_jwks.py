@@ -177,6 +177,89 @@ def test_missing_jwks_url_is_a_decode_error():
         auth.decode_verified_jwt(_token(KEY_1_PEM, "key-1"), jwks_url=None, issuer=None, audience=None)
 
 
+# --- IdToken cookie fallback inherits the bearer audience (issue #41) -------
+
+
+def _audience_token(private_pem: bytes, kid: str, audience: str) -> str:
+    return jwt.encode(
+        {"preferred_username": "signed-user", "aud": audience},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def test_id_token_fallback_inherits_the_bearer_audience(jwks, monkeypatch):
+    # Bearer-only verifier config (no dedicated FRAMES_IDTOKEN_JWKS_URL):
+    # cookie verification falls back to the bearer verifier and must inherit
+    # its audience too — a same-realm token minted for a different audience
+    # must not be accepted as a cookie, or the bearer audience restriction is
+    # bypassed entirely.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_AUDIENCE", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "another-client"))
+
+
+def test_id_token_own_audience_still_wins_over_bearer(jwks, monkeypatch):
+    # Precedence pin, not a fix-discriminating test: FRAMES_IDTOKEN_AUDIENCE
+    # was already honored when set, before and after this change (only the
+    # no-dedicated-audience fallback changed). This guards that a dedicated
+    # FRAMES_IDTOKEN_AUDIENCE, even without a dedicated FRAMES_IDTOKEN_JWKS_URL,
+    # keeps winning over the bearer audience as the fallback path evolves —
+    # the inherited-audience test above is the one that fails on the old code.
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+
+
+def _issuer_token(private_pem: bytes, kid: str, issuer: str) -> str:
+    return jwt.encode(
+        {"preferred_username": "signed-user", "iss": issuer},
+        private_pem,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def test_id_token_fallback_still_honors_a_dedicated_issuer(jwks, monkeypatch):
+    # A shared JWKS with a distinct IdToken issuer worked before this change
+    # and must keep working: the fallback path only gained audience
+    # inheritance, it must not also start discarding FRAMES_IDTOKEN_ISSUER in
+    # favor of the bearer issuer unconditionally (mirrors
+    # identity.enforce_single_issuer_for_pin's derived-exactly contract).
+    monkeypatch.delenv("FRAMES_IDTOKEN_JWKS_URL", raising=False)
+    monkeypatch.delenv("FRAMES_IDTOKEN_AUDIENCE", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_ISSUER", "https://idp.example.com/realms/idtoken-realm")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", jwks.url)
+    monkeypatch.setenv("FRAMES_BEARER_ISSUER", "https://idp.example.com/realms/bearer-realm")
+
+    accepted = auth.decode_id_token_payload(
+        _issuer_token(KEY_1_PEM, "key-1", "https://idp.example.com/realms/idtoken-realm")
+    )
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(
+            _issuer_token(KEY_1_PEM, "key-1", "https://idp.example.com/realms/bearer-realm")
+        )
+
+
 def test_separate_urls_do_not_share_a_client(jwks):
     other = _JWKSEndpoint()
     other.keys = [KEY_2_JWK]
@@ -587,3 +670,150 @@ def test_first_fetch_failure_has_no_set_to_fall_back_to(jwks):
     # a failed first fetch caches nothing.
     jwks.keys = [KEY_1_JWK]
     assert _decode(_token(KEY_1_PEM, "key-1"), jwks.url)["preferred_username"] == "signed-user"
+
+
+def test_a_dedicated_id_token_verifier_is_used_when_configured(jwks, monkeypatch):
+    # The dedicated-verifier path is unchanged by the fallback work: with
+    # FRAMES_IDTOKEN_JWKS_URL set, cookie verification uses the dedicated
+    # verifier and its own audience — the bearer audience plays no part, so a
+    # token minted for the bearer client is refused even though the bearer
+    # config would have accepted it.
+    monkeypatch.setenv("FRAMES_IDTOKEN_JWKS_URL", jwks.url)
+    monkeypatch.delenv("FRAMES_IDTOKEN_ISSUER", raising=False)
+    monkeypatch.setenv("FRAMES_IDTOKEN_AUDIENCE", "browser-client")
+    monkeypatch.delenv("FRAMES_BEARER_JWKS_URL", raising=False)
+    monkeypatch.setenv("FRAMES_BEARER_AUDIENCE", "apollo-desktop")
+
+    accepted = auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "browser-client"))
+    assert accepted["preferred_username"] == "signed-user"
+
+    with pytest.raises(auth.TokenDecodeError):
+        auth.decode_id_token_payload(_audience_token(KEY_1_PEM, "key-1", "apollo-desktop"))
+
+
+# ---------------------------------------------------------------------------
+# Startup https requirement for the JWKS URLs (issue #77)
+# ---------------------------------------------------------------------------
+#
+# The two URLs are handed straight to PyJWKClient, which fetches over whatever
+# scheme they carry. Signing keys fetched over cleartext http can be substituted
+# by an on-path attacker, so make_app refuses to start on a non-https URL —
+# except under FRAMES_UNSAFE_AUTH_ENABLED=true (local development), where http
+# is permitted and logged loudly.
+
+
+def _config(tmp_path):
+    from collab_hub_api.config import Config
+
+    return Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {
+                "active_state": {"backend": "memory"},
+                "history": {"backend": "memory"},
+                "groups": {"backend": "memory"},
+                "usage": {"backend": "memory"},
+                "mcp_session_manager_enabled": False,
+            },
+            "tasks": {"backend": "memory"},
+        }
+    )
+
+
+@pytest.fixture
+def _clean_jwks_env(monkeypatch):
+    for env_name in auth.JWKS_URL_ENVS:
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.delenv("FRAMES_UNSAFE_AUTH_ENABLED", raising=False)
+
+
+@pytest.mark.parametrize("env_name", auth.JWKS_URL_ENVS)
+def test_https_jwks_url_is_accepted(_clean_jwks_env, monkeypatch, env_name):
+    monkeypatch.setenv(env_name, "https://keycloak.internal/realms/nebari/protocol/openid-connect/certs")
+    auth.enforce_https_jwks_urls()
+
+
+def test_unset_jwks_urls_pass_vacuously(_clean_jwks_env):
+    # A missing URL is "this verifier is not configured", which already fails
+    # closed per token — not a startup error.
+    auth.enforce_https_jwks_urls()
+
+
+@pytest.mark.parametrize("env_name", auth.JWKS_URL_ENVS)
+def test_http_jwks_url_is_rejected(_clean_jwks_env, monkeypatch, env_name):
+    monkeypatch.setenv(env_name, "http://keycloak.internal/realms/nebari/protocol/openid-connect/certs")
+    with pytest.raises(RuntimeError, match=f"{env_name} must be an https:// URL"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_non_http_scheme_is_rejected_even_under_unsafe_auth(_clean_jwks_env, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "ftp://keycloak.internal/certs")
+    with pytest.raises(RuntimeError, match="must be an https:// URL"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_http_jwks_url_is_allowed_under_unsafe_auth_and_logged(_clean_jwks_env, monkeypatch, caplog):
+    # The dev exception: the same door the unsigned-token shortcuts sit behind,
+    # and it announces itself.
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "http://localhost:8080/realms/nebari/protocol/openid-connect/certs")
+    with caplog.at_level("WARNING", logger="frames_server.auth"):
+        auth.enforce_https_jwks_urls()
+    assert any("UNSAFE" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:secret@keycloak.internal/certs",
+        "https://user@keycloak.internal/certs",
+    ],
+)
+def test_jwks_url_with_userinfo_is_rejected(_clean_jwks_env, monkeypatch, url):
+    monkeypatch.setenv("FRAMES_IDTOKEN_JWKS_URL", url)
+    with pytest.raises(RuntimeError, match="userinfo"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_jwks_url_with_fragment_is_rejected(_clean_jwks_env, monkeypatch):
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "https://keycloak.internal/certs#frag")
+    with pytest.raises(RuntimeError, match="fragment"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_userinfo_is_rejected_even_under_unsafe_auth(_clean_jwks_env, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "http://user:secret@localhost:8080/certs")
+    with pytest.raises(RuntimeError, match="userinfo"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_jwks_url_without_hostname_is_rejected(_clean_jwks_env, monkeypatch):
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "https:///certs")
+    with pytest.raises(RuntimeError, match="no hostname"):
+        auth.enforce_https_jwks_urls()
+
+
+def test_jwks_url_with_invalid_port_is_rejected(_clean_jwks_env, monkeypatch):
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "https://keycloak.internal:not-a-port/certs")
+    with pytest.raises(RuntimeError):
+        auth.enforce_https_jwks_urls()
+
+
+def test_startup_rejects_a_cleartext_jwks_url(_clean_jwks_env, tmp_path, monkeypatch):
+    # The whole point: the misconfiguration fails the rollout, visibly, rather
+    # than silently fetching signing keys over cleartext.
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "http://keycloak.internal/certs")
+    with pytest.raises(RuntimeError, match="must be an https:// URL"):
+        make_app(_config(tmp_path))
+
+
+def test_startup_accepts_https_jwks_urls(_clean_jwks_env, tmp_path, monkeypatch):
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", "https://keycloak.internal/certs")
+    monkeypatch.setenv("FRAMES_IDTOKEN_JWKS_URL", "https://keycloak.internal/certs")
+    make_app(_config(tmp_path))

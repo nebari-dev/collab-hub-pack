@@ -1,0 +1,280 @@
+name: Dev Environment
+
+# Checks that `dev/` still runs the pack, because nothing else does: the test
+# workflow is pytest in api/ and the lint workflow renders the chart, so a
+# broken local-development setup reaches contributors before it reaches CI.
+#
+# Fork-safe: no secrets, read-only checkout, no registry logins.
+#
+# Coverage relaxes as the levels get more expensive, which is also how the
+# levels themselves are meant to be used:
+#
+#   level 1  both macOS and Linux, no containers at all      ~1 min
+#   level 2  Linux, Postgres + MinIO                         ~2 min
+#   level 3  Linux, + Keycloak (the one heavy image)         ~3 min
+#   level 4  rendered only -- no cluster, no node image      ~1 min
+#
+# Level 1 is the one that runs on macOS: GitHub's macOS runners have no Docker,
+# and level 1 is precisely the level that needs none. That is not a compromise
+# -- macOS is where the portability bugs live (`getent` is glibc-only), so it
+# is the level worth running there.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dev/**"
+      - "scripts/smoke_frames_common.sh"
+      - "helm/**"
+      - ".github/workflows/dev-env.yaml"
+  pull_request: {}   # runs on every PR so it can be a required status check
+
+concurrency:
+  group: dev-env-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Level 1 -- the API alone. No Docker, so this is the level macOS can run.
+  # ---------------------------------------------------------------------------
+  level-1:
+    name: Level 1 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: api/uv.lock
+
+      # The check that broke on macOS: `getent` does not exist there, and a
+      # resolver that cannot see /etc/hosts would block the desktop targets.
+      # It must pass on a runner with no entries added, because localhost and
+      # the loopback names it is asked about are not the point -- the point is
+      # that the check runs at all rather than erroring out.
+      - name: hosts-check resolves a name that certainly exists
+        run: make -C dev hosts-check DESKTOP_HOSTS=localhost
+
+      - name: hosts-check still rejects a name that does not
+        run: |
+          if make -C dev hosts-check DESKTOP_HOSTS=nope.invalid >/dev/null 2>&1; then
+            echo "hosts-check passed a hostname that does not resolve"; exit 1
+          fi
+          echo "correctly refused"
+
+      - name: make api serves frames with no token
+        run: |
+          set -euo pipefail
+          make -C dev api > /tmp/api.log 2>&1 &
+          trap 'pkill -f "collab_hub_api" || true' EXIT
+
+          for _ in $(seq 1 45); do
+            curl -sf -m 2 -o /dev/null http://127.0.0.1:8000/health && break
+            sleep 2
+          done
+          curl -sf -m 5 -o /dev/null http://127.0.0.1:8000/health \
+            || { echo "API never came up"; tail -40 /tmp/api.log; exit 1; }
+
+          # Dev auth: no Authorization header anywhere in this block.
+          id=$(curl -sfS -m 10 -X POST http://127.0.0.1:8000/v1/frames \
+                 -H 'Content-Type: application/json' \
+                 -d '{"name":"ci","body":"# from CI"}' \
+               | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          echo "created frame $id"
+
+          body=$(curl -sfS -m 10 "http://127.0.0.1:8000/v1/frames/$id" \
+                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["body"])')
+          [ "$body" = "# from CI" ] || { echo "read back '$body'"; exit 1; }
+
+          # Level 1 keeps frames on disk and everything else in memory.
+          test -d dev/.local/frames || { echo "no local frame store"; exit 1; }
+
+      - name: make clean removes the scratch state
+        run: |
+          make -C dev clean
+          test ! -d dev/.local || { echo "dev/.local survived make clean"; exit 1; }
+
+      - name: API log on failure
+        if: failure()
+        run: tail -60 /tmp/api.log || true
+
+  # ---------------------------------------------------------------------------
+  # Levels 2 and 3 -- one Linux runner, because level 3 reuses level 2's
+  # containers and re-pulling them in a second job would cost more than it buys.
+  # ---------------------------------------------------------------------------
+  levels-2-3:
+    name: Levels 2 and 3 (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: api/uv.lock
+
+      - name: Level 2 -- Postgres makes the 503 endpoints answer
+        run: |
+          set -euo pipefail
+          make -C dev api-pg > /tmp/api-pg.log 2>&1 &
+          trap 'pkill -f "collab_hub_api" || true' EXIT
+
+          for _ in $(seq 1 60); do
+            curl -sf -m 2 -o /dev/null http://127.0.0.1:8000/health && break
+            sleep 2
+          done
+          curl -sf -m 5 -o /dev/null http://127.0.0.1:8000/health \
+            || { echo "API never came up"; tail -40 /tmp/api-pg.log; exit 1; }
+
+          # /health/db answers 200 either way, so the body is the assertion.
+          db=$(curl -sfS -m 10 http://127.0.0.1:8000/health/db)
+          echo "$db" | grep -q '"status":"ok"' \
+            || { echo "expected a configured database, got: $db"; exit 1; }
+
+          # 503 at level 1, 200 here. This is the whole point of level 2.
+          code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/frame-groups)
+          [ "$code" = "200" ] || { echo "frame-groups returned $code, expected 200"; exit 1; }
+
+          pkill -f "collab_hub_api" || true
+          sleep 2
+
+      - name: Level 3 -- real Keycloak bearer tokens
+        run: |
+          set -euo pipefail
+          make -C dev api-oidc > /tmp/api-oidc.log 2>&1 &
+          trap 'pkill -f "collab_hub_api" || true' EXIT
+
+          for _ in $(seq 1 90); do
+            curl -sf -m 2 -o /dev/null http://127.0.0.1:8000/health && break
+            sleep 2
+          done
+          curl -sf -m 5 -o /dev/null http://127.0.0.1:8000/health \
+            || { echo "API never came up"; tail -60 /tmp/api-oidc.log; exit 1; }
+
+          # The dev-auth shortcut must be off at this level.
+          code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/frames)
+          [ "$code" = "401" ] || { echo "unauthenticated request returned $code, expected 401"; exit 1; }
+
+          token=$(make -s -C dev token)
+          code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
+                   -H "Authorization: Bearer $token" http://127.0.0.1:8000/v1/frames)
+          [ "$code" = "200" ] || { echo "authenticated request returned $code, expected 200"; exit 1; }
+
+          # A realm client that loses the `basic` scope issues tokens with no
+          # `sub`, and the hub then authenticates nobody. Cheap to assert here.
+          sub=$(make -s -C dev sub)
+          [ -n "$sub" ] || { echo "token carries no sub claim"; exit 1; }
+          echo "authenticated as $sub"
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          tail -60 /tmp/api-pg.log 2>/dev/null || true
+          tail -60 /tmp/api-oidc.log 2>/dev/null || true
+          make -C dev ps || true
+          timeout 15 make -C dev logs || true
+
+      - name: Stop the stack
+        if: always()
+        run: make -C dev down || true
+
+  # ---------------------------------------------------------------------------
+  # Level 4 -- rendered, not run. A kind cluster pulls a ~1 GB node image and
+  # builds the API image before it can tell us anything; rendering catches the
+  # failures that actually recur here (values drift, a chart change, and the
+  # IMAGE override silently not reaching the install) in seconds.
+  # ---------------------------------------------------------------------------
+  level-4-render:
+    name: Level 4 (rendered, no cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: The chart renders with the dev values
+        run: |
+          set -euo pipefail
+          helm lint helm/collab-hub
+          helm template collab-hub helm/collab-hub \
+            -f dev/values/kind.yaml --set namespace.create=false \
+            -n collab-hub > /tmp/rendered.yaml
+          grep -q 'imagePullPolicy: Never' /tmp/rendered.yaml \
+            || { echo "the kind values no longer pin pullPolicy: Never"; exit 1; }
+
+      - name: The dev-auth switches are legal in this install
+        run: |
+          set -euo pipefail
+          # values/kind.yaml enables neither the NebariApp nor the Ingress, which
+          # is what keeps the protection map unenforced and the dev-auth
+          # extraEnv renderable. If that ever flips, the chart refuses to render
+          # and this fails -- which is the point.
+          for var in FRAMES_UNSAFE_AUTH_ENABLED DEV_AUTH_ENABLED DEV_AUTH_USER; do
+            grep -q "$var" /tmp/rendered.yaml || { echo "$var missing from the render"; exit 1; }
+          done
+          grep -q 'COLLAB_HUB_API__SECURITY__DEFAULT_ACCESS' /tmp/rendered.yaml
+
+      - name: IMAGE reaches the install
+        run: |
+          set -euo pipefail
+          # kind-image builds and loads $(IMAGE); kind-up must deploy the same
+          # one. Rendering is enough to prove the wiring without a cluster.
+          rendered=$(helm template collab-hub helm/collab-hub \
+            -f dev/values/kind.yaml --set namespace.create=false -n collab-hub \
+            --set api.deployment.image.repository=collab-hub-api \
+            --set api.deployment.image.tag=ci-probe | grep -m1 'image:')
+          echo "$rendered" | grep -q 'collab-hub-api:ci-probe' \
+            || { echo "the image override did not reach the Deployment: $rendered"; exit 1; }
+
+      - name: Compose resolves, and the port overrides move together
+        run: |
+          set -euo pipefail
+          docker compose -f dev/compose.yaml --profile auth --profile fakes --profile desktop config -q
+
+          out=$(DESKTOP_PORT=9090 API_PORT=8010 docker compose -f dev/compose.yaml \
+                  --profile auth --profile desktop config)
+          echo "$out" | grep -q 'API_UPSTREAM: host.docker.internal:8010' \
+            || { echo "API_PORT did not reach the front door's upstream"; exit 1; }
+          echo "$out" | grep -q 'DESKTOP_PORT: "9090"' \
+            || { echo "DESKTOP_PORT did not reach the front door's listener"; exit 1; }
+          echo "$out" | grep -q 'published: "9090"' \
+            || { echo "DESKTOP_PORT did not reach the published port"; exit 1; }
+
+      - name: The realm ships what the clients need
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          realm = json.load(open("dev/keycloak/realm-nebari.json"))
+          assert realm["realm"] == "nebari", realm["realm"]
+          clients = {c["clientId"]: c for c in realm["clients"]}
+          assert set(clients) == {"apollo-desktop", "collab-web"}, sorted(clients)
+
+          # `basic` carries the sub mapper in Keycloak 25+. Without it the hub
+          # authenticates nobody once identity is pinned to sub.
+          for name, c in clients.items():
+              assert "basic" in c["defaultClientScopes"], f"{name} lost the basic scope"
+
+          # The desktop's audience check, and the web client's port-agnostic
+          # redirect (Keycloak honours a wildcard only at the end of a URI).
+          mappers = clients["apollo-desktop"].get("protocolMappers", [])
+          assert any(m["protocolMapper"] == "oidc-audience-mapper" for m in mappers), \
+              "apollo-desktop lost its audience mapper"
+          assert "http://localhost:*" in clients["collab-web"]["redirectUris"], \
+              "collab-web can no longer follow an API_PORT override"
+          print("realm looks right")
+          PY

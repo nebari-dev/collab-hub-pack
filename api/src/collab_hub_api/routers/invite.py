@@ -107,6 +107,7 @@ from ..frames.invitations import (
     InvitationRevokedError,
     InvitationService,
     InvitationsUnavailableError,
+    OrganizationCreationRefusedError,
     OrgNotFoundError,
 )
 from ..web.acceptance import (
@@ -120,6 +121,7 @@ from ..web.acceptance import (
     OUTCOME_ERROR,
     OUTCOME_EXPIRED,
     OUTCOME_NOT_FOUND,
+    OUTCOME_ORGANIZATION_CREATION_REFUSED,
     OUTCOME_ORGANIZATION_MISSING,
     OUTCOME_REAUTHENTICATION_REQUIRED,
     OUTCOME_REVOKED,
@@ -160,6 +162,11 @@ TERMINAL_OUTCOMES: tuple[tuple[type[Exception], str, int], ...] = (
     (EmailNotVerifiedError, OUTCOME_EMAIL_NOT_VERIFIED, status.HTTP_403_FORBIDDEN),
     (InvitationEmailMismatchError, OUTCOME_EMAIL_MISMATCH, status.HTTP_403_FORBIDDEN),
     (AlreadyInOrganizationError, OUTCOME_ALREADY_IN_ORGANIZATION, status.HTTP_409_CONFLICT),
+    (
+        OrganizationCreationRefusedError,
+        OUTCOME_ORGANIZATION_CREATION_REFUSED,
+        status.HTTP_409_CONFLICT,
+    ),
     (OrgNotFoundError, OUTCOME_ORGANIZATION_MISSING, status.HTTP_404_NOT_FOUND),
     (InvitationsUnavailableError, OUTCOME_UNAVAILABLE, status.HTTP_503_SERVICE_UNAVAILABLE),
 )
@@ -312,7 +319,7 @@ def make_routers(
 ) -> tuple[APIRouter, APIRouter]:
     """Build the acceptance page's ``(public_router, session_gated_router)``.
 
-    ``memberships_enabled`` is ``org_source_is_membership()``, resolved once
+    ``memberships_enabled`` is ``org_source_resolves_membership()``, resolved once
     at startup. On a claims-sourced deployment redemption would write
     ``collab_org_members`` rows that the authentication choke point never
     reads — reporting success while granting nothing — which is the exact

@@ -261,11 +261,11 @@ def _sent_at(payload: dict, headers: dict[str, str]) -> datetime | None:
     internal_date = _string(payload.get("internalDate"))
     try:
         return datetime.fromtimestamp(int(internal_date) / 1000, tz=timezone.utc)
-    except TypeError, ValueError, OSError:
+    except (TypeError, ValueError, OSError):
         pass
     try:
         parsed = parsedate_to_datetime(headers.get("date", ""))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -339,7 +339,7 @@ def _decode_body(value: str) -> str:
     try:
         padded = value + ("=" * (-len(value) % 4))
         return base64.urlsafe_b64decode(padded.encode()).decode("utf-8", errors="replace")
-    except ValueError, TypeError:
+    except (ValueError, TypeError):
         return ""
 
 
@@ -391,7 +391,7 @@ def _string(value: object) -> str:
 def _non_negative_int(value: object) -> int:
     try:
         return max(0, int(value))
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 0
 
 

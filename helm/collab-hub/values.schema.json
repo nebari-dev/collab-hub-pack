@@ -473,7 +473,9 @@
               "type": "object",
               "properties": {
                 "jwksUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^$|^https://",
+                  "description": "Must be https:// (or empty to leave the verifier unconfigured): signing keys fetched over cleartext http can be substituted by an on-path attacker."
                 },
                 "issuer": {
                   "type": "string"
@@ -488,7 +490,9 @@
               "type": "object",
               "properties": {
                 "jwksUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "pattern": "^$|^https://",
+                  "description": "Must be https:// (or empty to leave the verifier unconfigured): signing keys fetched over cleartext http can be substituted by an on-path attacker."
                 },
                 "issuer": {
                   "type": "string"
@@ -512,8 +516,27 @@
               "enum": [
                 "",
                 "claims",
-                "membership"
+                "membership",
+                "single"
               ]
+            },
+            "singleOrg": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "memberSources": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": false
             },
             "defaults": {
               "type": "object",
@@ -860,6 +883,41 @@
               "type": "string"
             },
             "apiBaseUrl": {
+              "type": "string"
+            },
+            "requestTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1
+            },
+            "allowedOrgs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 39,
+                "pattern": "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"
+              }
+            },
+            "apiGetEnabled": {
+              "type": "boolean"
+            },
+            "apiGetMaxConcurrency": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "notion": {
+          "type": "object",
+          "properties": {
+            "brokerTokenUrl": {
+              "type": "string"
+            },
+            "apiBaseUrl": {
+              "type": "string"
+            },
+            "notionVersion": {
               "type": "string"
             },
             "requestTimeoutSeconds": {

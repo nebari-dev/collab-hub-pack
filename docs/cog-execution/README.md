@@ -4,8 +4,9 @@ This directory is the basis for the hub's Cog and Op execution work: the
 vocabulary, the boundary between the hub and a Cog, and the contracts that
 cross it. Read it before picking up any issue labeled `cog-execution`, and
 check work against it in review. The decisions themselves are recorded in
-[ADR-0001](../adr/0001-cog-execution.md); this directory explains the terms
-and the seam the ADR assumes.
+[ADR-0001](../adr/0001-cog-execution.md) and
+[ADR-0002](../adr/0002-lifecycle-runner-durability-and-placement.md); this
+directory explains the terms and the seam the ADRs assume.
 
 Contents:
 
@@ -59,8 +60,8 @@ hub to is drifting:
 
 ## Review checklist
 
-Ask these of every `cog-execution` change; each maps to an ADR-0001
-invariant or a seam rule.
+Ask these of every `cog-execution` change; each maps to an ADR invariant or
+decision, or a seam rule. A bare *Invariant N* is ADR-0001's.
 
 1. Does the orchestrator touch the Cog only through declared entry points?
    (Invariant 5.) A step that reaches into a package, builds a prompt for
@@ -81,18 +82,45 @@ invariant or a seam rule.
    (D9.)
 8. Does an unknown or unavailable capability degrade uniformly rather than
    being special-cased? (Invariant 4.)
+9. Does any lifecycle logic live in a durability backend? Would the change
+   behave differently under `none`, `dbos` or `temporal` in anything but
+   what survives a restart? (ADR-0002 invariant 1.)
+10. Is run status read from anywhere but the Track? (ADR-0002 invariant 2.)
+11. Can the public API reach the executor, or does anything besides the run
+    controller hold workload permissions? (ADR-0002 invariant 3.)
+12. Is it harness-neutral — does the hub side depend only on the seam,
+    never on the worker SDK or a particular harness? (ADR-0002 invariant 4.)
+13. Is what it adds runnable from `dev/` at the lowest level that can host
+    it, and asserted in CI at that level? (ADR-0002 invariant 5, D9.)
+14. Which documents did it make stale, and are they updated in the same PR?
+    (ADR-0002 invariant 5, D10.)
 
 ## How the open issues map to the ADR
 
+Bare decision and invariant numbers are ADR-0001's.
+
 | Issue | Decision / invariant | Note |
 |---|---|---|
-| #1 worker lifecycle on the hub | D5, invariants 1–3 | *Install* vs *materialize* — see vocabulary. Depends on #7 for the artifact to materialize from. |
-| #2 durable Op engine | D2, D5, D8, invariant 5 | Gates are declared on the step; recovery must not depend on a caller re-submitting. |
+| #1 worker lifecycle on the hub | D5, invariants 1–3; ADR-0002 D1, D4 | *Install* vs *materialize* — see vocabulary. Depends on #7 for the artifact to materialize from. Runs advance in the run controller, which alone owns the executor; a step executed again within the same attempt does not repeat its side effect. |
+| #2 durable Op engine | D2, D5, D8, invariant 5; ADR-0002 D1–D3, D8 | One lifecycle runner with a durability backend (`none`, `dbos`, `temporal`). Gates are declared on the step; recovery must not depend on a caller re-submitting. |
 | #3 model binding | D3, invariant 4 | The hub offers the inventory; the Cog's `resolve` selects; the binding record is the output. |
 | #4 budgets and idle workers | invariant 3 | Duration is a hard pre-check; token/cost is post-interaction accounting. |
-| #5 durable Track | D8 | Carry binding identity per step and actor per gate decision. Catalog persistence belongs to #7. |
-| #6 least-privilege grant | invariant 2 | Namespace-scoped; workers carry no ServiceAccount token. |
+| #5 durable Track | D8; ADR-0002 D3 | Carry binding identity per step and actor per gate decision. Run status comes only from the Track, under every backend. Catalog persistence belongs to #7. |
+| #6 least-privilege grant | invariant 2; ADR-0002 D4, invariant 3 | Namespace-scoped; workers carry no ServiceAccount token. Only the run controller holds workload permissions. |
 | #7 registry and catalog | D6, D9 | The catalog card derives from the manifest; index the full profile as declared. |
 | #8 delegated connector access | "deferred" list | The hub's brokered connectors act as the user; no credential enters the worker. |
 | #9 Guards | seam item 2 | Guards consume the envelope; a Cog's contract checks are inputs to Guards, not Guards. Gates decide. |
 | #10–#13 sensitivity | D9, D10, invariants 6–7 | See [sensitivity](sensitivity.md). Blocked on the rating scale. |
+| #98 result envelope from workers | seam item 2 | Workers return the envelope; the engine stops reading `output`. |
+| #99 Gates on Op steps | ADR-0002 D8 | A Cog can no longer pause a run. |
+| #100 extract the lifecycle runner | ADR-0002 D1 | A refactor with no behaviour change. |
+| #101 the `none` backend | ADR-0002 D1–D3, invariants 1–2 | In-flight runs end `interrupted` after a restart and are never resumed. |
+| #102 keyed claim | ADR-0002 D1 | One attempt acts once; a recorded failure retries under a new key. |
+| #103 run API | ADR-0002 D4, D7, invariant 3 | The API records intent and reads the Track; it never calls the executor. |
+| #104 DBOS backend | ADR-0002 D1, D3 | Resumes after a restart; status still comes from the Track. |
+| #105 materialize from the artifact | D5, invariant 2 | The worker runs the Cog's own `serve`. |
+| #106 install by digest | D5 | Install runs `check` once; materialize happens per run. |
+| #107 worker SDK | ADR-0002 D5, invariant 4 | Optional for Cogs; the hub never imports it. |
+| #108 Hermes harness Cog | ADR-0002 D5 | The first harness Cog, built on the worker SDK. |
+| #109 local executor, DBOS on SQLite | ADR-0002 D6 | Local execution through the same package. |
+| #110 Temporal backend | ADR-0002 D1, D3 | The same conformance suites as the other backends. |

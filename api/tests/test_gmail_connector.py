@@ -7,7 +7,7 @@ import httpx
 from httpx import ASGITransport, AsyncClient, Response
 
 from collab_hub_api.config import Config
-from collab_hub_api.connectors.gmail_client import _message_content_info, _recipient_headers
+from collab_hub_api.connectors.gmail_client import _decode_body, _message_content_info, _recipient_headers
 from collab_hub_api.core import make_app
 
 
@@ -237,3 +237,9 @@ def test_gmail_content_info_distinguishes_multipart_bodies_and_attachments():
             ],
         }
     ) == ("multipart", 1)
+
+
+def test_gmail_decode_body_returns_empty_text_for_malformed_base64():
+    # One data character is not valid base64 even once padding is added.
+    assert _decode_body("a") == ""
+    assert _decode_body("aGVsbG8") == "hello"
