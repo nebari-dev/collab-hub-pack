@@ -695,6 +695,11 @@ async def test_notion_search_days_back_window(tmp_path, monkeypatch):
             json={"query": "x", "days_back": 7, "time_zone": "UTC"},
         )
     assert response.status_code == 200
+    assert captured["body"]["sort"] == {
+        "timestamp": "last_edited_time",
+        "direction": "descending",
+    }
+    assert captured["body"]["query"] == "x"
 
 
 async def test_notion_read_page_walks_nested_and_paginated_blocks(tmp_path, monkeypatch):
