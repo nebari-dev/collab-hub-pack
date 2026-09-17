@@ -230,7 +230,11 @@ class CogRegistryCredentials(BaseModel):
     # hide_input_in_errors keeps the submitted values out of a ValidationError's
     # text; SecretStr keeps the password out of repr()/str() of this model and
     # of any config that nests it. Adapters read it with get_secret_value().
-    model_config = ConfigDict(hide_input_in_errors=True)
+    # extra="forbid" because the ``cogs:`` config block (config.py) resolves
+    # ``username_env`` / ``password_env`` indirections *before* this model is
+    # built: a misspelled key that pydantic ignored would leave the source
+    # silently unauthenticated instead of failing at startup.
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
 
     username: str = ""
     password: SecretStr = SecretStr("")
@@ -256,9 +260,17 @@ class CogRegistryCredentials(BaseModel):
 
 
 class CogRegistrySourceConfig(BaseModel):
-    """One registry the hub indexes. Shape shared with the ``cogs:`` config block (#87)."""
+    """One registry the hub indexes. Shape shared with the ``cogs:`` config block (#87).
 
-    model_config = ConfigDict(hide_input_in_errors=True)
+    Secrets (``credentials.password``, ``webhook_secret``) arrive here already
+    resolved: ``config.CogsConfig`` accepts ``*_env`` indirections naming the
+    environment variables the chart mounts from Kubernetes Secrets and swaps the
+    values in before validation. This model never sees an unresolved name, so
+    adapters need no notion of where a secret came from. ``extra="forbid"`` for
+    the same reason as :class:`CogRegistryCredentials`.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
 
     id: str
     kind: RegistryKind
