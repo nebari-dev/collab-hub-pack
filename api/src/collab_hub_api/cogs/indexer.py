@@ -69,8 +69,10 @@ import asyncio
 import json
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -106,6 +108,15 @@ logger = logging.getLogger("frames_server.cogs.indexer")
 
 DEFAULT_INTERVAL_SECONDS = 300
 
+STORE_WORKER_THREADS = 4
+"""Size of the indexer's own store-call thread pool.
+
+Its own, rather than asyncio's default executor, for one reason: the
+``concurrent.futures.Future`` a submit returns is owned by this object and is
+not tied to the event loop, so the lock hand-off below can wait for a worker
+from a plain thread after the loop that started it is gone.
+"""
+
 DRAIN_DEADLINE_SECONDS = 30.0
 """How long a cancelled sweep waits for an in-flight worker thread before handing it off.
 
@@ -115,15 +126,21 @@ connection is not bounded by the pool timeout (which bounds checkout only) or
 by ``statement_timeout`` (which the server cannot enforce if the transport is
 dead), so the wait itself must have a deadline. Past it the sweep coroutine
 stops waiting -- but it does **not** release the lock: ownership of the lock
-and of the still-running worker is handed to a background task
-(:meth:`CogIndexer._late_release`) that releases only once the worker has
-actually finished. The lock is therefore never released while a write may
-still be running, however long that write takes; what the deadline bounds is
-the sweep coroutine, and through it app shutdown. Chosen above
+and of the still-running worker is handed to a daemon **thread**
+(:meth:`CogIndexer._hand_off`) that releases only once the worker has actually
+finished. A thread, not an asyncio task, because the hand-off has to outlive
+the event loop: at shutdown every task is cancelled and the loop closes, and
+an asyncio owner would simply stop running -- leaving the lock context object
+to be finalized by the garbage collector, whose ``finally`` would unlock while
+the write was still in flight. The lock is therefore never released while a
+write may still be running; what the deadline bounds is the sweep coroutine,
+and through it the lifespan's shutdown wait. Chosen above
 :data:`..catalog.SWEEP_STATEMENT_TIMEOUT_SECONDS` so the server's own abort
-fires first in every case where the transport still works; when it does not,
-the pool's TCP keepalives (see ``frames/db.py``) end the worker in bounded
-time and the hand-off task releases then.
+fires first in every case where the transport still works.
+
+If the process exits first, the hand-off thread is a daemon and dies with it
+-- which is safe for the same reason abandoning is safe at all: the advisory
+lock is session-scoped, so the server releases it when the connection goes.
 """
 
 INDEXER_SHUTDOWN_TIMEOUT_SECONDS = DRAIN_DEADLINE_SECONDS + 15.0
@@ -135,6 +152,12 @@ await the task on timeout -- the drain defers repeated cancellations, so that
 would wait the whole drain out again). Past the deadline the task is left
 pending and logged; it dies with the process, and everything it could still
 touch is either process-local or a lock the server drops with the connection.
+
+What this bounds is the **lifespan's wait**, not the termination of the worker
+threads themselves: a store call blocked on a peer that acknowledges packets
+but never answers is not ended by ``statement_timeout`` (the server never runs
+it) nor by keepalives (the peer is not dead). Those threads are daemons or
+pool workers and go when the process does.
 """
 
 MAX_ARTIFACTS_PER_REPOSITORY = 10_000
@@ -247,17 +270,19 @@ class CogIndexer:
         self._max_bytes_per_file = max_bytes_per_file
         self._clock = clock
         self.last_summary: SweepSummary | None = None
+        self._executor = ThreadPoolExecutor(max_workers=STORE_WORKER_THREADS, thread_name_prefix="cog-index-store")
         # Workers a cancelled sweep stopped waiting for (see _drain): they
         # still own whatever they were doing, so the lock release that would
-        # have followed them is handed to a background task instead.
-        self._abandoned: list[asyncio.Future] = []
-        self._late_releases: set[asyncio.Task] = set()
-        # Per-source fairness state for the fetch budget (see _schedule):
-        # the interleave phase advances every sweep, the retry cursor by the
-        # number of retries actually attempted, so both classes progress at
-        # any budget.
+        # have followed them is handed to a thread instead.
+        self._abandoned: list[Future] = []
+        self._late_releases: set[threading.Thread] = set()
+        # Per-source fairness state for the fetch budget (see _schedule): the
+        # interleave phase advances every sweep, and the retry order is a
+        # rotating list of (repository, digest) -- identities, not positions,
+        # so candidates entering or leaving between sweeps cannot make the
+        # rotation skip one.
         self._phase: dict[str, int] = {}
-        self._retry_cursor: dict[str, int] = {}
+        self._retry_order: dict[str, list[tuple[str, str]]] = {}
 
     @property
     def sources(self) -> list[RegistrySource]:
@@ -265,9 +290,20 @@ class CogIndexer:
 
     @property
     def pending_late_releases(self) -> int:
-        """Lock releases handed off to background tasks that have not completed yet."""
+        """Lock releases handed off to threads that have not completed yet."""
 
+        self._late_releases = {thread for thread in self._late_releases if thread.is_alive()}
         return len(self._late_releases)
+
+    def close(self) -> None:
+        """Stop accepting store calls. Does not interrupt calls already running.
+
+        ``cancel_futures`` drops work that never started; a submitted call that
+        is already on a thread runs to completion, which is what the lock
+        hand-off waits for.
+        """
+
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     # -- threading discipline ---------------------------------------------------
 
@@ -289,17 +325,52 @@ class CogIndexer:
         here. A worker still running at the deadline (a dead connection the
         server cannot abort) is recorded in ``_abandoned``: the coroutine
         moves on, but :meth:`_release` will not release the lock until that
-        worker has finished -- it hands the release to a background task.
+        worker has finished -- it hands the release to a thread.
+
+        The call is submitted to this indexer's own executor rather than
+        ``asyncio.to_thread``, so the ``concurrent.futures.Future`` is an
+        object this module owns: the hand-off thread can wait on it without
+        an event loop.
+
+        The worker's outcome travels as a **value**, never as the future's
+        exception, and is re-raised here. That is not style: ``asyncio.shield``
+        attaches a logger to the inner future when the outer is cancelled
+        (``asyncio/tasks.py``'s ``_log_on_exception``), and it hands the raw
+        exception to the loop's exception handler -- for a store call, an
+        exception whose text can name the database URL this module is careful
+        never to log. A future that never fails has nothing to report.
         """
 
-        future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+        worker = self._executor.submit(_capture, func, args, kwargs)
+        future = asyncio.wrap_future(worker)
         try:
-            return await asyncio.shield(future)
+            failed, value = await asyncio.shield(future)
         except asyncio.CancelledError:
-            await self._drain(future)
+            await self._drain(future, worker)
             raise
+        if failed:
+            raise value
+        return value
 
-    async def _drain(self, future: asyncio.Future) -> None:
+    def _observe(self, worker: Future) -> None:
+        """Log an abandoned worker's failure, by class name, when it eventually lands.
+
+        An abandoned future is dropped by whoever handed it off, so without
+        this its outcome would go unrecorded -- and a store call that failed
+        after the sweep gave up on it is worth a line.
+        """
+
+        def consume(done: Future) -> None:
+            if done.cancelled():
+                return
+            outcome = done.result()
+            failed, value = outcome
+            if failed:
+                logger.error("cog_index_abandoned_worker_failed", extra={"error": type(value).__name__})
+
+        worker.add_done_callback(consume)
+
+    async def _drain(self, future: asyncio.Future, worker: Future) -> None:
         """Wait for a cancelled call's worker, deferring further cancels, up to the deadline."""
 
         deadline = self._clock() + self._drain_deadline
@@ -309,12 +380,15 @@ class CogIndexer:
                 # The thread is stuck on something no timeout reached (a dead
                 # transport, most likely). Stop waiting -- hanging shutdown
                 # forever helps nobody -- but do not pretend it finished: the
-                # release that follows must wait for it (see _release).
+                # release that follows must wait for it (see _release), and
+                # whoever ends up dropping it has already arranged for its
+                # outcome to be consumed.
                 logger.error(
                     "cog_index_worker_drain_expired",
                     extra={"deadline_seconds": self._drain_deadline},
                 )
-                self._abandoned.append(future)
+                self._observe(worker)
+                self._abandoned.append(worker)
                 return
             try:
                 # Shielded: a second cancellation must interrupt this wait
@@ -347,50 +421,69 @@ class CogIndexer:
         expired), the lock is **not** released here: a release under a live
         worker is exactly the state single-flight exists to prevent -- another
         replica would acquire and a late write would land under its lock.
-        The release is handed to :meth:`_late_release` instead, which waits
-        for the worker without a deadline and then exits the lock.
+        The release is handed to :meth:`_hand_off` instead, which waits for
+        the worker without a deadline and then exits the lock.
         """
 
         if self._abandoned:
             pending, self._abandoned = self._abandoned, []
-            task = asyncio.create_task(self._late_release(lock, pending), name="cog-index-late-release")
-            self._late_releases.add(task)
-            task.add_done_callback(self._late_releases.discard)
-            logger.error("cog_index_lock_release_deferred", extra={"workers": len(pending)})
+            self._hand_off(lock, pending)
             return
         try:
             await self._on_thread(lock.__exit__, None, None, None)
         except asyncio.CancelledError:
             if self._abandoned:
-                # The unlock itself outlived the drain deadline. It still runs
-                # on its thread and completes on its own; nothing is left to
-                # do for it, and there is no worker to wait for.
+                # The unlock itself outlived the drain deadline. It is still
+                # running on its thread and will finish the exit on its own,
+                # so there is nothing to hand off -- but the lock object must
+                # stay reachable until it does, or finalizing the context
+                # manager would run the very unlock we are waiting for on
+                # whatever thread happens to collect it.
+                self._hand_off(None, self._abandoned)
                 self._abandoned = []
                 logger.error("cog_index_lock_release_outlived_drain")
             raise
         except Exception as exc:
             logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__})
 
-    async def _late_release(self, lock, workers: list[asyncio.Future]) -> None:
-        """Wait out abandoned workers -- no deadline -- then exit the lock.
+    def _hand_off(self, lock, workers: list[Future]) -> None:
+        """Wait out abandoned workers on a daemon thread -- no deadline -- then exit ``lock``.
 
-        Runs as its own task, never cancelled by the sweep: the invariant it
-        keeps is that the lock is exited only after every store call of the
-        sweep that held it has finished, and the sweep's own cancellation is
-        no reason to break it. What bounds this task is the workers
-        themselves: the server's ``statement_timeout`` where the transport
-        lives, the pool's TCP keepalives where it does not.
+        A thread rather than a task because this has to outlive the event
+        loop. At shutdown every task is cancelled and the loop closes; an
+        asyncio owner would stop mid-wait, drop the last reference to the lock
+        context, and leave the garbage collector to run its ``finally`` --
+        unlocking while the write was still in flight, which is the one thing
+        the drain exists to prevent.
+
+        ``lock`` is ``None`` when the unlock is itself the abandoned call: the
+        thread then only holds the reference and waits, so nothing finalizes
+        the context manager underneath it.
+
+        Daemon, so the process can still exit: if it does, the write and the
+        session-scoped lock die together with the connection, which is the
+        same reason abandoning is safe at all. What bounds the wait is the
+        worker: ``statement_timeout`` where the transport works, keepalives
+        where the peer is gone, the process otherwise.
         """
 
-        for worker in workers:
-            with suppress(Exception):
-                await worker
-        try:
-            await asyncio.to_thread(lock.__exit__, None, None, None)
-        except Exception as exc:
-            logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__, "late": True})
-            return
-        logger.warning("cog_index_lock_released_late", extra={"workers": len(workers)})
+        def run() -> None:
+            for worker in workers:
+                with suppress(BaseException):
+                    worker.result()
+            if lock is None:
+                return
+            try:
+                lock.__exit__(None, None, None)
+            except Exception as exc:
+                logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__, "late": True})
+                return
+            logger.warning("cog_index_lock_released_late", extra={"workers": len(workers)})
+
+        thread = threading.Thread(target=run, name="cog-index-late-release", daemon=True)
+        self._late_releases.add(thread)
+        thread.start()
+        logger.error("cog_index_lock_release_deferred", extra={"workers": len(workers)})
 
     # -- the sweep ------------------------------------------------------------
 
@@ -405,7 +498,9 @@ class CogIndexer:
         started = self._clock()
         summary = SweepSummary(sources=len(self._sources))
         # Workers a targeted reindex (which takes no lock) may have left
-        # behind are not this sweep's to wait for.
+        # behind are not this sweep's to wait for. Dropping the reference is
+        # safe: nothing is waiting on their result, they hold no lock, and
+        # _observe already arranged for their outcome to be consumed.
         self._abandoned = []
         # The lock is taken and released on a worker thread: it is a blocking
         # database call, and the connection it occupies stays checked out for
@@ -473,10 +568,15 @@ class CogIndexer:
                 else:
                     outcome = await self._reconcile(source, repository, artifact, known_row)
                     _count(summary, outcome)
-        fetch, defer = self._schedule(source.id, unseen, retries)
+        fetch, deferred = self._schedule(source.id, unseen, retries)
         for repository, artifact, known_row in fetch:
+            if known_row is not None:
+                # Recorded as the attempt begins, not when the sweep was
+                # planned: a sweep that raises or is cancelled partway must
+                # not rotate past candidates it never tried.
+                self._note_retry_attempt(source.id, (repository, artifact.digest))
             _count(summary, await self._reconcile(source, repository, artifact, known_row))
-        for _ in defer:
+        for _ in range(deferred):
             _count(summary, OUTCOME_DEFERRED)
 
         # Removal is per repository: what was not enumerated cannot be
@@ -493,8 +593,8 @@ class CogIndexer:
         if removed:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc(removed)
 
-    def _schedule(self, source_id: str, unseen: list, retries: list) -> tuple[list, list]:
-        """Split this sweep's fetches into (fetch now, defer) so neither class starves.
+    def _schedule(self, source_id: str, unseen: list, retries: list) -> tuple[list, int]:
+        """Split this sweep's fetches into (fetch now, number deferred) so neither class starves.
 
         Slots are dealt in a fixed pattern -- every ``RETRY_SLOT_EVERY``-th
         slot to a retry of a failed row, the rest to never-seen artifacts --
@@ -502,21 +602,18 @@ class CogIndexer:
         pieces of per-source state make it fair *across* sweeps, not just
         within one: the pattern's **phase** advances each sweep, so even a
         budget of one alternates classes over successive sweeps instead of
-        always serving slot zero; and retries are taken from a **rotating
-        cursor**, so a stable prefix of permanent failures cannot occupy the
-        retry slots forever while a recoverable failure behind it waits.
-        Never-seen artifacts keep enumeration order (once indexed they cost
-        nothing, so the tail is reached without rotation).
+        always serving slot zero; and retries are served from a **rotating
+        order of identities** (see :meth:`_retry_candidates`), so a stable
+        prefix of permanent failures cannot occupy the retry slots forever
+        while a recoverable failure behind it waits. Never-seen artifacts keep
+        enumeration order (once indexed they cost nothing, so the tail is
+        reached without rotation).
         """
 
         phase = self._phase.get(source_id, 0)
         self._phase[source_id] = (phase + 1) % RETRY_SLOT_EVERY
-        if retries:
-            cursor = self._retry_cursor.get(source_id, 0) % len(retries)
-            retries = retries[cursor:] + retries[:cursor]
-        else:
-            cursor = 0
-        unseen_queue, retry_queue = list(unseen), list(retries)
+        unseen_queue = list(unseen)
+        retry_queue = self._retry_candidates(source_id, retries)
         fetch: list = []
         slot = phase
         while len(fetch) < self._max_new_fetches and (unseen_queue or retry_queue):
@@ -526,9 +623,37 @@ class CogIndexer:
             else:
                 fetch.append(unseen_queue.pop(0))
             slot += 1
-        attempted_retries = len(retries) - len(retry_queue)
-        self._retry_cursor[source_id] = (cursor + attempted_retries) % len(retries) if retries else 0
-        return fetch, unseen_queue + retry_queue
+        return fetch, len(unseen_queue) + len(retry_queue)
+
+    def _retry_candidates(self, source_id: str, retries: list) -> list:
+        """This source's failed rows in rotation order, oldest attempt first.
+
+        The order is remembered as ``(repository, digest)`` identities rather
+        than a position, because the candidate list changes between sweeps: a
+        newly failed artifact can appear anywhere in enumeration order, and a
+        recovered one disappears. A positional cursor moved by those edits and
+        could step over a candidate every sweep, which is the starvation this
+        is here to prevent. Remembered identities that are still failing keep
+        their order; ones that are new go behind them; ones that are gone are
+        forgotten, so the state stays the size of the failed set.
+        """
+
+        by_key = {
+            (repository, artifact.digest): (repository, artifact, known) for repository, artifact, known in retries
+        }
+        remembered = [key for key in self._retry_order.get(source_id, ()) if key in by_key]
+        seen = set(remembered)
+        order = remembered + [key for key in by_key if key not in seen]
+        self._retry_order[source_id] = order
+        return [by_key[key] for key in order]
+
+    def _note_retry_attempt(self, source_id: str, key: tuple[str, str]) -> None:
+        """Move one identity to the back of its source's rotation, as its attempt begins."""
+
+        order = self._retry_order.get(source_id)
+        if order and key in order:
+            order.remove(key)
+            order.append(key)
 
     async def _enumerate(self, source: RegistrySource) -> _Enumeration:
         # Broad excepts on purpose: adapters talk to third-party systems and
@@ -786,6 +911,19 @@ class CogIndexer:
 
 
 # -- helpers ------------------------------------------------------------------
+
+
+def _capture(func, args, kwargs):
+    """Run ``func`` on the worker thread and return ``(failed, value_or_error)``.
+
+    See :meth:`CogIndexer._on_thread`: the outcome must not become the
+    future's exception, or asyncio reports it for us with its text intact.
+    """
+
+    try:
+        return False, func(*args, **kwargs)
+    except BaseException as exc:  # noqa: BLE001 - re-raised by the caller, or logged by class name
+        return True, exc
 
 
 def _count(summary: SweepSummary, outcome: str) -> None:
