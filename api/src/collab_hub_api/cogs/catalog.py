@@ -37,10 +37,11 @@ store here. The indexer is async and bridges with ``asyncio.to_thread``.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -132,6 +133,9 @@ class CogArtifact:
         return self.removed_at is None
 
 
+logger = logging.getLogger("frames_server.cogs.catalog")
+
+
 @dataclass(frozen=True)
 class KnownArtifact:
     """What the indexer needs to know about a row before deciding to refetch it."""
@@ -215,11 +219,16 @@ class CogCatalogStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def mark_removed(self, source_id: str, present: Mapping[str, Iterable[str]]) -> int:
+    def mark_removed(
+        self, source_id: str, present: Mapping[str, Iterable[str]], *, excluding: Iterable[str] = ()
+    ) -> int:
         """Set ``removed_at = now()`` on this source's present rows whose digest is not in ``present``.
 
-        ``present`` maps repository -> digests enumerated this sweep. Returns
-        the number of rows newly marked. Never deletes.
+        ``present`` maps repository -> digests enumerated this sweep; rows in
+        a repository listed in ``excluding`` (one whose enumeration failed
+        this sweep) are left untouched, because what was not enumerated
+        cannot be declared gone. Returns the number of rows newly marked.
+        Never deletes.
         """
 
         raise NotImplementedError
@@ -409,7 +418,7 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
         raise self._refuse()
 
-    def mark_removed(self, source_id, present) -> int:
+    def mark_removed(self, source_id, present, *, excluding=()) -> int:
         raise self._refuse()
 
     def mark_removed_one(self, source_id, repository, digest) -> bool:
@@ -495,15 +504,16 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             )
             return True
 
-    def mark_removed(self, source_id, present) -> int:
+    def mark_removed(self, source_id, present, *, excluding=()) -> int:
         wanted = {repo: set(digests) for repo, digests in present.items()}
+        shielded = set(excluding)
         now = datetime.now(UTC)
         marked = 0
         with self._lock:
             for key, row in list(self._rows.items()):
                 if row.source_id != source_id or row.removed_at is not None:
                     continue
-                if row.digest in wanted.get(row.repository, ()):
+                if row.repository in shielded or row.digest in wanted.get(row.repository, ()):
                     continue
                 self._rows[key] = replace(row, removed_at=now)
                 marked += 1
@@ -740,14 +750,16 @@ class PostgresCogCatalogStore(CogCatalogStore):
             ).fetchone()
         return row is not None
 
-    def mark_removed(self, source_id, present) -> int:
+    def mark_removed(self, source_id, present, *, excluding=()) -> int:
         from psycopg.types.json import Jsonb
 
         # The present set travels as one jsonb document ({repo: [digest, ...]})
         # and is unnested server-side, so a source with thousands of artifacts
         # is one statement rather than one per repository, and the whole
-        # decision is one snapshot.
+        # decision is one snapshot. Repositories whose listing failed travel
+        # as an array and are excluded from the UPDATE outright.
         document = {repo: sorted(set(digests)) for repo, digests in present.items()}
+        shielded = sorted(set(excluding))
         with self._sweep_connection() as conn:
             row = conn.execute(
                 """
@@ -761,6 +773,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
                     SET removed_at = now()
                     WHERE a.source_id = %s
                       AND a.removed_at IS NULL
+                      AND NOT (a.repository = ANY(%s))
                       AND NOT EXISTS (
                           SELECT 1 FROM present p
                           WHERE p.repository = a.repository AND p.digest = a.digest
@@ -769,7 +782,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 )
                 SELECT count(*) AS n FROM marked
                 """,
-                (Jsonb(document), source_id),
+                (Jsonb(document), source_id, shielded),
             ).fetchone()
         return int(row["n"]) if row else 0
 
@@ -882,9 +895,19 @@ def _postgres_sweep_lock(db):
 
     with db.connection() as conn:
         original_autocommit = conn.autocommit
-        conn.autocommit = True
         acquired = False
+        # The connection goes back to the pool only if every step of taking
+        # the lock and giving it back is known to have succeeded. Anything
+        # else -- the acquire statement failing (did the server take the lock
+        # before the error?), the unlock failing (the session still holds
+        # it), the RESET or the autocommit restore failing (the next borrower
+        # would inherit a 20 s statement timeout, or autocommit) -- leaves
+        # the session's state uncertain, and an uncertain session must not
+        # be handed to the next borrower. Closing it makes the pool discard
+        # it and open a fresh one; the server releases any lock with it.
+        clean = False
         try:
+            conn.autocommit = True
             # Session-set (autocommit makes a transaction-local set a no-op)
             # and RESET below before the connection returns: the acquire and
             # release statements are trivial, so this only matters when the
@@ -894,15 +917,20 @@ def _postgres_sweep_lock(db):
             conn.execute(f"SET statement_timeout = '{int(SWEEP_STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
             row = conn.execute("SELECT pg_try_advisory_lock(%s) AS locked", (COG_INDEX_LOCK_KEY,)).fetchone()
             acquired = bool(row and row["locked"])
-            yield acquired
-        finally:
             try:
-                if acquired and not conn.closed:
-                    conn.execute("SELECT pg_advisory_unlock(%s)", (COG_INDEX_LOCK_KEY,))
+                yield acquired
             finally:
                 if not conn.closed:
+                    if acquired:
+                        conn.execute("SELECT pg_advisory_unlock(%s)", (COG_INDEX_LOCK_KEY,))
                     conn.execute("RESET statement_timeout")
                     conn.autocommit = original_autocommit
+                    clean = True
+        finally:
+            if not clean and not conn.closed:
+                logger.error("cog_index_lock_connection_discarded", extra={"acquired": acquired})
+                with suppress(Exception):
+                    conn.close()
 
 
 def card_search_fields(card: Mapping[str, Any]) -> dict[str, str | None]:

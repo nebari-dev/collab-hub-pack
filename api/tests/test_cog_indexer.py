@@ -454,24 +454,52 @@ async def test_one_repository_failing_reconciles_the_rest_but_skips_removal():
     assert store.get("sha256:" + "c" * 64).status == STATUS_INDEXED
 
 
-async def test_over_bound_repository_fails_like_a_listing_error_and_the_rest_proceed():
-    # The per-repository bound is a refusal, never a prefix: an over-bound
-    # repository is skipped like a failed listing while every other repository
-    # still reconciles -- so the bound cannot starve the artifacts sorted
-    # behind it, sweep after sweep (round-2 codex finding). Removal stays off
-    # for the source because its picture is incomplete.
-    artifacts = registry()
-    artifacts["cogs/transcriber"].append(entry("c", ["v2"], COMPLETE))
+def stale(repository: str, seed: str) -> CogArtifact:
+    """A present row for this source whose digest the registry no longer has."""
+
+    return CogArtifact(
+        source_id=SOURCE_ID,
+        host=HOST,
+        repository=repository,
+        digest="sha256:" + (seed * 64)[:64],
+        status=STATUS_INDEXED,
+        tags=("old",),
+        pushed_at=PUSHED,
+    )
+
+
+async def test_over_bound_repository_shields_only_its_own_rows_from_removal():
+    # The per-repository bound is a refusal, never a prefix, and its blast
+    # radius is that one repository: everything sorted BEHIND it still
+    # reconciles -- including removal -- while the over-bound repository's
+    # own rows are left untouched, because what was not enumerated cannot be
+    # declared gone (round-3 codex finding: a permanently oversized
+    # repository used to disable removal for its whole source, forever).
+    artifacts = {
+        # Sorted first, and over a bound of one.
+        "cogs/a-big": [entry("a", ["v1"], COMPLETE), entry("c", ["v2"], COMPLETE)],
+        # Sorted after it: an implementation that stopped at the over-bound
+        # repository would never reach this one.
+        "cogs/z-small": [entry("b", ["v1"], CONTEXT)],
+    }
     indexer, store, _ = make(artifacts, max_artifacts_per_repository=1)
+    store.upsert(stale("cogs/a-big", "1"))  # must survive: its repository was not enumerated
+    store.upsert(stale("cogs/z-small", "2"))  # must be removed: its repository was fully listed
+    store.upsert(stale("cogs/vanished", "3"))  # must be removed: the source no longer lists that repository
 
-    for _ in range(2):  # the same outcome every sweep: no prefix creep, no removals
+    for sweep in range(2):  # the same outcome every sweep: no prefix creep
         summary = await indexer.sweep()
-        assert summary.sources_failed == 1 and summary.removed == 0
-        assert summary.errors == [f"{SOURCE_ID}: list_artifacts cogs/transcriber: over the 1-artifact bound"]
+        assert summary.sources_failed == 1
+        assert summary.errors == [
+            f"{SOURCE_ID}: list_artifacts cogs/a-big: over the 1-artifact bound; removal skipped for it"
+        ]
+        assert summary.removed == (2 if sweep == 0 else 0)
 
-    # cogs/notes (one artifact, under the bound) was fully reconciled.
-    assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED
+    assert store.get("sha256:" + "b" * 64).status == STATUS_INDEXED, "the repository behind the bound was reached"
     assert store.get("sha256:" + "a" * 64) is None and store.get("sha256:" + "c" * 64) is None
+    assert store.get("sha256:" + "1" * 64).present, "rows of the over-bound repository are not declared gone"
+    assert not store.get("sha256:" + "2" * 64).present
+    assert not store.get("sha256:" + "3" * 64).present
 
 
 async def test_retries_never_starve_new_artifacts_of_the_budget():
@@ -500,6 +528,57 @@ async def test_retries_never_starve_new_artifacts_of_the_budget():
 
     third = await indexer.sweep()
     assert (third.skipped, third.failed, third.deferred) == (1, 1, 0), "the leftover budget now retries the poison"
+
+
+async def test_retries_get_a_reserved_share_under_a_continuous_unseen_backlog():
+    # Round-3 codex finding: strict never-seen-first let a source that always
+    # has more new artifacts than the budget starve every retry forever. The
+    # schedule now deals every fourth slot to a retry and advances its phase
+    # each sweep, so even at budget 1 the retry is reached within four sweeps
+    # while new artifacts keep arriving.
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    artifacts = {"cogs/a-poison": [entry("e", ["v1"], poison)], "cogs/b-stream": [entry("0", ["v1"], CONTEXT)]}
+    indexer, store, client = make(artifacts, max_new_fetches_per_sweep=2)
+    first = await indexer.sweep()
+    assert (first.failed, first.indexed) == (1, 1)  # the poison is now a failed row
+
+    indexer._max_new_fetches = 1
+    retried = 0
+    for n in range(1, 5):
+        # A brand-new artifact every sweep: the unseen backlog never drains.
+        new = entry(str(n), ["v1"], CONTEXT)
+        artifacts["cogs/b-stream"].append(new)
+        client.seed({"cogs/b-stream": [new]})
+        summary = await indexer.sweep()
+        assert summary.deferred == 1, "budget 1, two candidates: exactly one waits each sweep"
+        retried += summary.failed
+    assert retried == 1, "the failed row was retried once within a four-sweep window despite constant arrivals"
+    assert store.get("sha256:" + "1" * 64).status == STATUS_INDEXED, "and new artifacts kept landing"
+
+
+async def test_retries_rotate_so_a_prefix_of_permanent_failures_does_not_starve_a_recoverable_one():
+    # Three failed rows and a budget of one: without a cursor the same first
+    # failure would be retried every sweep and the third never. With the
+    # rotating cursor every failed row is retried once across three sweeps.
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    artifacts = {f"cogs/{name}": [entry(seed, ["v1"], poison)] for name, seed in (("a", "1"), ("b", "2"), ("c", "3"))}
+    indexer, store, client = make(artifacts, max_new_fetches_per_sweep=3)
+    assert (await indexer.sweep()).failed == 3
+
+    # The third one recovers: its publisher fixed the bundle under the same digest
+    # is impossible, so model recovery as the registry now serving a healthy
+    # manifest for that digest (what a transient 5xx-then-fine looks like).
+    fixed = entry("3", ["v1"], CONTEXT)
+    client.seed({"cogs/c": [fixed]})
+    indexer._max_new_fetches = 1
+    outcomes = []
+    for _ in range(3):
+        summary = await indexer.sweep()
+        outcomes.append((summary.indexed, summary.failed, summary.deferred))
+    assert sorted(outcomes) == [(0, 1, 2), (0, 1, 2), (1, 0, 2)], "each failed row got exactly one retry"
+    assert store.get("sha256:" + "3" * 64).status == STATUS_INDEXED
 
 
 async def test_missing_configured_repository_is_empty_not_failed():
@@ -758,6 +837,57 @@ async def test_app_exposes_the_store_and_no_indexer_when_indexing_is_off(config,
         assert app.state.cog_indexer is None and app.state.cog_registry_sources == []
 
 
+async def test_app_shutdown_is_bounded_when_the_sweep_is_stuck(tmp_path, monkeypatch, caplog):
+    # Round-3 codex finding: wait_for re-cancels and then AWAITS the task on
+    # timeout, and the indexer defers cancellation while draining -- so the
+    # "outer wall" waited the whole drain out. The lifespan now uses
+    # asyncio.wait and leaves a still-pending task behind, loudly.
+    from collab_hub_api import config as config_module
+    from collab_hub_api import core
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setattr(core, "INDEXER_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
+    config = Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {
+                "active_state": {"backend": "memory"},
+                "history": {"backend": "memory"},
+                "usage": {"backend": "memory"},
+                "mcp_session_manager_enabled": False,
+            },
+            "tasks": {"backend": "memory"},
+            "cogs": cogs_block(STATIC_SOURCE, interval_seconds=3600, run_on_startup=True),
+        }
+    )
+    store = _EventedStore()
+    store.release_enter.clear()  # the sweep's lock acquisition never returns
+    monkeypatch.setattr(config_module, "build_cog_catalog_store", lambda *_: store)
+    monkeypatch.setattr("collab_hub_api.core.build_cog_catalog_store", lambda *_: store)
+
+    app = make_app(config)
+    loop = asyncio.get_running_loop()
+    async with app.router.lifespan_context(app):
+        await asyncio.to_thread(store.enter_started.wait, 10)
+        task = {t.get_name(): t for t in asyncio.all_tasks()}["cog-index"]
+        # A drain deadline well past the shutdown wall: the wall must win.
+        app.state.cog_indexer._drain_deadline = 30.0
+        started = loop.time()
+        with caplog.at_level(logging.ERROR, logger="frames_server.core"):
+            pass
+    elapsed = loop.time() - started
+    assert elapsed < 3, f"lifespan exit took {elapsed:.1f}s: shutdown is not bounded"
+    assert not task.done(), "the stuck task is left pending, not waited out"
+    assert "cog_indexer_shutdown_abandoned" in [r.message for r in caplog.records]
+
+    # Let the worker finish so the task unwinds and the interpreter can exit.
+    store.release_enter.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert store.events == ["entered", "unlocked"]
+
+
 async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdown(tmp_path, monkeypatch):
     from collab_hub_api import config as config_module
     from collab_hub_api.core import make_app
@@ -961,36 +1091,80 @@ async def test_double_cancellation_during_unlock_completes_the_unlock():
     assert store.events == ["entered", "unlocked"]
 
 
-async def test_drain_deadline_abandons_a_worker_that_never_completes(caplog):
+async def test_drain_deadline_hands_the_lock_off_instead_of_releasing_under_a_live_write(caplog):
     # The one hang no timeout upstream can break: a thread stuck on a call
-    # that never returns (a dead transport). The drain must give up after its
-    # deadline -- loudly -- so a cancelled sweep, and therefore app shutdown,
-    # is finitely bounded even then.
+    # that never returns (a dead transport). The cancelled sweep must come
+    # back after its drain deadline -- so app shutdown is bounded -- but it
+    # must NOT release the lock: the write is still running, and a release
+    # now would let another sweep acquire and a late write land under its
+    # lock (round-3 codex repro: entered -> unlocked -> write_done). The
+    # release is handed to a background task that waits for the worker.
     indexer, store, _ = evented_indexer(drain_deadline_seconds=0.3)
-    store.release_write.clear()  # the write never completes until teardown
+    store.release_write.clear()
 
     loop = asyncio.get_running_loop()
     task = asyncio.create_task(indexer.sweep())
-    try:
-        await asyncio.to_thread(store.write_started.wait, 10)
-        task.cancel()
-        started = loop.time()
-        with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=5)
-        elapsed = loop.time() - started
-        assert elapsed < 3, "the cancelled sweep did not come back within a small multiple of the deadline"
-        messages = [record.message for record in caplog.records]
-        assert "cog_index_worker_drain_abandoned" in messages, "abandonment must be loud"
-        # The abandoned write is still running: the lock was NOT handed out as
-        # if the sweep had finished cleanly -- the release path ran (bounded),
-        # but write_done had not happened when the task returned.
-        assert "write_done" not in store.events
-    finally:
-        # Let the worker thread finish so the process can exit (to_thread
-        # workers are non-daemon and joined at interpreter shutdown).
-        store.release_write.set()
-        await asyncio.sleep(0.05)
+    await asyncio.to_thread(store.write_started.wait, 10)
+    task.cancel()
+    started = loop.time()
+    with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    assert loop.time() - started < 3, "the cancelled sweep did not come back within a small multiple of the deadline"
+    messages = [record.message for record in caplog.records]
+    assert "cog_index_worker_drain_expired" in messages and "cog_index_lock_release_deferred" in messages
+
+    # The sweep is gone but the lock is still held: nobody else may sweep.
+    # (Probe through the base class so the probe itself is not recorded.)
+    assert store.events == ["entered"]
+    assert indexer.pending_late_releases == 1
+    with InMemoryCogCatalogStore.sweep_lock(store) as held:
+        assert held is False, "the lock must not be handed out while the abandoned write runs"
+
+    # The worker finally finishes; only then is the lock released.
+    store.release_write.set()
+    for _ in range(100):
+        if indexer.pending_late_releases == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert store.events == ["entered", "write_done", "unlocked"]
+    assert indexer.pending_late_releases == 0
+    with InMemoryCogCatalogStore.sweep_lock(store) as held:
+        assert held is True
+
+
+async def test_drain_deadline_during_acquisition_exits_the_lock_only_after_entry_finishes():
+    # Same hand-off when the stuck call is the acquisition itself: __exit__
+    # must not run while __enter__ is still executing (round-3 codex repro:
+    # a release error followed by "entered" with nobody left to unlock).
+    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.3)
+    store.release_enter.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.enter_started.wait, 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert store.events == [] and indexer.pending_late_releases == 1
+
+    store.release_enter.set()
+    for _ in range(100):
+        if indexer.pending_late_releases == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert store.events == ["entered", "unlocked"], "entry completed, then its matching exit -- in that order"
+    with store.sweep_lock() as held:
+        assert held is True
+
+
+async def test_a_targeted_reindex_left_behind_does_not_defer_the_next_sweeps_release():
+    # reindex() takes no lock; a worker it abandoned is not the next sweep's
+    # to wait for, or every later release would be needlessly deferred.
+    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
+    indexer._abandoned.append(asyncio.get_running_loop().create_future())  # a never-finishing leftover
+    await indexer.sweep()
+    assert store.events == ["entered", "write_done", "write_done", "unlocked"]
+    assert indexer.pending_late_releases == 0
 
 
 # ---------------------------------------------------------------------------

@@ -899,27 +899,52 @@ as present, so removal stays correct. Safety rules operators should know:
   snapshot). Replicas starting together do not double-index: the loser logs
   `cog_index_sweep_skipped` and waits for its next interval. That connection
   is one slot of the shared pool while a sweep runs.
-- **Removal needs a complete picture.** Rows are marked removed only for a
-  source whose enumeration fully succeeded this sweep. A listing API that
-  errors, one repository that fails to list, or an enumeration cut short by the
-  per-source bound leaves that source's removal step skipped and counted in
-  `sources_failed` — a transient registry outage never marks a catalog gone.
-  The adapters uphold their half by **raising past their own limits instead of
-  truncating** (a repository over the static adapter's tag bound, a Harbor
-  listing over its page bound), and the indexer's own artifact bound is
-  per-repository and a refusal, never a prefix: a truncated list presented as
-  complete would turn a bound into false removals, and a prefix cut at the
+- **Removal needs a complete picture — per repository.** Rows are marked
+  removed only in repositories whose listing fully succeeded this sweep. If the
+  source's *repository list* cannot be obtained, nothing is reconciled and
+  nothing is declared gone. If one repository fails to list, or is refused for
+  exceeding the per-repository artifact bound, only **that repository's** rows
+  are shielded from removal (the summary says `removal skipped for it` and
+  counts the source in `sources_failed`); every other repository — and every
+  repository that has vanished from the source's list — still reconciles,
+  removal included. A transient registry outage therefore never marks a
+  catalog gone, and one permanently oversized repository does not freeze
+  removal for its neighbours. The adapters uphold their half by **raising past
+  their own limits instead of truncating** (a repository over the static
+  adapter's tag bound, a Harbor listing over its page bound), and the indexer's
+  own artifact bound is a refusal, never a prefix: a truncated list presented
+  as complete would turn a bound into false removals, and a prefix cut at the
   same sorted position every sweep would permanently starve what lies behind
-  it. New (never-seen) artifacts outrank retries of failed ones for the fetch
-  budget, so a prefix of permanent failures cannot starve healthy artifacts
-  either.
-- **Shutdown is finitely bounded.** Sweep-path statements carry a server-side
-  `statement_timeout`; a cancelled sweep waits for its in-flight worker thread
-  (never releasing the lock mid-write, however many times it is cancelled) up
-  to a drain deadline, past which it logs `cog_index_worker_drain_abandoned`
-  and gives up — the session-scoped advisory lock is then released by the
-  server when the dead connection drops; and the app lifespan bounds its own
-  await of the cancelled indexer task.
+  it.
+- **The fetch budget is dealt fairly.** Fetch slots go to never-seen artifacts
+  and to retries of `failed` rows in a fixed interleave (every fourth slot is a
+  retry slot; a class that has run out yields its slot). The interleave's phase
+  advances each sweep and retries are taken from a rotating cursor, so even a
+  budget of one reaches a retry within four sweeps under a constant stream of
+  new artifacts, and a stable prefix of permanent failures cannot occupy the
+  retry slots while a recoverable failure behind it waits. Never-seen
+  artifacts keep enumeration order; once indexed they cost nothing, so the tail
+  of a large registry is reached across sweeps without rotation.
+- **The lock is never released under a live write; shutdown is still bounded.**
+  Sweep-path statements carry a server-side `statement_timeout`, and every
+  pooled connection has TCP keepalives, so a worker thread blocked on the
+  database always finishes in bounded time even if the peer vanished. A
+  cancelled sweep waits for its in-flight worker thread up to a drain deadline
+  (30 s), however many times it is cancelled. Past that deadline the sweep
+  stops waiting — but it does **not** release the lock: it logs
+  `cog_index_worker_drain_expired` and `cog_index_lock_release_deferred`, and
+  hands the lock to a background task (`cog-index-late-release`) that releases
+  it only once the worker has actually finished (`cog_index_lock_released_late`).
+  Until then other replicas keep seeing `cog_index_sweep_skipped`, which is
+  correct: a write may still be running. The app lifespan waits at most 45 s
+  for the cancelled indexer task and otherwise leaves it pending with
+  `cog_indexer_shutdown_abandoned`; it dies with the process, and any lock it
+  still holds is released by the server with the connection. If any step of
+  taking or giving back the lock fails (unlock, `RESET statement_timeout`,
+  autocommit restore), the lock connection is **closed, not returned**
+  (`cog_index_lock_connection_discarded`) so the pool opens a fresh one instead
+  of handing a session with an altered timeout — or one still holding the lock —
+  to the next borrower.
 - **Indexing needs two pooled connections.** The sweep lock occupies one
   connection of the shared `frames.postgres` pool for the sweep's whole
   duration while reads and writes check out another, so the API refuses to

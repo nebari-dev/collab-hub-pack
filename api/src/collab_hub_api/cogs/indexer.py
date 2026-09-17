@@ -107,25 +107,34 @@ logger = logging.getLogger("frames_server.cogs.indexer")
 DEFAULT_INTERVAL_SECONDS = 300
 
 DRAIN_DEADLINE_SECONDS = 30.0
-"""How long a cancelled sweep waits for an in-flight worker thread.
+"""How long a cancelled sweep waits for an in-flight worker thread before handing it off.
 
 A worker thread cannot be interrupted, so a cancelled sweep *drains* -- waits
 for the thread -- before releasing the lock. But an unresponsive established
 connection is not bounded by the pool timeout (which bounds checkout only) or
 by ``statement_timeout`` (which the server cannot enforce if the transport is
-dead), so the wait itself must have a deadline. Past it the drain logs loudly
-and abandons the thread: the session-scoped advisory lock is the backstop,
-released by the server when the dead connection drops. Chosen above
+dead), so the wait itself must have a deadline. Past it the sweep coroutine
+stops waiting -- but it does **not** release the lock: ownership of the lock
+and of the still-running worker is handed to a background task
+(:meth:`CogIndexer._late_release`) that releases only once the worker has
+actually finished. The lock is therefore never released while a write may
+still be running, however long that write takes; what the deadline bounds is
+the sweep coroutine, and through it app shutdown. Chosen above
 :data:`..catalog.SWEEP_STATEMENT_TIMEOUT_SECONDS` so the server's own abort
-fires first in every case where the transport still works.
+fires first in every case where the transport still works; when it does not,
+the pool's TCP keepalives (see ``frames/db.py``) end the worker in bounded
+time and the hand-off task releases then.
 """
 
 INDEXER_SHUTDOWN_TIMEOUT_SECONDS = DRAIN_DEADLINE_SECONDS + 15.0
-"""Deadline the app lifespan puts on awaiting the cancelled indexer task.
+"""Deadline the app lifespan puts on waiting for the cancelled indexer task.
 
-The drain deadline plus room for the lock release: shutdown must not hang on
-a database that stopped answering. Past it the task is abandoned to die with
-the process; everything it could still touch is process-local.
+The drain deadline plus room for the lock release. The lifespan waits with
+``asyncio.wait`` (which, unlike ``wait_for``, does not re-cancel and then
+await the task on timeout -- the drain defers repeated cancellations, so that
+would wait the whole drain out again). Past the deadline the task is left
+pending and logged; it dies with the process, and everything it could still
+touch is either process-local or a lock the server drops with the connection.
 """
 
 MAX_ARTIFACTS_PER_REPOSITORY = 10_000
@@ -173,6 +182,9 @@ OUTCOME_FAILED = "failed"
 OUTCOME_REMOVED = "removed"
 OUTCOME_DEFERRED = "deferred"
 
+RETRY_SLOT_EVERY = 4
+"""Every fourth fetch slot goes to a retry of a ``failed`` row (see :meth:`CogIndexer._schedule`)."""
+
 
 @dataclass
 class SweepSummary:
@@ -207,7 +219,10 @@ class _Enumeration:
 
     present: dict[str, list[ArtifactRef]] = field(default_factory=dict)
     complete: bool = True
-    error: str | None = None
+    """Whether the *repository list* itself was obtained. False = nothing can be declared gone."""
+    failed_repositories: list[str] = field(default_factory=list)
+    """Repositories whose own listing failed or was refused: reconciled nothing, removal skipped for them only."""
+    errors: list[str] = field(default_factory=list)
 
 
 class CogIndexer:
@@ -232,10 +247,27 @@ class CogIndexer:
         self._max_bytes_per_file = max_bytes_per_file
         self._clock = clock
         self.last_summary: SweepSummary | None = None
+        # Workers a cancelled sweep stopped waiting for (see _drain): they
+        # still own whatever they were doing, so the lock release that would
+        # have followed them is handed to a background task instead.
+        self._abandoned: list[asyncio.Future] = []
+        self._late_releases: set[asyncio.Task] = set()
+        # Per-source fairness state for the fetch budget (see _schedule):
+        # the interleave phase advances every sweep, the retry cursor by the
+        # number of retries actually attempted, so both classes progress at
+        # any budget.
+        self._phase: dict[str, int] = {}
+        self._retry_cursor: dict[str, int] = {}
 
     @property
     def sources(self) -> list[RegistrySource]:
         return list(self._sources)
+
+    @property
+    def pending_late_releases(self) -> int:
+        """Lock releases handed off to background tasks that have not completed yet."""
+
+        return len(self._late_releases)
 
     # -- threading discipline ---------------------------------------------------
 
@@ -254,9 +286,10 @@ class CogIndexer:
         The drain itself is shielded and deadline-bounded (see
         :meth:`_drain`): repeated cancellations are deferred until the worker
         completes -- they collapse into the one ``CancelledError`` re-raised
-        here -- and a worker that never completes (a dead connection the
-        server cannot abort) is abandoned after ``drain_deadline_seconds``
-        with a loud log line, so shutdown always has a finite bound.
+        here. A worker still running at the deadline (a dead connection the
+        server cannot abort) is recorded in ``_abandoned``: the coroutine
+        moves on, but :meth:`_release` will not release the lock until that
+        worker has finished -- it hands the release to a background task.
         """
 
         future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
@@ -274,13 +307,14 @@ class CogIndexer:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 # The thread is stuck on something no timeout reached (a dead
-                # transport, most likely). Abandon it -- the session-scoped
-                # advisory lock is released by the server with the connection,
-                # and hanging shutdown forever helps nobody.
+                # transport, most likely). Stop waiting -- hanging shutdown
+                # forever helps nobody -- but do not pretend it finished: the
+                # release that follows must wait for it (see _release).
                 logger.error(
-                    "cog_index_worker_drain_abandoned",
+                    "cog_index_worker_drain_expired",
                     extra={"deadline_seconds": self._drain_deadline},
                 )
+                self._abandoned.append(future)
                 return
             try:
                 # Shielded: a second cancellation must interrupt this wait
@@ -308,14 +342,55 @@ class CogIndexer:
         the sweep; an exit failure is logged by class name only. Cancellation
         during the release drains like every other store call, so the unlock
         (and the pooled connection's return) always completes.
+
+        If an earlier store call of this sweep is still running (its drain
+        expired), the lock is **not** released here: a release under a live
+        worker is exactly the state single-flight exists to prevent -- another
+        replica would acquire and a late write would land under its lock.
+        The release is handed to :meth:`_late_release` instead, which waits
+        for the worker without a deadline and then exits the lock.
         """
 
+        if self._abandoned:
+            pending, self._abandoned = self._abandoned, []
+            task = asyncio.create_task(self._late_release(lock, pending), name="cog-index-late-release")
+            self._late_releases.add(task)
+            task.add_done_callback(self._late_releases.discard)
+            logger.error("cog_index_lock_release_deferred", extra={"workers": len(pending)})
+            return
         try:
             await self._on_thread(lock.__exit__, None, None, None)
         except asyncio.CancelledError:
+            if self._abandoned:
+                # The unlock itself outlived the drain deadline. It still runs
+                # on its thread and completes on its own; nothing is left to
+                # do for it, and there is no worker to wait for.
+                self._abandoned = []
+                logger.error("cog_index_lock_release_outlived_drain")
             raise
         except Exception as exc:
             logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__})
+
+    async def _late_release(self, lock, workers: list[asyncio.Future]) -> None:
+        """Wait out abandoned workers -- no deadline -- then exit the lock.
+
+        Runs as its own task, never cancelled by the sweep: the invariant it
+        keeps is that the lock is exited only after every store call of the
+        sweep that held it has finished, and the sweep's own cancellation is
+        no reason to break it. What bounds this task is the workers
+        themselves: the server's ``statement_timeout`` where the transport
+        lives, the pool's TCP keepalives where it does not.
+        """
+
+        for worker in workers:
+            with suppress(Exception):
+                await worker
+        try:
+            await asyncio.to_thread(lock.__exit__, None, None, None)
+        except Exception as exc:
+            logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__, "late": True})
+            return
+        logger.warning("cog_index_lock_released_late", extra={"workers": len(workers)})
 
     # -- the sweep ------------------------------------------------------------
 
@@ -329,6 +404,9 @@ class CogIndexer:
 
         started = self._clock()
         summary = SweepSummary(sources=len(self._sources))
+        # Workers a targeted reindex (which takes no lock) may have left
+        # behind are not this sweep's to wait for.
+        self._abandoned = []
         # The lock is taken and released on a worker thread: it is a blocking
         # database call, and the connection it occupies stays checked out for
         # the whole sweep (see the store's sweep_lock contract).
@@ -367,62 +445,90 @@ class CogIndexer:
 
     async def _sweep_source(self, source: RegistrySource, summary: SweepSummary) -> None:
         enumeration = await self._enumerate(source)
-        if enumeration.error is not None:
+        if enumeration.errors:
             summary.sources_failed += 1
-            summary.errors.append(f"{source.id}: {enumeration.error}")
-            logger.warning("cog_index_source_failed", extra={"source": source.id, "reason": enumeration.error})
-            if not enumeration.present:
-                return
+            for error in enumeration.errors:
+                summary.errors.append(f"{source.id}: {error}")
+                logger.warning("cog_index_source_failed", extra={"source": source.id, "reason": error})
+        if not enumeration.complete:
+            # No repository list: nothing to reconcile and nothing that can be
+            # declared gone.
+            return
 
         known = {(row.repository, row.digest): row for row in await self._on_thread(self._store.known, source.id)}
         # Three classes, mirroring _reconcile's decision: bookkeeping (known,
         # not failed) costs no budget; a fetch happens for digests the catalog
-        # has never seen and for retries of failed rows. Fetches run in two
-        # passes -- never-seen artifacts first, failed retries with whatever
-        # budget remains -- so a prefix of permanent failures at the same
-        # sorted position cannot eat every sweep's budget and starve healthy
-        # new artifacts behind it (round-2 codex finding). Within each class,
-        # enumeration order is kept.
-        unseen: list[tuple[str, ArtifactRef]] = []
+        # has never seen and for retries of failed rows. Which fetches get
+        # this sweep's budget is decided by _schedule, which interleaves the
+        # two classes so neither can starve the other.
+        unseen: list[tuple[str, ArtifactRef, None]] = []
         retries: list[tuple[str, ArtifactRef, KnownArtifact]] = []
         for repository, artifacts in enumeration.present.items():
             for artifact in artifacts:
                 known_row = known.get((repository, artifact.digest))
                 if known_row is None:
-                    unseen.append((repository, artifact))
+                    unseen.append((repository, artifact, None))
                 elif known_row.status == STATUS_FAILED:
                     retries.append((repository, artifact, known_row))
                 else:
                     outcome = await self._reconcile(source, repository, artifact, known_row)
                     _count(summary, outcome)
-        budget = self._max_new_fetches
-        for repository, artifact in unseen:
-            if budget <= 0:
-                _count(summary, OUTCOME_DEFERRED)
-                continue
-            budget -= 1
-            _count(summary, await self._reconcile(source, repository, artifact, None))
-        for repository, artifact, known_row in retries:
-            if budget <= 0:
-                _count(summary, OUTCOME_DEFERRED)
-                continue
-            budget -= 1
+        fetch, defer = self._schedule(source.id, unseen, retries)
+        for repository, artifact, known_row in fetch:
             _count(summary, await self._reconcile(source, repository, artifact, known_row))
+        for _ in defer:
+            _count(summary, OUTCOME_DEFERRED)
 
-        if not enumeration.complete:
-            # Skipping removal is the whole point of tracking completeness:
-            # what was not enumerated cannot be declared gone. Deferred
-            # fetches do NOT skip removal -- those artifacts were enumerated
-            # and stand in the present set below.
-            if enumeration.error is None:
-                summary.sources_failed += 1
-                summary.errors.append(f"{source.id}: enumeration incomplete; removal step skipped")
-            return
+        # Removal is per repository: what was not enumerated cannot be
+        # declared gone, so repositories whose listing failed keep their rows
+        # untouched, while every fully listed repository -- and every
+        # repository that has vanished from the source's list -- is
+        # reconciled. Deferred fetches do NOT skip removal: those artifacts
+        # were enumerated and stand in the present set.
         present = {repo: [artifact.digest for artifact in artifacts] for repo, artifacts in enumeration.present.items()}
-        removed = await self._on_thread(self._store.mark_removed, source.id, present)
+        removed = await self._on_thread(
+            self._store.mark_removed, source.id, present, excluding=enumeration.failed_repositories
+        )
         summary.removed += removed
         if removed:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc(removed)
+
+    def _schedule(self, source_id: str, unseen: list, retries: list) -> tuple[list, list]:
+        """Split this sweep's fetches into (fetch now, defer) so neither class starves.
+
+        Slots are dealt in a fixed pattern -- every ``RETRY_SLOT_EVERY``-th
+        slot to a retry of a failed row, the rest to never-seen artifacts --
+        with a class that has run out yielding its slot to the other. Two
+        pieces of per-source state make it fair *across* sweeps, not just
+        within one: the pattern's **phase** advances each sweep, so even a
+        budget of one alternates classes over successive sweeps instead of
+        always serving slot zero; and retries are taken from a **rotating
+        cursor**, so a stable prefix of permanent failures cannot occupy the
+        retry slots forever while a recoverable failure behind it waits.
+        Never-seen artifacts keep enumeration order (once indexed they cost
+        nothing, so the tail is reached without rotation).
+        """
+
+        phase = self._phase.get(source_id, 0)
+        self._phase[source_id] = (phase + 1) % RETRY_SLOT_EVERY
+        if retries:
+            cursor = self._retry_cursor.get(source_id, 0) % len(retries)
+            retries = retries[cursor:] + retries[:cursor]
+        else:
+            cursor = 0
+        unseen_queue, retry_queue = list(unseen), list(retries)
+        fetch: list = []
+        slot = phase
+        while len(fetch) < self._max_new_fetches and (unseen_queue or retry_queue):
+            take_retry = slot % RETRY_SLOT_EVERY == RETRY_SLOT_EVERY - 1
+            if (take_retry and retry_queue) or not unseen_queue:
+                fetch.append(retry_queue.pop(0))
+            else:
+                fetch.append(unseen_queue.pop(0))
+            slot += 1
+        attempted_retries = len(retries) - len(retry_queue)
+        self._retry_cursor[source_id] = (cursor + attempted_retries) % len(retries) if retries else 0
+        return fetch, unseen_queue + retry_queue
 
     async def _enumerate(self, source: RegistrySource) -> _Enumeration:
         # Broad excepts on purpose: adapters talk to third-party systems and
@@ -435,7 +541,7 @@ class CogIndexer:
             repositories = await source.list_repositories()
         except Exception as exc:
             result.complete = False
-            result.error = f"list_repositories: {_describe(exc)}"
+            result.errors.append(f"list_repositories: {_describe(exc)}")
             return result
         for repository in repositories:
             try:
@@ -446,22 +552,25 @@ class CogIndexer:
                 # -- if it ever had any -- are correctly marked removed.
                 artifacts = []
             except Exception as exc:
-                result.complete = False
-                result.error = f"list_artifacts {repository}: {_describe(exc)}"
+                result.failed_repositories.append(repository)
+                result.errors.append(f"list_artifacts {repository}: {_describe(exc)}; removal skipped for it")
                 continue
             if len(artifacts) > self._max_artifacts:
-                # Treated exactly like a failed listing, and never as a
-                # prefix: enumeration always runs to the end of the
-                # repository list, so the artifacts behind an over-bound
-                # repository are not starved (round-2 codex finding) and the
-                # bound cannot silently misrepresent a partial view as
-                # complete.
+                # Treated exactly like a failed listing of this one
+                # repository, and never as a prefix: enumeration always runs
+                # to the end of the repository list, so the artifacts behind
+                # an over-bound repository are not starved and the bound
+                # cannot silently misrepresent a partial view as complete.
+                # Only this repository's rows are shielded from removal.
                 logger.warning(
                     "cog_index_repository_over_bound",
                     extra={"source": source.id, "repository": repository, "bound": self._max_artifacts},
                 )
-                result.complete = False
-                result.error = f"list_artifacts {repository}: over the {self._max_artifacts}-artifact bound"
+                result.failed_repositories.append(repository)
+                result.errors.append(
+                    f"list_artifacts {repository}: over the {self._max_artifacts}-artifact bound;"
+                    " removal skipped for it"
+                )
                 continue
             result.present[repository] = artifacts
         return result
