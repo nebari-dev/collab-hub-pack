@@ -37,6 +37,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 - **#94** — the local development environment in `dev/`: four levels (`make api` with no containers; `make api-pg` with Postgres and MinIO; `make api-oidc` with Keycloak, plus `api-fakes`, `api-full`, `api-membership`; `make kind-up` for the chart), fake Google, Slack and GitHub providers, a `nebari` realm, `seed-org` for owner and operator grants, and a single-port front door so Collab signs in at `http://localhost:9080` (`make api-desktop`). `dev-env.yaml` runs level 1 on Linux and macOS, levels 2–3 on Linux, and level 4 rendered only.
 - **#35** — the standalone `execution/` distribution `collab-hub-execution` (Python ≥ 3.11, depends only on `httpx`): `WorkflowEngine` and the reference `DurableWorkflowEngine`, which recovers from the Track when a caller resubmits; `CogExecutor` with in-memory and Kubernetes implementations (a per-run Deployment + Service + ingress-only NetworkPolicy, no ServiceAccount token on workers); `TrackStore` with in-memory and Postgres adapters; `CogLifecycle`, `RunBudget`; `DeclaredCapabilityResolver`; a kind E2E running a gated two-step Op (`test-execution.yaml`, `test-execution-e2e.yaml`).
 - **#111** and **#112** — Phases 0 and 1: the API runs on Python 3.13 with a CI job proving it, and ADR-0002 records the decisions the phases below depend on. **#115** moved the dev MinIO images to quay.io on the way.
+- **#120** — Phase 2: `CogWorker.interact` returns the result envelope, which the engine reads everywhere it read `{output, usage}`. `ok: false` with an `error.code` fails the step and keeps the code; `ok: true` with `problems` completes it and records them for a Gate. The envelope's invariants hold on construction as on parsing, and the worker client maps the document's HTTP statuses. `InteractionResult` is gone.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -49,7 +50,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 
 | Today (#35) | Required | Source |
 |---|---|---|
-| Worker answers `{output, usage}`, or `{"pause": true}` to pause | The result envelope; the **step's Gate** decides a pause, never the Cog | #2 comment, seam note |
+| ~~Worker answers `{output, usage}`~~ — *the envelope landed in #120; `{"pause": true}` is still how a Cog pauses* | The result envelope; the **step's Gate** decides a pause, never the Cog | #2 comment, seam note |
 | One engine, durable only through Track replay a caller triggers | One **lifecycle runner**, with the durability engine absent (`none`) or plugged in (`dbos`, `temporal`) | #2 |
 | The executor is whichever class the caller constructs, and the only real one needs a cluster | An **agent location**, `local` or `remote`, chosen by configuration like the backend — and `local`, a child process, first | this plan |
 | At-least-once across pod replacement | A keyed claim, so a re-invoked step never repeats a side effect | #1 comment |
@@ -249,7 +250,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 |---|---|---|---|---|---|---|
 | 0 | #96 | Record the decisions for running Ops: lifecycle runner, durability backends, placement (ADR-0002) | `docs/adr-0002-cog-runs` | — | S | merged, #112 |
 | 1 | #97 | Run the API on Python 3.13 as well as 3.14 | `feat/api-python-3.13` | — | S | merged, #111 |
-| 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | in review, #120 |
+| 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | merged, #120 |
 | 3 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2 | M | not started |
 | 4 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3 | M | not started |
 | 5 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 4 | M | not started |
@@ -320,7 +321,7 @@ ADR-0002 records the decisions this program forces before code depends on them: 
 No infrastructure in these three: they change what crosses the seam and what the Track records, and every later phase builds on that shape.
 
 #### Phase 2 — Return the result envelope from Cog workers
-**Issue** #98 · **Branch** `feat/cog-result-envelope` · **Depends on** Phase 0 · **Size** M · **Status** in review, #120
+**Issue** #98 · **Branch** `feat/cog-result-envelope` · **Depends on** Phase 0 · **Size** M · **Status** merged as #120
 
 Workers return `envelope: 1`; the engine reads it everywhere it read `{output, usage}`.
 
