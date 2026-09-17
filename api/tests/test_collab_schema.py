@@ -44,6 +44,7 @@ from collab_hub_api.frames.collab_schema import (  # noqa: E402
 )
 
 COLLAB_TABLES = (
+    "collab_cog_artifacts",
     "collab_service_access_grants",
     "collab_provisioned_accounts",
     "collab_invitations",
@@ -239,6 +240,53 @@ def test_no_workspaces_table_is_created_and_invitations_arrived_only_in_v3():
     )
     assert "collab_invitations" not in early
     assert "collab_invitations" in created
+
+
+def test_migration_creates_the_cog_catalog_schema():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    (catalog,) = server.ddl_for("collab_cog_artifacts")
+    # Identity is the digest, per location: the same bytes in two
+    # repositories (or two sources) are two rows; the repository path is
+    # not identity and carries no uniqueness of its own.
+    assert "PRIMARY KEY (source_id, repository, digest)" in catalog
+    assert "UNIQUE" not in catalog
+    # The card is the reader's output as structured JSON, nullable because
+    # non-Cog and failed rows have none; status is a closed vocabulary.
+    assert "card jsonb," in catalog
+    assert "status text NOT NULL CHECK (status IN ('indexed', 'non_cog', 'failed'))" in catalog
+    assert "read_errors jsonb NOT NULL DEFAULT '[]'::jsonb" in catalog
+    assert "tags text[] NOT NULL DEFAULT '{}'" in catalog
+    # Never hard-deleted: removal is a timestamp.
+    assert "removed_at timestamptz," in catalog
+    for column in (
+        "cog_id text,",
+        "name text,",
+        "version text,",
+        "kind text,",
+        "publisher text,",
+        "manifest_schema text,",
+    ):
+        assert column in catalog, column
+    assert "host text NOT NULL" in catalog and "pushed_at timestamptz," in catalog
+
+    created = " ".join(server.statements)
+    for index in (
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx ON collab_cog_artifacts (cog_id)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_kind_idx ON collab_cog_artifacts (kind)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_removed_at_idx ON collab_cog_artifacts (removed_at)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_card_idx"
+        " ON collab_cog_artifacts USING GIN (card jsonb_path_ops)",
+    ):
+        assert index in created, index
+    # Appended as version 7; nothing earlier mentions the table.
+    earlier = " ".join(
+        statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 7 for statement in statements
+    )
+    assert "collab_cog_artifacts" not in earlier
+    assert LATEST_COLLAB_SCHEMA_VERSION == 7
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -479,6 +527,21 @@ def test_live_migration_creates_tables_constraints_and_index(clean_database):
         index_rows = conn.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'collab_org_members'").fetchall()
         indexes = {row["indexname"] for row in index_rows}
         assert "collab_org_members_org" in indexes
+
+        catalog_indexes = {
+            row["indexname"]: row["indexdef"]
+            for row in conn.execute(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'collab_cog_artifacts'"
+            ).fetchall()
+        }
+        assert {
+            "collab_cog_artifacts_pkey",
+            "collab_cog_artifacts_cog_id_idx",
+            "collab_cog_artifacts_kind_idx",
+            "collab_cog_artifacts_removed_at_idx",
+            "collab_cog_artifacts_card_idx",
+        } <= set(catalog_indexes)
+        assert "USING gin (card jsonb_path_ops)" in catalog_indexes["collab_cog_artifacts_card_idx"]
 
         assert applied_collab_schema_version(clean_database) == LATEST_COLLAB_SCHEMA_VERSION
 

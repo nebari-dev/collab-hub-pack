@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -12,9 +13,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
 from .config import (
     BaseConfig,
     build_active_frame_store,
+    build_cog_catalog_store,
+    build_cog_indexing,
     build_frames_store,
     build_group_store,
     build_history_store,
@@ -239,6 +243,12 @@ def make_app(config: BaseConfig) -> FastAPI:
     # construction the way the frames_server_ tables' DDL does. Same trigger
     # (frames.postgres.url + auto_migrate), same startup failure semantics.
     migrate_collab_schema(config, postgres_pools)
+    # The Cog catalog (issue #84) rides the same collab_ migration (version
+    # 7) and is always built so the catalog read API is up whether or not
+    # this replica sweeps registries. The indexer -- and the registry
+    # sources it owns -- exist only when cogs.index.enabled (issue #87).
+    cog_catalog_store = build_cog_catalog_store(config, postgres_pools)
+    cog_indexing = build_cog_indexing(config, cog_catalog_store)
     if org_source_resolves_membership():
         # Third membership precondition (the env-only ones are checked above):
         # the organization store must have a real backend. Membership is an
@@ -303,6 +313,25 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.org_store = org_store
             app.state.mcp_server = mcp
             app.state.connectors_config = config.connectors
+            # For the catalog API (#85) and the webhook receiver (#86):
+            # the store is always there; the indexer and its sources only
+            # on a sweeping replica.
+            app.state.cog_catalog_store = cog_catalog_store
+            app.state.cog_indexer = cog_indexing.indexer if cog_indexing is not None else None
+            app.state.cog_registry_sources = cog_indexing.indexer.sources if cog_indexing is not None else []
+            cog_index_task: asyncio.Task | None = None
+            if cog_indexing is not None:
+                # After the migration (which ran in make_app) and after the
+                # pools opened: the first sweep may be immediate. The loop
+                # jitters its interval so replicas drift apart, and the
+                # store's advisory lock keeps them from sweeping at once.
+                cog_index_task = asyncio.create_task(
+                    cog_indexing.indexer.run(
+                        interval_seconds=cog_indexing.interval_seconds,
+                        run_on_startup=cog_indexing.run_on_startup,
+                    ),
+                    name="cog-index",
+                )
             if config.web.enabled:
                 # Again at boot, and this is the **last** time either check
                 # runs. make_app verifies what *it* registered; this sees
@@ -320,6 +349,57 @@ def make_app(config: BaseConfig) -> FastAPI:
             try:
                 yield
             finally:
+                # First, before the pools close: a sweep in flight may hold
+                # the lock connection and be mid-write. Cancel, wait for it
+                # to unwind (its finally releases the lock), then close the
+                # registry clients it was talking to.
+                if cog_index_task is not None:
+                    # Bounded: the indexer's drain already has a deadline, and
+                    # this is the outer wall -- a database that stopped
+                    # answering must not be able to hang app shutdown.
+                    # asyncio.wait, not wait_for: wait_for cancels the task
+                    # again on timeout and then AWAITS it, and the indexer
+                    # defers repeated cancellations until its worker finishes
+                    # -- which is the wait this deadline exists to bound.
+                    # Past the deadline the task stays pending and dies with
+                    # the process; any lock it still holds is the server's to
+                    # release with the connection. A reference is kept below
+                    # for as long as this frame lives so it is not finalized
+                    # while pending.
+                    cog_index_task.cancel()
+                    _, still_pending = await asyncio.wait({cog_index_task}, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
+                    if still_pending:
+                        # Deliberately NOT closing the indexer's executor here:
+                        # the abandoned task may yet come back and need to
+                        # submit its lock release, and a shut-down executor
+                        # would turn that into an exception -- losing the
+                        # unlock this whole path exists to protect. Close it
+                        # when the task does finish, whenever that is, so a
+                        # process that outlives this lifespan (a reload, a
+                        # test holding the app) does not keep idle workers.
+                        if cog_indexing is not None:
+                            indexer = cog_indexing.indexer
+                            cog_index_task.add_done_callback(lambda _task: indexer.close())
+                        logger.error(
+                            "cog_indexer_shutdown_abandoned",
+                            extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
+                        )
+                    else:
+                        if cog_indexing is not None and cog_indexing.indexer.pending_late_releases:
+                            logger.warning(
+                                "cog_indexer_shutdown_with_late_release_pending",
+                                extra={"pending": cog_indexing.indexer.pending_late_releases},
+                            )
+                        if cog_indexing is not None:
+                            # The task is done, so no further store calls are
+                            # coming: stop accepting them. Work already on a
+                            # thread -- including a hand-off waiting to
+                            # release the lock -- still finishes.
+                            cog_indexing.indexer.close()
+                if cog_indexing is not None:
+                    for source in cog_indexing.indexer.sources:
+                        with suppress(Exception):
+                            await source.aclose()
                 user_directory_client.close()
                 # Same reason as the line above: this granter owns an
                 # `httpx.Client`, so its connection pool outlives the app
@@ -611,9 +691,7 @@ def make_app(config: BaseConfig) -> FastAPI:
         # through the two seams make_router exposes, so the public one still
         # costs the reviewed entry in PUBLIC_WEB_PATHS — make_router refuses
         # a public page route that is missing it.
-        invite_public, invite_gated = invite.make_routers(
-            memberships_enabled=org_source_resolves_membership()
-        )
+        invite_public, invite_gated = invite.make_routers(memberships_enabled=org_source_resolves_membership())
         # The operator invitation page (issue #91). Mounted only where
         # invitations can mean anything, for the same reason #89's API router
         # is: on a claims-sourced deployment the platform-role axis is

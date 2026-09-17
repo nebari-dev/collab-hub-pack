@@ -855,6 +855,137 @@ expired everywhere the API presents it, and no sweeper process exists or is
 needed. `token_hash` is the only trace of the secret; there is no column, and
 no query, that can recover a link.
 
+### The Cog catalog (`collab_cog_artifacts`)
+
+Migration version 7 adds the Cog catalog: one row per artifact the indexer has
+seen in a configured registry source, keyed by `(source_id, repository,
+digest)`. It rides the same shared `frames.postgres.url` and the same
+`autoMigrate` switch as every other `collab_` table.
+
+- **Identity is the digest.** `cog_id`/`name`/`version`/`kind`/`publisher` are
+  search keys read from the Cog's own declarations; the repository path is not
+  identity (published names carry an id suffix, and one Cog may be published to
+  several repositories, each of which is its own row). The pinned install
+  reference `<host>/<repository>@<digest>` is rebuilt from the row.
+- **`card` is the bundle reader's output, verbatim, as `jsonb`** — the whole
+  profile as structured data. A GIN index (`jsonb_path_ops`) on it serves the
+  containment filters (`card @> …`) the catalog API uses for
+  requires/provides/io; plain indexes cover `cog_id`, `kind` and `removed_at`.
+- **`status`** is `indexed` (the reader produced a card — a draft or a Cog with
+  a broken profile is still a Cog and lists with what it declared, its errors
+  mirrored into `read_errors`), `non_cog` (the manifest carries no `COG.md` and
+  no Prog `pixi.toml`; recorded with a reason so a repository full of images is
+  not re-read every sweep) or `failed` (the fetch or read failed; retried on
+  the next sweep).
+- **Rows are never deleted.** An artifact that disappears from its registry is
+  marked `removed_at = now()` and stays readable by digest — installs and runs
+  may reference it long after its publisher removed it. A digest that comes
+  back is restored (and retagged) without a refetch.
+
+The indexer is a reconciliation loop: enumerate each source, skip digests
+already indexed with the same tag set, fetch and read only new digests
+(`COG.md` first, then the profile file it names — never the lockfile, by
+title **or** media type), then mark this source's rows whose digest is no
+longer present as removed. A card the database cannot store (a NUL character
+anywhere in its JSON, or an oversized card) becomes a `failed` row with a
+reason instead of a sweep-aborting error. Fetching is budgeted per sweep
+(already-known digests cost nothing), so a large registry's tail is reached
+across successive sweeps rather than starved; deferred artifacts still count
+as present, so removal stays correct. Safety rules operators should know:
+
+- **Single flight.** A sweep takes the session-level advisory lock
+  `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its whole
+  duration (outside any transaction, so a minutes-long sweep pins no
+  snapshot). Replicas starting together do not double-index: the loser logs
+  `cog_index_sweep_skipped` and waits for its next interval. That connection
+  is one slot of the shared pool while a sweep runs.
+- **Removal needs a complete picture — per repository.** Rows are marked
+  removed only in repositories whose listing fully succeeded this sweep. If the
+  source's *repository list* cannot be obtained, nothing is reconciled and
+  nothing is declared gone. If one repository fails to list, or is refused for
+  exceeding the per-repository artifact bound, only **that repository's** rows
+  are shielded from removal (the summary says `removal skipped for it` and
+  counts the source in `sources_failed`); every other repository — and every
+  repository that has vanished from the source's list — still reconciles,
+  removal included. A transient registry outage therefore never marks a
+  catalog gone, and one permanently oversized repository does not freeze
+  removal for its neighbours. The adapters uphold their half by **raising past
+  their own limits instead of truncating** (a repository over the static
+  adapter's tag bound, a Harbor listing over its page bound), and the indexer's
+  own artifact bound is a refusal, never a prefix: a truncated list presented
+  as complete would turn a bound into false removals, and a prefix cut at the
+  same sorted position every sweep would permanently starve what lies behind
+  it.
+- **The fetch budget is dealt fairly.** Fetch slots go to never-seen artifacts
+  and to retries of `failed` rows in a fixed interleave (every fourth slot is a
+  retry slot; a class that has run out yields its slot). The interleave's phase
+  advances each sweep, and retries are served from a rotating order of
+  `(repository, digest)` identities — identities rather than positions, because
+  the failed set changes between sweeps and a positional cursor would step over
+  a candidate each time it did. A candidate moves to the back of the rotation as
+  its attempt *begins*, so a sweep that dies partway does not rotate past work it
+  never tried. The effect: even a budget of one reaches a retry within four
+  sweeps under a constant stream of new artifacts, and a stable prefix of
+  permanent failures cannot occupy the retry slots while a recoverable failure
+  behind it waits. Never-seen artifacts keep enumeration order; once indexed
+  they cost nothing, so the tail of a large registry is reached across sweeps
+  without rotation.
+- **The lock is never released under a live write.** A cancelled sweep waits for
+  its in-flight worker thread up to a drain deadline (30 s), however many times
+  it is cancelled. Past that deadline the sweep stops waiting — but it does
+  **not** release the lock: it logs `cog_index_worker_drain_expired` and
+  `cog_index_lock_release_deferred`, and hands the lock to a daemon thread
+  (`cog-index-late-release`) that releases it only once the worker has actually
+  finished (`cog_index_lock_released_late`). A thread rather than a task because
+  it must outlive the event loop: at shutdown every task is cancelled and the
+  loop closes, and an asyncio owner would stop mid-wait and leave the lock
+  context to be finalized by the garbage collector — unlocking while the write
+  was still in flight. Until the hand-off completes, other replicas keep seeing
+  `cog_index_sweep_skipped`, which is correct: a write may still be running.
+- **Shutdown bounds the wait, not the workers.** The app lifespan waits at most
+  45 s for the cancelled indexer task and otherwise leaves it pending with
+  `cog_indexer_shutdown_abandoned`. Sweep-path statements carry a server-side
+  `statement_timeout` and every pooled connection sets TCP keepalives (a dead
+  peer is noticed in about 90 s), which covers the ordinary partition; neither
+  ends a call to a peer whose kernel still answers probes while the database
+  process is stopped. The hand-off thread is a daemon, but the blocked call
+  itself runs on a pool worker, and those are joined at interpreter exit — so a
+  permanently blocked store call means the pod needs its `SIGKILL` (the
+  `terminationGracePeriodSeconds` deadline) rather than exiting on its own.
+- **One crash window is not yet closed.** The sweep lock is held on one pooled
+  connection while the sweep's reads and writes use another. If the process
+  dies mid-write, the server can drop the lock session before the write session
+  finishes, letting another replica start sweeping while the previous write is
+  still landing. Both sweeps write the same rows from the same registry, so the
+  visible effect is limited to a stale `mark_removed` set; it is nonetheless a
+  real gap, and closing it means running the sweep's writes on the session that
+  holds the lock (or fencing them with a token). Tracked as issue #128.
+- **A doubtful lock connection is discarded, not returned.** If any step of
+  taking or giving back the lock fails (setting autocommit, the acquire, the
+  unlock, `RESET statement_timeout`, restoring autocommit), the connection is
+  **closed** (`cog_index_lock_connection_discarded`) so the pool opens a fresh
+  one instead of handing a session with an altered timeout — or one still
+  holding the lock — to the next borrower.
+- **Indexing needs two pooled connections.** The sweep lock occupies one
+  connection of the shared `frames.postgres` pool for the sweep's whole
+  duration while reads and writes check out another, so the API refuses to
+  start with `cogs.index.enabled` and `frames.postgres.pool.max_size < 2`.
+
+Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
+non_cog / failed / removed / sources_failed / duration) and exports the same
+counts as `frames_server_cog_index_artifacts_total{outcome}`,
+`frames_server_cog_index_sweeps_total{result}` and
+`frames_server_cog_index_sweep_duration_seconds`. Per-artifact failures are
+stored in the row's `read_errors` and never abort the sweep.
+
+On content and secrecy, precisely: the `card` is the published bundle's own
+declarations, stored verbatim — whatever a publisher writes in `COG.md` or the
+profile is what the catalog holds. The guarantee is narrower and absolute:
+*configured registry credentials* never reach cards, `read_errors`, or logs;
+`read_errors` and log lines carry exception class names (plus the message only
+for the OCI client's own errors, whose contract is that messages name neither
+URLs nor headers), never raw URLs or exception chains.
+
 ### Connection pooling
 
 All Postgres-backed stores draw connections from a shared `psycopg_pool`

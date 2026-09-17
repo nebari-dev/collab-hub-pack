@@ -64,11 +64,6 @@ from collab_hub_api.web.privacy_statement import (
     PRIVACY_STATEMENT_TEXT,
     privacy_statement_page,
 )
-from collab_hub_api.web.terms_of_service import (
-    TERMS_OF_SERVICE_IS_PLACEHOLDER,
-    TERMS_OF_SERVICE_TEXT,
-    terms_of_service_page,
-)
 from collab_hub_api.web.session import (
     SESSION_COOKIE,
     SESSION_PURPOSE,
@@ -87,6 +82,11 @@ from collab_hub_api.web.surface import (
     build_web_surface,
     clamped_session_lifetime,
     enforce_web_surface_map_access,
+)
+from collab_hub_api.web.terms_of_service import (
+    TERMS_OF_SERVICE_IS_PLACEHOLDER,
+    TERMS_OF_SERVICE_TEXT,
+    terms_of_service_page,
 )
 
 WEB_CLIENT_ID = "collab-web"

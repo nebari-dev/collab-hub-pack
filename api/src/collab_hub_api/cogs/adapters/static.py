@@ -42,7 +42,14 @@ INDEX_SCHEMA_VERSION = 1
 MAX_INDEX_BYTES = 1024 * 1024
 """An index is a list of names; a document past this is not one."""
 MAX_TAGS_PER_REPOSITORY = 200
-"""Bound on manifests fetched per repository; a Cog repository has a handful of tags."""
+"""Bound on manifests fetched per repository; a Cog repository has a handful of tags.
+
+Past the bound the adapter **raises** rather than truncating. A truncated
+list returned as if complete is worse than no list: the indexer would treat
+it as authoritative, replace retained rows' tags with the truncated view,
+and mark every artifact outside the prefix as removed. An error keeps that
+source's removal step skipped and says which repository is out of shape.
+"""
 
 
 class StaticRegistrySource:
@@ -95,14 +102,13 @@ class StaticRegistrySource:
     async def list_artifacts(self, repo: str) -> list[ArtifactRef]:
         tags = sorted(set(await self._oci.list_tags(repo)))
         if len(tags) > MAX_TAGS_PER_REPOSITORY:
-            logger.warning(
-                "cogs.registry: source %s repository %s has %d tags; enumerating the first %d",
-                self.id,
-                repo,
-                len(tags),
-                MAX_TAGS_PER_REPOSITORY,
+            # Never truncate: see MAX_TAGS_PER_REPOSITORY. The indexer treats
+            # this like any other failed listing -- reconcile what it can,
+            # skip removal for the source.
+            raise RegistrySourceProtocolError(
+                f"source {self.id!r}: repository {repo} lists {len(tags)} tags, over the"
+                f" {MAX_TAGS_PER_REPOSITORY} bound; refusing to enumerate a truncated view"
             )
-            tags = tags[:MAX_TAGS_PER_REPOSITORY]
         grouped: dict[str, list[str]] = {}
         details: dict[str, ArtifactRef] = {}
         for tag in tags:
@@ -151,12 +157,18 @@ class StaticRegistrySource:
         try:
             async with self._http.stream("GET", self._index_url) as response:
                 if response.status_code != 200:
+                    # The URL is never echoed: index_url may carry an access
+                    # token in its path, and the operator knows the URL from
+                    # the source's own configuration.
                     raise RegistrySourceProtocolError(
-                        f"source {self.id!r}: index {self._index_url} answered HTTP {response.status_code}"
+                        f"source {self.id!r}: the configured index_url answered HTTP {response.status_code}"
                     )
                 body = await _read_capped(response, MAX_INDEX_BYTES, what=f"source {self.id!r} index")
         except httpx.HTTPError as exc:
-            raise RegistrySourceError(f"source {self.id!r}: fetching index {self._index_url} failed: {exc}") from exc
+            # Class name only: httpx messages embed the request URL.
+            raise RegistrySourceError(
+                f"source {self.id!r}: fetching the configured index_url failed: {type(exc).__name__}"
+            ) from exc
         return parse_index_document(body, what=f"source {self.id!r} index")
 
 

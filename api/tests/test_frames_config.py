@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from collab_hub_api.cogs.catalog import PostgresCogCatalogStore, UnavailableCogCatalogStore
 from collab_hub_api.config import (
     Config,
     build_active_frame_store,
+    build_cog_catalog_store,
     build_group_store,
     build_history_store,
     build_postgres_pools,
@@ -110,6 +112,26 @@ def test_build_group_store_uses_shared_postgres():
     store = _build(build_group_store, Config.parse({"frames": {"postgres": {"url": "postgresql://shared/db"}}}))
 
     assert isinstance(store, PostgresFrameGroupStore)
+
+
+# --- Cog catalog: shared frames.postgres, else refuses; no memory toggle ------
+
+
+def test_build_cog_catalog_store_unavailable_without_db():
+    store = _build(build_cog_catalog_store, Config.parse())
+
+    assert isinstance(store, UnavailableCogCatalogStore)
+
+
+def test_build_cog_catalog_store_uses_shared_postgres():
+    config = Config.parse({"frames": {"postgres": {"url": "postgresql://shared/db"}}})
+    pools = build_postgres_pools(config)
+
+    store = build_cog_catalog_store(config, pools)
+
+    assert isinstance(store, PostgresCogCatalogStore)
+    # Same pool as every other store on the shared URL; no second registry.
+    assert store._db is pools.database("postgresql://shared/db")
 
 
 def test_build_task_store_supports_memory_backend():
