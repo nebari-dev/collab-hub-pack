@@ -29,6 +29,7 @@ from collab_hub_api.cogs.catalog import (
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
+    SWEEP_STATEMENT_TIMEOUT_SECONDS,
     CatalogFilter,
     CogArtifact,
     CogCatalogDataError,
@@ -737,6 +738,237 @@ def test_lock_connection_is_discarded_when_setting_autocommit_fails():
         with _postgres_sweep_lock(_FakeLockDb(conn)):
             pass
     assert conn.closed and conn.statements == [], "it failed before any statement ran"
+
+
+# ---------------------------------------------------------------------------
+# The Postgres store against a fake connection.
+#
+# The live suites below are the real proof, but they are opt-in and CI has no
+# server, so these pin the parts a server-less run can still check: that every
+# method issues the statement it claims, with the parameters it claims, and
+# maps rows back the way the API expects. They are what keeps the Postgres
+# paths from being untested whenever the live suites are skipped.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _FakeConnection:
+    """Records every statement and replays canned rows, in order."""
+
+    def __init__(self, results=()):
+        self.calls: list[tuple[str, tuple]] = []
+        self._results = list(results)
+        self.closed = False
+        self.autocommit = False
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        self.calls.append((text, tuple(params or ())))
+        if text.startswith("SELECT set_config"):
+            # The sweep connection's own preamble: it consumes no canned rows,
+            # so a test's results line up with the statements it cares about.
+            return _FakeResult([])
+        return _FakeResult(self._results.pop(0) if self._results else [])
+
+    def close(self):
+        self.closed = True
+
+    @property
+    def statements(self) -> list[str]:
+        return [sql for sql, _ in self.calls]
+
+
+class _FakeDb:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @contextmanager
+    def connection(self, timeout=None):
+        yield self.conn
+
+
+DIGEST_A = digest("a")
+DIGEST_B = digest("b")
+
+
+def _fake_store(results=()):
+    conn = _FakeConnection(results)
+    return PostgresCogCatalogStore(_FakeDb(conn)), conn
+
+
+def _row(**overrides) -> dict:
+    row = {
+        "source_id": SOURCE,
+        "host": HOST,
+        "repository": "cogs/cog-a",
+        "digest": DIGEST_A,
+        "tags": ["v1"],
+        "pushed_at": T0,
+        "indexed_at": T0,
+        "manifest_media_type": None,
+        "status": STATUS_INDEXED,
+        "card": card(),
+        "cog_id": "example/cog-a",
+        "name": "cog-a",
+        "version": "1",
+        "kind": "complete",
+        "publisher": "Example",
+        "manifest_schema": "openteams/cog-manifest [0.1]",
+        "read_errors": [],
+        "removed_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_sweep_path_statements_are_bounded_by_a_transaction_local_timeout():
+    store, conn = _fake_store()
+    store.known(SOURCE)
+    first, params = conn.calls[0]
+    assert first.startswith("SELECT set_config('statement_timeout'")
+    assert params == (str(int(SWEEP_STATEMENT_TIMEOUT_SECONDS * 1000)),)
+    assert "WHERE source_id = %s" in conn.statements[1]
+
+
+def test_known_maps_rows_to_known_artifacts():
+    rows = [
+        {
+            "repository": "cogs/a",
+            "digest": DIGEST_A,
+            "tags": ["v1", "latest"],
+            "status": STATUS_INDEXED,
+            "removed": False,
+        },
+        {"repository": "cogs/b", "digest": DIGEST_B, "tags": None, "status": STATUS_FAILED, "removed": True},
+    ]
+    store, _ = _fake_store([rows])
+    known = store.known(SOURCE)
+    assert [(k.repository, k.tags, k.status, k.removed) for k in known] == [
+        ("cogs/a", ("v1", "latest"), STATUS_INDEXED, False),
+        ("cogs/b", (), STATUS_FAILED, True),
+    ]
+
+
+def test_upsert_sends_sorted_tags_and_clears_removed_at():
+    store, conn = _fake_store()
+    store.upsert(artifact("a", tags=("v2", "v1", "v2")))
+    sql, params = conn.calls[1]
+    assert sql.startswith("INSERT INTO collab_cog_artifacts")
+    assert "removed_at = NULL" in sql and "indexed_at = now()" in sql
+    assert params[4] == ["v1", "v2"], "tags are deduplicated and sorted"
+
+
+def test_upsert_refuses_an_unknown_status_before_touching_the_database():
+    store, conn = _fake_store()
+    with pytest.raises(ValueError, match="unknown catalog status"):
+        store.upsert(replace(artifact("a"), status="invented"))
+    assert conn.calls == []
+
+
+def test_upsert_translates_a_psycopg_data_error():
+    import psycopg
+
+    class _Refusing(_FakeConnection):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if sql.strip().startswith("INSERT"):
+                raise psycopg.DataError("unsupported Unicode escape sequence")
+            return _FakeResult([])
+
+    conn = _Refusing()
+    store = PostgresCogCatalogStore(_FakeDb(conn))
+    with pytest.raises(CogCatalogDataError) as info:
+        store.upsert(artifact("a"))
+    # Class name only: the server's own message quotes the offending value.
+    assert str(info.value) == "DataError"
+    assert "unsupported" not in str(info.value)
+
+
+def test_update_tags_reports_whether_a_row_existed():
+    store, conn = _fake_store([[{"digest": DIGEST_A}]])
+    assert store.update_tags(SOURCE, "cogs/a", DIGEST_A, ["b", "a", "b"], pushed_at=T0) is True
+    sql, params = conn.calls[1]
+    assert "SET tags = %s" in sql and "removed_at = NULL" in sql
+    assert params[0] == ["a", "b"] and params[1] == T0
+
+    store, _ = _fake_store([[]])
+    assert store.update_tags(SOURCE, "cogs/a", DIGEST_A, ["v1"]) is False
+
+
+def test_mark_removed_excludes_the_repositories_it_is_given():
+    store, conn = _fake_store([[{"n": 3}]])
+    marked = store.mark_removed(SOURCE, {"cogs/a": [DIGEST_A, DIGEST_A]}, excluding=["cogs/z", "cogs/z"])
+    assert marked == 3
+    sql, params = conn.calls[1]
+    assert "NOT (a.repository = ANY(%s))" in sql
+    assert params[0].obj == {"cogs/a": [DIGEST_A]}, "the present set is deduplicated and sorted"
+    assert params[1] == SOURCE and params[2] == ["cogs/z"]
+
+
+def test_mark_removed_answers_zero_without_a_row():
+    store, _ = _fake_store([[]])
+    assert store.mark_removed(SOURCE, {}) == 0
+
+
+def test_mark_removed_one_only_marks_a_present_row():
+    store, conn = _fake_store([[{"digest": DIGEST_A}]])
+    assert store.mark_removed_one(SOURCE, "cogs/a", DIGEST_A) is True
+    assert "removed_at IS NULL" in conn.statements[1]
+
+    store, _ = _fake_store([[]])
+    assert store.mark_removed_one(SOURCE, "cogs/a", DIGEST_A) is False
+
+
+def test_get_prefers_present_rows_and_scopes_by_source_and_repository():
+    store, conn = _fake_store([[_row()]])
+    found = store.get(DIGEST_A, source_id=SOURCE, repository="cogs/cog-a")
+    assert found.digest == DIGEST_A and found.cog_id == "example/cog-a"
+    sql, params = conn.calls[0]
+    assert "ORDER BY (removed_at IS NOT NULL), indexed_at DESC" in sql
+    assert params == (DIGEST_A, SOURCE, SOURCE, "cogs/cog-a", "cogs/cog-a")
+
+    store, _ = _fake_store([[]])
+    assert store.get(DIGEST_A) is None
+
+
+def test_locations_returns_every_row_for_a_digest():
+    store, conn = _fake_store([[_row(), _row(repository="cogs/mirror")]])
+    assert [a.repository for a in store.locations(DIGEST_A)] == ["cogs/cog-a", "cogs/mirror"]
+    assert "ORDER BY source_id, repository" in conn.statements[0]
+
+
+def test_list_current_builds_the_filters_it_is_given():
+    store, conn = _fake_store([[_row()]])
+    rows = store.list_current(CatalogFilter(kind="complete", publisher="Example", requires="gpu"), limit=5)
+    assert [r.cog_id for r in rows] == ["example/cog-a"]
+    sql, params = conn.calls[0]
+    assert "DISTINCT ON (cog_id)" in sql and "card @> %s" in sql
+    assert "removed_at IS NULL" in sql and "kind = %s" in sql and "publisher = %s" in sql
+    assert params[-1] == 5, "the bounded limit is the last parameter"
+
+
+def test_list_current_without_filters_still_excludes_removed_rows():
+    store, conn = _fake_store([[]])
+    assert store.list_current() == []
+    assert "removed_at IS NULL" in conn.statements[0] and "card @>" not in conn.statements[0]
+
+
+def test_list_versions_orders_newest_first_and_can_include_removed():
+    store, conn = _fake_store([[_row(version="2"), _row(version="1")]])
+    assert [a.version for a in store.list_versions("example/cog-a", include_removed=True)] == ["2", "1"]
+    sql, params = conn.calls[0]
+    assert "ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC" in sql
+    assert params == ("example/cog-a", True)
 
 
 @live_postgres
