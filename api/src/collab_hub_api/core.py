@@ -380,13 +380,27 @@ def make_app(config: BaseConfig) -> FastAPI:
                 if cog_index_task is not None:
                     # Bounded: the indexer's drain already has a deadline, and
                     # this is the outer wall -- a database that stopped
-                    # answering must not be able to hang app shutdown. Past it
-                    # the task is abandoned to die with the process.
+                    # answering must not be able to hang app shutdown.
+                    # asyncio.wait, not wait_for: wait_for cancels the task
+                    # again on timeout and then AWAITS it, and the indexer
+                    # defers repeated cancellations until its worker finishes
+                    # -- which is the wait this deadline exists to bound.
+                    # Past the deadline the task stays pending (kept on
+                    # app.state so it is owned, not dropped) and dies with the
+                    # process; any lock it still holds is the server's to
+                    # release with the connection.
                     cog_index_task.cancel()
-                    try:
-                        await asyncio.wait_for(cog_index_task, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
-                    except (TimeoutError, asyncio.CancelledError):
-                        pass
+                    _, still_pending = await asyncio.wait({cog_index_task}, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
+                    if still_pending:
+                        logger.error(
+                            "cog_indexer_shutdown_abandoned",
+                            extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
+                        )
+                    elif cog_indexing is not None and cog_indexing.indexer.pending_late_releases:
+                        logger.warning(
+                            "cog_indexer_shutdown_with_late_release_pending",
+                            extra={"pending": cog_indexing.indexer.pending_late_releases},
+                        )
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):

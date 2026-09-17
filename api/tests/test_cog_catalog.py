@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, tzinfo
 
@@ -642,6 +643,112 @@ def test_live_sweep_lock_is_single_flight_across_connections_and_restores_autoco
     # test_live_lock_connection_returns_with_autocommit_restored below; a
     # checkout from a many-connection pool here would not have proven it was
     # the lock's connection being inspected.
+
+
+class _FakeLockConnection:
+    """A psycopg-shaped connection for the lock helper's cleanup paths.
+
+    ``fail_on`` names a statement prefix whose execution raises; the helper's
+    contract under test is what happens to the connection afterwards.
+    """
+
+    def __init__(self, fail_on: str | None = None):
+        self.fail_on = fail_on
+        self.autocommit = False
+        self.closed = False
+        self.statements: list[str] = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql.strip())
+        if self.fail_on and sql.strip().startswith(self.fail_on):
+            raise RuntimeError(f"injected failure on {self.fail_on}")
+        return self
+
+    def fetchone(self):
+        return {"locked": True}
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeLockDb:
+    def __init__(self, conn):
+        self.conn = conn
+
+    @contextmanager
+    def connection(self):
+        yield self.conn
+
+
+def test_lock_connection_goes_back_clean_on_the_happy_path():
+    from collab_hub_api.cogs.catalog import _postgres_sweep_lock
+
+    conn = _FakeLockConnection()
+    with _postgres_sweep_lock(_FakeLockDb(conn)) as held:
+        assert held is True and conn.autocommit is True
+    assert not conn.closed
+    assert conn.autocommit is False, "autocommit restored"
+    assert [s.split("(")[0].split(" =")[0] for s in conn.statements] == [
+        "SET statement_timeout",
+        "SELECT pg_try_advisory_lock",
+        "SELECT pg_advisory_unlock",
+        "RESET statement_timeout",
+    ]
+
+
+@pytest.mark.parametrize(
+    "fail_on",
+    ["SELECT pg_advisory_unlock", "RESET statement_timeout", "SELECT pg_try_advisory_lock", "SET statement_timeout"],
+)
+def test_lock_connection_is_discarded_when_any_cleanup_step_fails(fail_on):
+    # Round-3 codex finding: a failed unlock left a session still holding the
+    # advisory lock, and a failed RESET left the altered timeout (and
+    # autocommit) on a connection that then went back to the pool. Any step
+    # whose outcome is uncertain now closes the connection, so the pool
+    # discards it instead of handing it to the next borrower.
+    from collab_hub_api.cogs.catalog import _postgres_sweep_lock
+
+    conn = _FakeLockConnection(fail_on=fail_on)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        with _postgres_sweep_lock(_FakeLockDb(conn)):
+            pass
+    assert conn.closed, f"a connection whose {fail_on} failed must not return to the pool"
+
+
+@live_postgres
+def test_live_lock_connection_is_discarded_when_the_backend_dies_mid_sweep(live_store):
+    """The unlock fails because the server killed the session: the pool must not reuse it.
+
+    Terminating the lock holder's backend is the realistic version of "the
+    unlock did not succeed": on exit the helper's cleanup raises, the
+    connection is broken, and the one-connection pool's next checkout is a
+    fresh backend (a different pid) with default transaction semantics.
+    """
+
+    import psycopg
+
+    _, database = live_store
+    single = _database(max_size=1)
+    store = PostgresCogCatalogStore(single)
+    try:
+        with pytest.raises(psycopg.OperationalError):
+            with store.sweep_lock() as held:
+                assert held is True
+                with database.connection() as conn:
+                    row = conn.execute(
+                        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = %s AND objid = %s",
+                        (COG_INDEX_LOCK_KEY >> 32, COG_INDEX_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()
+                    holder_pid = row["pid"]
+                    conn.execute("SELECT pg_terminate_backend(%s)", (holder_pid,))
+        with single.connection() as conn:
+            assert conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"] != holder_pid
+            assert conn.autocommit is False
+            assert conn.execute("SHOW statement_timeout").fetchone()["statement_timeout"] == "0"
+        with store.sweep_lock() as held:
+            assert held is True, "the lock died with the terminated session"
+    finally:
+        single.close()
 
 
 @live_postgres
