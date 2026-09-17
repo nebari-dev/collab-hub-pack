@@ -37,7 +37,8 @@ from typing import Any, Protocol
 
 from httpx import ConnectError, ConnectTimeout
 
-from .orchestration import _NO_SIGNAL, InteractionResult, UsageUnavailable
+from .envelope import CODE_FOR_STATUS, EnvelopeInvalid, ResultEnvelope
+from .orchestration import _NO_SIGNAL, PauseRequest
 
 _log = logging.getLogger(__name__)
 
@@ -405,25 +406,41 @@ class _KubernetesWorker:
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> InteractionResult:
+    ) -> ResultEnvelope:
         payload = {"entry_point": entry_point, "input": input, "idempotency_key": idempotency_key}
         if signal is not _NO_SIGNAL:
             payload["signal"] = signal
-        response = self._post_with_retry(
-            f"{self.url}/invoke",
-            payload,
-        )
+        response = self._post_with_retry(f"{self.url}/invoke", payload)
+        status = response.status_code
+        body = self._decoded(response)
+        if status == 200:
+            if isinstance(body, dict) and "envelope" not in body and body.get("pause") is True:
+                # Transitional (see PauseRequest): the reference worker still asks
+                # to pause, with an answer that is not an envelope. Step-declared
+                # Gates (#99) retire it. An envelope that happens to carry a
+                # `pause` field is an envelope with an unknown field, ignored.
+                raise PauseRequest(body.get("reason", "cog requested a pause"), usage=body.get("usage"))
+            return ResultEnvelope.parse(body)
+        if status in CODE_FOR_STATUS:
+            # The envelope document's error statuses. The body is an error
+            # envelope; when it is not one (a proxy's page, a worker that died
+            # mid-answer) the status alone still names the failure.
+            if isinstance(body, dict) and "envelope" in body:
+                envelope = ResultEnvelope.parse(body)
+                if envelope.ok:
+                    raise EnvelopeInvalid(f"HTTP {status} carried an ok: true envelope")
+                return envelope
+            return ResultEnvelope.failure(CODE_FOR_STATUS[status], f"HTTP {status} from the worker without an envelope")
         response.raise_for_status()
-        body = response.json()
-        if not isinstance(body, dict) or ("output" not in body and body.get("pause") is not True):
-            raise UsageUnavailable("/invoke must return output or pause with top-level usage")
-        if body.get("pause"):
-            # The Cog asked to pause for a decision — surface it as the engine's
-            # PauseRequest so a Gate/human can approve, reject, or send back.
-            from .orchestration import PauseRequest
+        raise EnvelopeInvalid(f"unexpected HTTP {status} from /invoke")
 
-            raise PauseRequest(body.get("reason", "cog requested a pause"), usage=body.get("usage"))
-        return InteractionResult(body["output"], body.get("usage"))
+    @staticmethod
+    def _decoded(response: Any) -> Any:
+        """The response's JSON body, or None when there is none to decode."""
+        try:
+            return response.json()
+        except Exception:  # noqa: BLE001 - a non-JSON body is answered by the status handling
+            return None
 
     def _post_with_retry(self, url: str, payload: Any, *, attempts: int = 40, delay: float = 0.5) -> Any:
         # A freshly materialized Service can be briefly unroutable (endpoints /

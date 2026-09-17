@@ -13,11 +13,11 @@ import pytest
 from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
-    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
     PostgresTrackStore,
+    ResultEnvelope,
     RunBudget,
     RunStatus,
     TrackEvent,
@@ -88,7 +88,7 @@ def test_pause_accounting_survives_postgres_recovery(store):
     def handler(entry, value, *, signal=_NO_SIGNAL):
         if signal is _NO_SIGNAL:
             raise PauseRequest("feedback", usage={"tokens": 6})
-        return InteractionResult(value, {"tokens": 6})
+        return ResultEnvelope.success(value, usage={"tokens": 6})
 
     def engine():
         return DurableWorkflowEngine(

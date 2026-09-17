@@ -13,10 +13,10 @@ from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
-    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
+    ResultEnvelope,
     RunBudget,
     RunStatus,
     TrackEvent,
@@ -28,14 +28,14 @@ from collab_hub_execution.orchestration import _NO_SIGNAL, _serialize_op
 def test_token_budget_survives_restart_and_stops_the_run():
     """Budget is reconstructed from the Track, so it holds across an engine restart."""
     def always_usage(entry, value):
-        return InteractionResult({"result": value}, {"tokens": 60})
+        return ResultEnvelope.success({"result": value}, usage={"tokens": 60})
 
     state = {"paused": True}
 
     def gate_then_usage(entry, value, *, signal=None):
         if state["paused"]:
             raise PauseRequest("approve step 2", usage={"tokens": 0})
-        return InteractionResult({"result": value}, {"tokens": 60})
+        return ResultEnvelope.success({"result": value}, usage={"tokens": 60})
 
     track = InMemoryTrackStore()
     budget = RunBudget(max_tokens=100)
@@ -144,7 +144,7 @@ class _CapturingWorker:
 
     def interact(self, entry_point, input=None, idempotency_key=None):
         self.keys.append(idempotency_key)
-        return InteractionResult({"ok": True})
+        return ResultEnvelope.success({"ok": True})
 
 
 class _CapturingExecutor:
@@ -210,7 +210,7 @@ class _KeyHonoringWorker:
         if idempotency_key in self._seen:
             return self._seen[idempotency_key]  # replay -> no repeated side effect
         self.side_effects.append(idempotency_key)  # the side effect
-        self._seen[idempotency_key] = InteractionResult({"done": idempotency_key})
+        self._seen[idempotency_key] = ResultEnvelope.success({"done": idempotency_key})
         if self._crash_once:
             self._crash_once = False
             raise SystemExit("process died after side effect, before completion")
@@ -266,7 +266,7 @@ class _RetryProbeExecutor:
             self._outer.attempts += 1
             if self._outer.attempts == 1:
                 raise RuntimeError("first attempt fails")
-            return InteractionResult({"ok": True})
+            return ResultEnvelope.success({"ok": True})
 
     def materialize(self, cog, run_id, instance=""):
         return self._Worker(self)
@@ -374,7 +374,7 @@ def test_signal_value_is_durable_across_a_crash_mid_resume():
         if crash["once"]:
             crash["once"] = False
             raise SystemExit("crash after signal consumed, before completion")
-        return InteractionResult({"ok": True})
+        return ResultEnvelope.success({"ok": True})
 
     track = InMemoryTrackStore()
 
@@ -397,7 +397,7 @@ def test_signal_can_resume_a_step_with_an_explicit_none():
         if signal is _NO_SIGNAL:  # an explicit None is still a signal
             raise PauseRequest("approve")
         seen.append((value, signal))
-        return InteractionResult({"ok": True})
+        return ResultEnvelope.success({"ok": True})
 
     track = InMemoryTrackStore()
 
@@ -422,7 +422,7 @@ class _KeyCapture:
 
         def interact(self, entry_point, input=None, idempotency_key=None):
             self._outer.keys.append(idempotency_key)
-            return InteractionResult({"ok": True})
+            return ResultEnvelope.success({"ok": True})
 
     def __init__(self):
         self.keys = []
@@ -464,7 +464,7 @@ def test_between_steps_status_is_running_not_tearing_down():
 
 def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
     engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: InteractionResult(v, {"tokens": 60})}),
+        executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage={"tokens": 60})}),
         track=InMemoryTrackStore(),
         budget=RunBudget(max_tokens=60),
     )
@@ -476,7 +476,7 @@ class _TeardownFailsExecutor:
         cog = "c"
 
         def interact(self, entry_point, input=None, idempotency_key=None):
-            return InteractionResult({"ok": True})
+            return ResultEnvelope.success({"ok": True})
 
     def materialize(self, cog, run_id, instance=""):
         return self._Worker()

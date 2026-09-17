@@ -10,9 +10,9 @@ from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
-    InteractionResult,
     OpDefinition,
     OpStep,
+    ResultEnvelope,
     RunBudget,
     RunStatus,
 )
@@ -29,7 +29,7 @@ from collab_hub_execution import (
 def test_exhausted_budget_retry_is_rejected_without_mutating_run(budget, status):
     calls = []
     executor = InMemoryCogExecutor({
-        "c": lambda entry, value: calls.append(value) or InteractionResult(usage={"tokens": 10, "cost": 1}),
+        "c": lambda entry, value: calls.append(value) or ResultEnvelope.success(usage={"tokens": 10, "cost": 1}),
     })
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=executor, track=track, budget=budget)
