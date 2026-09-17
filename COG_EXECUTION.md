@@ -346,7 +346,8 @@ Move approval out of the Cog and onto the Op step, where the glossary puts it.
 
 *In scope*
 - `OpStep.gate`: a declared policy over the envelope (and, from Phase 21, Guard findings) with three outcomes — `pass`, `pass_with_problems`, `escalate`. Default: any `problem` with severity `error` escalates.
-- A decision signal `{actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit.
+- Each escalation gets an **escalation id**, minted over the step attempt and the envelope that escalated, and recorded with it. It is what a decision answers, so a decision is bound to the revision its reviewer actually saw; a send back closes it and the next escalation on that step gets a new one.
+- A decision signal `{escalation, actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit. A decision naming a closed escalation is refused as stale rather than applied to whatever is open now.
 - A Gate declares `approvers` (roles); one that declares none is decided by organization owners and platform operators (decision 1). The engine records the decision; Phase 4 versions it and Phase 10 authorizes it.
 - `PauseRequest` and the worker `{"pause": true}` leave the protocol; the E2E fixture becomes a step-declared Gate.
 
@@ -355,7 +356,8 @@ Move approval out of the Cog and onto the Op step, where the glossary puts it.
 *Acceptance*
 - [ ] A Cog cannot pause a run; only a step's Gate can.
 - [ ] approve, reject and send back each drive the run as stated; send back past the revise bound ends with a status that says so.
-- [ ] Each decision is recorded with actor, outcome, findings, and the envelope it decided on.
+- [ ] Each decision is recorded with its escalation id, actor, outcome, findings, and the envelope it decided on.
+- [ ] A decision naming an escalation that a send back has closed is refused, and the run is unchanged.
 
 #### Phase 4 — The Track as the accountability record
 **Issue** #5 · **Branch** `feat/cog-track-record-5` · **Depends on** Phases 2, 3 · **Size** M
@@ -429,7 +431,7 @@ Where a worker runs is the second axis under the runner, chosen by configuration
 
 *In scope*
 - An **agent location**, `location: local | remote`, selecting the `CogExecutor` the controller constructs. `remote` fails at startup as *not implemented* until Phase 15, so the configuration shape is fixed now and callers never import an executor.
-- **`local`**: `LocalProcessCogExecutor`. Materialize runs the Cog package's declared `serve` task as a child process of the controller, in the package's own pixi environment, bound to a loopback port the executor chooses, with a run token in its environment; ready polls `/healthz`; teardown kills the process tree and reaps it. The package comes from a directory — #83's `static` source — so `nebi pull` and install by digest (Phases 16, 17) are not needed here.
+- **`local`**: `LocalProcessCogExecutor`. Materialize runs the Cog package's declared `serve` task as a child process of the controller, in the package's own pixi environment, bound to a loopback port the executor chooses, with a run token in its environment; ready polls `/healthz`; teardown kills the process tree and reaps it. The package comes from a directory, through a **directory package source** this phase adds: it maps an allowlisted name to a directory under a configured root, reads the package with the bundle reader #81 merged, and refuses a name or path that escapes the roots. It is not #83's `static` registry source, which enumerates an OCI registry and cannot resolve a local path. A package resolved this way is recorded on the Track and in claims by that name plus the digest of its manifest and lock, so a development run is identifiable and never mistaken for a published one. `nebi pull` and install by digest (Phases 16, 17) are not needed here.
 - The executor never binds a non-loopback address; a worker inherits nothing from the controller's environment beyond what the binding delivers. The worker's stdout and stderr are captured to a per-run directory and referenced from the Track, never inlined. A binding's `auth_ref` is resolved by the controller and the value enters only the child's environment: never the Track, never a file on disk.
 - A **location conformance suite** — materialize, ready, an `/invoke` round trip, teardown, cancel mid-interaction, the controller dying with a worker in flight (the worker must not outlive it), two workers on one host without a port collision — run by `local` now and `remote` in Phase 15.
 - #35's `KubernetesCogExecutor` is untouched here; Phase 15 puts it behind `remote`.
@@ -441,6 +443,7 @@ Where a worker runs is the second axis under the runner, chosen by configuration
 - [ ] Killing the controller leaves no worker process running.
 - [ ] `location` is the only switch; no caller imports an executor.
 - [ ] `local` and the in-memory executor pass the location conformance suite.
+- [ ] At level 1 with registry access disabled, the directory source finds and launches a package by name, and a name or path outside the configured roots is refused.
 
 #### Phase 8 — No repeated side effects: the keyed claim
 **Issue** #102 · **Branch** `feat/cog-keyed-claim` · **Depends on** Phase 6 · **Size** M
@@ -450,14 +453,18 @@ A step can be invoked again after it already acted: a durable backend resuming a
 *In scope*
 - Every interaction carries an idempotency key, stable for one step attempt.
 - A durable **keyed claim** store on the hub, with two states. A worker *reserves* the key before it acts and *commits* the envelope after; a replay of a committed key returns the envelope without acting. A replay that finds a key reserved but never committed — the worker died between the side effect and its result — must not act again: the step fails as `outcome-unknown`, and only a person, or an entry point the Cog declares idempotent, resolves it. The claim narrows the crash window to the reserve-to-commit gap and makes it visible; it does not pretend to close it.
+- **Two stores, both first-class**: SQLite for level 1 and the desktop, Postgres for the hub, behind one protocol and one suite — the same shape Phase 4 gives the Track, and what lets M3 run with no container.
+- **A worker-facing transport**, since the worker is a separate process even at level 1: `POST /v1/claims/{key}/reserve` and `/commit`, and `GET /v1/claims/{key}`, authorized by the run token the executor already delivers (Phase 7) and scoped to that run's own keys — a worker can neither read nor commit another run's. Phase 22's "claim endpoint" is this one, and Phase 11's SDK is its client.
 - The claim contract documented for workers; the reference worker implements it, and the Phase 11 SDK implements it for every adapter.
-- The lifecycle suite gains "retry of an interrupted run does not repeat a completed side effect"; the durability suite gains "a worker replaced after reserving, before committing" (the step ends `outcome-unknown`, nothing acts twice) and "a worker replaced after committing, before the step was recorded" (the envelope is returned).
+- The lifecycle suite gains "retry of an interrupted run does not repeat a completed side effect"; the durability suite gains "a worker replaced after reserving, before committing" (the step ends `outcome-unknown`, nothing acts twice) and "a worker replaced after committing, before the step was recorded" (the envelope is returned). A **claim conformance suite** runs reserve, commit, replay of a committed key, replay of a reserved-but-uncommitted key, and expiry, against SQLite and Postgres alike.
 
-*Dev and CI* — the `fake-cog` compose service joins the `fakes` profile; the claim's retry case runs in `test-execution.yaml` against Postgres. *Docs* — `op-cog-seam.md` gains the claim contract; `frames-operations.md` lists the claims table and how long claims are kept.
+*Dev and CI* — at level 1 the SQLite claim store sits beside the SQLite Track in `dev/.local/`, so a fake Cog running as a child process (Phase 7) reserves and commits over HTTP with no container; the `fake-cog` compose service joins the `fakes` profile at level 2. CI: the claim conformance suite runs in `test-execution.yaml` against both stores, and `level-1` restarts a worker and then its controller mid-step and asserts the claim answers. *Docs* — `op-cog-seam.md` gains the claim contract; `frames-operations.md` lists the claims table and how long claims are kept.
 
 *Acceptance*
 - [ ] Re-invoking a step whose side effect already happened returns the recorded envelope and does not act again, under `none` retry.
 - [ ] A worker replaced between reserving a key and committing its envelope leaves the step `outcome-unknown`; nothing acts twice.
+- [ ] A real local worker replays its claim across a worker restart and a controller restart, at level 1, with no Postgres: the side effect ran once.
+- [ ] Both claim stores pass the claim conformance suite, and a run token reaches only its own run's keys.
 - [ ] The claim contract is documented and implemented by the reference worker.
 
 #### Phase 9 — Run controller and run pickup
@@ -495,8 +502,8 @@ State a Cog for execution, run it, read its output and errors, stop it — as en
 - `GET /v1/runs`, `GET /v1/runs/{id}` — organization-scoped, status derived from the Track, `interrupted` included.
 - `GET /v1/runs/{id}/events` — replay from `after`, and `text/event-stream` for a live run.
 - `GET /v1/runs/{id}/steps/{step}/payload` — the output a step event references, under the run's own authorization; errors are read from `step_failed` events.
-- `POST /v1/runs/{id}/steps/{step}/decision` — approve, reject or send back with findings; authorized against the Gate's `approvers`; the actor from the auth context.
-- `POST /v1/runs/{id}/cancel`; `POST /v1/runs/{id}/retry`, which re-runs a failed or interrupted run as a new attempt.
+- `POST /v1/runs/{id}/steps/{step}/decision` — approve, reject or send back with findings; authorized against the Gate's `approvers`; the actor from the auth context. The body carries the **escalation id** the reviewer is answering (Phase 3 mints one per escalation, over the step attempt and the envelope it escalated on). A decision is accepted atomically and only while that escalation is the open one: a second decision on the same escalation is idempotent if it repeats the first and a conflict otherwise, and a decision naming an escalation already closed — the revision it reviewed has been sent back and replaced — is refused as stale, naming the escalation that is open now. Two reviewers racing on one escalation cannot both win, and a late approval can never approve a revision its author never saw.
+- `POST /v1/runs/{id}/cancel`; `POST /v1/runs/{id}/retry`, which carries Phase 6's retry identity into the API: a run interrupted mid-step resumes that step under its existing attempt and idempotency key, so a committed claim answers instead of the work running twice; a step whose failure was recorded runs again as a new attempt with a new key. A step left `outcome-unknown` (Phase 8) is not retried this way at all — it is reconciled explicitly, and the endpoint refuses with a reason naming the step. The response says which of the three happened.
 - The response to a submission names the durability backend and the location it will run under, so a client never assumes a `none` run survives a restart (decision 3) or that a `local` worker is isolated (decision 11).
 - The API writes intent and reads the Track and never calls the executor, enforced by an import-boundary test.
 
@@ -504,6 +511,8 @@ State a Cog for execution, run it, read its output and errors, stop it — as en
 
 *Acceptance*
 - [ ] At level 1 and against the kind stack, a client submits, streams events, reads a step's payload, decides a gate and sees completion using only these endpoints.
+- [ ] A worker commits its claim, the controller is killed before the Track records the step, and `POST .../retry` returns the original envelope with the work having run once.
+- [ ] Two conflicting decisions on one escalation: one wins, the other is a conflict; an approval naming an escalation closed by a send-back is refused as stale.
 - [ ] A member without an approver role gets 403, and a member of another organization cannot read a run's payload; every accepted decision is on the Track with its actor.
 - [ ] Unauthenticated requests are refused under the hardened path map.
 
@@ -587,10 +596,11 @@ The same runner, backend and Cog; the worker becomes a pod. Then the rest of the
 Same runner, same `none`, same Hermes Cog — the worker becomes a pod. The only identity able to create workloads is the controller, never the public API.
 
 *In scope*
-- `location: remote` constructs #35's `KubernetesCogExecutor` (a per-run Deployment + Service + ingress-only NetworkPolicy), which passes Phase 7's location conformance suite unchanged. Until Phase 16 the pod runs the baked runner image, as #35's E2E does.
+- `location: remote` constructs #35's `KubernetesCogExecutor` (a per-run Deployment + Service + ingress-only NetworkPolicy). Until Phase 16 the pod runs the baked runner image, as #35's E2E does.
+- It passes Phase 7's location conformance suite, whose controller-death case is written per location rather than one rule for both — the way the durability suite already differs per backend. `local`: the worker dies with its controller, since it is that process's child. `remote`: the pod survives the controller, and the next controller start reaps it; the suite asserts the reap, and that no run advances and no claim is acted on in between. Neither location leaves a worker serving an orphaned run indefinitely, and orphan cleanup and claim reconciliation both precede any retry that could act again.
 - Chart: the controller's Deployment, a ServiceAccount and a namespace-scoped Role and RoleBinding for the controller only, over the kinds actually materialized and the verbs used; `values.yaml` and `values.schema.json` change together; the API pod holds no workload permissions; `automountServiceAccountToken: false` on workers.
 - The run token and the binding reach the pod the way they reach a child process — environment and a mounted file — so the SDK does not know its location.
-- A pod that outlives a dead controller is reaped on the controller's next start, the `remote` half of Phase 9's start-up sweep.
+- That reap is the `remote` half of Phase 9's start-up sweep; a `local` worker needs none, having died with its parent.
 
 *Dev and CI* — `make kind-up` deploys the controller from the chart with `location: remote`, and `make op` on kind materializes a worker pod. CI: `level-4-render` asserts the controller Deployment renders, the Role is limited to materialized kinds and the API ServiceAccount has no workload verbs; `test-execution-e2e.yaml` runs the location suite against kind. *Docs* — `runs.md`'s location table gains `remote`; `docs/standalone-deployment.md` *Namespace ownership* states the controller's Role; the chart values are described.
 
@@ -598,7 +608,7 @@ Same runner, same `none`, same Hermes Cog — the worker becomes a pod. The only
 - [ ] On kind with default RBAC, the controller materializes a worker pod, and `kubectl auth can-i` shows the API ServiceAccount cannot create one.
 - [ ] The grant is namespace-scoped and limited to materialized kinds, and workers carry no ServiceAccount token.
 - [ ] The fake Cog runs in a pod through `location: remote` with no change to the Op that ran it as a child process.
-- [ ] `remote` passes the location conformance suite.
+- [ ] `remote` passes the location conformance suite, including its own controller-death expectation: the pod is reaped on the next controller start, and nothing advances or acts on a claim in between.
 
 #### Phase 16 — Workers run the Cog's own `serve`, from its artifact
 **Issue** #105 · **Branch** `feat/cog-materialize-serve` · **Depends on** Phases 12, 15; #84, #85 (develop against #83's `static` source) · **Size** L
@@ -627,7 +637,7 @@ The materialize half of install-versus-materialize: a worker is the Cog package,
 Pinning a Cog and proving it works happens once, not on every run.
 
 *In scope*
-- `POST /v1/cogs/installs` pins `<host>/<repo>@<digest>` from the catalog, runs the Cog's `check` lifecycle entry point through Phase 16's materialization, and records the card and install state. A failing check leaves the Cog not invokable.
+- `POST /v1/cogs/installs` pins `<host>/<repo>@<digest>` from the catalog and records the card. An install moves through **fetched → bound → invokable**, in that order, because a Cog's `check` may probe what its binding gives it — a context Cog's `check` that asks its model for health cannot pass before resolution has chosen that model. So: fetch and provision the environment; resolve against the hub's inventory and admit the binding (Phase 18; until then the controller's `models:` stopgap supplies it); *then* run `check` through Phase 16's materialization with that binding delivered. A failing check leaves the install `bound`, not invokable, and says which step failed. `GET` shows the state, so a Cog stuck before `invokable` is visible rather than silently absent.
 - `GET /v1/cogs/installs`; `DELETE /v1/cogs/installs/{id}` removes the install and every runtime resource it created — Phase 19 extends that to its warm pool.
 - `POST /v1/runs` gains the "run one installed Cog once" form: a bundled op on an installed digest. A run on a digest that is not installed is refused.
 
@@ -635,7 +645,8 @@ Pinning a Cog and proving it works happens once, not on every run.
 
 *Acceptance*
 - [ ] Installing a context Cog makes it invokable with no hand-authored per-Cog deployment.
-- [ ] A Cog whose `check` fails is not invokable, and says why.
+- [ ] A Cog whose `check` fails stays `bound`, is not invokable, and says which step failed.
+- [ ] A context Cog with no prior binding and no default model server installs from the host's model configuration alone: it is bound before its `check` runs, and the `check` sees that binding.
 - [ ] Uninstall removes every runtime resource the install created.
 
 #### Phase 18 — Model binding: inventory, the Cog's `resolve`, delivery
@@ -649,6 +660,7 @@ The hub offers, the Cog selects, the hub records and delivers — so the hub doe
 - The binding is delivered to the worker as a mounted file plus environment; secrets arrive by reference. A check refuses literal secrets in manifests and bindings.
 - The binding id appears on every step event and in the envelope's `binding`.
 - A plug point for #10: the inventory is filtered before `resolve` sees it. No filter is implemented here.
+- The install sequence Phase 17 defines does not change: fetch and provision, bind, then `check`. This phase replaces what supplies the binding at the bind step — the Cog's own `resolve` over the inventory, instead of the controller's `models:` stopgap — so a Cog's `check` still runs against a real binding.
 - Resolution covers `requires: harness` as it covers models: the inventory lists the installed harness Cogs, the Cog's `resolve` selects one, and the binding names it — which is when a context Cog first resolves to the Hermes Cog of Phase 12.
 
 *Dev and CI* — Phase 11's stdlib fake model joins the `fakes` compose profile as `fake-model`, and the dev model configuration generates the inventory from it; `test-execution-e2e.yaml` asserts a worker's connection comes only from its delivered binding. *Docs* — `op-cog-seam.md` gains binding delivery; `values-example.yaml` shows the model configuration; `docs/cog-execution/sensitivity.md` names the inventory filter as #10's plug point.
