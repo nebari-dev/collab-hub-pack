@@ -84,13 +84,36 @@ from collab_hub_api.connectors.slack_client import (
 from collab_hub_api.connectors.slack_tokens import SlackTokenProvider
 from collab_hub_api.connectors.validation import has_control_or_nonprintable
 from collab_hub_api.frames.auth import get_auth_context
+from collab_hub_api.frames.connector_state import apply_disabled
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
 logger = logging.getLogger("frames_server.connectors")
 
 
 def get_connectors_config(request: Request) -> ConnectorsConfig:
-    return request.app.state.connectors_config
+    """This deployment's connector configuration, minus anything switched off.
+
+    The switch is applied here rather than in each handler because every
+    connector route already takes this dependency: one place to enforce, and no
+    route that can forget. A disabled connector arrives with its credentials
+    blanked, so it reads as unconfigured to code that already handles that --
+    see :mod:`..frames.connector_state`.
+
+    A store that cannot answer disables nothing. Failing closed here would take
+    every connector down over a database blip, which is a far worse outcome
+    than briefly honouring a switch late.
+    """
+
+    config = request.app.state.connectors_config
+    store = getattr(request.app.state, "connector_store", None)
+    if store is None:
+        return config
+    try:
+        disabled = store.disabled()
+    except Exception:
+        logger.warning("connector_state_unavailable")
+        return config
+    return apply_disabled(config, disabled)
 
 
 @router.get("", response_model=list[ConnectorSummary])

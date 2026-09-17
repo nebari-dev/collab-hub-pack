@@ -313,7 +313,7 @@ re-derives it from the served response body as well.
 
 ACCEPTANCE_CONTENT_SECURITY_POLICY = (
     f"default-src 'none'; style-src 'self'; script-src '{ACCEPTANCE_SCRIPT_HASH}'; "
-    "connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'self'; "
+    "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; "
     "frame-ancestors 'none'"
 )
 """This page's policy — see the module docstring for why it differs.

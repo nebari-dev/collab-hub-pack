@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -16,12 +17,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .config import (
     BaseConfig,
     build_active_frame_store,
+    build_audit_log,
+    build_connector_store,
     build_frames_store,
     build_group_store,
     build_history_store,
     build_invitation_email_delivery,
     build_invitation_service,
+    build_model_access,
+    build_model_catalog,
     build_org_store,
+    build_platform_role_admin,
+    build_platform_role_sync,
     build_postgres_pools,
     build_service_access_granter,
     build_task_store,
@@ -57,6 +64,8 @@ from .frames.store import ConcurrentFrameUpdateError
 from .path_protection import PathProtectionMiddleware, api_path, request_path
 from .routers import (
     admin,
+    admin_api,
+    admin_ui,
     connectors,
     frame_groups,
     frames,
@@ -246,6 +255,14 @@ def make_app(config: BaseConfig) -> FastAPI:
     usage_store = build_usage_store(config, postgres_pools)
     task_store = build_task_store(config, postgres_pools)
     org_store = build_org_store(config, postgres_pools)
+    # After the store, because the reconcile writes through whichever one
+    # this deployment actually has.
+    platform_role_sync = build_platform_role_sync(config, postgres_pools, org_store)
+    audit_log = build_audit_log(config, postgres_pools)
+    platform_role_admin = build_platform_role_admin(config, postgres_pools)
+    connector_store = build_connector_store(config, postgres_pools)
+    model_catalog = build_model_catalog(config)
+    model_access = build_model_access(config, postgres_pools)
     # The collab_ tenancy tables' store carries no DDL of its own, so their
     # migration is invoked here rather than falling out of a store's
     # construction the way the frames_server_ tables' DDL does. Same trigger
@@ -307,6 +324,13 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.group_store = group_store
             app.state.invitation_email_delivery = invitation_email_delivery
             app.state.invitation_service = invitation_service
+            app.state.platform_role_sync = platform_role_sync
+            app.state.audit_log = audit_log
+            app.state.platform_role_admin = platform_role_admin
+            app.state.connector_store = connector_store
+            app.state.model_catalog = model_catalog
+            app.state.model_access = model_access
+            app.state.model_groups = dict(config.frames.model_access.model_groups)
             app.state.service_access_granter = service_access_granter
             app.state.granted_service_groups = granted_service_groups
             app.state.user_directory_client = user_directory_client
@@ -659,6 +683,18 @@ def make_app(config: BaseConfig) -> FastAPI:
                 # declared organization — how a single-org hub grants `owner`
                 # — go through the owner page and API as usual.
                 page_routers.append(admin.make_router())
+            # The panel's JSON. Mounted on the outer condition rather than
+            # beside the invitation page: everything it manages — models,
+            # roles, connectors, usage, the audit log — is just as meaningful
+            # on a single-organization hub. Only the org-creating invitation
+            # page is particular to the multi-organization source.
+            page_routers.append(admin_api.make_router())
+            # The built panel, when this deployment ships one. Checked here
+            # rather than inside the router so that a deployment without a
+            # build mounts nothing at all.
+            admin_ui_dist = _built_admin_ui(config)
+            if admin_ui_dist is not None:
+                page_routers.append(admin_ui.make_router(admin_ui_dist))
             # The owner invitation page (issue #142), same mounting rule and
             # for the same reason: on a claims-sourced deployment the org-role
             # axis is structurally None, so every owner would be refused, and
@@ -770,3 +806,22 @@ def make_app(config: BaseConfig) -> FastAPI:
         enforce_web_surface_map_access(app.routes, config)
 
     return app
+
+
+def _built_admin_ui(config) -> Path | None:
+    """The panel's built directory, or ``None`` if this build has no panel.
+
+    A configured path whose ``index.html`` is missing counts as no panel. That
+    is the failure a broken Docker stage produces, and answering it with the
+    pre-panel behaviour is both truthful and harmless; a startup refusal would
+    take down sign-in and the invitation pages over a front-end build.
+    """
+
+    configured = config.web.admin_ui_dist
+    if not configured:
+        return None
+    dist = Path(configured)
+    if not (dist / "index.html").is_file():
+        logger.warning("admin_ui_dist_missing_index", extra={"path": str(dist)})
+        return None
+    return dist

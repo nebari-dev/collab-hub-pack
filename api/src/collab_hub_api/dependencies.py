@@ -12,6 +12,7 @@ from .frames.account_provisioning import DisabledServiceAccessGranter
 if TYPE_CHECKING:
     from .frames.account_provisioning import ServiceAccessGranter
     from .frames.active_state import ActiveFrameStore
+    from .frames.audit_log import AuditLog
     from .frames.groups import FrameGroupStore
     from .frames.history import FrameHistoryStore
     from .frames.invitation_email import InvitationEmailDelivery
@@ -40,6 +41,20 @@ def get_group_store(request: Request) -> FrameGroupStore:
 
 def get_user_directory_client(request: Request) -> UserDirectoryClient:
     return request.app.state.user_directory_client
+
+
+def get_audit_log(request: Request) -> AuditLog:
+    """The audit reader owned by the app serving this request.
+
+    ``getattr`` with the refusing default for the same reason the service-access
+    granter uses one: an app assembled outside ``make_app`` should refuse to
+    read a log it has no connection to, rather than raise ``AttributeError``
+    from inside a route.
+    """
+
+    from .frames.audit_log import UnavailableAuditLog
+
+    return getattr(request.app.state, "audit_log", UnavailableAuditLog())
 
 
 def get_usage_store(request: Request) -> UsageStore:

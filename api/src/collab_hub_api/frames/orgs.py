@@ -238,7 +238,7 @@ class InMemoryOrgStore(OrgStore):
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._memberships: dict[str, OrgMembership] = {}
-        self._platform_roles: dict[str, tuple[str, str]] = {}
+        self._platform_roles: dict[str, tuple[str, str, str]] = {}
 
     def set_membership(
         self,
@@ -263,11 +263,32 @@ class InMemoryOrgStore(OrgStore):
         user_id: str,
         role: str = PLATFORM_ROLE_OPERATOR,
         status: str = PLATFORM_ROLE_ACTIVE,
+        source: str = "manual",
     ) -> None:
-        """Seed or replace a platform-role row (dev/test only; grants have no API)."""
+        """Seed or replace a platform-role row (dev/test only; grants have no API).
+
+        ``source`` defaults to ``manual`` to match the column default the
+        Postgres table carries: a row put here by hand is hand-administered,
+        and the identity-provider sync must leave it alone. See
+        :mod:`.platform_role_sync`.
+        """
 
         with self._lock:
-            self._platform_roles[user_id] = (role, status)
+            self._platform_roles[user_id] = (role, status, source)
+
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored row, shaped like the Postgres read, or ``None``.
+
+        Exists so the identity-provider sync can take one decision against
+        either backend instead of carrying two copies of the rule.
+        """
+
+        with self._lock:
+            stored = self._platform_roles.get(user_id)
+        if stored is None:
+            return None
+        role, status, source = stored
+        return {"role": role, "status": status, "source": source}
 
     def resolve_principal(self, user_id: str) -> ResolvedPrincipal:
         # Through get_membership on purpose, so a test subclass that counts or
@@ -448,6 +469,28 @@ class PostgresOrgStore(OrgStore):
                 extra={"user": user_id, "org": org_id},
             )
         return membership, created
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored role row, or ``None``.
+
+        Separate from :meth:`resolve_principal`, which deliberately collapses a
+        revoked grant to "no role": the admin panel needs the row as written --
+        including where it came from -- to explain what revoking will actually
+        do. Not on the auth path, so it costs nothing there.
+        """
+
+        import psycopg
+
+        try:
+            with self._db.connection() as conn:
+                row = conn.execute(
+                    "SELECT role, status, source FROM collab_platform_roles WHERE user_id = %s",
+                    (user_id,),
+                ).fetchone()
+        except psycopg.errors.UndefinedTable as exc:
+            raise self._missing_schema() from exc
+        if row is None:
+            return None
+        return {"role": row["role"], "status": row["status"], "source": row["source"]}
 
     def _missing_schema(self) -> OrgSchemaMissingError:
         message = (

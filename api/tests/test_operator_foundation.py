@@ -44,6 +44,7 @@ from httpx import ASGITransport, AsyncClient
 
 psycopg = pytest.importorskip("psycopg")
 
+from fake_audit_db import FakeAuditDatabase  # noqa: E402
 from psycopg import pq, sql  # noqa: E402
 
 from collab_hub_api.config import Config  # noqa: E402
@@ -706,75 +707,10 @@ def test_an_org_read_inside_an_mcp_tool_body_fails_closed_as_a_tool_error(tmp_pa
 # ---------------------------------------------------------------------------
 
 
-class FakeTransaction:
-    def __init__(self, conn):
-        self.conn = conn
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        return False
-
-
-class FakeConnectionInfo:
-    def __init__(self):
-        self.transaction_status = pq.TransactionStatus.INTRANS
-
-
-class FakeAuditConnection:
-    """Records statements and the transaction outcome, like the pooled CM."""
-
-    # psycopg's AdaptContext surface, so psycopg.sql composables render
-    # against the double the way they would against a real connection
-    # (connection=None simply means "no connection settings": UTF-8).
-    connection = None
-    adapters = psycopg.adapters
-
-    def __init__(self):
-        self.statements: list[tuple[str, tuple | None]] = []
-        self.outcome: str | None = None
-        self.info = FakeConnectionInfo()
-        self._pending: dict | None = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, *exc_info):
-        # psycopg_pool's connection() context manager: commit on clean exit,
-        # rollback when the body raised.
-        self.outcome = "rollback" if exc_type else "commit"
-        return False
-
-    def transaction(self):
-        return FakeTransaction(self)
-
-    def cursor(self):
-        # The fake doubles as its own cursor: execute/fetch live here anyway.
-        return self
-
-    def execute(self, sql, params=None):
-        # psycopg is handed bytes for a rendered composable; record the text
-        # the server would actually receive.
-        sql = sql.decode() if isinstance(sql, (bytes, bytearray)) else str(sql)
-        self.statements.append((" ".join(sql.split()), params))
-        if "INSERT INTO collab_audit_events" in str(sql):
-            self._pending = {"id": len(self.statements)}
-        return self
-
-    def fetchone(self):
-        return self._pending
-
-
-class FakeAuditDatabase:
-    def __init__(self):
-        self.connections: list[FakeAuditConnection] = []
-
-    def connection(self, timeout=None):
-        conn = FakeAuditConnection()
-        self.connections.append(conn)
-        return conn
-
+# The connection double lives in ``fake_audit_db`` now that the
+# platform-role sync suite drives the same contract: two hand-copied
+# doubles would be one psycopg change away from disagreeing about what the
+# pooled context manager does, which is the only thing the double is for.
 
 def test_audited_runs_the_mutation_and_the_event_insert_on_one_connection():
     db = FakeAuditDatabase()
@@ -1349,8 +1285,10 @@ def _effective_check(column: str) -> set[str]:
 def test_the_action_vocabulary_is_exactly_the_ratified_beta_set():
     """The closed set, spelled out so widening it is a deliberate edit here.
 
-    ``service_access.grant`` was appended by #180. The target vocabulary has
-    not moved: a grant's target is the accepter, which is already ``user``.
+    ``service_access.grant`` was appended by #180, and the two
+    ``platform_role.*`` actions by the sync that lets an identity provider
+    decide who is an operator. The target vocabulary has not moved: every one
+    of these aims at a person, which is already ``user``.
     """
 
     assert AUDIT_ACTIONS == {
@@ -1362,8 +1300,13 @@ def test_the_action_vocabulary_is_exactly_the_ratified_beta_set():
         "org.rename",
         "operator.manual",
         "service_access.grant",
+        "platform_role.grant",
+        "platform_role.revoke",
+        "service_access.revoke",
+        "connector.enable",
+        "connector.disable",
     }
-    assert AUDIT_TARGET_TYPES == {"org", "user", "invitation"}
+    assert AUDIT_TARGET_TYPES == {"org", "user", "invitation", "connector"}
 
 
 def test_the_check_constraints_match_the_code_vocabulary_exactly():

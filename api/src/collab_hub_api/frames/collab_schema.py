@@ -463,6 +463,143 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        7,
+        (
+            # Where a platform-role row came from, so that sync can remove its
+            # own rows without ever removing a hand-administered one.
+            #
+            # Sync has to be able to revoke: a copy of the identity provider's
+            # answer that only ever adds would leave a dropped admin's row
+            # standing forever, and the deployment would believe the provider
+            # had revoked them. But the bootstrap operator's row was inserted
+            # by hand, and their subject may be in no group at all -- so a sync
+            # that could revoke anything would lock the first admin out of the
+            # deployment they had just bootstrapped, on their next sign-in.
+            #
+            # The default is `manual`, which is what makes this migration safe
+            # on a live database: every row that exists when it runs was
+            # inserted by hand, and every one of them keeps its authority.
+            """
+            ALTER TABLE collab_platform_roles
+            ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual'
+            CHECK (source IN ('manual', 'idp'))
+            """,
+            # Widen the audit action vocabulary by two: `platform_role.grant`
+            # and `platform_role.revoke`. Same mechanics as v5 -- drop the
+            # constraint by the name v5 chose, add the replacement under that
+            # same name -- and the same test pins the effective constraint to
+            # AUDIT_ACTIONS, so widening one without the other fails at unit
+            # speed rather than on a production sign-in.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        8,
+        (
+            # Version 2 shipped this table with no index beyond its primary
+            # key, and said so deliberately: the log was read from psql at
+            # beta volume. It now has a paginated reader behind the admin
+            # panel, so the two filters that reader offers need to be seeks
+            # rather than scans over a table that only grows.
+            #
+            # `id DESC` in both, matching the reader's ORDER BY exactly: an
+            # index whose order disagrees with the query's is read forwards
+            # and then sorted, which is the cost this exists to avoid. The
+            # unfiltered listing is already served by the primary key.
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_actor_idx
+            ON collab_audit_events (actor, id DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_action_idx
+            ON collab_audit_events (action, id DESC)
+            """,
+        ),
+    ),
+    (
+        9,
+        (
+            # Widen the action vocabulary by one: `service_access.revoke`.
+            # Same mechanics as v5 and v7. It had no counterpart before because
+            # nothing in this codebase could take service access away; the
+            # admin panel can.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        10,
+        (
+            # Which connectors an administrator has switched off.
+            #
+            # One bit per connector and nothing else. Credentials stay in
+            # deployment configuration, which is what decides whether a
+            # connector is possible at all; this decides whether it is
+            # currently offered. A row here can only ever take a configured
+            # connector away, never conjure an unconfigured one -- there is no
+            # credential column for it to supply.
+            #
+            # Absence means enabled, so a deployment that never opens this
+            # screen behaves exactly as it did before the table existed.
+            """
+            CREATE TABLE IF NOT EXISTS collab_connector_state (
+                connector   text PRIMARY KEY,
+                enabled     boolean NOT NULL,
+                updated_at  timestamptz NOT NULL DEFAULT now(),
+                updated_by  text
+            )
+            """,
+            # Two more actions, and the first new target type since version 2:
+            # a connector is not an org, a user or an invitation.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke',
+                              'connector.enable', 'connector.disable'))
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_target_type_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_target_type_check
+            CHECK (target_type IN ('org', 'user', 'invitation', 'connector'))
+            """,
+        ),
+    ),
 )
 
 
