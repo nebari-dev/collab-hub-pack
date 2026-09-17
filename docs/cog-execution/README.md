@@ -106,7 +106,7 @@ Bare decision and invariant numbers are ADR-0001's.
 | #3 model binding | D3, invariant 4 | The hub offers the inventory; the Cog's `resolve` selects; the binding record is the output. |
 | #4 budgets and idle workers | invariant 3 | Duration is a hard pre-check; token/cost is post-interaction accounting. |
 | #5 durable Track | D8; ADR-0002 D3 | Carry binding identity per step and actor per gate decision. Run status comes only from the Track, under every backend. Catalog persistence belongs to #7. |
-| #6 least-privilege grant | invariant 2; ADR-0002 D4, invariant 3 | Namespace-scoped; workers carry no ServiceAccount token. Only the run controller holds workload permissions. |
+| #6 the remote location and least-privilege RBAC | invariant 2; ADR-0002 D4, invariant 3 | `location: remote` puts the Kubernetes executor behind the switch #109 adds; a namespace-scoped grant to the controller only; workers carry no ServiceAccount token. |
 | #7 registry and catalog | D6, D9 | The catalog card derives from the manifest; index the full profile as declared. |
 | #8 delegated connector access | "deferred" list | The hub's brokered connectors act as the user; no credential enters the worker. |
 | #9 Guards | seam item 2 | Guards consume the envelope; a Cog's contract checks are inputs to Guards, not Guards. Gates decide. |
@@ -117,10 +117,11 @@ Bare decision and invariant numbers are ADR-0001's.
 | #101 the `none` backend | ADR-0002 D1–D3, invariants 1–2 | In-flight runs end `interrupted` after a restart and are never resumed. |
 | #102 keyed claim | ADR-0002 D1 | One attempt acts once; a recorded failure retries under a new key. |
 | #103 run API | ADR-0002 D4, D7, invariant 3 | The API records intent and reads the Track; it never calls the executor. |
+| #121 run controller and run pickup | ADR-0002 D4, invariant 3 | Runs advance in the controller, which alone constructs an executor; pickup under `none`. |
 | #104 DBOS backend | ADR-0002 D1, D3 | Resumes after a restart; status still comes from the Track. |
 | #105 materialize from the artifact | D5, invariant 2 | The worker runs the Cog's own `serve`. |
 | #106 install by digest | D5 | Install runs `check` once; materialize happens per run. |
 | #107 worker SDK | ADR-0002 D5, invariant 4 | Optional for Cogs; the hub never imports it. |
 | #108 Hermes harness Cog | ADR-0002 D5 | The first harness Cog, built on the worker SDK. |
-| #109 local executor, DBOS on SQLite | ADR-0002 D6 | Local execution through the same package. |
+| #109 agent location | ADR-0002 D1, D6 | `location`, `local` or `remote`, beside `backend`: a child process first, a pod (#6) behind the same switch. |
 | #110 Temporal backend | ADR-0002 D1, D3 | The same conformance suites as the other backends. |
