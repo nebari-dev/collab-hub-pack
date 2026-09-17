@@ -919,32 +919,44 @@ as present, so removal stays correct. Safety rules operators should know:
 - **The fetch budget is dealt fairly.** Fetch slots go to never-seen artifacts
   and to retries of `failed` rows in a fixed interleave (every fourth slot is a
   retry slot; a class that has run out yields its slot). The interleave's phase
-  advances each sweep and retries are taken from a rotating cursor, so even a
-  budget of one reaches a retry within four sweeps under a constant stream of
-  new artifacts, and a stable prefix of permanent failures cannot occupy the
-  retry slots while a recoverable failure behind it waits. Never-seen
-  artifacts keep enumeration order; once indexed they cost nothing, so the tail
-  of a large registry is reached across sweeps without rotation.
-- **The lock is never released under a live write; shutdown is still bounded.**
-  Sweep-path statements carry a server-side `statement_timeout`, and every
-  pooled connection has TCP keepalives, so a worker thread blocked on the
-  database always finishes in bounded time even if the peer vanished. A
-  cancelled sweep waits for its in-flight worker thread up to a drain deadline
-  (30 s), however many times it is cancelled. Past that deadline the sweep
-  stops waiting — but it does **not** release the lock: it logs
-  `cog_index_worker_drain_expired` and `cog_index_lock_release_deferred`, and
-  hands the lock to a background task (`cog-index-late-release`) that releases
-  it only once the worker has actually finished (`cog_index_lock_released_late`).
-  Until then other replicas keep seeing `cog_index_sweep_skipped`, which is
-  correct: a write may still be running. The app lifespan waits at most 45 s
-  for the cancelled indexer task and otherwise leaves it pending with
-  `cog_indexer_shutdown_abandoned`; it dies with the process, and any lock it
-  still holds is released by the server with the connection. If any step of
-  taking or giving back the lock fails (unlock, `RESET statement_timeout`,
-  autocommit restore), the lock connection is **closed, not returned**
-  (`cog_index_lock_connection_discarded`) so the pool opens a fresh one instead
-  of handing a session with an altered timeout — or one still holding the lock —
-  to the next borrower.
+  advances each sweep, and retries are served from a rotating order of
+  `(repository, digest)` identities — identities rather than positions, because
+  the failed set changes between sweeps and a positional cursor would step over
+  a candidate each time it did. A candidate moves to the back of the rotation as
+  its attempt *begins*, so a sweep that dies partway does not rotate past work it
+  never tried. The effect: even a budget of one reaches a retry within four
+  sweeps under a constant stream of new artifacts, and a stable prefix of
+  permanent failures cannot occupy the retry slots while a recoverable failure
+  behind it waits. Never-seen artifacts keep enumeration order; once indexed
+  they cost nothing, so the tail of a large registry is reached across sweeps
+  without rotation.
+- **The lock is never released under a live write.** A cancelled sweep waits for
+  its in-flight worker thread up to a drain deadline (30 s), however many times
+  it is cancelled. Past that deadline the sweep stops waiting — but it does
+  **not** release the lock: it logs `cog_index_worker_drain_expired` and
+  `cog_index_lock_release_deferred`, and hands the lock to a daemon thread
+  (`cog-index-late-release`) that releases it only once the worker has actually
+  finished (`cog_index_lock_released_late`). A thread rather than a task because
+  it must outlive the event loop: at shutdown every task is cancelled and the
+  loop closes, and an asyncio owner would stop mid-wait and leave the lock
+  context to be finalized by the garbage collector — unlocking while the write
+  was still in flight. Until the hand-off completes, other replicas keep seeing
+  `cog_index_sweep_skipped`, which is correct: a write may still be running.
+- **Shutdown bounds the wait, not the workers.** The app lifespan waits at most
+  45 s for the cancelled indexer task and otherwise leaves it pending with
+  `cog_indexer_shutdown_abandoned`. Sweep-path statements carry a server-side
+  `statement_timeout` and every pooled connection sets TCP keepalives (a dead
+  peer is noticed in about 90 s), which covers the ordinary partition; neither
+  ends a call to a peer whose kernel still answers probes while the database
+  process is stopped. Such a thread is a daemon and goes when the process does,
+  taking the connection — and with it the session-scoped advisory lock — along.
+  That is why abandoning is safe at all.
+- **A doubtful lock connection is discarded, not returned.** If any step of
+  taking or giving back the lock fails (setting autocommit, the acquire, the
+  unlock, `RESET statement_timeout`, restoring autocommit), the connection is
+  **closed** (`cog_index_lock_connection_discarded`) so the pool opens a fresh
+  one instead of handing a session with an altered timeout — or one still
+  holding the lock — to the next borrower.
 - **Indexing needs two pooled connections.** The sweep lock occupies one
   connection of the shared `frames.postgres` pool for the sweep's whole
   duration while reads and writes check out another, so the API refuses to

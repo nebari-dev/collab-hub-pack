@@ -48,6 +48,7 @@ from collab_hub_api.cogs.oci import (
     OCIError,
 )
 from collab_hub_api.cogs.registry import (
+    ArtifactRef,
     CogRegistrySourceConfig,
     RegistrySourceError,
     build_registry_sources,
@@ -947,6 +948,7 @@ class _EventedStore(InMemoryCogCatalogStore):
         self.release_write = threading.Event()
         self.exit_started = threading.Event()
         self.release_exit = threading.Event()
+        self.fail_write: BaseException | None = None
         # Default: nothing blocks unless a test arms it.
         self.release_enter.set()
         self.release_write.set()
@@ -968,6 +970,8 @@ class _EventedStore(InMemoryCogCatalogStore):
     def upsert(self, artifact):
         self.write_started.set()
         assert self.release_write.wait(timeout=10)
+        if self.fail_write is not None:
+            raise self.fail_write
         super().upsert(artifact)
         self.events.append("write_done")
 
@@ -1157,11 +1161,133 @@ async def test_drain_deadline_during_acquisition_exits_the_lock_only_after_entry
         assert held is True
 
 
+async def test_the_hand_off_survives_cancellation_of_every_asyncio_task():
+    # Round-4 codex repro: the hand-off used to be an asyncio task. At loop
+    # shutdown every task is cancelled, the task stopped mid-wait, the last
+    # reference to the lock context went with it, and finalizing the context
+    # manager ran its unlock -- while the write was still in flight
+    # (entered -> unlocked -> second sweeper acquired -> write_done). The
+    # hand-off is a thread now, so cancelling every task cannot disturb it.
+    import gc
+
+    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
+    store.release_write.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.write_started.wait, 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert indexer.pending_late_releases == 1
+
+    # The structural guarantee: the owner is a thread, so there is no task for
+    # a loop shutdown to cancel in the first place.
+    assert all(isinstance(owner, threading.Thread) for owner in indexer._late_releases)
+    assert not [t for t in asyncio.all_tasks() if t.get_name() == "cog-index-late-release"]
+
+    # And the sweep's own task is gone, so the only thing keeping the lock
+    # context alive is the hand-off. Collecting must not run its __exit__.
+    del task
+    gc.collect()
+    await asyncio.sleep(0.05)
+
+    assert store.events == ["entered"], "no unlock while the write is in flight"
+    with InMemoryCogCatalogStore.sweep_lock(store) as held:
+        assert held is False
+
+    store.release_write.set()
+    for _ in range(100):
+        if indexer.pending_late_releases == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert store.events == ["entered", "write_done", "unlocked"]
+
+
+def test_retry_rotation_is_keyed_by_identity_not_position():
+    # Round-4 codex repro: the rotation was an integer cursor, so a candidate
+    # list that changed shape between sweeps moved what that position pointed
+    # at -- with new failures arriving ahead of the old ones, the originals
+    # were stepped over every sweep and never retried. The order is a list of
+    # (repository, digest) identities now.
+    indexer, _, _ = make()
+
+    def candidate(digest: str):
+        return ("cogs/r", ArtifactRef(digest=digest, tags=("v1",)), None)
+
+    first = indexer._retry_candidates(SOURCE_ID, [candidate("d1"), candidate("d2"), candidate("d3")])
+    assert [ref.digest for _, ref, _ in first] == ["d1", "d2", "d3"], "enumeration order, the first time"
+
+    indexer._note_retry_attempt(SOURCE_ID, ("cogs/r", "d1"))
+    # Next sweep: d1 recovered and is gone, d0 is newly failed and sorts FIRST
+    # in enumeration order -- exactly the reshuffle the cursor could not take.
+    second = indexer._retry_candidates(SOURCE_ID, [candidate("d0"), candidate("d2"), candidate("d3")])
+    assert [ref.digest for _, ref, _ in second] == ["d2", "d3", "d0"], (
+        "remembered candidates keep their order and newcomers go behind them"
+    )
+    assert ("cogs/r", "d1") not in indexer._retry_order[SOURCE_ID], "a recovered candidate is forgotten"
+
+
+async def test_an_interrupted_sweep_does_not_rotate_past_an_unattempted_retry():
+    # The rotation advances as an attempt BEGINS, so a sweep that dies before
+    # reaching a candidate leaves that candidate at the front for the next one.
+    poison = dict(COMPLETE)
+    poison[COG_ENTRY_FILE] = COMPLETE[COG_ENTRY_FILE] + b"\x00tail"
+    artifacts = {"cogs/p": [entry("1", ["v1"], poison)], "cogs/q": [entry("2", ["v1"], poison)]}
+    indexer, _, _ = make(artifacts, max_new_fetches_per_sweep=2)
+    await indexer.sweep()  # both become failed rows
+    await indexer.sweep()  # and are established in the rotation
+    before = list(indexer._retry_order[SOURCE_ID])
+    assert len(before) == 2
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("the sweep dies during the first retry")
+
+    indexer._reconcile = explode
+    with pytest.raises(RuntimeError):
+        await indexer.sweep()
+
+    # The first candidate's attempt began (it is rotated to the back); the
+    # second was never reached and is still at the front.
+    assert indexer._retry_order[SOURCE_ID] == [before[1], before[0]]
+
+
+async def test_an_abandoned_workers_failure_is_consumed_and_logged_by_class(caplog):
+    # Round-4 codex finding: nobody observed an abandoned worker, so a failure
+    # inside it surfaced through asyncio's default handler with the raw
+    # exception -- which for a store call can carry a URL this module never
+    # logs. The abandoning side now attaches a consumer.
+    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
+    handled: list[dict] = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handled.append(context))
+    store.release_write.clear()
+    store.fail_write = ValueError("postgresql://user:secret@db.internal/collab refused the write")
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.write_started.wait, 10)
+    task.cancel()
+    with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        store.release_write.set()
+        for _ in range(100):
+            if indexer.pending_late_releases == 0:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+
+    records = [r for r in caplog.records if r.message == "cog_index_abandoned_worker_failed"]
+    assert records and records[0].error == "ValueError", "the failure is logged, by class name"
+    assert not any("secret" in str(record.__dict__) for record in caplog.records), "never the message itself"
+    assert handled == [], "and nothing reached asyncio's default exception handler"
+
+
 async def test_a_targeted_reindex_left_behind_does_not_defer_the_next_sweeps_release():
     # reindex() takes no lock; a worker it abandoned is not the next sweep's
     # to wait for, or every later release would be needlessly deferred.
+    from concurrent.futures import Future
+
     indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
-    indexer._abandoned.append(asyncio.get_running_loop().create_future())  # a never-finishing leftover
+    indexer._abandoned.append(Future())  # a never-finishing leftover
     await indexer.sweep()
     assert store.events == ["entered", "write_done", "write_done", "unlocked"]
     assert indexer.pending_late_releases == 0

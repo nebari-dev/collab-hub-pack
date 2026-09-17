@@ -51,11 +51,18 @@ Without them a connection whose peer silently vanished (a node lost, a NAT
 entry expired, a network partition) blocks its caller in ``recv`` until the
 OS keepalive fires -- two hours by default. A worker thread blocked like that
 cannot be interrupted from Python, and ``statement_timeout`` cannot help
-because the server never sees the statement or cannot deliver its abort. With
-these values a dead peer is detected within about ninety seconds (30 s idle +
-6 probes 10 s apart), which is what lets the Cog indexer promise that a
-drained worker thread always finishes (see ``cogs/indexer.py``) and keeps any
-other blocked pooled call bounded too. Ignored for Unix-socket connections.
+because the server never sees the statement. With these values a dead peer is
+detected in about ninety seconds (30 s idle + 6 probes 10 s apart), which
+turns the common partition case from "blocked until the process dies" into
+"blocked for a minute and a half".
+
+What this is **not** is a guarantee that every blocked call ends: a peer whose
+kernel still answers TCP probes while the database process is stopped defeats
+both keepalives and ``statement_timeout``, and the settings do not apply to
+Unix-socket connections at all. Nothing in this codebase may promise bounded
+*worker termination* on the strength of these values -- only a bounded wait by
+whoever is waiting. Set through the pool's connection kwargs, so they take
+precedence over any keepalive parameters in the connection string.
 """
 
 # Sanity bounds, mirrored by the app config validators and the helm schema.

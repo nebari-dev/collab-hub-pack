@@ -361,22 +361,35 @@ def make_app(config: BaseConfig) -> FastAPI:
                     # again on timeout and then AWAITS it, and the indexer
                     # defers repeated cancellations until its worker finishes
                     # -- which is the wait this deadline exists to bound.
-                    # Past the deadline the task stays pending (kept on
-                    # app.state so it is owned, not dropped) and dies with the
-                    # process; any lock it still holds is the server's to
-                    # release with the connection.
+                    # Past the deadline the task stays pending and dies with
+                    # the process; any lock it still holds is the server's to
+                    # release with the connection. A reference is kept below
+                    # for as long as this frame lives so it is not finalized
+                    # while pending.
                     cog_index_task.cancel()
                     _, still_pending = await asyncio.wait({cog_index_task}, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
                     if still_pending:
+                        # Deliberately NOT closing the indexer's executor here:
+                        # the abandoned task may yet come back and need to
+                        # submit its lock release, and a shut-down executor
+                        # would turn that into an exception -- losing the
+                        # unlock this whole path exists to protect.
                         logger.error(
                             "cog_indexer_shutdown_abandoned",
                             extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
                         )
-                    elif cog_indexing is not None and cog_indexing.indexer.pending_late_releases:
-                        logger.warning(
-                            "cog_indexer_shutdown_with_late_release_pending",
-                            extra={"pending": cog_indexing.indexer.pending_late_releases},
-                        )
+                    else:
+                        if cog_indexing is not None and cog_indexing.indexer.pending_late_releases:
+                            logger.warning(
+                                "cog_indexer_shutdown_with_late_release_pending",
+                                extra={"pending": cog_indexing.indexer.pending_late_releases},
+                            )
+                        if cog_indexing is not None:
+                            # The task is done, so no further store calls are
+                            # coming: stop accepting them. Work already on a
+                            # thread -- including a hand-off waiting to
+                            # release the lock -- still finishes.
+                            cog_indexing.indexer.close()
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):
@@ -672,9 +685,7 @@ def make_app(config: BaseConfig) -> FastAPI:
         # through the two seams make_router exposes, so the public one still
         # costs the reviewed entry in PUBLIC_WEB_PATHS — make_router refuses
         # a public page route that is missing it.
-        invite_public, invite_gated = invite.make_routers(
-            memberships_enabled=org_source_resolves_membership()
-        )
+        invite_public, invite_gated = invite.make_routers(memberships_enabled=org_source_resolves_membership())
         # The operator invitation page (issue #91). Mounted only where
         # invitations can mean anything, for the same reason #89's API router
         # is: on a claims-sourced deployment the platform-role axis is

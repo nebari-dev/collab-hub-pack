@@ -652,11 +652,22 @@ class _FakeLockConnection:
     contract under test is what happens to the connection afterwards.
     """
 
-    def __init__(self, fail_on: str | None = None):
+    def __init__(self, fail_on: str | None = None, *, fail_autocommit: bool = False):
         self.fail_on = fail_on
-        self.autocommit = False
+        self.fail_autocommit = fail_autocommit
+        self._autocommit = False
         self.closed = False
         self.statements: list[str] = []
+
+    @property
+    def autocommit(self) -> bool:
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool) -> None:
+        if self.fail_autocommit:
+            raise RuntimeError("injected failure on autocommit")
+        self._autocommit = value
 
     def execute(self, sql, params=None):
         self.statements.append(sql.strip())
@@ -713,6 +724,19 @@ def test_lock_connection_is_discarded_when_any_cleanup_step_fails(fail_on):
         with _postgres_sweep_lock(_FakeLockDb(conn)):
             pass
     assert conn.closed, f"a connection whose {fail_on} failed must not return to the pool"
+
+
+def test_lock_connection_is_discarded_when_setting_autocommit_fails():
+    # The one cleanup step that is not a statement: if the session cannot be
+    # put into (or taken out of) autocommit, what the next borrower would
+    # inherit is unknown, so the connection goes rather than the pool.
+    from collab_hub_api.cogs.catalog import _postgres_sweep_lock
+
+    conn = _FakeLockConnection(fail_autocommit=True)
+    with pytest.raises(RuntimeError, match="injected failure on autocommit"):
+        with _postgres_sweep_lock(_FakeLockDb(conn)):
+            pass
+    assert conn.closed and conn.statements == [], "it failed before any statement ran"
 
 
 @live_postgres
