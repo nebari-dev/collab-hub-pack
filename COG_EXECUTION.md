@@ -12,7 +12,7 @@ The hub runs **Cogs** — packaged AI workers — and **Ops** — supervised, mu
 
 - **Two locations.** A worker runs as **`local`** — a child process of the run controller, on the same OS — or **`remote`** — a Kubernetes pod. Same runner, same Cog, one configuration value; `local` first.
 - **Three durability backends.** **`none`** (no durability engine), **`dbos`** and **`temporal`**, behind one seam. **The priority is `none`**: it ships first, `dbos` is the next brought to a full implementation, `temporal` comes last.
-- **Any harness.** The hub never learns which agent harness a Cog uses. **Hermes** is the first harness Cog; **pi** and **OpenCode** follow, and any harness that speaks ACP wraps with the adapter Hermes uses. Supporting a new harness is an adapter in the worker SDK, never a change to the hub.
+- **Any harness.** The hub never learns which agent harness a Cog uses. **Hermes** is the first harness Cog; **pi** and **OpenCode** follow, and any harness that speaks ACP wraps with the adapter Hermes uses. Supporting a new harness is an adapter in the Worker SDK, never a change to the hub.
 - **Launched from Collab, and from a terminal.** The desktop submits a run, watches its Track, decides its Gates and grants connector access — on the hub first, and later on the user's own machine, through the same run API. The `collab-hub` CLI drives the same endpoints, so every feature is scriptable from the day it exists.
 - **Accountable and bounded.** Every run has a Track that names what produced each result and who signed it. Gates are declared on Op steps and decided by people. Budgets, least-privilege workloads and egress restriction hold the trust boundary.
 
@@ -22,14 +22,14 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 
 | Requirement | What it means here | Where |
 |---|---|---|
-| Harness-agnostic | The hub speaks only the seam (a task entry point, the result envelope, a health probe, a catalog card). Hermes first; pi, OpenCode and any ACP harness next, each an adapter in the worker SDK. | Phases 11, 12; [§4](#4-target-architecture) |
+| Harness-agnostic | The hub speaks only the seam (a task entry point, the result envelope, a health probe, a catalog card). Hermes first; pi, OpenCode and any ACP harness next, each an adapter in the Worker SDK. | Phases 11, 12; [§4](#4-target-architecture) |
 | Agent location: `local` and `remote` | `location: local \| remote` selects the executor: a child process on the controller's host, or a pod. Chosen by configuration, like the durability backend. | Phases 7, 17 |
 | Durability: `none`, `dbos`, `temporal` — in that order | One lifecycle runner; a backend decides only scheduling and checkpointing. `none` marks in-flight runs `interrupted` after a restart and never resumes them. | Phases 6, 22, 28 |
 | Launched from Collab | The desktop drives runs on the hub, then on the user's machine, through one run API served by two hosts. | Phases 10, 15, 16, 27 |
 | Scriptable from a terminal | A `collab-hub` CLI on Typer, authentication first, then a command per run-API endpoint; each later phase adds its own commands. | Phases 13, 14 |
 | Runnable from `dev/`, asserted in CI, in the same PR | Every phase adds its `make` target at the lowest level that can host it, documents it, and asserts its contract in CI at that level. | [§5](#5-the-dev-environment-and-the-docs-carry-every-phase) |
 | Documented in the same PR | Every phase updates the documents it makes stale, names them in the PR, and adds its terms to the glossary. | [§5](#5-the-dev-environment-and-the-docs-carry-every-phase) |
-| Python 3.13 and 3.14 | The API supports both and CI tests both; the execution package, the worker SDK and the CLI support 3.11 and up. A Cog pins its own interpreter. | Phase 1 (done) |
+| Python 3.13 and 3.14 | The API supports both and CI tests both; the execution package, the Worker SDK and the CLI support 3.11 and up. A Cog pins its own interpreter. | Phase 1 (done) |
 
 ## 3. Where we start
 
@@ -87,42 +87,68 @@ flowchart LR
   cli["collab-hub CLI<br/>Typer · device-flow sign-in"]
 
   subgraph hub["collab-hub-pack — the hub"]
-    api["Run API /v1/runs<br/>writes intent · reads the Track"]
-    ctl["Run controller<br/>lifecycle runner<br/>location: local | remote<br/>durability: none | dbos | temporal"]
+    api["Run API<br/>/v1/runs · /v1/claims<br/>writes intent · reads the Track"]
+    ctl["Run controller<br/>Lifecycle runner<br/>location: local | remote<br/>durability: none | dbos | temporal"]
     track[("Track · claims · run pickup<br/>Postgres, collab_schema")]
     lexec["LocalProcessCogExecutor"]
     kexec["KubernetesCogExecutor"]
+    gw["Model egress gateway · connector proxy"]
     api --> track
     ctl --> track
     ctl --> lexec
     ctl --> kexec
   end
 
-  subgraph proc["local worker = a child process<br/>the same Cog package"]
-    psdk["worker SDK · harness adapter"]
+  subgraph proc["Local worker — a child process, the same Cog package"]
+    psdk["Worker SDK<br/>/invoke → envelope"]
+    pad["Harness adapter"]
+    pharn["Harness<br/>Hermes over ACP · pi · OpenCode"]
+    psdk --> pad --> pharn
   end
 
-  subgraph pod["remote worker = a pod<br/>the same Cog package"]
-    sdk["worker SDK<br/>/invoke → envelope"]
-    ad["HarnessAdapter"]
-    herm["hermes acp · pi · opencode"]
-    sdk --> ad --> herm
+  subgraph pod["Remote worker — a pod, the same Cog package"]
+    sdk["Worker SDK<br/>/invoke → envelope"]
+    ad["Harness adapter"]
+    harn["Harness<br/>Hermes over ACP · pi · OpenCode"]
+    sdk --> ad --> harn
   end
 
-  subgraph local["the desktop's local run host"]
-    lapi["same run API"]
-    lctl["lifecycle runner<br/>none, or dbos on SQLite"]
-    lw["local worker<br/>same Cog package"]
+  subgraph local["Local run host — inside the desktop"]
+    lapi["Run API<br/>the same routes"]
+    lctl["Lifecycle runner<br/>none, or dbos on SQLite"]
+    lw["Local worker<br/>the same Cog package"]
     lapi --> lctl --> lw
   end
 
   rt -->|"hub · bearer via loopback proxy"| api
-  cli -->|"hub · bearer"| api
   rt -->|"local · loopback"| lapi
+  cli -->|"hub · bearer"| api
   lexec -->|"spawn · loopback · run token"| psdk
   kexec -->|"materialize · /invoke with run token"| sdk
-  sdk -. "claims · connectors · model, all hub-mediated" .-> hub
+  psdk -. "claims, with the run token" .-> api
+  sdk -. "claims, with the run token" .-> api
+  sdk -. "model · connectors, hub-mediated" .-> gw
 ```
+
+**The boxes.** Each name below is the name the phases use.
+
+| Box | What it is | Where it runs | Built in |
+|---|---|---|---|
+| **Collab desktop** — Run view, Run target | The desktop client: submits runs, renders the Track, decides Gates, manages grants. The Run target picks the hub or the local run host through the desktop's existing placement model. | The user's machine | Phases 15, 16, 26 |
+| **collab-hub CLI** | A Typer client over the same REST endpoints: sign in by device flow, then a command per run-API endpoint. Imports no hub package. | A terminal, a script, a CI job | Phases 13, 14 |
+| **Run API** | `/v1/runs` and `/v1/claims`: records intent (`op_submitted`, decisions, cancel) and reads the Track; never calls an executor. The claim routes are worker-facing, authorized by the run token. | The API process (`collab-hub-api`) | Phases 10 (runs), 8 (claims) |
+| **Run controller** | The process that advances runs: picks them up, owns the executor, hosts the Lifecycle runner, watches the Track for signals, minting each worker's run token. The only identity that can create workloads. | Its own process at level 1, its own Deployment on a hub | Phase 9 |
+| **Lifecycle runner** | The lifecycle written once as step functions: resolve → materialize → ready → interact → envelope → Guards → Gate → idle or teardown. A durability backend schedules and checkpoints those steps: `none` in process, `dbos` as workflow steps, `temporal` as activities. | Inside the Run controller, and inside the Local run host | Phases 5, 6, 22, 28 |
+| **Track · claims · run pickup** | The store both processes share: the Track (the only source of run status), the keyed-claim store, the pickup records and the run token hashes. | Postgres through `collab_schema` on a hub; SQLite at level 1 and on the desktop | Phases 4, 8, 9 |
+| **LocalProcessCogExecutor** | The `local` executor: spawns the Cog package's `serve` as a child process in its own process group, on loopback, and kills it when the controller dies. | Inside the Run controller | Phase 7 |
+| **KubernetesCogExecutor** | The `remote` executor: a per-run Deployment, Service and NetworkPolicy, the artifact pulled by an init container. | Inside the Run controller, on a hub | Phases 17, 18 |
+| **Model egress gateway · connector proxy** | The hub Services a `remote` worker may reach: the gateway forwards to the endpoints in `models:`, the proxy acts as the user under a grant. Both take the run token. | The hub | Phases 24, 25 |
+| **Local worker** / **Remote worker** | The same Cog package, materialized as a child process or as a pod. Nothing in the package knows which. | The controller's host / the controller's namespace | Phases 7, 17 |
+| **Worker SDK** | The seam implemented once: `POST /invoke` returning an envelope, `GET /healthz`, cancellation, the binding loader, the claim client, run-token verification. A library a Cog *may* use; the hub never imports it. | Inside a worker | Phase 11 |
+| **Harness adapter** | The `HarnessAdapter` protocol between the SDK and an agent harness: `start`, `interact`, `cancel`, `close`. One adapter covers a protocol family; ACP first. | Inside a worker | Phase 11 |
+| **Harness** | The agent the adapter drives: Hermes over ACP first, pi and OpenCode next. It lives in the Cog's own environment, never in the hub. | Inside a worker | Phase 12; decision 17 |
+| **Local run host** | `collab-hub-execution` embedded in the desktop, serving the same Run API routes and claim transport on a bearer-gated loopback surface, with the `local` executor and `none` or `dbos` on SQLite. | The user's machine | Phase 27 |
+
 
 **The seams.** Every requirement lands behind one of these, which is what keeps ADR-0001 invariants 2 and 5 true as implementations multiply:
 
@@ -132,7 +158,7 @@ flowchart LR
 | Location | `location`, `local` or `remote`, selecting a `CogExecutor`; plus the location conformance suite | `local`, a child process (Phase 7); `remote`, a pod (Phase 17; from its artifact in Phase 18); in-memory (tests) |
 | Track | `TrackStore` + the Track conformance suite | Postgres via migrations, SQLite, in-memory (Phase 4) |
 | Resolution | hub inventory → the Cog's `resolve` → binding record | Phase 20 |
-| Harness | `HarnessAdapter` inside the worker SDK | ACP (Phase 11) → Hermes (Phase 12), then pi and OpenCode; an OpenAI-compatible direct call (Phase 11) |
+| Harness | `HarnessAdapter` inside the Worker SDK | ACP (Phase 11) → Hermes (Phase 12), then pi and OpenCode; an OpenAI-compatible direct call (Phase 11) |
 | Placement | one run API served by two hosts; the desktop's run target | hub (Phases 10, 15), local (Phase 27) |
 
 ### The lifecycle runner and its durability
@@ -187,9 +213,9 @@ Location and backend are independent: either location runs under any backend, an
 
 ### Harness neutrality
 
-The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and reads an envelope. "Any harness is supported" is therefore something the hub has by construction; the work is making a harness cheap to wrap. The worker SDK (Phase 11) implements the seam once — envelope, health, keyed claim, binding, cancellation, usage — and hands the interaction to a `HarnessAdapter`. ACP comes first because it is how Collab already drives Hermes and a protocol other agent harnesses implement too, so one adapter covers a family rather than one product: Hermes is the first Cog built on it (Phase 12), pi and OpenCode the next, each a Cog package and, where the harness does not speak ACP, an adapter — never a change to the hub. The SDK is a library a Cog author *may* use; the hub requires only the seam, and an import-boundary test keeps the hub from ever depending on it.
+The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and reads an envelope. "Any harness is supported" is therefore something the hub has by construction; the work is making a harness cheap to wrap. The Worker SDK (Phase 11) implements the seam once — envelope, health, keyed claim, binding, cancellation, usage — and hands the interaction to a `HarnessAdapter`. ACP comes first because it is how Collab already drives Hermes and a protocol other agent harnesses implement too, so one adapter covers a family rather than one product: Hermes is the first Cog built on it (Phase 12), pi and OpenCode the next, each a Cog package and, where the harness does not speak ACP, an adapter — never a change to the hub. The SDK is a library a Cog author *may* use; the hub requires only the seam, and an import-boundary test keeps the hub from ever depending on it.
 
-**Python.** Each distribution declares its own floor and CI tests that floor and the newest version: the API `>=3.13`, the execution package, the worker SDK and the CLI `>=3.11`. A Cog's environment pins its own interpreter, so none of these constrains what a harness needs.
+**Python.** Each distribution declares its own floor and CI tests that floor and the newest version: the API `>=3.13`, the execution package, the Worker SDK and the CLI `>=3.11`. A Cog's environment pins its own interpreter, so none of these constrains what a harness needs.
 
 ## 5. The dev environment and the docs carry every phase
 
@@ -264,7 +290,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 8 | #102 | Never repeat a completed side effect when a step is invoked again | `feat/cog-keyed-claim` | 6 | M | not started |
 | 9 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 6, 7 | M | not started |
 | 10 | #103 | Submit, watch, decide and stop runs through a hub run API | `feat/cog-run-api` | 8, 9 | L | not started |
-| 11 | #107 | Add a worker SDK with harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 8 | M | not started |
+| 11 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 8 | M | not started |
 | 12 | #108 | Publish a Hermes harness Cog, launched by the hub as a local process | `feat/hermes-acp-harness` | 7, 10, 11 | M | not started |
 | 13 | #125 | The `collab-hub` CLI: sign in and call the hub | `feat/cli-auth` | — | M | not started |
 | 14 | #126 | Run Cogs and Ops from the `collab-hub` CLI | `feat/cli-runs` | 10, 13 | M | not started |
@@ -485,6 +511,7 @@ The process that advances runs, separate from the process that accepts them — 
 - `collab-hub-run-controller`: the same image with its own entrypoint. It runs the lifecycle runner with `backend` and `location` from configuration, and it alone constructs an executor; the API process constructs none, which an import-boundary test enforces from here on.
 - **Run pickup**, under every backend: the API records `op_submitted` and nothing else — it never enqueues into an engine, which is what keeps it backend-agnostic — and a controller takes the run with an atomic pickup record, so two replicas never both start it. What differs per backend is ownership *after* pickup. Under `none` a run in flight belongs to the process that picked it up and ends `interrupted` with it; under `dbos` and `temporal` the picking controller hands the run to the engine's queue, and the engine decides which replica resumes it when that controller dies.
 - On start, the controller records `interrupted` for every run it owned and did not finish, and reaps, by the pid and process group it recorded, any `local` worker of its own left behind.
+- **Signals travel through the Track.** The API records what a client asked for — `gate_decided`, `cancel_requested` — and the controller's Track watcher delivers it to the run it owns: under `none` straight to the waiting runner, under `dbos` and `temporal` as the engine's own message or signal (Phases 22, 28). Nothing calls the controller, so the API needs no route to it and no engine client.
 - Controller health and readiness.
 - A minimal `models:` configuration block — endpoint, model id, `auth_ref` — from chart values and environment, since the hub has none today (§3). It is what the controller writes the stopgap binding from until Phase 20, and what Phase 20's inventory is generated from after.
 
@@ -583,7 +610,7 @@ A terminal client for the hub, and the thing every other command needs first: a 
 - Profiles, so several hubs are one flag apart: `~/.config/collab-hub/config.toml`, overridden by `--hub`, `--profile` or `COLLAB_HUB_URL`.
 - Level 1 has no realm, so the CLI also works against the dev-auth shortcut and says on `whoami` that the session is unauthenticated dev auth, never implying a signed-in user.
 - Two commands that prove the plumbing against surfaces that already exist: `collab-hub whoami` and `collab-hub frames list`. Human-readable tables by default, `--json` for scripts, and exit codes a script can branch on.
-- An import-boundary test: the CLI imports neither `collab_hub_api` nor `collab_hub_execution` — the rule the worker SDK follows, for the same reason.
+- An import-boundary test: the CLI imports neither `collab_hub_api` nor `collab_hub_execution` — the rule the Worker SDK follows, for the same reason.
 
 *Dev and CI* — `make cli` installs it into the dev environment and prints the login line for the level in use. CI: `level-1` runs `collab-hub whoami --json` against `make api`'s dev auth and asserts it reports an unauthenticated session; `levels-2-3` signs in against the real realm with a token from `make token` and asserts `whoami` names the `dev` user. The device flow itself is unit-tested against a stub authorization server, since approving it needs a browser. The CLI's own suite runs on Python 3.11 and 3.14, the SDK's rule.
 
@@ -762,7 +789,7 @@ The second durability backend, brought to a full implementation once `none` runs
 The first durability engine behind the runner — what makes #2's "a restart does not lose the run" true.
 
 *In scope*
-- The runner's step functions run as the steps of one DBOS workflow per run; a Gate's human decision is a durable wait on a message; cancellation uses DBOS cancellation.
+- The runner's step functions run as the steps of one DBOS workflow per run; a Gate's human decision is a durable wait on a message, sent by Phase 9's Track watcher when `gate_decided` lands, so the API still only writes the Track; cancellation uses DBOS cancellation, raised the same way.
 - The DBOS system database: Postgres on the hub, on the same instance as the Track; SQLite for the desktop and for level 1.
 - The chart provisions DBOS's databases, or documents granting `CREATEDB` — DBOS otherwise tries to create them at startup and fails.
 - Ownership across replicas from DBOS queues and a unique executor id per replica, taking over from Phase 9's pickup once a run is picked up: the controller that picks a run up enqueues it as a DBOS workflow, and from then on the queue decides who resumes it. The API still only writes `op_submitted`. No hand-built lease.
@@ -878,7 +905,7 @@ The desktop embeds what M2 built: `local` is its executor, and Phase 22's `dbos`
 #### Phase 28 — The `temporal` backend
 **Issue** #110 · **Branch** `feat/cog-durability-temporal` · **Depends on** Phases 6, 8, 9 · **Size** L
 
-*In scope* — one workflow per run; the runner's step functions — Cog interaction, executor calls and Track appends — as **activities**, so workflow code stays deterministic; signals for gate decisions and cancellation; ownership across replicas from task queues, which Phase 9's pickup hands the run to as it does for `dbos`; Phase 8's keyed claim for activity re-execution; Temporal's persistence on the same Postgres instance as the Track; configurable TLS to the frontend.
+*In scope* — one workflow per run; the runner's step functions — Cog interaction, executor calls and Track appends — as **activities**, so workflow code stays deterministic; signals for gate decisions and cancellation, raised by Phase 9's Track watcher; ownership across replicas from task queues, which Phase 9's pickup hands the run to as it does for `dbos`; Phase 8's keyed claim for activity re-execution; Temporal's persistence on the same Postgres instance as the Track; configurable TLS to the frontend.
 
 *Dev and CI* — an optional `temporal` compose profile runs the Temporal CLI's `temporal server start-dev` — one process, not a cluster image — and `make controller BACKEND=temporal` uses it at level 2; `test-execution.yaml` runs both conformance suites against it; `dev-env.yaml` does not, keeping its cost rule. *Docs* — `runs.md` gains `temporal`; `frames-operations.md` adds Temporal's persistence; the chart values are described.
 
@@ -898,7 +925,7 @@ flowchart TD
   ph6 & ph7 --> ph9["9 · controller"]
   ph8 & ph9 --> ph10["10 · run API"]
   ph13["13 · CLI sign-in"]
-  ph2 & ph8 --> ph11["11 · worker SDK"]
+  ph2 & ph8 --> ph11["11 · Worker SDK"]
   ph7 & ph10 & ph11 --> ph12["12 · Hermes, local"]
   ph10 & ph13 --> ph14["14 · CLI runs"]
   ph10 --> ph15["15 · desktop client"]
@@ -1009,15 +1036,121 @@ Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the 
 3. **Gated Ops on `none`** — *decided 2026-09-16: allowed.* A run waiting at a Gate cannot survive a restart there, so the submission response names the backend (Phase 10) and a client never assumes the pause survives.
 4. **Warm pool bounds** — the pool cap and the default idle timeout.
 5. **Encryption at rest for grants' offline tokens** — Kubernetes Secrets with envelope encryption, or a KMS.
-6. **Where the worker SDK lives** — *decided 2026-09-16 with decision 12:* this repository, under `worker/`.
+6. **Where the Worker SDK lives** — *decided 2026-09-16 with decision 12:* this repository, under `worker/`.
 7. **Whether local Tracks ever sync to the hub** — out of scope here; confirm.
 8. **The Python the hub image and `api/.python-version` run.** Phase 1 makes 3.13 supported and tested; both stay on 3.14. Proposal: keep 3.14 unless a deployment target ships only 3.13.
 9. **When the pack docs site starts.** Proposal: as its own issue once M3 lands, when there is a run API for users to read about.
 10. **Where this plan lives** — *decided 2026-09-17: here*, at the root of this repository, reviewed through pull requests; the desktop phases are listed with their issues in the desktop repository.
 11. **`local` in production** — *decided 2026-09-16: development and the desktop only.* A `local` worker shares the controller's host and network identity, so the trust boundary does not hold for it. A Kubernetes hub always runs `remote`: the hub image ships neither pixi nor a Cog environment, and the chart does not offer `location: local`. The controller still accepts the value, because level 1 is the hub as a plain process. ADR-0002 D11 (Phase 7) records it.
-12. **How a Cog's environment gets the worker SDK** — *decided 2026-09-16: a git dependency on this repository*, pinned to a commit (`#subdirectory=worker`), so no PyPI release is needed; `dev/cogs/*` may pin it by path.
+12. **How a Cog's environment gets the Worker SDK** — *decided 2026-09-16: a git dependency on this repository*, pinned to a commit (`#subdirectory=worker`), so no PyPI release is needed; `dev/cogs/*` may pin it by path.
 13. **What the first Hermes run binds to** — *decided 2026-09-16:* an OpenAI-compatible endpoint from the hub's `models:` block (Phase 9) — given by environment at level 1, by chart values on a hub — with the stdlib fake model in CI. The llm-serving-pack's internal endpoint is one such entry, not a special case.
 14. **What the first Hermes run may do** — *decided 2026-09-16:* no tools at M3 — prompt in, envelope out. Hub-mediated MCP (Frames, connectors) follows Phase 25's grants.
 15. **Windows for `local`** — *decided 2026-09-16: no.* Linux and macOS in CI; the desktop's local run host (Phase 27) inherits the limit.
 16. **Which Hermes to pin, and where the Cog lives** — *decided 2026-09-16:* `hermes-agent` 0.19.0, and the Cog lives in this repository at `cogs/hermes/`, published with Nebi by a `publish-cogs.yaml` workflow to the registry the catalog indexes. The configuration it ports (written for 0.17) is re-verified against 0.19.
 17. **The next harness Cogs.** pi and OpenCode follow Hermes, each its own Cog under `cogs/`, in that order unless a user need reorders them; a harness that does not speak ACP gets an adapter in the SDK. Open: which ships first, and whether either needs an adapter of its own.
+
+## 11. Appendix — two launches, step by step
+
+Two sequences through the boxes of §4, one per client and per pair of axis values. Both run the same Hermes Cog and the same Op; what differs is who submits, where the worker lives and what survives a restart.
+
+### A. From the CLI — `local` and `none`, at dev level 1
+
+The shape of `make api` plus `make controller LOCATION=local`: two processes, a SQLite Track and claim store, no container, driven by `collab-hub run submit` (Phases 13, 14).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor User as User at a terminal
+  participant CLI as collab-hub CLI
+  participant API as Run API
+  participant Store as Track · claims · pickup<br/>SQLite at level 1
+  participant Ctl as Run controller<br/>Lifecycle runner on none
+  participant Exec as LocalProcessCogExecutor
+  participant W as Local worker<br/>Worker SDK · Harness adapter · Hermes
+  participant Model as Model endpoint<br/>from the models: block
+  User->>CLI: collab-hub run submit --cog hermes --entry ask --input - --watch
+  CLI->>API: POST /v1/runs (bearer, or dev auth at level 1)
+  API->>Store: op_submitted
+  API-->>CLI: 202 run id, backend none, location local
+  CLI->>API: GET /v1/runs/{id}/events (stream)
+  Ctl->>Store: pickup, atomic: the run is this controller's
+  Ctl->>Exec: materialize cogs/hermes through the directory source
+  Note over Ctl,Exec: run token minted, its hash recorded in the store
+  Exec->>W: the launcher spawns serve in its own process group<br/>run token in the environment, binding file from models:
+  Exec->>W: GET /healthz until ready
+  Ctl->>W: POST /invoke (task, idempotency key, run token)
+  W->>API: POST /v1/claims/{key}/reserve (run token)
+  W->>Model: the Harness adapter drives hermes acp, which calls the model
+  W->>API: POST /v1/claims/{key}/commit (envelope)
+  W-->>Ctl: envelope
+  Ctl->>Store: step_completed (binding, problems, usage, payload reference)
+  opt the step's Gate escalates
+    Ctl->>Store: gate_escalated (escalation id)
+    API-->>CLI: event: waiting at a Gate, exit code 4
+    User->>CLI: collab-hub run decide ID STEP --approve
+    CLI->>API: POST .../decision (escalation id, approve)
+    API->>Store: gate_decided (actor)
+    Store-->>Ctl: the Track watcher delivers the decision to the waiting runner
+  end
+  Ctl->>Exec: teardown: the process group is killed
+  Ctl->>Store: run_completed
+  API-->>CLI: event: completed, exit code 0
+  User->>CLI: collab-hub run payload ID STEP
+```
+
+If the controller is killed between steps 10 and 15, the launcher kills the worker when the controller's pipe closes, the next controller start records the run `interrupted`, and `collab-hub run retry ID` resumes the step under its existing key: a claim already committed answers instead of Hermes running again (Phases 6, 8, 10).
+
+### B. From Collab — `remote` and `dbos`, on a Kubernetes hub
+
+Production's shape: the desktop's loopback proxy, the API and the controller as separate Deployments, the Track and DBOS's system database on one Postgres, the worker a pod pulled from its artifact (Phases 15–18, 22, 24).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor User as User in Collab
+  participant Collab as Collab desktop<br/>Run view · loopback proxy
+  participant API as Run API
+  participant Store as Track · claims · pickup<br/>Postgres
+  participant Ctl as Run controller<br/>Lifecycle runner on dbos
+  participant DBOS as DBOS<br/>queue · system database
+  participant Exec as KubernetesCogExecutor
+  participant Pod as Remote worker pod<br/>Worker SDK · Harness adapter · Hermes
+  participant GW as Model egress gateway
+  User->>Collab: launch the Op, run target: hub
+  Collab->>API: POST /v1/runs (bearer stamped by the proxy)
+  API->>Store: op_submitted
+  API-->>Collab: 202 run id, backend dbos, location remote
+  Collab->>API: GET /v1/runs/{id}/events (stream, relayed to the run view)
+  Ctl->>Store: pickup, atomic
+  Ctl->>DBOS: enqueue the run as a workflow: ownership is the queue's from here
+  DBOS->>Ctl: run the step functions as DBOS steps, each checkpointed
+  Ctl->>Exec: materialize the installed digest
+  Note over Ctl,Exec: run token minted, its hash recorded, mounted into the pod
+  Exec->>Pod: Deployment, Service, ingress and egress NetworkPolicy<br/>init container: nebi pull, then serve
+  Exec->>Pod: GET /healthz until ready
+  Ctl->>Pod: POST /invoke (task, idempotency key, run token verified by the SDK)
+  Pod->>API: POST /v1/claims/{key}/reserve (run token)
+  Pod->>GW: model call, the only egress the policy allows
+  Pod->>API: POST /v1/claims/{key}/commit (envelope)
+  Pod-->>Ctl: envelope
+  Ctl->>Store: step_completed
+  Ctl->>Store: gate_escalated (escalation id)
+  Ctl->>DBOS: durable wait for the decision
+  API-->>Collab: events: a pending decision in the run view
+  User->>Collab: approve
+  Collab->>API: POST .../decision (escalation id, approve)
+  API->>Store: gate_decided (actor)
+  Store-->>Ctl: the Track watcher sees gate_decided
+  Ctl->>DBOS: send the decision to the waiting workflow
+  opt a controller replica dies mid-step
+    DBOS->>Ctl: another replica recovers the workflow by executor id
+    Ctl->>Exec: reap the orphaned pod, materialize again
+    Ctl->>Pod: POST /invoke again, same idempotency key
+    Pod->>API: reserve finds the key committed: the envelope is returned, nothing acts twice
+  end
+  Ctl->>Store: run_completed
+  Ctl->>Exec: teardown: the pod and its objects are deleted
+  API-->>Collab: completion in the run view
+```
+
+What `dbos` buys: steps 8 to 25 are checkpointed, so a controller restart resumes the workflow, at the Gate too, with nobody resubmitting; the same run under `none` would end `interrupted` (decision 3). What `remote` buys: the pod's egress policy makes step 14 the only way out, and the API's ServiceAccount could not have created the pod (Phase 17).
