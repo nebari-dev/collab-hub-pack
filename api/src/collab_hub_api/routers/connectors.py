@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
 
 import httpx
@@ -14,6 +16,7 @@ from collab_hub_api.connectors.calendar_client import (
 )
 from collab_hub_api.connectors.drive_client import DriveUpstreamError, GoogleDriveClient, UnsupportedDriveFileType
 from collab_hub_api.connectors.github_client import (
+    GitHubApiRequestError,
     GitHubClient,
     GitHubSearchError,
     GitHubUpstreamError,
@@ -30,6 +33,7 @@ from collab_hub_api.connectors.models import (
     DRIVE_READONLY_SCOPE,
     GMAIL_READONLY_SCOPE,
     GOOGLE_CALENDAR_READONLY_SCOPE,
+    NOTION_READONLY_CAPABILITIES,
     SLACK_READONLY_SCOPES,
     CalendarReadRequest,
     CalendarReadResponse,
@@ -40,6 +44,8 @@ from collab_hub_api.connectors.models import (
     DriveReadResponse,
     DriveSearchRequest,
     DriveSearchResponse,
+    GitHubApiGetRequest,
+    GitHubApiGetResponse,
     GitHubFileReadRequest,
     GitHubFileReadResponse,
     GitHubItemReadRequest,
@@ -60,6 +66,13 @@ from collab_hub_api.connectors.models import (
     GmailStatus,
     GoogleCalendarStatus,
     GoogleDriveStatus,
+    NotionDatabaseQueryRequest,
+    NotionDatabaseQueryResponse,
+    NotionPageReadRequest,
+    NotionPageReadResponse,
+    NotionSearchRequest,
+    NotionSearchResponse,
+    NotionStatus,
     SlackChannelsResponse,
     SlackDmsResponse,
     SlackReadRequest,
@@ -70,6 +83,13 @@ from collab_hub_api.connectors.models import (
     SlackThreadReadRequest,
     SlackThreadReadResponse,
 )
+from collab_hub_api.connectors.notion_client import (
+    NotionClient,
+    NotionSearchError,
+    NotionUpstreamError,
+    notion_time_bounds,
+)
+from collab_hub_api.connectors.notion_tokens import NotionTokenProvider
 from collab_hub_api.connectors.slack_client import (
     SLACK_TOKEN_INVALID_ERRORS,
     SlackClient,
@@ -77,6 +97,7 @@ from collab_hub_api.connectors.slack_client import (
     SlackUpstreamError,
 )
 from collab_hub_api.connectors.slack_tokens import SlackTokenProvider
+from collab_hub_api.connectors.validation import has_control_or_nonprintable
 from collab_hub_api.frames.auth import get_auth_context
 
 router = APIRouter(prefix="/connectors", tags=["connectors"])
@@ -99,6 +120,7 @@ async def list_connectors(
         await _google_calendar_status(request, config),
         await _slack_status(request, config),
         await _github_status(request, config),
+        await _notion_status(request, config),
     ]
 
 
@@ -487,6 +509,124 @@ async def search_github(
     return GitHubSearchResponse(hits=hits, next_page_token=next_page_token, incomplete_results=incomplete)
 
 
+# Floor for the upstream-read deadline after the concurrency-permit wait has eaten
+# into the shared request budget: keep a just-acquired permit from handing the read
+# a near-zero timeout that would 502 immediately.
+_API_GET_MIN_READ_BUDGET_SECONDS = 1.0
+
+
+@router.post("/github/api/get", response_model=GitHubApiGetResponse)
+async def github_api_get(
+    body: GitHubApiGetRequest,
+    request: Request,
+    auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> GitHubApiGetResponse:
+    if not config.github.api_get_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "generic API read is disabled on this hub")
+    # The generic read has a wider aperture than the curated tools, so its
+    # request/refusal/truncation/upstream events are the alertable surface for
+    # abuse (per-user via auth.user + the validated path).
+    logger.info(
+        "github_api_get_request",
+        extra={"user": auth.user, "path": body.path, "media_type": body.media_type},
+    )
+    # Broker the token OUTSIDE the concurrency permit: _github_client does a live
+    # Keycloak round-trip, and holding a permit across it would let a slow broker
+    # fill every slot with requests that fail before GitHub is even contacted (and
+    # the curated reads take no permit, so it bounds nothing). A token error then
+    # surfaces its own status without ever queueing behind the semaphore.
+    client = await _github_client(request, config)
+
+    # Bound concurrent generic reads so an injected agent can't exhaust the hub's
+    # sockets/memory by fanning out api_get calls. Waiting for a permit is itself
+    # bounded (request_timeout_seconds): rather than queue unbounded and invisibly
+    # until the pod OOMs, a saturated read sheds itself as a 429 and logs a throttle
+    # event (with the queue depth) so contention is observable. The semaphore is
+    # sized once at app startup (lifespan).
+    semaphore = request.app.state.github_api_get_semaphore
+    loop = asyncio.get_running_loop()
+    wait_start = loop.time()
+    request.app.state.github_api_get_waiters += 1
+    try:
+        async with asyncio.timeout(config.github.request_timeout_seconds):
+            await semaphore.acquire()
+    except TimeoutError as exc:
+        logger.info(
+            "github_api_get_throttled",
+            extra={
+                "user": auth.user,
+                "path": body.path,
+                # Queue depth at shed time. Read before the finally decrement, so it
+                # includes this request — which WAS a waiter until it gave up here —
+                # i.e. the honest snapshot of the state variable, not "others only".
+                "waiters": request.app.state.github_api_get_waiters,
+            },
+        )
+        # 429 Too Many Requests, with Retry-After so the client backs off ~the wait
+        # budget instead of immediately re-queuing and re-saturating the pool. The
+        # detail string ("busy") is distinct from the GitHub-upstream rate-limit
+        # 429 ("GitHub rate limit exceeded"), and apollo-desktop surfaces both
+        # generically by status+detail with no GitHub-specific 429 branch, so this
+        # cannot be mistaken for a GitHub rate limit. Retry-After is integer seconds
+        # (RFC 9110 delta-seconds), rounded up, floored at 1.
+        retry_after = str(max(1, math.ceil(config.github.request_timeout_seconds)))
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "generic GitHub read is busy; retry shortly",
+            headers={"Retry-After": retry_after},
+        ) from exc
+    finally:
+        request.app.state.github_api_get_waiters -= 1
+    try:
+        # The permit wait and the upstream read draw on ONE budget
+        # (request_timeout_seconds). Charge the read only the time left after the
+        # wait so a saturated read is bounded to that budget total, not ~2x (a full
+        # wait followed by a full read). Floor a near-zero remainder so a
+        # just-acquired permit doesn't 502 the read on an empty deadline — but never
+        # above the configured budget itself (which may be sub-second).
+        budget = config.github.request_timeout_seconds
+        read_budget = max(min(budget, _API_GET_MIN_READ_BUDGET_SECONDS), budget - (loop.time() - wait_start))
+        result = await client.api_get(
+            path=body.path,
+            params=body.params,
+            media_type=body.media_type,
+            max_chars=body.max_chars,
+            timeout_seconds=read_budget,
+        )
+    except GitHubApiRequestError as exc:
+        logger.info(
+            "github_api_get_refusal",
+            extra={"reason": str(exc), "path": body.path, "media_type": body.media_type},
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except GitHubUpstreamError as exc:
+        logger.info(
+            "github_api_get_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code, "path": body.path},
+        )
+        # A GitHub 400/422 on the generic read is model-correctable (malformed
+        # params, or paging a search-backed endpoint past its 1000-result cap),
+        # not a gateway failure — surface it as 422 so the model fixes the request
+        # rather than blindly retrying a 502. str(exc) carries only GitHub's
+        # structured message.
+        if exc.status_code in (status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_CONTENT):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        _raise_github_upstream(exc, not_found_detail=_GITHUB_NOT_FOUND_DETAIL)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub API read failed") from exc
+    finally:
+        semaphore.release()
+    if result.truncated:
+        logger.info(
+            "github_api_get_truncation",
+            extra={"path": body.path, "media_type": body.media_type, "content_type": result.content_type},
+        )
+    # api_get already returns the response model (sanitized + capped), so no
+    # field-by-field copy is needed.
+    return result
+
+
 @router.post("/github/items/{number}/read", response_model=GitHubItemReadResponse)
 async def read_github_item(
     number: int,
@@ -602,7 +742,11 @@ async def read_github_project(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A positive GitHub project number is required")
     client = await _github_client(request, config)
     try:
-        project, items = await client.read_project(owner=body.owner, number=number, max_items=body.max_items)
+        # Counts run concurrently with the enumeration and never raise; only the
+        # board read's own failure surfaces here to be mapped.
+        project, items, counts = await client.read_project_with_counts(
+            owner=body.owner, number=number, max_items=body.max_items
+        )
     except GitHubUpstreamError as exc:
         logger.info(
             "github_project_read_upstream_error",
@@ -619,7 +763,109 @@ async def read_github_project(
         items=items,
         total_count=total,
         truncated=total > len(items),
+        counts=counts,
     )
+
+
+@router.get("/notion/status", response_model=NotionStatus)
+async def notion_status(
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionStatus:
+    return await _notion_status(request, config)
+
+
+@router.post("/notion/search", response_model=NotionSearchResponse)
+async def search_notion(
+    body: NotionSearchRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionSearchResponse:
+    client = await _notion_client(request, config)
+    lower, upper = notion_time_bounds(
+        days_back=body.days_back,
+        since_date=body.since_date,
+        until_date=body.until_date,
+        time_zone=body.time_zone,
+    )
+    try:
+        hits, next_page_token = await client.search(
+            query=body.query,
+            object_type=body.object_type,
+            limit=body.limit,
+            start_cursor=body.page_token,
+            lower=lower,
+            upper=upper,
+        )
+    except NotionSearchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except NotionUpstreamError as exc:
+        logger.info("notion_search_upstream_error", extra={"operation": exc.operation, "status_code": exc.status_code})
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion search failed") from exc
+    return NotionSearchResponse(hits=hits, next_page_token=next_page_token)
+
+
+@router.post("/notion/pages/{page_id}/read", response_model=NotionPageReadResponse)
+async def read_notion_page(
+    page_id: str,
+    body: NotionPageReadRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionPageReadResponse:
+    _validate_notion_id(page_id)
+    client = await _notion_client(request, config)
+    try:
+        return await client.read_page(page_id=page_id, max_chars=body.max_chars)
+    except NotionUpstreamError as exc:
+        logger.info(
+            "notion_page_read_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code},
+        )
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion page read failed") from exc
+
+
+@router.post("/notion/databases/{database_id}/query", response_model=NotionDatabaseQueryResponse)
+async def query_notion_database(
+    database_id: str,
+    body: NotionDatabaseQueryRequest,
+    request: Request,
+    _auth=Depends(get_auth_context),
+    config: ConnectorsConfig = Depends(get_connectors_config),
+) -> NotionDatabaseQueryResponse:
+    _validate_notion_id(database_id)
+    client = await _notion_client(request, config)
+    lower, upper = notion_time_bounds(
+        days_back=body.days_back,
+        since_date=body.since_date,
+        until_date=body.until_date,
+        time_zone=body.time_zone,
+    )
+    try:
+        rows, next_page_token = await client.query_database(
+            database_id=database_id,
+            limit=body.limit,
+            start_cursor=body.page_token,
+            lower=lower,
+            upper=upper,
+        )
+    except NotionSearchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except NotionUpstreamError as exc:
+        logger.info(
+            "notion_database_query_upstream_error",
+            extra={"operation": exc.operation, "status_code": exc.status_code},
+        )
+        _raise_notion_upstream(exc)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Notion database query failed") from exc
+    return NotionDatabaseQueryResponse(rows=rows, next_page_token=next_page_token)
 
 
 async def _github_status(request: Request, config: ConnectorsConfig) -> GitHubStatus:
@@ -654,6 +900,7 @@ def _new_github_client(token: str, config: ConnectorsConfig) -> GitHubClient:
         access_token=token,
         api_base_url=config.github.api_base_url,
         timeout_seconds=config.github.request_timeout_seconds,
+        allowed_orgs=config.github.allowed_orgs,
     )
 
 
@@ -706,14 +953,19 @@ def _validate_github_repo(repo: str) -> None:
 
 def _validate_github_path(path: str) -> None:
     candidate = path.strip()
-    # Reject traversal, absolute paths, backslashes, and control characters
-    # before the value is ever placed into an upstream URL.
+    # Reject traversal, absolute paths, backslashes, and non-printable characters
+    # before the value is ever placed into an upstream URL. An ordinary ASCII space
+    # is allowed (it stays printable), but non-printable Unicode — a non-breaking
+    # space, zero-width/bidi marks, control/DEL — is rejected on purpose even though
+    # GitHub may accept it in a name: on an LLM-facing surface those are
+    # homoglyph/Trojan-Source spoofing vectors, so a rare legitimate filename takes a
+    # clear 422 rather than resolving to a name that can disguise itself as another.
     if (
         not candidate
         or candidate.startswith("/")
         or "\\" in candidate
         or ".." in candidate.split("/")
-        or any(ord(ch) < 0x20 for ch in candidate)
+        or has_control_or_nonprintable(candidate)
     ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid GitHub file path")
 
@@ -722,14 +974,88 @@ def _validate_github_ref(ref: str) -> None:
     candidate = ref.strip()
     if not candidate:
         return  # empty ref = default branch
+    # Same strict rejection as _validate_github_path, for the same reason: a ref
+    # (branch/tag/sha) carrying a non-breaking space, zero-width/bidi mark, or
+    # control/DEL is refused even though git may permit it, because those are
+    # spoofing vectors on this surface. The two char checks are not redundant:
+    # isspace() also rejects an ordinary ASCII space — legal in a file path but
+    # never valid in a git ref — which isprintable() would otherwise let through.
     if (
         candidate.startswith("/")
         or candidate.startswith("-")
         or "\\" in candidate
         or ".." in candidate
-        or any(ord(ch) < 0x20 or ch.isspace() for ch in candidate)
+        or any(ch.isspace() for ch in candidate)
+        or has_control_or_nonprintable(candidate)
     ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid GitHub ref")
+
+
+async def _notion_status(request: Request, config: ConnectorsConfig) -> NotionStatus:
+    provider = NotionTokenProvider(config.notion)
+    try:
+        token = await provider.access_token(request)
+    except ConnectorTokenError as exc:
+        return NotionStatus(connected=False, state=exc.state, scopes=[], detail=str(exc))
+    client = _new_notion_client(token, config)
+    try:
+        access = await client.verify_access()
+    except NotionUpstreamError as exc:
+        state = "reconnect_required" if exc.status_code in {401, 403} else "unavailable"
+        return NotionStatus(connected=False, state=state, scopes=[], detail=str(exc))
+    except httpx.HTTPError:
+        return NotionStatus(
+            connected=False,
+            state="unavailable",
+            scopes=[],
+            detail="Notion API access check failed.",
+        )
+    return NotionStatus(
+        connected=True,
+        state="connected",
+        scopes=[*NOTION_READONLY_CAPABILITIES],
+        account=access.workspace_name,
+    )
+
+
+def _new_notion_client(token: str, config: ConnectorsConfig) -> NotionClient:
+    return NotionClient(
+        access_token=token,
+        api_base_url=config.notion.api_base_url,
+        notion_version=config.notion.notion_version,
+        timeout_seconds=config.notion.request_timeout_seconds,
+    )
+
+
+async def _notion_client(request: Request, config: ConnectorsConfig) -> NotionClient:
+    provider = NotionTokenProvider(config.notion)
+    try:
+        token = await provider.access_token(request)
+    except ConnectorNotConnected as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ConnectorReconnectRequired as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ConnectorTokenError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return _new_notion_client(token, config)
+
+
+# A Notion id is 32 hex chars, optionally UUID dash-grouped (8-4-4-4-12).
+_NOTION_ID_PATTERN = r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
+def _validate_notion_id(value: str) -> None:
+    if not re.fullmatch(_NOTION_ID_PATTERN, value.strip()):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "A valid Notion id is required")
+
+
+def _raise_notion_upstream(exc: NotionUpstreamError) -> None:
+    # Notion returns 400 for caller-correctable input: invalid params or a
+    # stale/garbage start_cursor. Surface those as 422; everything else
+    # (timeout, 5xx, bad JSON, cursor cycle) is a provider failure -> 502.
+    if exc.status_code == 400:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
 
 
 async def _google_drive_status(request: Request, config: ConnectorsConfig) -> GoogleDriveStatus:

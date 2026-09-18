@@ -1,3 +1,4 @@
+import re
 import sys
 from typing import Any, Literal, Self
 
@@ -519,6 +520,58 @@ class FramesServiceAccessConfig(BaseModel):
         return self
 
 
+class FramesInvitationsConfig(BaseModel):
+    """What invitation acceptance requires of the accepter's identity."""
+
+    require_verified_email: bool = True
+    """Whether Gate B additionally requires the identity provider to have
+    verified the address (#190).
+
+    **True is the default and must stay the default.** Turning it off is a
+    deliberate deployment trade, and a default that silently weakened an
+    existing deployment on upgrade would be the wrong kind of convenient.
+
+    Gate B is two checks: the accepter's address is verified, *and* it equals
+    the invited address. Setting this false drops the first and keeps the
+    second, on the argument that the invitation token is itself proof of
+    mailbox control — it is a 256-bit secret delivered only to the invited
+    address, which is exactly what a verification link proves. Requiring both
+    is defence in depth rather than one necessary check.
+
+    **What is given up, stated so a deployment chooses it knowingly.** Once the
+    identity provider stops verifying addresses, the ``email`` claim is
+    *self-asserted*: whoever holds the invitation link can register an account
+    typing the invited address, or point an existing account at it, and redeem.
+    So the invitation becomes usable by **anyone who obtains the link by any
+    means** -- forwarding and shared mailboxes are the mundane cases, not the
+    boundary.
+
+    What they receive is the organization membership and role the invitation
+    grants, plus anything ``frames.service_access.grant_on_acceptance`` grants
+    at acceptance -- identity-provider group membership included. And the
+    account they end up with carries the invited person's address permanently,
+    which is an identity-confusion problem in the member list on top of the
+    access one.
+
+    **What the retained address match does and does not buy.** With verification
+    required it is an access control: an accepter must prove control of the
+    invited address. Without it, the match is a *labelling* property -- the
+    address recorded on the membership row is the invited one -- and not a
+    barrier, because the claim it compares is unverified. Keeping it
+    unconditional is still right; it is simply not the thing standing between a
+    link-holder and the grant.
+
+    **When to leave it true.** Any deployment whose invitees arrive through an
+    identity provider with ``trustEmail``: those accounts are already verified
+    on creation, so the check costs nothing and the invitee never sees a
+    verification step. Turning it off buys nothing there.
+
+    **When false is reasonable.** A password-based deployment with no identity
+    provider, a known invitee list, and a verification round trip that is
+    friction rather than assurance.
+    """
+
+
 class FramesConfig(BaseModel):
     storage_backend: str = "local"
     s3: FramesS3Config = Field(default_factory=FramesS3Config)
@@ -530,6 +583,7 @@ class FramesConfig(BaseModel):
     orgs: FramesOrgsConfig = Field(default_factory=FramesOrgsConfig)
     email: FramesEmailConfig = Field(default_factory=FramesEmailConfig)
     service_access: FramesServiceAccessConfig = Field(default_factory=FramesServiceAccessConfig)
+    invitations: FramesInvitationsConfig = Field(default_factory=FramesInvitationsConfig)
     mcp_session_manager_enabled: bool = True
 
 
@@ -549,10 +603,66 @@ class SlackConnectorConfig(BaseModel):
     request_timeout_seconds: float = 10.0
 
 
+# GitHub login: alphanumeric characters with single hyphens between them, no
+# leading/trailing/doubled hyphen (GitHub's own login rule). Deliberately
+# stricter than routers/connectors.py's ``_GITHUB_OWNER_PATTERN`` -- that one
+# only has to bound *request-time* free text, but an allowed_orgs entry is
+# deploy config that gets spliced directly into GitHub search-query syntax as
+# ``org:{org}``, so a value like "acme OR repo:other/private" would silently
+# widen the search instead of narrowing it. No lookahead, so the same pattern
+# also works as-is for the chart's values.schema.json (JSON Schema regexes
+# run through Go's RE2, which does not support it); the length half of
+# GitHub's rule is checked separately, mirroring the schema's ``maxLength``.
+_GITHUB_LOGIN_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+_GITHUB_LOGIN_MAX_LENGTH = 39
+
+
 class GitHubConnectorConfig(BaseModel):
     broker_token_url: str = ""
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
+    request_timeout_seconds: float = 10.0
+    # Restrict the generic api_get read to these GitHub org logins. Empty = the
+    # token's full visibility (personal repos + every approved org). Set this in
+    # real deploys so the generic read cannot reach outside the allowlist. (The
+    # curated search reads the SAME key once PR #76 lands its _build_query
+    # enforcement; on this branch only api_get consults it.)
+    allowed_orgs: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_orgs")
+    @classmethod
+    def _check_allowed_orgs(cls, value: list[str]) -> list[str]:
+        for org in value:
+            if len(org) > _GITHUB_LOGIN_MAX_LENGTH or not _GITHUB_LOGIN_PATTERN.fullmatch(org):
+                raise ValueError(
+                    f"connectors.github.allowed_orgs entry {org!r} is not a valid GitHub org login: "
+                    "alphanumeric characters and single hyphens only, no leading/trailing hyphen, "
+                    f"max {_GITHUB_LOGIN_MAX_LENGTH} characters"
+                )
+        return value
+
+    # Kill switch for the generic /api/get read, distinct from blanking
+    # broker_token_url (which would also kill the curated reads). Defaults to
+    # False (fail-closed): the long-tail tool ships opt-in, so an upgraded hub
+    # gains full-token-visibility generic read only after an operator explicitly
+    # flips this on (and sets allowed_orgs). The curated tools work regardless.
+    api_get_enabled: bool = False
+    # Bound concurrent generic reads per hub process so an injected agent can't
+    # fan out unbounded outbound requests (each api_get opens its own client plus
+    # a token-broker fetch). Curated tools are unaffected.
+    api_get_max_concurrency: int = Field(default=8, ge=1)
+
+
+class NotionConnectorConfig(BaseModel):
+    # Option A: Keycloak generic-OAuth broker URL. Empty under Option B (the Hub
+    # owns the Notion OAuth flow and its own encrypted token store).
+    broker_token_url: str = ""
+    api_base_url: str = "https://api.notion.com"
+    # Pinned Notion API version, sent on every request. Do not float: newer
+    # versions (2025-09-03+) split databases into data sources and move the query
+    # endpoint, which is a migration, not a config change. See docs/notion-connector.md.
+    notion_version: str = "2022-06-28"
+    static_access_token: str = ""  # dev/CI only -- never in prod values
     request_timeout_seconds: float = 10.0
 
 
@@ -560,6 +670,7 @@ class ConnectorsConfig(BaseModel):
     google: GoogleConnectorConfig = Field(default_factory=GoogleConnectorConfig)
     slack: SlackConnectorConfig = Field(default_factory=SlackConnectorConfig)
     github: GitHubConnectorConfig = Field(default_factory=GitHubConnectorConfig)
+    notion: NotionConnectorConfig = Field(default_factory=NotionConnectorConfig)
 
 
 class KeycloakUserDirectoryConfig(BaseModel):
@@ -730,7 +841,10 @@ def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> Invita
 
     url = config.frames.postgres.url
     if url:
-        return PostgresInvitationService(pools.database(url))
+        return PostgresInvitationService(
+            pools.database(url),
+            require_verified_email=config.frames.invitations.require_verified_email,
+        )
     return UnavailableInvitationService()
 
 
@@ -753,6 +867,9 @@ def build_invitation_email_delivery(
             provider,
             accept_url=email.accept_url,
             app_instructions=email.app_instructions,
+            # The same value the acceptance check reads, so the copy and the
+            # rule it describes cannot disagree.
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
     raise RuntimeError(f"Unsupported invitation email provider: {email.provider}")
 

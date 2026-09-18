@@ -34,6 +34,14 @@ from .binding import (
     ModelBinding,
     ModelCog,
 )
+from .envelope import (
+    ENVELOPE_VERSION,
+    ERROR_CODES,
+    EnvelopeError,
+    EnvelopeInvalid,
+    Problem,
+    ResultEnvelope,
+)
 from .kubernetes import KubernetesCogExecutor, cog_slug, label_value, resource_name
 from .lifecycle import (
     BudgetExceeded,
@@ -45,7 +53,6 @@ from .lifecycle import (
 from .orchestration import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
-    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
@@ -81,7 +88,12 @@ __all__ = [
     "ModelCog",
     "DurableWorkflowEngine",
     "InMemoryCogExecutor",
-    "InteractionResult",
+    "ENVELOPE_VERSION",
+    "ERROR_CODES",
+    "EnvelopeError",
+    "EnvelopeInvalid",
+    "Problem",
+    "ResultEnvelope",
     "UsageUnavailable",
     "OpDefinition",
     "OpStep",

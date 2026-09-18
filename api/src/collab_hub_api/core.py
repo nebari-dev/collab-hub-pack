@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext
@@ -30,7 +31,13 @@ from .config import (
     preflight_collab_schema,
 )
 from .frames import error_codes
-from .frames.auth import NoOrganizationError, current_auth_context, get_auth_context, get_caller_identity
+from .frames.auth import (
+    NoOrganizationError,
+    current_auth_context,
+    enforce_https_jwks_urls,
+    get_auth_context,
+    get_caller_identity,
+)
 from .frames.authorization import verify_protected_routes
 from .frames.db import postgres_error_classes
 from .frames.identity import enforce_single_issuer_for_pin, identity_pinned_to_sub
@@ -201,6 +208,11 @@ def make_app(config: BaseConfig) -> FastAPI:
     # has to collapse to one (a bare 'sub' is unique only within an issuer).
     identity_pinned_to_sub()
     enforce_single_issuer_for_pin()
+    # Same fail-fast contract for the JWKS URLs both verifiers fetch signing
+    # keys from (issue #77): a cleartext http URL would let an on-path attacker
+    # substitute the key set, so it fails the rollout here — visible in the
+    # pod's events — rather than silently fetching keys over http.
+    enforce_https_jwks_urls()
     # Same fail-fast contract for where the caller's organization comes from
     # (issue #63): a mistyped FRAMES_AUTH_ORG_SOURCE, membership resolution
     # without the identity pin it is keyed on, a leftover retired
@@ -303,6 +315,19 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.org_store = org_store
             app.state.mcp_server = mcp
             app.state.connectors_config = config.connectors
+            # Process-wide bound on concurrent generic GitHub reads (api_get).
+            # Created once here, where the sizing config is in hand and we're
+            # already inside the event loop — so the route needs no lazy
+            # get-or-create dance and its no-await-between invariant disappears.
+            app.state.github_api_get_semaphore = asyncio.Semaphore(
+                config.connectors.github.api_get_max_concurrency
+            )
+            # Observe-only gauge of how many requests are in the acquire phase
+            # (queued for a permit). A plain int is safe here: asyncio is
+            # single-threaded and the route never awaits between reading and
+            # mutating it. Logged in the throttle event so a deferred queue-length
+            # cap (max_waiting) stays a monitored deferral, not a blind one.
+            app.state.github_api_get_waiters = 0
             if config.web.enabled:
                 # Again at boot, and this is the **last** time either check
                 # runs. make_app verifies what *it* registered; this sees
@@ -612,7 +637,8 @@ def make_app(config: BaseConfig) -> FastAPI:
         # costs the reviewed entry in PUBLIC_WEB_PATHS — make_router refuses
         # a public page route that is missing it.
         invite_public, invite_gated = invite.make_routers(
-            memberships_enabled=org_source_resolves_membership()
+            memberships_enabled=org_source_resolves_membership(),
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
         # The operator invitation page (issue #91). Mounted only where
         # invitations can mean anything, for the same reason #89's API router

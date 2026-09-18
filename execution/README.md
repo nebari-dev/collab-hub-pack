@@ -23,20 +23,47 @@ run with a new id. Budgets are not reset by retrying. Duration is checked at
 step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
-## Usage accounting
+## The result envelope
 
-Every `CogWorker.interact()` returns `InteractionResult(output, usage)`.
-Usage is separate from application output. The HTTP adapter reads it beside
-`output`, for example:
+Every `CogWorker.interact()` returns a `ResultEnvelope`, the version-1 envelope
+of [`docs/cog-execution/result-envelope.md`](../docs/cog-execution/result-envelope.md).
+Over HTTP a worker answers `/invoke` with that envelope as JSON, for example:
 
 ```json
-{"output": {"answer": "..."}, "usage": {"tokens": 10, "cost": 0.002}}
+{"envelope": 1, "ok": true, "payload": {"answer": "..."}, "problems": [], "usage": {"tokens": 10, "cost": 0.002}}
 ```
 
-`tokens` is a non-negative integer; `cost` is a finite, non-negative number in
-the same units as `RunBudget.max_cost`. Reports cover this interaction only,
-not cumulative usage. In-memory handlers return `InteractionResult` to report
-usage; raw handler values are output with unknown usage.
+`ResultEnvelope.parse` reads it: the version is `envelope`, unknown fields are
+ignored, and anything that is not an envelope — no version, `ok` not a
+boolean, `ok: false` without an `error`, `ok: true` with one — fails the step
+as `EnvelopeInvalid`. In-memory handlers return a `ResultEnvelope` or an
+envelope-shaped mapping; any other value becomes the payload of a successful
+envelope with unknown usage.
+
+`ok: false` needs `error: {code, detail}`, with the code one of the five the
+envelope document lists — any other code is an invalid envelope, not a new
+kind of failure. The step fails, and the Track's `failed` event keeps the code
+as its `error` and the detail as its `reason`. These rules hold on construction
+as well as on parsing, so an envelope a worker builds in process cannot
+sidestep them.
+`ok: true` with a non-empty `problems` list is **not** a failure: the step
+completes, and the problems are recorded on `step_completed` for a Gate to
+decide — step-declared Gates are #99. A `binding`, when the worker reports one,
+is recorded there too.
+
+Over HTTP the statuses follow the envelope document: 200 carries an envelope
+(`ok` true or false); 422 (`invalid-input`), 502 (`model-call-failed`,
+`model-response-malformed`) and 503 (`model-unavailable`, `binding-invalid`)
+carry an error envelope, and when the body is not one — a proxy's page, a worker
+that died mid-answer — the status alone names the failure with that code. Any
+other status is a transport error and fails the step by its exception's name.
+
+## Usage accounting
+
+`usage` is read from the envelope, never from inside `payload`. `tokens` is a
+non-negative integer; `cost` is a finite, non-negative number in the same units
+as `RunBudget.max_cost`. Reports cover this interaction only, not cumulative
+usage.
 
 Missing usage is unknown. A configured token limit requires `tokens`, and a
 configured cost limit requires `cost`; explicit zero is valid. Missing required
@@ -45,10 +72,10 @@ starts. With neither spending limit configured, absent usage is allowed.
 
 Paused interactions report usage through `PauseRequest(..., usage=...)`, or a
 top-level `usage` field beside HTTP `pause`. The Track records each report before
-teardown, including pauses, so spending survives recovery. Unknown usage from a
-failed interaction prevents retry from advancing under a spending limit.
-These reports are worker-supplied accounting, not independent metering or hard
-per-request caps. This contract does not adopt the full result-envelope schema.
+teardown — pauses and `ok: false` answers included — so spending survives
+recovery. Unknown usage from a failed interaction prevents retry from advancing
+under a spending limit. These reports are worker-supplied accounting, not
+independent metering or hard per-request caps.
 
 ## Signals and workers
 
@@ -59,10 +86,10 @@ A resume after a pause gets a new attempt key; crash recovery of that attempt
 reuses its key.
 
 A signal is external feedback, not a Gate implementation. The current
-`PauseRequest` and E2E approval fixture exercise pause/resume transport.
-The [glossary](../docs/GLOSSARY.md) defines a Gate as an Op-owned decision.
-This experimental implementation does not yet implement step-owned Gates or
-the [result envelope](../docs/cog-execution/result-envelope.md).
+`PauseRequest` and E2E approval fixture exercise pause/resume transport, and
+both are transitional: the [glossary](../docs/GLOSSARY.md) defines a Gate as an
+Op-owned decision, and step-declared Gates (#99) retire a Cog's
+`{"pause": true}` answer.
 
 `KubernetesCogExecutor(interaction_timeout=300)` sets the default worker HTTP
 client's read/write timeout in seconds (default: 60); `None` disables only those

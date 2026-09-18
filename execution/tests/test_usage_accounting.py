@@ -7,10 +7,10 @@ from collab_hub_execution import (
     DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
-    InteractionResult,
     OpDefinition,
     OpStep,
     PauseRequest,
+    ResultEnvelope,
     RunBudget,
     RunStatus,
 )
@@ -43,11 +43,11 @@ def test_second_executor_and_http_stop_ten_step_run_at_fifteen_tokens(transport)
     class Worker:
         def interact(self, entry_point, input=None, idempotency_key=None):
             calls.append(input)
-            return InteractionResult("result", {"tokens": 10})
+            return ResultEnvelope.success("result", usage={"tokens": 10})
 
     def handle(request):
         calls.append(request)
-        return httpx.Response(200, json={"output": "result", "usage": {"tokens": 10}})
+        return httpx.Response(200, json={"envelope": 1, "ok": True, "payload": "result", "usage": {"tokens": 10}})
 
     with httpx.Client(transport=httpx.MockTransport(handle)) as client:
         worker = Worker() if transport == "local" else _KubernetesWorker("c", "w", "http://worker", client)
@@ -65,7 +65,7 @@ def test_second_executor_and_http_stop_ten_step_run_at_fifteen_tokens(transport)
     {"tokens": -1}, {"tokens": 1.5}, {"tokens": float("nan")}, {"tokens": float("inf")}, "unknown",
 ])
 def test_missing_or_invalid_tokens_fail_durably_without_starting_next_step(usage):
-    executor = InMemoryCogExecutor({"c": lambda e, v: InteractionResult(v, usage)})
+    executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)})
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
     assert engine.submit(op()) is RunStatus.FAILED
@@ -84,7 +84,7 @@ def test_missing_or_invalid_tokens_fail_durably_without_starting_next_step(usage
     {"cost": float("nan")}, {"cost": float("inf")}, {"cost": float("-inf")}, {"cost": 10**400},
 ])
 def test_cost_budget_requires_a_valid_cost_report(usage):
-    executor = InMemoryCogExecutor({"c": lambda e, v: InteractionResult(v, usage)})
+    executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)})
     engine = DurableWorkflowEngine(executor=executor, track=InMemoryTrackStore(), budget=RunBudget(max_cost=1))
     assert engine.submit(op()) is RunStatus.FAILED
     assert len(executor.materialized) == 1
@@ -99,17 +99,20 @@ def test_cost_budget_requires_a_valid_cost_report(usage):
 ])
 def test_explicit_zero_and_unbudgeted_unknown_usage_are_supported(usage, budget):
     engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: InteractionResult(v, usage)}),
+        executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)}),
         track=InMemoryTrackStore(), budget=budget,
     )
     assert engine.submit(op(count=2)) is RunStatus.COMPLETED
 
 
 @pytest.mark.parametrize("body", [
-    {"output": {"usage": {"tokens": 10}}},  # the old, implicit convention
+    {"output": {"usage": {"tokens": 10}}},  # the pre-envelope convention
     {"output": "done"},
     {"output": "done", "usage": {"total_tokens": 10}},
-    {"payload": "done", "usage": {"tokens": 10}},  # unsupported response shape
+    {"payload": "done", "usage": {"tokens": 10}},  # no envelope version
+    {"envelope": 2, "ok": True, "payload": "done", "usage": {"tokens": 10}},  # a version this hub does not read
+    {"envelope": 1, "ok": True, "payload": {"usage": {"tokens": 10}}},  # usage hidden in the payload
+    {"envelope": 1, "ok": True, "payload": "done", "usage": {"total_tokens": 10}},
     [],
 ])
 def test_wrong_http_shape_or_misplaced_usage_cannot_disable_budget(body):
@@ -120,11 +123,11 @@ def test_wrong_http_shape_or_misplaced_usage_cannot_disable_budget(body):
         assert executor.torn_down == 1
 
 
-def test_output_usage_field_is_payload_not_accounting():
+def test_usage_inside_the_payload_is_output_not_accounting():
     payload = {"usage": {"tokens": 1000}, "answer": "unrelated field"}
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"c": lambda e, v: InteractionResult(payload, {"tokens": 1})}),
+        executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(payload, usage={"tokens": 1})}),
         track=track, budget=RunBudget(max_tokens=15),
     )
     assert engine.submit(op(count=2)) is RunStatus.COMPLETED
@@ -141,14 +144,16 @@ def test_worker_must_return_declared_result_type():
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track)
     assert engine.submit(op()) is RunStatus.FAILED
-    assert track.replay("accounting")[-1].payload["reason"] == "interact() must return InteractionResult"
+    failed = track.replay("accounting")[-1].payload
+    assert failed["error"] == "EnvelopeInvalid"
+    assert failed["reason"] == "interact() must return a ResultEnvelope"
 
 
 def test_pause_usage_and_completed_usage_survive_restart_without_double_counting():
     def handler(entry, value, *, signal=_NO_SIGNAL):
         if signal is _NO_SIGNAL:
             raise PauseRequest("feedback", usage={"tokens": 6})
-        return InteractionResult(value, {"tokens": 6})
+        return ResultEnvelope.success(value, usage={"tokens": 6})
 
     executor = InMemoryCogExecutor({"c": handler})
     track = InMemoryTrackStore()
@@ -193,7 +198,7 @@ def test_failed_interaction_does_not_reset_unknown_usage_on_retry():
 def test_accounting_survives_teardown_failure_and_retry():
     class Worker:
         def interact(self, entry_point, input=None, idempotency_key=None):
-            return InteractionResult("done", {"cost": 0.6})
+            return ResultEnvelope.success("done", usage={"cost": 0.6})
 
     class Executor(LocalExecutor):
         def teardown(self, worker):

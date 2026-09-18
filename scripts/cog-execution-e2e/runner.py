@@ -1,8 +1,13 @@
 """Minimal Cog worker for the kind E2E: serves /healthz and /invoke (stdlib only).
 
+/invoke answers with a version-1 result envelope
+(docs/cog-execution/result-envelope.md): ``payload`` echoes the input, ``usage``
+reports tokens, ``problems`` is empty.
+
 Pause fixture: a Cog whose COG_ID contains "gated" pauses until a separate
 signal carries ``{"approved": true}``. This exercises transport and recovery;
-it does not implement the Op-owned Gate policy defined in docs/GLOSSARY.md.
+it does not implement the Op-owned Gate policy defined in docs/GLOSSARY.md, and
+it leaves once Gates are declared on the step (#99).
 """
 
 from __future__ import annotations
@@ -49,10 +54,18 @@ class Handler(BaseHTTPRequestHandler):
         if key is not None and key in _SEEN:  # replayed key -> no repeated side effect
             self._send(200, _SEEN[key])
             return
-        result = {"output": {
-            "cog": COG_ID, "entry_point": entry, "echo": value,
-            "signal": signal,
-        }, "usage": {"tokens": 10}}
+        result = {
+            "envelope": 1,
+            "cog": {"id": COG_ID, "version": "0.0.0"},
+            "task": entry,
+            "ok": True,
+            "error": None,
+            "payload": {"cog": COG_ID, "entry_point": entry, "echo": value, "signal": signal},
+            "raw": None,
+            "problems": [],
+            "binding": None,
+            "usage": {"tokens": 10},
+        }
         if key is not None:
             _SEEN[key] = result
         self._send(200, result)

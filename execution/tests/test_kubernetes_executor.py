@@ -7,9 +7,9 @@ import httpx
 import pytest
 
 from collab_hub_execution import (
-    InteractionResult,
     KubernetesCogExecutor,
     PauseRequest,
+    ResultEnvelope,
     cog_slug,
     label_value,
     resource_name,
@@ -40,12 +40,12 @@ def test_connection_failure_can_retry_without_changing_payload(error, monkeypatc
         calls.append(request.content)
         if len(calls) == 1:
             raise error("not connected", request=request)
-        return httpx.Response(200, json={"output": "done"})
+        return httpx.Response(200, json={"envelope": 1, "ok": True, "payload": "done"})
 
     monkeypatch.setattr("collab_hub_execution.kubernetes.time.sleep", lambda _: None)
     with httpx.Client(transport=httpx.MockTransport(handle)) as client:
         worker = _KubernetesWorker("c", "worker", "http://worker", client)
-        assert worker.interact("run", "draft", idempotency_key="r:s:0") == InteractionResult("done")
+        assert worker.interact("run", "draft", idempotency_key="r:s:0") == ResultEnvelope.success("done")
     assert len(calls) == 2
     assert calls[0] == calls[1]
 
@@ -127,7 +127,7 @@ class FakeWorkerHttp:
 
     def post(self, url: str, *, json: dict) -> FakeResponse:
         self.posts.append((url, json))
-        return FakeResponse(200, {"output": f"handled:{json['entry_point']}"})
+        return FakeResponse(200, {"envelope": 1, "ok": True, "payload": f"handled:{json['entry_point']}"})
 
 
 def _executor(api, worker_http):
@@ -167,7 +167,7 @@ def test_interact_posts_to_the_entry_point_with_idempotency_key():
     api, http = FakeK8sApi(), FakeWorkerHttp()
     worker = _executor(api, http).materialize("openteams/draft-generator", "run-2")
     result = worker.interact("draft", {"topic": "x"}, idempotency_key="run-2:draft:0")
-    assert result == InteractionResult("handled:draft")
+    assert result == ResultEnvelope.success("handled:draft")
     url, body = http.posts[-1]
     assert url.endswith("/invoke")
     assert body["entry_point"] == "draft" and body["idempotency_key"] == "run-2:draft:0"

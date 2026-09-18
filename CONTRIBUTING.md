@@ -30,6 +30,12 @@ uv sync --group test        # install runtime + test deps
 uv run pytest               # run the test suite
 ```
 
+The API supports **Python 3.13 and later**. `api/.python-version` pins 3.14,
+the version the image runs, and CI runs the suite on 3.13 as well
+(`Test (Python 3.13)`). To reproduce that job, prefix the commands with
+`UV_PYTHON=3.13`. Keep code valid on 3.13: ruff targets `py313` and reports
+newer syntax.
+
 Running it by hand needs **all three** dev-auth switches —
 `FRAMES_UNSAFE_AUTH_ENABLED=true`, `DEV_AUTH_ENABLED=true` and
 `DEV_AUTH_USER=<name>`. Setting only `DEV_AUTH_USER` authenticates nothing and
@@ -51,6 +57,12 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
 - A [code owner](.github/CODEOWNERS) must approve before merge. Take PRs out of
   draft before requesting code-owner review.
 - Keep the change focused; describe *how* it addresses the issue.
+- Cog execution changes follow two same-PR rules from
+  [ADR-0002](docs/adr/0002-lifecycle-runner-durability-and-placement.md):
+  make what you add runnable from [`dev/`](dev/README.md#running-cogs-and-ops)
+  at the lowest level that can host it, with a CI assertion at that level
+  (D9); and update every document the change makes stale, naming them in the
+  PR description (D10).
 
 ## Reporting security issues
 

@@ -89,6 +89,24 @@ Optional; absent when the Cog cannot report it.
   review is the Gate's outcome, not something the Cog requests.
 - **Budgets** consume `usage`.
 
+## Over HTTP
+
+As the hub's worker client implements it (`collab_hub_execution.kubernetes`):
+
+| Status | Body | The hub reads |
+|---|---|---|
+| 200 | an envelope, `ok` true or false | the envelope |
+| 422 | an envelope with `error.code: invalid-input` | the envelope's code |
+| 502 | an envelope with `model-call-failed` or `model-response-malformed` | the envelope's code |
+| 503 | an envelope with `model-unavailable` or `binding-invalid` | the envelope's code |
+| 422 / 502 / 503 | not an envelope — a proxy's error page, a worker that died mid-answer | an error envelope with the status's own code: `invalid-input`, `model-call-failed`, `model-unavailable` |
+| anything else | — | a transport error; the step fails by the exception's name, not a code |
+
+A 200 whose body is not an envelope, and an error status carrying `ok: true`,
+are invalid answers (`EnvelopeInvalid`) and fail the step as such. The `usage`
+of an `ok: false` envelope is still recorded, so a failed call's spending
+counts against the budget.
+
 ## Versioning
 
 This document is `envelope: 1`. Additive changes (new optional fields) do

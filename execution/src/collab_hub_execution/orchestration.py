@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .envelope import EnvelopeInvalid, ResultEnvelope
 from .lifecycle import (
     BudgetExceeded,
     BudgetTracker,
@@ -41,21 +42,23 @@ def _key_component(value: str) -> str:
     return value.replace("%", "%25").replace(":", "%3A")
 
 
-@dataclass(frozen=True, slots=True)
-class InteractionResult:
-    """Worker output and accounting, independent of the output's own schema.
-
-    Every CogWorker returns this type. usage contains per-interaction tokens
-    (a non-negative integer) and/or cost (a finite non-negative number).
-    Missing usage is unknown, not zero.
-    """
-
-    output: Any = None
-    usage: Mapping[str, Any] | None = None
-
-
 class UsageUnavailable(ValueError):
     """A configured budget cannot be accounted for, or usage is malformed."""
+
+
+def _recorded(envelope: ResultEnvelope) -> dict[str, Any]:
+    """The envelope fields the Track keeps beside a step's outcome, when present.
+
+    ``problems`` are what a Gate decides on; ``binding`` is what makes the
+    outcome auditable. Both are optional in the envelope, so the event only
+    carries them when the worker reported them.
+    """
+    extra: dict[str, Any] = {}
+    if envelope.problems:
+        extra["problems"] = [{"check": p.check, "detail": p.detail, "severity": p.severity} for p in envelope.problems]
+    if envelope.binding is not None:
+        extra["binding"] = dict(envelope.binding)
+    return extra
 
 
 def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None:
@@ -101,7 +104,13 @@ class OpDefinition:
 
 
 class PauseRequest(Exception):
-    """A Cog's request for an external signal before continuing."""
+    """A Cog's request for an external signal before continuing.
+
+    Transitional. A pause is a Gate's decision, declared on the Op step, never
+    something a Cog asks for; this leaves the protocol when step-declared Gates
+    land (#99). Until then the reference worker's ``{"pause": true}`` answer is
+    surfaced through it.
+    """
 
     def __init__(self, reason: str, *, usage: Mapping[str, Any] | None = None) -> None:
         super().__init__(reason)
@@ -113,10 +122,11 @@ class CogWorker(Protocol):
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> InteractionResult:
+    ) -> ResultEnvelope:
         """Interact through a declared entry point.
 
-        Return InteractionResult(output, usage); never hide usage inside output.
+        Return the result envelope (``envelope.py``): ``payload`` is the Cog's
+        output and ``usage`` its accounting, never hidden inside the payload.
         A PauseRequest carries usage for the interaction that paused.
 
         ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
@@ -164,8 +174,10 @@ class WorkflowEngine(Protocol):
 class InMemoryCogExecutor(CogExecutor):
     """A fake executor for exercising orchestration without infrastructure.
 
-    Handlers return InteractionResult to report usage. Raw values are wrapped as
-    output with unknown usage; they cannot satisfy a configured spending limit.
+    A handler returns a ``ResultEnvelope`` (or an envelope-shaped mapping, one
+    with an ``envelope`` key) to report usage or problems. Any other value
+    becomes the payload of a successful envelope with unknown usage, which
+    cannot satisfy a configured spending limit.
     """
 
     def __init__(self, handlers: dict[str, Callable[..., Any]]) -> None:
@@ -189,10 +201,14 @@ class _Worker:
     def interact(
         self, entry_point: str, input: Any = None, idempotency_key: str | None = None,
         *, signal: Any = _NO_SIGNAL,
-    ) -> InteractionResult:
+    ) -> ResultEnvelope:
         feedback = {} if signal is _NO_SIGNAL else {"signal": signal}
         result = self.handler(entry_point, input, **feedback)
-        return result if isinstance(result, InteractionResult) else InteractionResult(result)
+        if isinstance(result, ResultEnvelope):
+            return result
+        if isinstance(result, Mapping) and "envelope" in result:
+            return ResultEnvelope.parse(result)
+        return ResultEnvelope.success(result)
 
 
 class DurableWorkflowEngine(WorkflowEngine):
@@ -385,7 +401,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             outcome: tuple[str, Any] = ("failed", "Unknown")
             teardown_error: str | None = None
             usage = None
-            accounting_error = None
+            failure_reason = None
             invoked = False
             # Materialize, interact, and teardown are all inside failure handling
             # so any infra error becomes a durable `failed` event (never a
@@ -401,11 +417,13 @@ class DurableWorkflowEngine(WorkflowEngine):
                 feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
                 try:
                     invoked = True
-                    value = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
-                    if not isinstance(value, InteractionResult):
-                        raise UsageUnavailable("interact() must return InteractionResult")
-                    outcome = ("ok", value.output)
-                    raw_usage = value.usage
+                    result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
+                    if not isinstance(result, ResultEnvelope):
+                        raise EnvelopeInvalid("interact() must return a ResultEnvelope")
+                    # ok with problems is not a failure: the step completes and a
+                    # Gate decides what the problems mean. ok: false is one.
+                    outcome = ("ok", result) if result.ok else ("error", result)
+                    raw_usage = result.usage
                 except PauseRequest as pause:
                     outcome = ("pause", pause.reason)
                     raw_usage = pause.usage
@@ -414,8 +432,13 @@ class DurableWorkflowEngine(WorkflowEngine):
             except UsageUnavailable as exc:
                 # Persist unknown accounting so recovery/retry cannot forget it.
                 self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
-                accounting_error = str(exc)
+                failure_reason = str(exc)
                 outcome = ("failed", "UsageUnavailable")
+            except EnvelopeInvalid as exc:
+                # Not the seam's envelope, so whatever the worker spent is unknown too.
+                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
+                failure_reason = str(exc)
+                outcome = ("failed", "EnvelopeInvalid")
             except Exception as exc:  # noqa: BLE001 - any materialize/interact failure is durable-failed
                 if invoked:
                     # A failed request may have spent resources before failing.
@@ -439,7 +462,13 @@ class DurableWorkflowEngine(WorkflowEngine):
             kind, detail = outcome
             if kind == "failed":
                 self._append(op.run_id, "failed", step=step.name, error=detail,
-                             **({"reason": accounting_error} if accounting_error else {}))
+                             **({"reason": failure_reason} if failure_reason else {}))
+                return RunStatus.FAILED
+            if kind == "error":
+                # The worker answered, and said no. The code is what a client acts
+                # on, so it is the event's error, verbatim; the detail is the reason.
+                self._append(op.run_id, "failed", step=step.name, error=detail.error.code,
+                             reason=detail.error.detail, **_recorded(detail))
                 return RunStatus.FAILED
             budget_stop = None
             if tracker is not None:
@@ -456,13 +485,16 @@ class DurableWorkflowEngine(WorkflowEngine):
                 self._append(op.run_id, "paused", step=step.name, reason=detail)
                 return RunStatus.PAUSED
 
-            value = detail
+            envelope = detail
             lifecycle.transition(LifecycleState.IDLE)
             self._append(op.run_id, "idle", step=step.name)
             lifecycle.transition(LifecycleState.TEARING_DOWN)
             self._append(op.run_id, "teardown_started", step=step.name)
             lifecycle.transition(LifecycleState.TORN_DOWN)
-            self._append(op.run_id, "step_completed", step=step.name, output=value, usage=usage)
+            # `output` keeps the Track's current key; the versioned event schema
+            # that renames it and stores large payloads by reference is #5.
+            self._append(op.run_id, "step_completed", step=step.name, output=envelope.payload, usage=usage,
+                         **_recorded(envelope))
             if budget_stop is not None:
                 return self._record_budget_stop(op.run_id, step.name, budget_stop)
         self._append(op.run_id, "completed")

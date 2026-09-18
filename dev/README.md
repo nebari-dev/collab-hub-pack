@@ -28,8 +28,10 @@ one, and only matters once you reach level 3.
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
 
-You do **not** need a local Python 3.14: `uv` provisions the pinned interpreter
-from `api/.python-version` on first run.
+You do **not** need a local Python: `uv` provisions the interpreter pinned in
+`api/.python-version` (3.14, the one the image runs) on first run. The API
+supports Python 3.13 and later; prefix any target with `UV_PYTHON=3.13` to run
+it on 3.13, the version CI also tests.
 
 One thing is not a tool. Connecting the Collab desktop client needs three
 hostnames pointed at your own machine, once per machine:
@@ -426,11 +428,18 @@ The dev-auth shortcut is **off**. The API verifies real RS256 tokens against
 the realm's JWKS, checking issuer and audience:
 
 ```sh
+FRAMES_UNSAFE_AUTH_ENABLED=true
 FRAMES_BEARER_JWKS_URL=http://localhost:8080/realms/nebari/protocol/openid-connect/certs
 FRAMES_BEARER_ISSUER=http://localhost:8080/realms/nebari
 FRAMES_BEARER_AUDIENCE=apollo-desktop
 FRAMES_AUTH_IDENTITY_CLAIM=sub
 ```
+
+`FRAMES_UNSAFE_AUTH_ENABLED=true` is there only because the local Keycloak's
+JWKS URL is plain `http`, which the API otherwise refuses at startup — JWKS
+URLs must be `https` outside local development (issue #77). It does not turn
+the dev-auth shortcut on (that also needs `DEV_AUTH_ENABLED`), and it does not
+accept unsigned tokens (that also needs `FRAMES_BEARER_ALLOW_UNSIGNED`).
 
 Get a token and use it:
 
@@ -803,6 +812,7 @@ No target sets these, so run the API by hand with the one you want — the
 ```sh
 cd ../api && env \
   COLLAB_HUB_API__SERVER__PORT=8000 \
+  FRAMES_UNSAFE_AUTH_ENABLED=true \
   FRAMES_BEARER_JWKS_URL=http://localhost:8080/realms/nebari/protocol/openid-connect/certs \
   FRAMES_BEARER_ISSUER=http://localhost:8080/realms/nebari \
   FRAMES_BEARER_AUDIENCE=apollo-desktop \
@@ -1022,6 +1032,47 @@ Frames and the user directory work immediately. Three things do not:
   it; this pack does not serve models. That is the `llm-serving-pack`'s job.
 - **Slack linking** needs an HTTPS broker endpoint — see
   [Slack](#7-slack) above.
+
+---
+
+## Running Cogs and Ops
+
+Nothing here runs a Cog through the hub yet: the API does not import the
+execution package (#35), and there is no run controller or run API to call.
+This section is where they arrive, one target at a time, under the rule
+[ADR-0002](../docs/adr/0002-lifecycle-runner-durability-and-placement.md) D9
+sets for every Cog execution change. In the same PR, what a change adds is:
+
+1. **runnable from here**, at the lowest level that can host it, through a
+   `make` target;
+2. **documented in this section** — the target, the level, what persists, and a
+   [troubleshooting](#troubleshooting) row for its first failure mode;
+3. **asserted in CI at that level** — no containers at level 1, no large image
+   downloads, and real clusters and heavy engines in their own workflows, never
+   in `dev-env.yaml` (see [What CI checks](#what-ci-checks)).
+
+Two things already run outside the hub. They predate this rule, so they are
+run directly rather than through `make`, and CI covers them in
+`test-execution.yaml` and `test-execution-e2e.yaml`:
+
+| What | Command | Needs |
+|---|---|---|
+| The execution package's tests | `cd execution && uv run --group test pytest` | nothing — the Postgres Track tests skip unless `TEST_POSTGRES_URL` is set |
+| A gated two-step Op on real worker pods, through `KubernetesCogExecutor` | `scripts/cog-execution-e2e/run.sh`, from the repository root | Docker, kind, `kubectl` |
+
+**Point `TEST_POSTGRES_URL` at a database of its own.** The Postgres Track tests
+drop and recreate `collab_track_events`. With level 2 up, `make psql`, run
+`CREATE DATABASE execution_test;`, then:
+
+```sh
+cd execution
+TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
+  uv run --group test pytest
+```
+
+**The E2E script brings its own cluster.** It creates a kind cluster named
+`cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
+runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 
 ---
 

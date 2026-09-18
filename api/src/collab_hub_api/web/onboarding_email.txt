@@ -23,9 +23,11 @@ If it lapses, tell us and we'll send a fresh one.
 
    The invitation can only be accepted by that address, so please do
    not substitute another one.
+[IF VERIFIED EMAIL REQUIRED]
 
    You will then get an email asking you to verify the address. Click
    the link in it before carrying on.
+[END IF]
 
 3. ACCEPT YOUR INVITATION
 
