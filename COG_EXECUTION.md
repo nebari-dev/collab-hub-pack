@@ -29,7 +29,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 | Scriptable from a terminal | A `collab-hub` CLI on Typer, authentication first, then a command per run-API endpoint; each later phase adds its own commands. | Phases 13, 14 |
 | Runnable from `dev/`, asserted in CI, in the same PR | Every phase adds its `make` target at the lowest level that can host it, documents it, and asserts its contract in CI at that level. | [§5](#5-the-dev-environment-and-the-docs-carry-every-phase) |
 | Documented in the same PR | Every phase updates the documents it makes stale, names them in the PR, and adds its terms to the glossary. | [§5](#5-the-dev-environment-and-the-docs-carry-every-phase) |
-| Python 3.13 and 3.14 | The API supports both and CI tests both; the execution package and the worker SDK support 3.11 and up. A Cog pins its own interpreter. | Phase 1 (done) |
+| Python 3.13 and 3.14 | The API supports both and CI tests both; the execution package, the worker SDK and the CLI support 3.11 and up. A Cog pins its own interpreter. | Phase 1 (done) |
 
 ## 3. Where we start
 
@@ -44,7 +44,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 
 **In flight — not this plan's to build**
 
-- **#7** is decomposed into **#81–#87**. #84 (catalog store), #85 (catalog read API), #86 (webhooks) and #87 (config, PR #118) are open. Phase 18 consumes #84/#85; Phase 7 needs only #83's `static` source, already merged.
+- **#7** is decomposed into **#81–#87**. #84 (catalog store), #85 (catalog read API), #86 (webhooks) and #87 (config, PR #118) are open. Phase 18 consumes #84/#85; Phase 7 needs none of them, since it reads a package from a directory through a source of its own.
 - **#78** moves the profile manifest into `pixi.toml` under `[tool.cog]`.
 
 **Gaps between #35 and the requirements** — nearly all named in review on the issues:
@@ -84,6 +84,8 @@ flowchart LR
     ui --> rt
   end
 
+  cli["collab-hub CLI<br/>Typer · device-flow sign-in"]
+
   subgraph hub["collab-hub-pack — the hub"]
     api["Run API /v1/runs<br/>writes intent · reads the Track"]
     ctl["Run controller<br/>lifecycle runner<br/>location: local | remote<br/>durability: none | dbos | temporal"]
@@ -115,6 +117,7 @@ flowchart LR
   end
 
   rt -->|"hub · bearer via loopback proxy"| api
+  cli -->|"hub · bearer"| api
   rt -->|"local · loopback"| lapi
   lexec -->|"spawn · loopback · run token"| psdk
   kexec -->|"materialize · /invoke with run token"| sdk
@@ -180,13 +183,13 @@ The second axis under the runner. Where the durability backend decides what surv
 
 Location and backend are independent: either location runs under any backend, and the conformance suites cover the grid — the lifecycle and durability suites per backend, the location suite per executor. The SDK never learns its location: the run token and the binding reach a child process and a pod the same way, so a Cog that runs at one location runs at the other unchanged.
 
-**Implementation priority.** Neither axis is built all at once, and the order is the primary goal read backwards. `none` ships first (Phase 6) with the `DurabilityBackend` slot carrying all three values, and `local` ships first (Phase 7) with the `location` slot carrying both, so nothing later changes a caller or the runner. The first thing that runs end to end is the hub launching the Hermes harness Cog as a child process (Phase 12), and Collab launching and watching that same run comes next (Phases 15–16). The same abstraction then launches it in a pod — `remote`, Phase 17 — still on `none`. `dbos` (Phase 22) is the next backend brought to a full implementation: the production backend (decision 2), needing no infrastructure beyond the Track's own Postgres. `temporal` (Phase 28) is deliberately last: two backends behind one seam already demonstrate it is swappable before the one that brings a new service is built.
+**Implementation priority.** Neither axis is built all at once, and the order is the primary goal read backwards. `none` ships first (Phase 6) with the `DurabilityBackend` slot carrying all three values, and `local` ships first (Phase 7) with the `location` slot carrying both, so nothing later changes a caller or the runner. The first thing that runs end to end is the hub launching the Hermes harness Cog as a child process (Phase 12), and the CLI and Collab launching and watching that same run come next (Phases 13–16). The same abstraction then launches it in a pod — `remote`, Phase 17 — still on `none`. `dbos` (Phase 22) is the next backend brought to a full implementation: the production backend (decision 2), needing no infrastructure beyond the Track's own Postgres. `temporal` (Phase 28) is deliberately last: two backends behind one seam already demonstrate it is swappable before the one that brings a new service is built.
 
 ### Harness neutrality
 
 The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and reads an envelope. "Any harness is supported" is therefore something the hub has by construction; the work is making a harness cheap to wrap. The worker SDK (Phase 11) implements the seam once — envelope, health, keyed claim, binding, cancellation, usage — and hands the interaction to a `HarnessAdapter`. ACP comes first because it is how Collab already drives Hermes and a protocol other agent harnesses implement too, so one adapter covers a family rather than one product: Hermes is the first Cog built on it (Phase 12), pi and OpenCode the next, each a Cog package and, where the harness does not speak ACP, an adapter — never a change to the hub. The SDK is a library a Cog author *may* use; the hub requires only the seam, and an import-boundary test keeps the hub from ever depending on it.
 
-**Python.** Each distribution declares its own floor and CI tests that floor and the newest version: the API `>=3.13`, the execution package and the worker SDK `>=3.11`. A Cog's environment pins its own interpreter, so none of these constrains what a harness needs.
+**Python.** Each distribution declares its own floor and CI tests that floor and the newest version: the API `>=3.13`, the execution package, the worker SDK and the CLI `>=3.11`. A Cog's environment pins its own interpreter, so none of these constrains what a harness needs.
 
 ## 5. The dev environment and the docs carry every phase
 
@@ -198,7 +201,7 @@ The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and 
 
 | Level | Already there (#94) | What this plan adds | First phase |
 |---|---|---|---|
-| **1** — no containers | `make api`: dev auth, frames on local disk | a SQLite Track in `dev/.local/` shared by the API and the controller; fake Cogs under `dev/cogs/`, each with a `pixi.toml`; `make op` to submit a fake Op and print its Track; `make controller LOCATION=local` running the lifecycle runner on `none`, so workers are real child processes — the Hermes Cog from `cogs/hermes` among them, against `make fake-model` | 4, 6, 7, 9, 12 |
+| **1** — no containers | `make api`: dev auth, frames on local disk | a SQLite Track in `dev/.local/` shared by the API and the controller; fake Cogs under `dev/cogs/`, each with a `pixi.toml`; `make op` to submit a fake Op and print its Track; `make controller LOCATION=local` running the lifecycle runner on `none`, so workers are real child processes — the Hermes Cog from `cogs/hermes` among them, against `make fake-model`; `make cli`, the `collab-hub` CLI against dev auth | 4, 6, 7, 9, 12, 13 |
 | **2** — Postgres, MinIO | `make api-pg`, `make psql` | the Track, claims and run pickup on Postgres; `make controller BACKEND=dbos` — DBOS is a library over the same Postgres, so no new image; a `fake-cog` HTTP worker and the `fake-model` endpoint in the `fakes` profile; optional `registry` and `temporal` profiles | 8, 20, 22, 28 |
 | **3** — Keycloak | `make api-oidc`, `api-fakes`, `seed-org`, `token` | Gate approvers from `seed-org`'s owner and operator; grants backed by the `dev` user's offline token; the connector proxy against the existing fakes; `collab-hub login` against the realm, which is where the CLI's device flow is real | 10, 13, 25 |
 | **4** — kind | `make kind-up` with `values/kind.yaml`, `kind-smoke` | the run controller Deployment and its Role from the chart, with `location: remote`; install from the local registry; `KIND_CNI=calico`, because kind's default CNI does not enforce NetworkPolicy | 17, 18, 24 |
@@ -212,11 +215,11 @@ The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and 
 
 | Workflow · job | Assertions added |
 |---|---|
-| `test.yaml` · `test-python-floor` | the API suite and `ruff check` on Python 3.15, beside `test` on 3.16 (Phase 1, done) |
-| `dev-env.yaml` · `level-1` (Linux, macOS) | a fake Op completes as a child process under `LOCATION=local`, and a killed controller leaves no worker behind — on macOS too, where process-tree teardown and pixi portability are the risk (7); the same across `make controller` and `make op` as two processes, the run ending `interrupted` when the controller is killed (9); a Gate escalates and a decision advances it over HTTP (10); fake Cogs that break policy or grounding escalate with findings (23) |
-| `dev-env.yaml` · `levels-2-3` | the Track schema comes only from migrations (4); two controllers never both start one run (9); a member without an approver role is refused (10); on `dbos`, a killed controller resumes the run, including one waiting at a Gate (22); a run with no bearer in flight reads a fake connector, and a revoked grant fails the next run (25) |
+| `test.yaml` · `test-python-floor` | the API suite and `ruff check` on Python 3.13, beside `test` on 3.14 (Phase 1, done) |
+| `dev-env.yaml` · `level-1` (Linux, macOS) | a fake Op completes as a child process under `LOCATION=local`, and a killed controller leaves no worker behind — on macOS too, where process-tree teardown and pixi portability are the risk (7); the same across `make controller` and `make op` as two processes, the run ending `interrupted` when the controller is killed (9); a Gate escalates and a decision advances it over HTTP (10); fake Cogs that break policy or grounding escalate with findings (23); the CLI reports an unauthenticated session, then submits a fake Op, watches it and decides its Gate with the documented exit codes (13, 14) |
+| `dev-env.yaml` · `levels-2-3` | the Track schema comes only from migrations (4); two controllers never both start one run (9); a member without an approver role is refused (10); on `dbos`, a killed controller resumes the run, including one waiting at a Gate (22); a run with no bearer in flight reads a fake connector, and a revoked grant fails the next run (25); `collab-hub login` against the realm, with `whoami` naming the `dev` user (13) |
 | `dev-env.yaml` · `level-4-render` | the controller Deployment and a Role limited to materialized kinds render, and the API ServiceAccount has no workload verbs (17); a worker Pod pulls a digest in an init container (18) and carries an egress NetworkPolicy (24) |
-| `test-execution.yaml` | the lifecycle and durability suites (6), the location suite (7), the claim's retry case against Postgres (8), budgets (21), `dbos` on SQLite (22), and Temporal through the Temporal CLI's `temporal server start-dev` rather than a cluster image (28) |
+| `test-execution.yaml` | the lifecycle and durability suites (6), the location suite (7), the claim conformance suite against SQLite and Postgres (8), budgets (21), `dbos` on SQLite (22), and Temporal through the Temporal CLI's `temporal server start-dev` rather than a cluster image (28) |
 | `test-hermes.yaml` (path-gated, new) | the Hermes harness Cog through the local executor on Linux, against the stdlib fake model — it downloads Hermes' environment, so it stays out of `dev-env.yaml` (12) |
 | `test-execution-e2e.yaml` (kind, path-gated) | the location suite against `remote` (17), materialization of a published fake Cog by digest (18), installing one and running it once (19), a worker configured from its delivered binding (20), and a denied egress connection recorded on the Track on a policy-enforcing CNI (24) |
 
@@ -236,7 +239,7 @@ The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and 
 | `docs/frames-operations.md` — tables, migrations, the shared Postgres | operator runbooks | 4, 8, 22, 25, 28 |
 | `docs/auth-flow.md`, the `docs/*-connector.md` pages | how identity reaches a connector | 25 |
 | `helm/collab-hub/values.yaml`, `values.schema.json`, `values-example.yaml` | configuration | 17, 18, 20, 21, 22, 24, 28 |
-| `README.md` — *Architecture*, *Documentation*, *Known limitations* | the front door | 6, 9, 17 |
+| `README.md` — *Architecture*, *Documentation*, *Known limitations* | the front door | 6, 9, 13, 17 |
 | `dev/README.md` — *Running Cogs and Ops* | the dev environment | every phase with a dev target |
 | `cogs/hermes/README.md` | the Hermes harness Cog | 12 |
 | `cli/README.md` (new) | the `collab-hub` CLI: signing in, the commands, output and exit codes | 13, 14, and every phase that adds a command |
@@ -273,7 +276,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 20 | #3 | Resolve a Cog's model binding into its worker's connection config | `feat/cog-model-binding-3` | 19 | M | not started |
 | 21 | #4 | Enforce time and cost limits on every Cog run, and clean up idle workers | `feat/cog-budgets-warm-workers-4` | 6, 20 | M | not started |
 | 22 | #104 | Add a DBOS durability backend so a restart does not lose a run | `feat/cog-durability-dbos` | 6, 8, 9 | L | not started |
-| 23 | #9 | Check Cog outputs with Guards, not just schema | `feat/cog-guards-9` | 3, 4 | M | not started |
+| 23 | #9 | Check Cog outputs with Guards, not just schema | `feat/cog-guards-9` | 3, 4, 6 | M | not started |
 | 24 | #11 | Restrict a Cog worker's network egress to hub-mediated paths | `feat/cog-worker-egress-11` | 11, 18, 20 | L | not started |
 | 25 | #8 | Let a Cog act as the user for its connectors when it runs unattended on the hub | `feat/cog-connector-grants-8` | 24 | L | not started |
 | 26 | apollo-desktop#826 | Grant and revoke unattended connector access from the desktop | `feat/connector-grants` | 15, 25 | S | not started |
@@ -369,7 +372,7 @@ Move approval out of the Cog and onto the Op step, where the glossary puts it.
 Make the Track answer "what produced this, and who signed it".
 
 *In scope*
-- Event schema v1, versioned by a `schema` field: `step_completed` carries the envelope's `binding`, `problems`, `usage` and a **reference** to the payload, not the payload inline; `gate_escalated` and `gate_decided` (with the actor) brought into v1; `step_failed` carries a bounded message, the error code, the idempotency key and the worker name. Pre-v1 events still replay through a reader, with a fixture in the conformance suite.
+- Event schema v1, versioned by a `schema` field: `step_completed` carries the envelope's `binding`, `problems`, `usage` and a **reference** to the payload, not the payload inline; `gate_escalated` and `gate_decided` (each with its escalation id, the latter with the actor) brought into v1; `step_failed` carries a bounded message, the error code, the idempotency key and the worker name. Pre-v1 events still replay through a reader, with a fixture in the conformance suite.
 - Large payloads stored by reference above a size threshold.
 - Hub Track tables through `COLLAB_SCHEMA_MIGRATIONS`; the standalone store's `ensure_schema` stays for standalone and local use, and the hub never calls it.
 - `SqliteTrackStore`, so level 1 runs the API and the controller as two processes over one Track file, and the desktop has its Track later.
@@ -502,8 +505,8 @@ The primary goal, in three phases: the endpoints that launch a run, the SDK that
 State a Cog for execution, run it, read its output and errors, stop it — as endpoints Collab and any other client can use.
 
 *In scope* — under `/v1`, authenticated, with protection-map entries and OpenAPI:
-- `POST /v1/runs` — submit an Op: JSON mirroring `OpDefinition` (steps with `name`, `cog`, `entry_point`, `input`, `gate`). Until Phase 19 a step's `cog` names a package under the `static` source's directory — how level 1 names `cogs/hermes` — and an unknown name is refused with 422.
-- `GET /v1/runs`, `GET /v1/runs/{id}` — organization-scoped, status derived from the Track, `interrupted` included.
+- `POST /v1/runs` — submit an Op: JSON mirroring `OpDefinition` (steps with `name`, `cog`, `entry_point`, `input`, `gate`). Until Phase 19 a step's `cog` names a package known to Phase 7's directory package source — how level 1 names `cogs/hermes` — and an unknown name is refused with 422.
+- `GET /v1/runs`, `GET /v1/runs/{id}` — organization-scoped, status derived from the Track, `interrupted` included, and for a step waiting at a Gate the open escalation id a decision must name.
 - `GET /v1/runs/{id}/events` — replay from `after`, and `text/event-stream` for a live run.
 - `GET /v1/runs/{id}/steps/{step}/payload` — the output a step event references, under the run's own authorization; errors are read from `step_failed` events.
 - `POST /v1/runs/{id}/steps/{step}/decision` — approve, reject or send back with findings; authorized against the Gate's `approvers`; the actor from the auth context. The body carries the **escalation id** the reviewer is answering (Phase 3 mints one per escalation, over the step attempt and the envelope it escalated on). A decision is accepted atomically and only while that escalation is the open one: a second decision on the same escalation is idempotent if it repeats the first and a conflict otherwise, and a decision naming an escalation already closed — the revision it reviewed has been sent back and replaced — is refused as stale, naming the escalation that is open now. Two reviewers racing on one escalation cannot both win, and a late approval can never approve a revision its author never saw.
@@ -548,7 +551,7 @@ The primary goal: `POST /v1/runs` on a laptop starts Hermes as a separate proces
 - `cogs/hermes/` in this repository (decision 16), published as `<registry>/cogs/hermes` by the publish workflow Phase 18 adds: a pixi environment on Python 3.13 — Hermes does not support 3.14 — with `hermes-agent[acp,mcp]==0.19.0` pinned, whose `serve` is the SDK with `AcpHarnessAdapter` running `hermes acp`.
 - Hermes configured headlessly from the binding at start, **porting** the desktop's headless Hermes configuration (written for 0.17, re-verified against 0.19) rather than re-deriving it: model endpoint and key by reference.
 - **No tools at first** (decision 14): no MCP servers configured, Hermes' terminal and file tools disabled — prompt in, envelope out. Hub-mediated MCP (Frames, connectors, restricted to hub endpoints) arrives with Phase 25's grants; Hermes' terminal backend, which would make the worker the sandbox, only once Phase 24's egress restriction and authenticated `/invoke` exist, and only for `remote`.
-- Level 1 runs it straight from `cogs/hermes` through the `static` source — no registry — until Phase 19 installs it by digest.
+- Level 1 runs it straight from `cogs/hermes` through Phase 7's directory package source — no registry — until Phase 19 installs it by digest.
 - A CI test against the stdlib fake model; one opt-in test against a real model.
 
 *Dev and CI* — `make controller LOCATION=local` and `make op OP=hermes` at level 1, against `make fake-model` or a real endpoint given by environment — the demonstration of M3. CI: a path-gated `test-hermes.yaml` runs the Cog through the local executor on Linux against the fake model; it downloads Hermes' environment, so it stays out of `dev-env.yaml`. *Docs* — `cogs/hermes/README.md`; the catalog card describes the harness; `docs/cog-execution/README.md` links it as the reference harness Cog; `dev/README.md` gains *Running Hermes*.
@@ -580,7 +583,7 @@ A terminal client for the hub, and the thing every other command needs first: a 
 - Two commands that prove the plumbing against surfaces that already exist: `collab-hub whoami` and `collab-hub frames list`. Human-readable tables by default, `--json` for scripts, and exit codes a script can branch on.
 - An import-boundary test: the CLI imports neither `collab_hub_api` nor `collab_hub_execution` — the rule the worker SDK follows, for the same reason.
 
-*Dev and CI* — `make cli` installs it into the dev environment and prints the login line for the level in use. CI: `level-1` runs `collab-hub whoami --json` against `make api`'s dev auth and asserts it reports an unauthenticated session; `levels-2-3` signs in against the real realm with a token from `make token` and asserts `whoami` names the `dev` user. The device flow itself is unit-tested against a stub authorization server, since approving it needs a browser.
+*Dev and CI* — `make cli` installs it into the dev environment and prints the login line for the level in use. CI: `level-1` runs `collab-hub whoami --json` against `make api`'s dev auth and asserts it reports an unauthenticated session; `levels-2-3` signs in against the real realm with a token from `make token` and asserts `whoami` names the `dev` user. The device flow itself is unit-tested against a stub authorization server, since approving it needs a browser. The CLI's own suite runs on Python 3.11 and 3.14, the SDK's rule.
 
 *Docs* — a new `cli/README.md`: installing, signing in, profiles, output and exit codes. `dev/README.md` gains a *Using the CLI* section under *Running Cogs and Ops*, and the root `README.md` links the CLI from its documentation section.
 
@@ -596,7 +599,7 @@ A terminal client for the hub, and the thing every other command needs first: a 
 Everything the run API does, from a terminal: the same endpoints, the same authorization, the same Track.
 
 *In scope*
-- `collab-hub run submit` — an Op from a file (`--file op.yaml`, or `-` for stdin), or the one-Cog shorthand `--cog NAME --entry ask --input -`; it prints the run id and, with `--watch`, follows the run to its end.
+- `collab-hub run submit` — an Op from a file (`--file op.yaml`, or `-` for stdin), or the one-Cog shorthand `--cog NAME --entry ask --input -`, a one-step Op the CLI builds itself until Phase 19's run-one-installed-Cog form exists; it prints the run id and, with `--watch`, follows the run to its end.
 - `collab-hub run list`, `run show ID`, `run watch ID` (the event stream rendered as it arrives, `--json` emitting one event per line), `run payload ID STEP`, `run cancel ID`, `run retry ID` (reporting which of Phase 10's three retry outcomes applied, including a refusal to retry an `outcome-unknown` step).
 - `collab-hub run decide ID STEP --approve | --reject | --send-back --finding ...`, carrying the escalation id it answers (Phase 10). A stale decision is reported as such, naming the escalation that is open now, rather than silently applying to a revision the reviewer never saw.
 - Exit codes a script can branch on: 0 the run completed, 1 it failed, 2 usage error, 3 it ended `interrupted`, 4 it is waiting at a Gate. `--json` on every command, shaped for `jq`.
@@ -605,7 +608,7 @@ Everything the run API does, from a terminal: the same endpoints, the same autho
 
 *Dev and CI* — at level 1, `collab-hub run submit --cog echo --entry run --input '{}' --watch` runs a fake Op end to end with no container, and `collab-hub run submit --cog hermes` reruns M3's demonstration from the terminal. CI: `level-1` submits a fake Op, watches it to completion and decides an escalated Gate, all through the CLI, and asserts the exit codes.
 
-*Docs* — `cli/README.md` gains the run commands with a worked example per command and the exit-code table; `dev/README.md`'s *Running Cogs and Ops* shows the CLI beside `make op`; `docs/cog-execution/runs.md` notes that every endpoint it documents has a CLI command.
+*Docs* — `cli/README.md` gains the run commands with a worked example per command and the exit-code table; `dev/README.md`'s *Running Cogs and Ops* shows the CLI beside `make op`, and `make op`, `make run-events` and `make run-decide` become thin wrappers over it, so the dev environment has one client; `docs/cog-execution/runs.md` notes that every endpoint it documents has a CLI command.
 
 *Acceptance*
 - [ ] At level 1, an Op submitted with `collab-hub run submit` completes, `run watch` shows its events live, and `run payload` prints the step's payload.
@@ -617,7 +620,7 @@ Everything the run API does, from a terminal: the same endpoints, the same autho
 
 ### M5 — Collab launches hub runs
 
-Needs only Phase 10, the run API, so it lands before the worker becomes a pod: from here on Collab is the demonstration surface, and every later milestone is shown from it.
+Needs only Phase 10, the run API, so it lands before the worker becomes a pod: from here on Collab is the demonstration surface, with the CLI as its scripted twin, and every later milestone is shown from it.
 
 #### Phase 15 — Desktop run client and placement
 **Issue** apollo-desktop#825 · **Branch** `feat/hub-run-client-690` · **Depends on** Phase 10 · **Size** M
@@ -678,7 +681,7 @@ The materialize half of install-versus-materialize: a worker is the Cog package,
 - An environment cache keyed by the `pixi.lock` digest, so a second run does not re-solve. Part of the phase, not a later optimization.
 - The chart stops using the baked runner image; tests keep it.
 
-*Dev and CI* — an optional `registry` compose profile with `make cog-publish COG=` for a fake Cog bundle and for `cogs/hermes`, and a `publish-cogs.yaml` workflow that publishes `cogs/*` with Nebi to the registry the catalog indexes, on a tag; level 1 and CI use #83's `static` source instead. CI: `level-4-render` asserts the worker's init container pulls a digest; `test-execution-e2e.yaml` materializes a published fake Cog by digest. *Docs* — `op-cog-seam.md` describes materialization as implemented; the chart values for the cache and the pull.
+*Dev and CI* — an optional `registry` compose profile with `make cog-publish COG=` for a fake Cog bundle and for `cogs/hermes`, and a `publish-cogs.yaml` workflow that publishes `cogs/*` with Nebi to the registry the catalog indexes, on a tag; level 1 keeps Phase 7's directory source, and CI enumerates the `registry` profile through #83's `static` source instead of the catalog. CI: `level-4-render` asserts the worker's init container pulls a digest; `test-execution-e2e.yaml` materializes a published fake Cog by digest. *Docs* — `op-cog-seam.md` describes materialization as implemented; the chart values for the cache and the pull.
 
 *Acceptance*
 - [ ] A published fake Cog, referenced by digest, materializes a worker running its own `serve`.
@@ -699,7 +702,7 @@ Pinning a Cog and proving it works happens once, not on every run.
 - `POST /v1/runs` gains the "run one installed Cog once" form: a bundled op on an installed digest. A run on a digest that is not installed is refused.
 - `collab-hub cog install|list|uninstall` join the CLI (Phase 14), so an install is reachable from a terminal as well as from Collab.
 
-*Dev and CI* — `make cog-install COG=` installs from the `registry` profile at level 2, or from the `static` source at level 1; `test-execution-e2e.yaml` installs a published fake Cog and runs it once. *Docs* — the protection map gains `/v1/cogs/**`; `runs.md` gains installing, uninstalling and running a Cog once.
+*Dev and CI* — `make cog-install COG=` installs from the `registry` profile at level 2, or from Phase 7's directory source at level 1; `test-execution-e2e.yaml` installs a published fake Cog and runs it once. *Docs* — the protection map gains `/v1/cogs/**`; `runs.md` gains installing, uninstalling and running a Cog once.
 
 *Acceptance*
 - [ ] Installing a context Cog makes it invokable with no hand-authored per-Cog deployment.
@@ -710,7 +713,7 @@ Pinning a Cog and proving it works happens once, not on every run.
 #### Phase 20 — Model binding: inventory, the Cog's `resolve`, delivery
 **Issue** #3 · **Branch** `feat/cog-model-binding-3` · **Depends on** Phase 19 · **Size** M
 
-The hub offers, the Cog selects, the hub records and delivers — so the hub does not grow a parallel resolver (#3 thread). Since Phase 11 the controller has written the binding file from the hub's `models:` block; this phase retires that stopgap: the Cog's `resolve` becomes the producer, and the file the worker reads does not change.
+The hub offers, the Cog selects, the hub records and delivers — so the hub does not grow a parallel resolver (#3 thread). Since Phase 9 the controller has written the binding file from the hub's `models:` block, and Phase 11's SDK has read it; this phase retires that stopgap: the Cog's `resolve` becomes the producer, and the file the worker reads does not change.
 
 *In scope*
 - A satisfier **inventory** generated from the hub's model configuration: one descriptor model Cog per served model, carrying endpoint, model id, transport, locality and `auth_ref`.
@@ -780,7 +783,7 @@ The first durability engine behind the runner — what makes #2's "a restart doe
 ### M8 — The trust boundary
 
 #### Phase 23 — Guards declared on Op steps
-**Issue** #9 · **Branch** `feat/cog-guards-9` · **Depends on** Phases 3, 4 · **Size** M
+**Issue** #9 · **Branch** `feat/cog-guards-9` · **Depends on** Phases 3, 4, 6 · **Size** M
 
 *In scope*
 - A `Guard` protocol: `(envelope, step context) -> findings`. Guards produce findings; they never decide.
@@ -854,7 +857,7 @@ The desktop embeds what M2 built: `local` is its executor, and Phase 22's `dbos`
 **Issue** apollo-desktop#827 · **Branch** `feat/local-run-host` · **Depends on** Phases 7, 15, 22 · **Size** M
 
 *In scope*
-- `collab-hub-execution` embedded in the desktop's local Python host, serving **the same run API routes as Phase 10** on its bearer-gated loopback surface, backed by Phase 7's `local` executor — `none` by default, Phase 22's `dbos` on SQLite selectable.
+- `collab-hub-execution` embedded in the desktop's local Python host, serving **the same run API routes as Phase 10**, and Phase 8's claim transport for its own workers, on its bearer-gated loopback surface, backed by Phase 7's `local` executor — `none` by default, Phase 22's `dbos` on SQLite selectable.
 - Hermes runs locally through the same harness Cog, with the desktop's existing Docker terminal sandbox rather than in-process tools.
 - Phase 15's local run target implemented; a run bound to local-only resources never reaches the hub.
 - Local Tracks stay local. Linux and macOS only, as `local` is (decision 15).
@@ -904,7 +907,7 @@ flowchart TD
   ph10 & ph18 --> ph19["19 · install"] --> ph20["20 · binding"]
   ph6 & ph20 --> ph21["21 · budgets"]
   ph6 & ph8 & ph9 --> ph22["22 · dbos"]
-  ph3 & ph4 --> ph23["23 · Guards"]
+  ph3 & ph4 & ph6 --> ph23["23 · Guards"]
   ph11 & ph18 & ph20 --> ph24["24 · egress"] --> ph25["25 · grants"]
   ph15 & ph25 --> ph26["26 · grants in Collab"]
   ph7 & ph15 & ph22 --> ph27["27 · local run host"]
@@ -950,7 +953,7 @@ flowchart TD
 | **M9** Local execution on the desktop | 27 | The same Op run on the user's machine from Collab, on `none` or durably on `dbos` over SQLite |
 | **M10** The third backend | 28 | The same suites green on `temporal` |
 
-**Parallel lanes.** M1 to M3 are the critical path to the primary goal and are built in order. Phase 13 depends on nothing in this plan and can start whenever someone wants it. Once Phase 10 lands, the two clients are independent lanes — M4 (13→14) and M5 (15→16) — and so are M6 (17→21) and M7 (22). That independence is about milestones that build features on `none` and `local`, not about the two axes underneath them, whose order is fixed regardless of what runs alongside: `local` first, `remote` next; `none` first, `dbos` brought to a full implementation next, `temporal` last. Phase 23 can start after M1. M8 needs M6, since its egress policy is per pod. M9 needs Phase 22. Phase 28 can start after Phase 9 but is sequenced last: two backends behind one seam already prove it is swappable, and Temporal is the one that brings new infrastructure.
+**Parallel lanes.** M1 to M3 are the critical path to the primary goal and are built in order. Phase 13 depends on nothing in this plan and can start whenever someone wants it. Once Phase 10 lands, the two clients are independent lanes — M4 (13→14) and M5 (15→16) — and so are M6 (17→21) and M7 (22). That independence is about milestones that build features on `none` and `local`, not about the two axes underneath them, whose order is fixed regardless of what runs alongside: `local` first, `remote` next; `none` first, `dbos` brought to a full implementation next, `temporal` last. Phase 23 can start after Phase 6, whose runner its Guards run in and whose fake Cogs its CI uses. M8 needs M6, since its egress policy is per pod. M9 needs Phase 22. Phase 28 can start after Phase 9 but is sequenced last: two backends behind one seam already prove it is swappable, and Temporal is the one that brings new infrastructure.
 
 ## 8. Coverage
 
@@ -963,12 +966,12 @@ flowchart TD
 | **Location priority: `local` first, `remote` next, both on `none` before any durable backend** | 7, 17, 22 |
 | **Backend priority: `none` first, `dbos` next to a full implementation, `temporal` last** | 6, 22, 28 |
 | A lifecycle component without a durability engine (`none`) or with one (`dbos`, `temporal`) | 5, 6, 22, 28 |
-| apollo-desktop#690 — state a Cog for execution, run it, read output and errors, stop it | 10, 18, 19, 15 |
+| apollo-desktop#690 — state a Cog for execution, run it, read output and errors, stop it | 10, 14, 15, 18, 19 |
 | · read a Cog, set up its environment | 7, 18, 19 (catalog from #85) |
-| · find the model | 20 (Phase 11's stopgap until then) |
+| · find the model | 20 (Phase 9's stopgap until then) |
 | · find Frames, data and other elements; verify existence and access | 20, 23, 25 |
 | · execute the Cog | 5, 6, 7, 9, 11, 12, 17 |
-| · capture and relay output | 2, 10, 15 |
+| · capture and relay output | 2, 10, 14, 15 |
 | · log start, stop and errors | 4 |
 | apollo-desktop#719 — approve, reject or send back from the desktop | 3, 10, 16 |
 | #2 — durable multi-step Ops on a swappable engine | 3, 5, 6, 22, 28 |
@@ -987,16 +990,17 @@ flowchart TD
 
 ## 9. Not in this plan
 
-- **Sensitivity (#10, #12, #13).** Blocked on the rating scale, per `docs/cog-execution/sensitivity.md`. The plug points are placed: the inventory filter (18), the reserved Track `label` field (4), and downgrade verification as a Guard (21).
+- **Sensitivity (#10, #12, #13).** Blocked on the rating scale, per `docs/cog-execution/sensitivity.md`. The plug points are placed: the inventory filter (20), the reserved Track `label` field (4), and downgrade verification as a Guard (23).
 - **The registry and catalog (#81–#87).** #81–#83 landed; #84–#87 are in flight; Phases 18 and 19 are their consumers.
 - **The pack docs site.** A GA requirement; the pack is `beta`. §5 keeps every page this plan writes ready for it; decision 9 says when to start.
 - **Syncing local Tracks to the hub.** Decision 7.
+- **Scheduling runs.** Nothing here submits a run on a timer; an unattended run (Phase 25) is one a user submitted and left. A scheduler is a client of the run API — the CLI in a cron job is the first one — and gets its own issue when someone needs it.
 - **Authoring Cogs** — ADR-0001 D7.
 - **Metering beyond the envelope's `usage`** — ADR-0001's deferred list.
 
 ## 10. Decisions
 
-Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the phase that needs them — 4 by Phase 21, 5 by Phase 25, 7 and 9 once M5 lands, 8 at the next Python release.
+Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the phase that needs them — 4 by Phase 21, 5 by Phase 25, 7 by Phase 27, 9 once M3 lands, 8 at the next Python release.
 
 1. **Default approvers** when a Gate declares none — *decided 2026-09-16:* organization owners and platform operators, the two roles `seed-org` already grants (Phases 3, 10).
 2. **The hub's production durability backend** — *decided 2026-09-16:* `dbos` — it reuses the Track's Postgres and adds no service; the chart's production values select it once Phase 22 lands. `none` stays the default for development, tests and the desktop.
