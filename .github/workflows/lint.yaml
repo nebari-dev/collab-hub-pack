@@ -30,3 +30,84 @@ jobs:
 
       - name: Validate rendered manifests
         run: helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
+
+      - name: Invitation acceptance renders only when relaxed
+        run: |
+          set -euo pipefail
+          # `frames.invitations.requireVerifiedEmail` renders NO environment
+          # variable at its strict default, so the variable's presence is what
+          # tells a reader the deployment took the trade. Both directions are
+          # asserted because the first version of that template block was
+          # nested inside a neighbouring conditional and rendered nothing at
+          # all -- a mistake a render check catches and a diff review does not.
+          helm template helm/collab-hub >/tmp/verify-default.yaml
+          if grep -q "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-default.yaml; then
+            echo "the strict default must render no requireVerifiedEmail env var" >&2
+            exit 1
+          fi
+
+          # A null value must fall strict, not open. Helm strips null-valued
+          # keys during coalescing rather than restoring the chart default, so
+          # `requireVerifiedEmail:` left empty while reflowing a values file
+          # used to render "false" -- relaxing Gate B on a deployment that never
+          # asked, with values that still read `true`. Neither the untouched
+          # default nor an explicit false covers that shape.
+          # Both depths of the same reflowing mistake: the leaf emptied, and the
+          # key removed with its `invitations:` header left behind. The second
+          # used to be a template error rather than a fallback.
+          printf 'frames:\n  invitations:\n    requireVerifiedEmail:\n' >/tmp/null-value.yaml
+          printf 'frames:\n  invitations:\n' >/tmp/null-parent.yaml
+          for null_form in \
+            "--set frames.invitations.requireVerifiedEmail=null" \
+            "--set frames.invitations=null" \
+            "-f /tmp/null-value.yaml" \
+            "-f /tmp/null-parent.yaml"; do
+            # shellcheck disable=SC2086
+            helm template helm/collab-hub ${null_form} >/tmp/verify-null.yaml
+            if grep -q "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-null.yaml; then
+              echo "a null requireVerifiedEmail must not render the env var (${null_form})" >&2
+              exit 1
+            fi
+          done
+
+          helm template helm/collab-hub \
+            --set frames.invitations.requireVerifiedEmail=false \
+            >/tmp/verify-relaxed.yaml
+          if [ "$(grep -c 'FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL' /tmp/verify-relaxed.yaml)" != "1" ]; then
+            echo "requireVerifiedEmail=false must render exactly one env var" >&2
+            exit 1
+          fi
+          if ! grep -A1 "FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL" /tmp/verify-relaxed.yaml \
+            | grep -q 'value: "false"'; then
+            echo "the rendered env var must carry \"false\"" >&2
+            exit 1
+          fi
+
+          # extraEnv renders after the chart's own env block, so a duplicate
+          # would win -- and since the strict default renders nothing, an entry
+          # there could relax the check on a deployment whose values say it is
+          # strict, with nothing in the manifest to show it.
+          #
+          # Both cases spelled out: pydantic-settings matches environment
+          # variables case-insensitively, so the lowercase name is honoured by
+          # the app just as much and was walking through an uppercase-only
+          # guard. Asserting only the uppercase form is what let that through.
+          for spelling in \
+            COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL \
+            collab_hub_api__frames__invitations__require_verified_email; do
+            if helm template helm/collab-hub \
+              --set "api.deployment.extraEnv[0].name=${spelling}" \
+              --set-string 'api.deployment.extraEnv[0].value=false' \
+              >/tmp/verify-extraenv.yaml 2>/tmp/verify-extraenv.err; then
+              echo "expected extraEnv ${spelling} to be refused" >&2
+              exit 1
+            fi
+            # Assert WHY it failed. Without this the check passes on any Helm
+            # error at all -- a renamed values path, a tightened schema, a typo
+            # in the --set key -- while proving nothing about the guard.
+            if ! grep -q "invitation acceptance configuration" /tmp/verify-extraenv.err; then
+              echo "extraEnv ${spelling} failed for the wrong reason:" >&2
+              cat /tmp/verify-extraenv.err >&2
+              exit 1
+            fi
+          done

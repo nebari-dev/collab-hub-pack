@@ -35,6 +35,7 @@ Wiring follows the house pattern: the tables ride the shared
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 collab_logger = logging.getLogger("frames_server.collab_schema")
@@ -72,6 +73,13 @@ is written. A test pins the two spellings together.
 #   3. Statements stay idempotent where the DDL allows it (IF NOT EXISTS), so a
 #      database that was hand-patched between releases does not wedge the whole
 #      migration transaction.
+#
+# Rule 2 is enforced mechanically, not just by review (issue #73): the registry
+# stores a SHA-256 checksum of each applied version's statement text, and the
+# runner verifies every already-applied version against the code's current text
+# before applying anything. An in-place edit of a shipped version is therefore
+# a startup failure naming the version, instead of a silent fork between old
+# and new databases.
 COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,
@@ -485,6 +493,86 @@ LATEST_COLLAB_SCHEMA_VERSION = COLLAB_SCHEMA_MIGRATIONS[-1][0] if COLLAB_SCHEMA_
 """Highest migration version this build knows how to apply."""
 
 
+def collab_migration_checksum(statements: tuple[str, ...]) -> str:
+    """SHA-256 hex digest of a migration's statement text (issue #73).
+
+    Hashes the **exact** text, statements NUL-separated so a statement boundary
+    cannot be moved without changing the digest. Deliberately no whitespace or
+    comment normalization: rule 2 above freezes the *text* of a released
+    version, and the comments in this file are part of what review approved —
+    a "cosmetic" edit to shipped SQL is exactly the kind of drift the checksum
+    exists to surface. Cosmetic changes go in an appended version like any
+    other change, or nowhere.
+    """
+
+    hasher = hashlib.sha256()
+    for statement in statements:
+        hasher.update(statement.encode("utf-8"))
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+class CollabSchemaChecksumError(RuntimeError):
+    """An already-applied migration's text no longer matches what was applied."""
+
+
+def _verify_recorded_checksums(conn) -> dict[int, str]:
+    """Check every applied version's recorded checksum against the code's text.
+
+    Runs inside the runner's locked transaction, **before** anything is
+    applied. Returns ``{version: recorded_checksum}`` for the applied rows —
+    the caller only needs ``max()`` of the keys, but the full mapping is what
+    tests (and any future caller reporting on checksum state) assert against,
+    so don't simplify it to a version number.
+
+    Three cases per applied row:
+
+    * **Match** — fine.
+    * **NULL** — a legacy row, applied by a build that predates checksums
+      (issue #73). Nothing can be verified retroactively, so it is accepted
+      and backfilled with the current text's checksum; from the next startup
+      on it is a verified row like any other.
+    * **Mismatch** — fail fast, naming the version. The database applied one
+      text and the code now carries another; starting anyway would let old and
+      new databases diverge silently, which is the failure mode the checksum
+      exists to make mechanical. The fix is to restore the released text and
+      append a new version (rule 2), never to edit the recorded row.
+
+    A recorded version this build does not know (database ahead, mid-rolling-
+    update) is skipped: there is no code text to compare against, and the
+    version preflight already handles that case deliberately.
+    """
+
+    statements_by_version = dict(COLLAB_SCHEMA_MIGRATIONS)
+    recorded: dict[int, str] = {}
+    rows = conn.execute(f"SELECT version, checksum FROM {COLLAB_SCHEMA_VERSION_TABLE} ORDER BY version").fetchall()
+    for row in rows:
+        version, stored = row["version"], row["checksum"]
+        recorded[version] = stored
+        statements = statements_by_version.get(version)
+        if statements is None:
+            continue
+        expected = collab_migration_checksum(statements)
+        if stored is None:
+            conn.execute(
+                f"UPDATE {COLLAB_SCHEMA_VERSION_TABLE} SET checksum = %s WHERE version = %s",
+                (expected, version),
+            )
+            recorded[version] = expected
+            collab_logger.info(
+                "collab_schema_checksum_backfilled",
+                extra={"version": version, "checksum": expected},
+            )
+        elif stored != expected:
+            raise CollabSchemaChecksumError(
+                f"collab_ schema migration version {version} has been edited after it was applied: "
+                f"the database recorded checksum {stored} but this build's text hashes to {expected}. "
+                "Released migration text is frozen — restore the original statements for "
+                f"version {version} and append the change as a new version."
+            )
+    return recorded
+
+
 def run_collab_schema_migrations(db) -> None:
     """Apply any unapplied ``collab_`` migrations, safely under concurrency.
 
@@ -498,6 +586,11 @@ def run_collab_schema_migrations(db) -> None:
     already recorded, and applies nothing. Failure semantics match the existing
     stores' ``auto_migrate``: an unreachable database raises here and the pod
     fails to start rather than serving against a schema it cannot verify.
+
+    Before applying anything, every already-applied version's recorded checksum
+    is verified against the code's current text (issue #73); a mismatch raises
+    :class:`CollabSchemaChecksumError` naming the version, and a ``NULL``
+    checksum from a pre-checksum build is accepted once and backfilled.
     """
 
     with db.connection() as conn:
@@ -509,20 +602,32 @@ def run_collab_schema_migrations(db) -> None:
             f"""
             CREATE TABLE IF NOT EXISTS {COLLAB_SCHEMA_VERSION_TABLE} (
                 version     integer PRIMARY KEY,
-                applied_at  timestamptz NOT NULL DEFAULT now()
+                applied_at  timestamptz NOT NULL DEFAULT now(),
+                checksum    text
             )
             """
         )
-        row = conn.execute(f"SELECT COALESCE(MAX(version), 0) AS version FROM {COLLAB_SCHEMA_VERSION_TABLE}").fetchone()
-        applied = row["version"] if row else 0
+        # A registry created before checksums existed (issue #73) lacks the
+        # column; add it in place rather than as a numbered migration, because
+        # the registry table is the runner's own bookkeeping — it exists before
+        # the version list is even consulted. Idempotent and under the lock,
+        # like everything else here. Nullable on purpose: NULL means "applied
+        # by a pre-checksum build", which the verifier accepts once and
+        # backfills.
+        conn.execute(f"ALTER TABLE {COLLAB_SCHEMA_VERSION_TABLE} ADD COLUMN IF NOT EXISTS checksum text")
+        # Verify (and backfill) every already-applied version before applying
+        # anything: an edited released migration must fail the startup, not
+        # half-run whatever follows it.
+        recorded = _verify_recorded_checksums(conn)
+        applied = max(recorded, default=0)
         for version, statements in COLLAB_SCHEMA_MIGRATIONS:
             if version <= applied:
                 continue
             for statement in statements:
                 conn.execute(statement)
             conn.execute(
-                f"INSERT INTO {COLLAB_SCHEMA_VERSION_TABLE} (version) VALUES (%s)",
-                (version,),
+                f"INSERT INTO {COLLAB_SCHEMA_VERSION_TABLE} (version, checksum) VALUES (%s, %s)",
+                (version, collab_migration_checksum(statements)),
             )
 
 

@@ -455,6 +455,27 @@ frames:
       regionKey: SES_REGION
       configurationSetKey: SES_CONFIGURATION_SET
       requestTimeoutSeconds: 10
+  invitations:
+    # -- Whether accepting an invitation additionally requires the identity
+    # provider to have verified the accepter's address.
+    #
+    # Gate B is two checks: the address is verified, AND it equals the invited
+    # address. This drops only the first. The argument for dropping it is that
+    # the invitation token already proves mailbox control -- a 256-bit secret
+    # delivered only to the invited address, which is exactly what a
+    # verification link proves.
+    #
+    # What it costs: a forwarded or shared-mailbox invitation becomes usable by
+    # whoever received it, and their account then carries the invited person's
+    # address permanently. Leave it true on any deployment whose invitees arrive
+    # through an identity provider with trustEmail -- there the check is free
+    # and the invitee never sees a verification step.
+    #
+    # Setting this false also requires the realm to stop forcing verification
+    # (Keycloak `verifyEmail=false`), or nothing changes: Keycloak will not
+    # issue a token to an unverified account, so the relaxed check is never
+    # reached.
+    requireVerifiedEmail: true
   serviceAccess:
     # -- Identity-provider group paths an accepted invitation grants. Empty
     # means grant nothing, which is the default and the only safe one: the
@@ -580,6 +601,32 @@ connectors:
     # -- GitHub REST API base URL. Override for local fake GitHub API smoke tests.
     apiBaseUrl: https://api.github.com
     # -- Timeout for broker and GitHub API requests.
+    requestTimeoutSeconds: 10
+    # -- GitHub org logins to restrict search and the generic api/get read to.
+    # Empty = the token's full visibility (personal repos + every approved org).
+    # Set this so agent searches do not interleave personal and work results and
+    # the generic read cannot reach outside the allowlist.
+    allowedOrgs: []
+    # -- Enable the generic GitHub read (api/get). Off by default (fail-closed):
+    # a hub opts in explicitly, ideally alongside allowedOrgs. Read once at
+    # startup, so toggling it is a redeploy/restart, not a live config reload —
+    # which is also the incident containment path.
+    apiGetEnabled: false
+    # -- Max concurrent generic GitHub reads per API process. The throttle short
+    # of the full kill switch during an abuse incident (read once at startup).
+    apiGetMaxConcurrency: 8
+  notion:
+    # -- Keycloak broker token endpoint for the linked Notion workspace (Option A).
+    # Normal hub users must also receive the broker client role `read-token`
+    # through their default role or group; otherwise Keycloak returns 403. Leave
+    # empty under Option B (hub-side OAuth + token store). See docs/notion-connector.md.
+    brokerTokenUrl: ""
+    # -- Notion API base URL. Override for local fake Notion API smoke tests.
+    apiBaseUrl: https://api.notion.com
+    # -- Pinned Notion API version, sent on every request. Do not float; bumping
+    # it (2025-09-03+) is a code migration, not a config change.
+    notionVersion: "2022-06-28"
+    # -- Timeout for broker and Notion API requests.
     requestTimeoutSeconds: 10
 
 userDirectory:

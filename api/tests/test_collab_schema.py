@@ -37,9 +37,11 @@ from collab_hub_api.frames.collab_schema import (  # noqa: E402
     COLLAB_SCHEMA_LOCK_KEY,
     COLLAB_SCHEMA_MIGRATIONS,
     LATEST_COLLAB_SCHEMA_VERSION,
+    CollabSchemaChecksumError,
     CollabSchemaVersionError,
     applied_collab_schema_version,
     check_collab_schema_version,
+    collab_migration_checksum,
     run_collab_schema_migrations,
 )
 
@@ -70,6 +72,7 @@ class FakeServer:
     def __init__(self):
         self.lock = threading.Lock()
         self.applied: list[int] = []
+        self.checksums: dict[int, str | None] = {}
         self.statements: list[str] = []
         self.holder: int | None = None
         self._guard = threading.Lock()
@@ -114,11 +117,25 @@ class FakeConnection:
         if statement.startswith("SELECT COALESCE(MAX(version)"):
             self._pending = {"version": max(self.server.applied, default=0)}
             return self
+        if statement.startswith("SELECT version, checksum FROM collab_schema_migrations"):
+            self._rows = [
+                {"version": version, "checksum": self.server.checksums.get(version)}
+                for version in sorted(self.server.applied)
+            ]
+            return self
+        if statement.startswith("UPDATE collab_schema_migrations SET checksum"):
+            checksum, version = params
+            if version not in self.server.applied:
+                raise AssertionError(f"checksum backfill for unapplied version {version}")
+            self.server.checksums[version] = checksum
+            self._pending = None
+            return self
         if statement.startswith("INSERT INTO collab_schema_migrations"):
-            (version,) = params
+            version, checksum = params
             if version in self.server.applied:
                 raise AssertionError(f"migration version {version} applied twice")
             self.server.applied.append(version)
+            self.server.checksums[version] = checksum
             self._pending = None
             return self
         # Widen the window a concurrent migrator would have to lose.
@@ -128,6 +145,9 @@ class FakeConnection:
 
     def fetchone(self):
         return self._pending
+
+    def fetchall(self):
+        return getattr(self, "_rows", [])
 
 
 class FakeDatabase:
@@ -258,6 +278,109 @@ def test_rerunning_the_migration_applies_nothing():
     assert not any(sql.startswith("INSERT") for sql in server.statements)
     assert server.applied == [version for version, _ in COLLAB_SCHEMA_MIGRATIONS]
     assert first_pass != server.statements
+
+
+EXPECTED_CHECKSUMS = {
+    version: collab_migration_checksum(statements) for version, statements in COLLAB_SCHEMA_MIGRATIONS
+}
+
+# The released digests, as literals. A mismatch here means live deployments
+# will refuse their next rollout with CollabSchemaChecksumError: the digest
+# covers the statements' exact text INCLUDING indentation, so re-indenting the
+# migration tuple (moving it into a class, a dedent, a quoting change) changes
+# every digest even though the SQL is untouched. Restore the text — never
+# update a pinned digest. Appending a new version means adding one line here.
+PINNED_CHECKSUMS = {
+    1: "9c557cd37a49b334b11a2e5cf8cc4d3574ab71bb4f37a87ee691fbc9d6e2072b",
+    2: "df9698121563cfcf06fc215c943d52e1fd7dc87b14e870717aa7ea52b4e160c5",
+    3: "49b961afc49e30e64edb7b0bfdc09e5f8da8d4e690b373d5ef0ebf1468b9e4e1",
+    4: "89f34af66d0f7e8a06a398ce43aeed2db93432cfd06ab72e236da2da90a07d8c",
+    5: "d6bdbe0d90f9206e5104c448d547b5917e68d7af6db5069b4b2b9a44983b770f",
+    6: "6150df72bb6ed264e1e40b60768f787e4e044e1bf8b232da19ba5a2eaf139835",
+}
+
+
+def test_released_digests_are_pinned_as_literals():
+    """The one failure mode checksums introduce, covered: a source refactor
+    that changes a released statement's *text* without touching its SQL would
+    keep every computed-against-itself assertion green while bricking every
+    deployed database's next startup. The literals catch it in CI instead."""
+
+    assert EXPECTED_CHECKSUMS == PINNED_CHECKSUMS
+
+
+def _with_edited_version_one() -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """The real migration list with version 1's last statement edited in place —
+    the exact violation of the frozen-text rule the checksum exists to catch."""
+
+    (first_version, first_statements), *rest = COLLAB_SCHEMA_MIGRATIONS
+    edited = (*first_statements[:-1], first_statements[-1] + " -- sneaky in-place edit")
+    return ((first_version, edited), *rest)
+
+
+def test_checksum_is_recorded_for_every_applied_version():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    assert server.checksums == EXPECTED_CHECKSUMS
+    # sha256 hex, and text-sensitive: the digest is of the exact statement text.
+    assert all(len(checksum) == 64 for checksum in server.checksums.values())
+
+
+def test_editing_an_applied_migration_fails_startup_naming_the_version(monkeypatch):
+    server = FakeServer()
+    database = FakeDatabase(server)
+    run_collab_schema_migrations(database)
+
+    monkeypatch.setattr(collab_schema, "COLLAB_SCHEMA_MIGRATIONS", _with_edited_version_one())
+    server.statements.clear()
+
+    with pytest.raises(CollabSchemaChecksumError, match="version 1 has been edited"):
+        run_collab_schema_migrations(database)
+
+    # Fail fast: the mismatch is detected before anything is applied, so the
+    # second pass touched only the registry and recorded nothing new.
+    assert all("collab_schema_migrations" in sql for sql in server.statements), server.statements
+    assert server.applied == [version for version, _ in COLLAB_SCHEMA_MIGRATIONS]
+    assert server.checksums == EXPECTED_CHECKSUMS
+
+
+def test_legacy_rows_without_checksums_are_accepted_once_and_backfilled():
+    # A registry written by a pre-checksum build: versions recorded, checksum
+    # column NULL (or freshly added by the runner's ALTER). Nothing can be
+    # verified retroactively, so the first run adopts the current text.
+    server = FakeServer()
+    database = FakeDatabase(server)
+    server.applied = [version for version, _ in COLLAB_SCHEMA_MIGRATIONS]
+    server.checksums = {version: None for version in server.applied}
+
+    run_collab_schema_migrations(database)
+
+    assert server.checksums == EXPECTED_CHECKSUMS
+    # Backfill only: nothing was re-applied (FakeServer raises on a duplicate
+    # INSERT, and no DDL outside the registry was issued).
+    assert all("collab_schema_migrations" in sql for sql in server.statements), server.statements
+
+    # From the next startup on, a legacy-backfilled row is a verified row.
+    server.statements.clear()
+    run_collab_schema_migrations(database)
+    assert not any(sql.startswith("UPDATE") for sql in server.statements)
+
+
+def test_a_recorded_version_this_build_does_not_know_is_not_checked():
+    # Database ahead of the build (ordinary rolling update): there is no code
+    # text to compare against, so the extra version is skipped, not an error.
+    server = FakeServer()
+    database = FakeDatabase(server)
+    run_collab_schema_migrations(database)
+    future = LATEST_COLLAB_SCHEMA_VERSION + 1
+    server.applied.append(future)
+    server.checksums[future] = "0" * 64
+
+    run_collab_schema_migrations(database)
+
+    assert server.applied[-1] == future
 
 
 def test_concurrent_migrators_do_not_race():
@@ -677,3 +800,56 @@ def test_live_concurrent_startup_does_not_race(clean_database):
     with clean_database.connection() as conn:
         versions = [row["version"] for row in conn.execute("SELECT version FROM collab_schema_migrations").fetchall()]
     assert versions == [version for version, _ in COLLAB_SCHEMA_MIGRATIONS]
+
+
+@live_postgres
+def test_live_checksums_are_recorded_on_apply(clean_database):
+    run_collab_schema_migrations(clean_database)
+
+    with clean_database.connection() as conn:
+        recorded = {
+            row["version"]: row["checksum"]
+            for row in conn.execute("SELECT version, checksum FROM collab_schema_migrations").fetchall()
+        }
+    assert recorded == EXPECTED_CHECKSUMS
+
+
+@live_postgres
+def test_live_edited_migration_is_refused_and_applies_nothing(clean_database, monkeypatch):
+    run_collab_schema_migrations(clean_database)
+
+    monkeypatch.setattr(collab_schema, "COLLAB_SCHEMA_MIGRATIONS", _with_edited_version_one())
+    with pytest.raises(CollabSchemaChecksumError, match="version 1 has been edited"):
+        run_collab_schema_migrations(clean_database)
+
+    # The failed run rolled back whole: recorded checksums are untouched, and a
+    # build carrying the released text still starts cleanly.
+    monkeypatch.undo()
+    run_collab_schema_migrations(clean_database)
+    with clean_database.connection() as conn:
+        recorded = {
+            row["version"]: row["checksum"]
+            for row in conn.execute("SELECT version, checksum FROM collab_schema_migrations").fetchall()
+        }
+    assert recorded == EXPECTED_CHECKSUMS
+
+
+@live_postgres
+def test_live_legacy_registry_gains_the_column_and_a_backfill(clean_database):
+    run_collab_schema_migrations(clean_database)
+    # Re-create the exact shape a pre-checksum deployment left behind: rows
+    # recorded, no checksum column at all.
+    with clean_database.connection() as conn:
+        conn.execute("ALTER TABLE collab_schema_migrations DROP COLUMN checksum")
+        conn.execute("INSERT INTO collab_orgs (id, created_by) VALUES ('org-keep', 'sub-owner')")
+
+    run_collab_schema_migrations(clean_database)
+
+    with clean_database.connection() as conn:
+        recorded = {
+            row["version"]: row["checksum"]
+            for row in conn.execute("SELECT version, checksum FROM collab_schema_migrations").fetchall()
+        }
+        # Backfill only — nothing was re-applied, existing data survives.
+        assert conn.execute("SELECT count(*) AS n FROM collab_orgs").fetchone()["n"] == 1
+    assert recorded == EXPECTED_CHECKSUMS
