@@ -142,7 +142,7 @@ flowchart LR
 | **Track · claims · run pickup** | The store both processes share: the Track (the only source of run status), the keyed-claim store, the pickup records and the run token hashes. | Postgres through `collab_schema` on a hub; SQLite at level 1 and on the desktop | Phases 4, 8, 9 |
 | **LocalProcessCogExecutor** | The `local` executor: spawns the Cog package's `serve` as a child process in its own process group, on loopback, and kills it when the controller dies. | Inside the Run controller | Phase 7 |
 | **KubernetesCogExecutor** | The `remote` executor: a per-run Deployment, Service and NetworkPolicy, the artifact pulled by an init container. | Inside the Run controller, on a hub | Phases 17, 18 |
-| **Model egress gateway · connector proxy** | The hub Services a `remote` worker may reach: the gateway forwards to the endpoints in `models:`, the proxy acts as the user under a grant. Both take the run token. | The hub | Phases 24, 25 |
+| **Model egress gateway · connector proxy** | The hub Services a `remote` worker may reach, by their cluster-internal names: the gateway forwards to the endpoints in `models:` that lie outside the cluster — a model served in the same cluster is selected by the egress policy directly — and the proxy acts as the user under a grant. Both take the run token. | The hub | Phases 24, 25 |
 | **Local worker** / **Remote worker** | The same Cog package, materialized as a child process or as a pod. Nothing in the package knows which. | The controller's host / the controller's namespace | Phases 7, 17 |
 | **Worker SDK** | The seam implemented once: `POST /invoke` returning an envelope, `GET /healthz`, cancellation, the binding loader, the claim client, run-token verification. A library a Cog *may* use; the hub never imports it. | Inside a worker | Phase 11 |
 | **Harness adapter** | The `HarnessAdapter` protocol between the SDK and an agent harness: `start`, `interact`, `cancel`, `close`. One adapter covers a protocol family; ACP first. | Inside a worker | Phase 11 |
@@ -449,7 +449,7 @@ The runner, with the durability engine plugged in or absent — and `none`, the 
 - Two conformance suites. **Lifecycle** — every backend passes: multi-step completion, a Gate escalating and each human decision, cancel, a budget stop, retry as a new attempt, the Track's contents. **Durability** — run by Phases 22 and 28: kill mid-step and resume without resubmission; a run paused at a Gate resuming there after a restart; replicas never both running one step. For `none`, the suite asserts the `interrupted` contract instead.
 - The executor is still whichever the caller constructs; Phase 7 adds the `location` switch beside `backend`, on the same pattern.
 
-*Dev and CI* — `make op OP=<name>` at level 1 runs a fake Op in process and prints its Track; Op definitions live in `dev/ops/<name>.yaml`, fake Cogs under `dev/cogs/` (`echo`, `needs-review`, `fails`, `slow`, `spender`); both suites run in `test-execution.yaml`. *Docs* — a new `docs/cog-execution/runs.md` opening with the backends table; the root `README.md` gains *Known limitations*, starting with "`none` does not survive a restart".
+*Dev and CI* — `make op OP=<name>` at level 1 runs a fake Op in process and prints its Track; Op definitions live in `dev/ops/<name>.yaml`, fake Cogs under `dev/cogs/` (`echo`, `needs-review`, `fails`, `slow`, `spender`); both suites run in `test-execution.yaml`. *Docs* — a new `docs/cog-execution/runs.md` opening with the backends table; the root `README.md` gains *Known limitations*, starting with "`none` does not survive a restart"; the glossary's *Interrupted* entry, which still says a retry is a new attempt, is corrected to say it continues the attempt in flight.
 
 *Acceptance*
 - [ ] A multi-step Op with a Gate completes on `none` through the runner.
@@ -515,7 +515,7 @@ The process that advances runs, separate from the process that accepts them — 
 - Controller health and readiness.
 - A minimal `models:` configuration block — endpoint, model id, `auth_ref` — from chart values and environment, since the hub has none today (§3). It is what the controller writes the stopgap binding from until Phase 20, and what Phase 20's inventory is generated from after.
 
-*Dev and CI* — `make controller` — SQLite Track at level 1, Postgres at level 2, `BACKEND=` and `LOCATION=` selecting each axis — and `make op` now records intent for the controller to pick up. CI: `level-1` asserts a fake Op completes across the two processes and that killing the controller leaves the run `interrupted`; `levels-2-3` asserts two controllers never both start one run. *Docs* — `runs.md` gains the controller; the root `README.md` *Architecture* diagram gains it and its workers.
+*Dev and CI* — `make controller` — SQLite Track at level 1, Postgres at level 2, `BACKEND=` and `LOCATION=` selecting each axis — and `make op` now records intent for the controller to pick up. CI: `level-1` asserts a fake Op completes across the two processes and that killing the controller leaves the run `interrupted`; `levels-2-3` asserts two controllers never both start one run. *Docs* — `runs.md` gains the controller; the root `README.md` *Architecture* diagram gains it and its workers; the glossary's *Run pickup* entry and ADR-0002 D4, which still say `dbos` and `temporal` replace pickup, are corrected to say they take over ownership after it.
 
 *Acceptance*
 - [ ] Two controller replicas never both start the same run.
@@ -834,6 +834,7 @@ Not in the original list, but #8 cannot be built safely without it, and it is wh
 
 *In scope*
 - A per-worker egress NetworkPolicy: DNS plus hub-mediated endpoints only, each an in-cluster Service the policy can select — a NetworkPolicy cannot name an arbitrary hostname, and resolved addresses change. So model traffic goes through a **model egress gateway** on the hub, a stable Service that forwards to the endpoints in `models:`; a `remote` worker's binding (Phase 20) names the gateway, a `local` worker's the endpoint itself. The connector proxy and the claim endpoint are hub Services already.
+- A `remote` worker always runs in the hub's own cluster, so it reaches the gateway by its cluster-internal Service name — no ingress, no public route, no TLS termination to leave the cluster and come back. For the same reason a model that is itself served in that cluster, as the llm-serving-pack's endpoint is, needs no gateway at all: the egress policy selects its Service directly and the binding names it. The gateway stays in the path only for endpoints outside the cluster, which a policy cannot name.
 - `/invoke` authentication with Phase 7's run token: the controller already presents it on every `/invoke`, and the SDK's authentication hook (Phase 11) starts verifying it against the value the worker was materialized with. No second token is minted.
 - A denied egress attempt recorded as a Track boundary event, reported through the executor (invariant 6).
 - `local` workers are out of scope: they share the controller's network identity, which ADR-0002 D11 records as the reason the trust boundary is `remote`'s.
@@ -1049,9 +1050,9 @@ Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the 
 16. **Which Hermes to pin, and where the Cog lives** — *decided 2026-09-16:* `hermes-agent` 0.19.0, and the Cog lives in this repository at `cogs/hermes/`, published with Nebi by a `publish-cogs.yaml` workflow to the registry the catalog indexes. The configuration it ports (written for 0.17) is re-verified against 0.19.
 17. **The next harness Cogs.** pi and OpenCode follow Hermes, each its own Cog under `cogs/`, in that order unless a user need reorders them; a harness that does not speak ACP gets an adapter in the SDK. Open: which ships first, and whether either needs an adapter of its own.
 
-## 11. Appendix — two launches, step by step
+## 11. Appendix — two launches, and the states of a Cog
 
-Two sequences through the boxes of §4, one per client and per pair of axis values. Both run the same Hermes Cog and the same Op; what differs is who submits, where the worker lives and what survives a restart.
+Two sequences through the boxes of §4, one per client and per pair of axis values — both run the same Hermes Cog and the same Op; what differs is who submits, where the worker lives and what survives a restart — then the state machine they both move through.
 
 ### A. From the CLI — `local` and `none`, at dev level 1
 
@@ -1130,7 +1131,7 @@ sequenceDiagram
   Exec->>Pod: GET /healthz until ready
   Ctl->>Pod: POST /invoke (task, idempotency key, run token verified by the SDK)
   Pod->>API: POST /v1/claims/{key}/reserve (run token)
-  Pod->>GW: model call, the only egress the policy allows
+  Pod->>GW: model call over the internal Service, the only egress the policy allows
   Pod->>API: POST /v1/claims/{key}/commit (envelope)
   Pod-->>Ctl: envelope
   Ctl->>Store: step_completed
@@ -1154,3 +1155,104 @@ sequenceDiagram
 ```
 
 What `dbos` buys: steps 8 to 25 are checkpointed, so a controller restart resumes the workflow, at the Gate too, with nobody resubmitting; the same run under `none` would end `interrupted` (decision 3). What `remote` buys: the pod's egress policy makes step 14 the only way out, and the API's ServiceAccount could not have created the pod (Phase 17).
+
+### C. The states of a Cog
+
+"The state of a Cog" is four questions, each with its own small machine: is the Cog **installed** on this hub, is a **worker** of it up, what happened to one **step attempt** on that worker, and where is the **run** that asked. They nest: only an `INVOKABLE` Cog is materialized, a `RUNNING` run drives step attempts one at a time, and each attempt holds a worker `INTERACTING`. The names below are this plan's, in capitals; where #35's code already has a state, the table gives its spelling.
+
+```mermaid
+stateDiagram-v2
+  direction TB
+
+  state "The Cog on a hub — install, once per digest" as cog {
+    direction LR
+    [*] --> PUBLISHED
+    PUBLISHED --> FETCHED: install by digest
+    FETCHED --> BOUND: binding admitted
+    BOUND --> INVOKABLE: check passed
+    BOUND --> BOUND: check failed, recorded
+    INVOKABLE --> UNINSTALLED: uninstall
+    UNINSTALLED --> [*]
+  }
+
+  state "A worker — once per materialization" as worker {
+    direction LR
+    [*] --> MATERIALIZED
+    MATERIALIZED --> READY: healthz answers
+    READY --> INTERACTING: invoke
+    INTERACTING --> IDLE: envelope returned
+    IDLE --> INTERACTING: next step, warm
+    IDLE --> TEARING_DOWN: one-shot, or idle timeout
+    READY --> TEARING_DOWN: cancel, or orphan reaped
+    TEARING_DOWN --> TORN_DOWN
+    MATERIALIZED --> WORKER_FAILED
+    READY --> WORKER_FAILED
+    INTERACTING --> WORKER_FAILED
+    TORN_DOWN --> [*]
+    WORKER_FAILED --> [*]
+  }
+
+  state "A step attempt — the keyed claim" as step {
+    direction LR
+    [*] --> INVOKED
+    INVOKED --> RESERVED: the worker reserves the key
+    RESERVED --> COMMITTED: the envelope is committed
+    COMMITTED --> RECORDED: the Track records the step
+    RESERVED --> OUTCOME_UNKNOWN: worker lost before committing
+    OUTCOME_UNKNOWN --> RECORDED: reconciled by a person
+    RECORDED --> [*]
+  }
+
+  state "A run — status from the Track only" as run {
+    direction LR
+    [*] --> SUBMITTED
+    SUBMITTED --> RUNNING: pickup
+    RUNNING --> WAITING_AT_GATE: a Gate escalates
+    WAITING_AT_GATE --> RUNNING: approve, or send back
+    WAITING_AT_GATE --> REJECTED: reject
+    RUNNING --> COMPLETED
+    RUNNING --> FAILED
+    RUNNING --> BUDGET_EXCEEDED
+    RUNNING --> CANCELLED: cancel
+    WAITING_AT_GATE --> CANCELLED: cancel
+    RUNNING --> INTERRUPTED: host stops, on none
+    WAITING_AT_GATE --> INTERRUPTED: host stops, on none
+    INTERRUPTED --> RUNNING: retry, same attempt and key
+    FAILED --> RUNNING: retry, new attempt and key
+    BUDGET_EXCEEDED --> RUNNING: retry, new budget epoch
+    COMPLETED --> [*]
+    REJECTED --> [*]
+    CANCELLED --> [*]
+  }
+
+  INVOKABLE --> MATERIALIZED: a step of a run needs this Cog
+```
+
+| State | Of | Meaning | Defined in |
+|---|---|---|---|
+| `PUBLISHED` | the Cog | The package is in a registry the catalog indexes, addressable as `<host>/<repo>@<digest>`; nothing of it is on the hub yet. A development package read from a directory (Phase 7) has no install states: it is materialized straight from its directory. | ADR-0001 D6; #7 |
+| `FETCHED` | the Cog | Install has pulled the package and provisioned its environment. Not invokable. | glossary, *Install*; Phase 19 |
+| `BOUND` | the Cog | Its requirements are resolved and the binding admitted — from the `models:` stopgap, then from the Cog's own `resolve`. A failing `check` leaves it here, with the failing step recorded. | Phases 19, 20 |
+| `INVOKABLE` | the Cog | `check` passed against the delivered binding and the catalog card is recorded; a run may name the digest. Installing starts no worker. | glossary, *Install*; ADR-0001 D5 |
+| `UNINSTALLED` | the Cog | The install and every runtime resource it created are removed, its warm pool drained. | Phases 19, 21 |
+| `MATERIALIZED` | a worker | The executor has brought up the package's `serve` — a child process at `local`, a pod at `remote` — and minted its run token; it is not answering yet. | `LifecycleState.MATERIALIZED`; glossary, *Materialize / worker* |
+| `READY` | a worker | `/healthz` answers; the worker can take an `/invoke`. | `LifecycleState.READY` |
+| `INTERACTING` | a worker | An `/invoke` is in flight: the Harness adapter is driving the harness. Cancellation and the duration deadline act here. | `LifecycleState.INTERACTING` |
+| `IDLE` | a worker | The envelope is back. A warm worker waits here for the next step until its idle timeout; a one-shot worker leaves at once. | `LifecycleState.IDLE`; Phase 21 |
+| `TEARING_DOWN` | a worker | The executor is reclaiming it: the process group killed, or the pod and its objects deleted. Also how an orphan is reaped when the next controller starts. | `LifecycleState.TEARING_DOWN`; Phases 7, 9, 17 |
+| `TORN_DOWN` | a worker | Gone. A local assertion only: the Track records a teardown that failed, never this state. | `LifecycleState.TORN_DOWN` |
+| `WORKER_FAILED` | a worker | Materialization, readiness or an interaction failed; terminal for this worker, and the run decides what follows. | `LifecycleState.FAILED` |
+| `INVOKED` | a step attempt | The controller has POSTed the task with the attempt's idempotency key. | Phase 8 |
+| `RESERVED` | a step attempt | The worker reserved the key before acting. | Phase 8; ADR-0002 D1 |
+| `COMMITTED` | a step attempt | The worker committed its envelope; any replay of the key returns that envelope without acting again. | Phase 8 |
+| `RECORDED` | a step attempt | The Track holds `step_completed` or `step_failed` for the attempt. | Phase 4 |
+| `OUTCOME_UNKNOWN` | a step attempt | The key was reserved and never committed: the worker was lost between the side effect and its result. Nothing acts again, an ordinary retry is refused, and a person — or an entry point the Cog declares idempotent — reconciles it. | Phases 8, 10 |
+| `SUBMITTED` | a run | The API recorded `op_submitted`; no controller has picked the run up. | `RunStatus.SUBMITTED`; Phase 9 |
+| `RUNNING` | a run | A controller owns it and the Lifecycle runner is advancing its steps. #35's finer statuses — `materialized`, `ready`, `interacting`, `idle`, `tearing_down` — are the worker's states surfaced while the run is here. | `RunStatus.RUNNING` |
+| `WAITING_AT_GATE` | a run | A step's Gate escalated; the run waits for a decision naming the open escalation id. A send back re-runs the step, bounded by the revise limit, past which the run ends with a status that says so. `paused` in #35's code, where the Cog asked for it; Phase 3 moves the decision to the step. | `RunStatus.PAUSED`; Phases 3, 10 |
+| `COMPLETED` | a run | Every step completed, and every Gate passed or was approved. Terminal. | `RunStatus.COMPLETED` |
+| `FAILED` | a run | A step's envelope came back `ok: false` with an error code, its worker failed, or a step attempt ended `OUTCOME_UNKNOWN`. Retry runs a recorded failure as a new attempt under a new key. | `RunStatus.FAILED`; Phase 6 |
+| `REJECTED` | a run | A reviewer rejected at a Gate. Terminal. | Phase 3 |
+| `CANCELLED` | a run | A client cancelled: the worker is torn down and the actor recorded. Terminal. | Phase 6 |
+| `BUDGET_EXCEEDED` | a run | A budget dimension — `duration`, `tokens` or `cost` — stopped it; `timed_out` in #35's code is the duration case. Retry opens a new budget epoch. | `RunStatus.BUDGET_EXCEEDED`; Phase 21 |
+| `INTERRUPTED` | a run | Its host stopped under `none`, which cannot resume; recorded when the host next starts. Retry continues the attempt in flight under its existing key. Under `dbos` and `temporal` a host stop leaves the run `RUNNING` or `WAITING_AT_GATE`, and it resumes. | glossary, *Interrupted*; ADR-0002 D2; Phase 6 |
