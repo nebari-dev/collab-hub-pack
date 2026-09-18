@@ -152,7 +152,7 @@ No lifecycle logic lives inside a backend. That is ADR-0001 invariant 1 carried 
 | Durability engine | none | DBOS | Temporal |
 | Process restart mid-step | the run ends **`interrupted`** | resumes | resumes |
 | Run paused at a Gate, then a restart | the run ends **`interrupted`** | resumes at the Gate | resumes at the Gate |
-| Who owns a run across replicas | the controller that picked it up | DBOS queues | Temporal task queues |
+| Who owns a run across replicas | the controller that picked it up | DBOS queues, after pickup | Temporal task queues, after pickup |
 | A step invoked again after a crash or retry | keyed claim | keyed claim | keyed claim |
 | Where checkpoints live | nowhere | DBOS system database — Postgres on the hub, SQLite locally | Temporal persistence |
 | **Run status comes from** | **the Track** | **the Track** | **the Track** |
@@ -177,7 +177,7 @@ The second axis under the runner. Where the durability backend decides what surv
 | Isolation | the OS process boundary; the host's network identity | the pod; per-worker ingress and, from Phase 24, egress NetworkPolicy |
 | Needs | pixi on the host | a cluster, and RBAC for the controller (Phase 17) |
 | Resource limits | none beyond the host's — budgets (Phase 21) are the only bound | the pod's requests and limits |
-| The controller dies | the worker is torn down with it | the pod outlives it until the next controller start reaps it |
+| The controller dies | the launcher kills the worker when the controller's pipe closes | the pod outlives it until the next controller start reaps it |
 | Suits | development and the desktop (decision 11) | every Kubernetes hub — and anything the trust boundary must hold |
 | First in | Phase 7 | Phase 17 |
 
@@ -439,15 +439,17 @@ Where a worker runs is the second axis under the runner, chosen by configuration
 *In scope*
 - An **agent location**, `location: local | remote`, selecting the `CogExecutor` the controller constructs. `remote` fails at startup as *not implemented* until Phase 17, so the configuration shape is fixed now and callers never import an executor.
 - **`local`**: `LocalProcessCogExecutor`. Materialize runs the Cog package's declared `serve` task as a child process of the controller, in the package's own pixi environment, bound to a loopback port the executor chooses, with a run token in its environment; ready polls `/healthz`; teardown kills the process tree and reaps it. The package comes from a directory, through a **directory package source** this phase adds: it maps an allowlisted name to a directory under a configured root, reads the package with the bundle reader #81 merged, and refuses a name or path that escapes the roots. It is not #83's `static` registry source, which enumerates an OCI registry and cannot resolve a local path. A package resolved this way is recorded on the Track and in claims by that name plus the digest of its manifest and lock, so a development run is identifiable and never mistaken for a published one. `nebi pull` and install by digest (Phases 18, 19) are not needed here.
+- The **run token**, defined here because every hub-mediated path a worker uses later relies on it: one per materialized worker, minted by the controller when it materializes the worker and expiring at teardown, an opaque secret whose hash is recorded beside the run in the store the API and the controller share — so either process verifies it without asking the other. It reaches the worker in its environment at `local` and mounted into the pod at `remote` (Phase 17). The worker presents it to every hub endpoint it calls — the claim transport (Phase 8), the model egress gateway (Phase 24), the connector proxy (Phase 25) — and the controller presents it to the worker's `/invoke` once Phase 24 makes the SDK verify it. One token, both directions, never a second one.
+- A `local` worker cannot outlive its controller by accident, and the executor does not rely on it being a child for that: an orphaned child survives a killed parent on Linux and macOS alike. The executor starts each worker in its own process group through a small launcher of its own, which holds a pipe from the controller and kills the group when that pipe closes — on any controller death, `SIGKILL` included — with `PR_SET_PDEATHSIG` as a second line on Linux. The Cog knows nothing of this. The controller also records each worker's pid and process group on the run, so its next start (Phase 9) reaps a survivor that beat the launcher.
 - The executor never binds a non-loopback address; a worker inherits nothing from the controller's environment beyond what the binding delivers. The worker's stdout and stderr are captured to a per-run directory and referenced from the Track, never inlined. A binding's `auth_ref` is resolved by the controller and the value enters only the child's environment: never the Track, never a file on disk.
-- A **location conformance suite** — materialize, ready, an `/invoke` round trip, teardown, cancel mid-interaction, the controller dying with a worker in flight (the worker must not outlive it), two workers on one host without a port collision — run by `local` now and `remote` in Phase 17.
+- A **location conformance suite** — materialize, ready, an `/invoke` round trip, teardown, cancel mid-interaction, the controller dying with a worker in flight (killed with `SIGKILL`, not a signal it can handle; the worker must not outlive it), two workers on one host without a port collision — run by `local` now and `remote` in Phase 17.
 - #35's `KubernetesCogExecutor` is untouched here; Phase 17 puts it behind `remote`.
 
 *Dev and CI* — `make controller LOCATION=local` at level 1 — no containers, the SQLite Track — and `make op OP=echo` runs the `echo` fake Cog as a real child process. pixi joins level 1's prerequisites, marked as needed only for `LOCATION=local`. CI: `level-1` runs one fake Cog through the local executor on Linux and macOS (Windows is out of scope, decision 15) and asserts a killed controller leaves no worker behind; the location suite runs in `test-execution.yaml`. *Docs* — ADR-0002 gains **D11, agent location**, appended and never renumbered, and a sixth invariant: no lifecycle logic inside an executor, and `location` is the only switch; the glossary gains *Agent location*, *Local worker*, *Remote worker*; `runs.md` gains the location table.
 
 *Acceptance*
 - [ ] With `location: local`, an Op step runs in a child process of the controller and completes with a valid envelope, at dev level 1, on Linux and macOS.
-- [ ] Killing the controller leaves no worker process running.
+- [ ] Killing the controller with `SIGKILL` leaves no worker process running, on Linux and macOS.
 - [ ] `location` is the only switch; no caller imports an executor.
 - [ ] `local` and the in-memory executor pass the location conformance suite.
 - [ ] At level 1 with registry access disabled, the directory source finds and launches a package by name, and a name or path outside the configured roots is refused.
@@ -461,7 +463,7 @@ A step can be invoked again after it already acted: a durable backend resuming a
 - Every interaction carries an idempotency key, stable for one step attempt.
 - A durable **keyed claim** store on the hub, with two states. A worker *reserves* the key before it acts and *commits* the envelope after; a replay of a committed key returns the envelope without acting. A replay that finds a key reserved but never committed — the worker died between the side effect and its result — must not act again: the step fails as `outcome-unknown`, and only a person, or an entry point the Cog declares idempotent, resolves it. The claim narrows the crash window to the reserve-to-commit gap and makes it visible; it does not pretend to close it.
 - **Two stores, both first-class**: SQLite for level 1 and the desktop, Postgres for the hub, behind one protocol and one suite — the same shape Phase 4 gives the Track, and what lets M3 run with no container.
-- **A worker-facing transport**, since the worker is a separate process even at level 1: `POST /v1/claims/{key}/reserve` and `/commit`, and `GET /v1/claims/{key}`, authorized by the run token the executor already delivers (Phase 7) and scoped to that run's own keys — a worker can neither read nor commit another run's. Phase 24's "claim endpoint" is this one, and Phase 11's SDK is its client.
+- **A worker-facing transport**, since the worker is a separate process even at level 1: `POST /v1/claims/{key}/reserve` and `/commit`, and `GET /v1/claims/{key}`, served by the API process, authorized by Phase 7's run token — which the API verifies against the hash the controller recorded, never by asking the controller — and scoped to that run's own keys, so a worker can neither read nor commit another run's. Phase 24's "claim endpoint" is this one, and Phase 11's SDK is its client.
 - The claim contract documented for workers; the reference worker implements it, and the Phase 11 SDK implements it for every adapter.
 - The lifecycle suite gains "retry of an interrupted run does not repeat a completed side effect"; the durability suite gains "a worker replaced after reserving, before committing" (the step ends `outcome-unknown`, nothing acts twice) and "a worker replaced after committing, before the step was recorded" (the envelope is returned). A **claim conformance suite** runs reserve, commit, replay of a committed key, replay of a reserved-but-uncommitted key, and expiry, against SQLite and Postgres alike.
 
@@ -481,8 +483,8 @@ The process that advances runs, separate from the process that accepts them — 
 
 *In scope*
 - `collab-hub-run-controller`: the same image with its own entrypoint. It runs the lifecycle runner with `backend` and `location` from configuration, and it alone constructs an executor; the API process constructs none, which an import-boundary test enforces from here on.
-- **Run pickup** under `none`: the API records `op_submitted`, and a controller takes the run with an atomic pickup record, so two replicas never both start it. A run in flight belongs to the process that picked it up and ends `interrupted` with it; `dbos` and `temporal` replace pickup with their own queues.
-- On start, the controller records `interrupted` for every run it owned and did not finish, and reaps any `local` worker of its own left behind.
+- **Run pickup**, under every backend: the API records `op_submitted` and nothing else — it never enqueues into an engine, which is what keeps it backend-agnostic — and a controller takes the run with an atomic pickup record, so two replicas never both start it. What differs per backend is ownership *after* pickup. Under `none` a run in flight belongs to the process that picked it up and ends `interrupted` with it; under `dbos` and `temporal` the picking controller hands the run to the engine's queue, and the engine decides which replica resumes it when that controller dies.
+- On start, the controller records `interrupted` for every run it owned and did not finish, and reaps, by the pid and process group it recorded, any `local` worker of its own left behind.
 - Controller health and readiness.
 - A minimal `models:` configuration block — endpoint, model id, `auth_ref` — from chart values and environment, since the hub has none today (§3). It is what the controller writes the stopgap binding from until Phase 20, and what Phase 20's inventory is generated from after.
 
@@ -657,10 +659,10 @@ Same runner, same `none`, same Hermes Cog — the worker becomes a pod. The only
 
 *In scope*
 - `location: remote` constructs #35's `KubernetesCogExecutor` (a per-run Deployment + Service + ingress-only NetworkPolicy). Until Phase 18 the pod runs the baked runner image, as #35's E2E does.
-- It passes Phase 7's location conformance suite, whose controller-death case is written per location rather than one rule for both — the way the durability suite already differs per backend. `local`: the worker dies with its controller, since it is that process's child. `remote`: the pod survives the controller, and the next controller start reaps it; the suite asserts the reap, and that no run advances and no claim is acted on in between. Neither location leaves a worker serving an orphaned run indefinitely, and orphan cleanup and claim reconciliation both precede any retry that could act again.
+- It passes Phase 7's location conformance suite, whose controller-death case is written per location rather than one rule for both — the way the durability suite already differs per backend. `local`: the worker dies with its controller, because Phase 7's launcher kills it when the controller's pipe closes. `remote`: the pod survives the controller, and the next controller start reaps it; the suite asserts the reap, and that no run advances and no claim is acted on in between. Neither location leaves a worker serving an orphaned run indefinitely, and orphan cleanup and claim reconciliation both precede any retry that could act again.
 - Chart: the controller's Deployment, a ServiceAccount and a namespace-scoped Role and RoleBinding for the controller only, over the kinds actually materialized and the verbs used; `values.yaml` and `values.schema.json` change together; the API pod holds no workload permissions; `automountServiceAccountToken: false` on workers.
 - The run token and the binding reach the pod the way they reach a child process — environment and a mounted file — so the SDK does not know its location.
-- That reap is the `remote` half of Phase 9's start-up sweep; a `local` worker needs none, having died with its parent.
+- That reap is the `remote` half of Phase 9's start-up sweep; a `local` worker seldom needs it, the launcher having killed it, and the pid record covers a survivor.
 
 *Dev and CI* — `make kind-up` deploys the controller from the chart with `location: remote`, and `make op` on kind materializes a worker pod. CI: `level-4-render` asserts the controller Deployment renders, the Role is limited to materialized kinds and the API ServiceAccount has no workload verbs; `test-execution-e2e.yaml` runs the location suite against kind. *Docs* — `runs.md`'s location table gains `remote`; `docs/standalone-deployment.md` *Namespace ownership* states the controller's Role; the chart values are described.
 
@@ -763,7 +765,7 @@ The first durability engine behind the runner — what makes #2's "a restart doe
 - The runner's step functions run as the steps of one DBOS workflow per run; a Gate's human decision is a durable wait on a message; cancellation uses DBOS cancellation.
 - The DBOS system database: Postgres on the hub, on the same instance as the Track; SQLite for the desktop and for level 1.
 - The chart provisions DBOS's databases, or documents granting `CREATEDB` — DBOS otherwise tries to create them at startup and fails.
-- Ownership across replicas from DBOS queues and a unique executor id per replica, replacing Phase 9's pickup when `dbos` is selected. No hand-built lease.
+- Ownership across replicas from DBOS queues and a unique executor id per replica, taking over from Phase 9's pickup once a run is picked up: the controller that picks a run up enqueues it as a DBOS workflow, and from then on the queue decides who resumes it. The API still only writes `op_submitted`. No hand-built lease.
 - Step re-execution after a crash is made safe by Phase 8's keyed claim.
 - Passes the lifecycle suite and the durability suite unchanged — and passes the durability suite on a SQLite system database over the SQLite Track too, so a local run can be made durable without Postgres.
 
@@ -805,7 +807,7 @@ Not in the original list, but #8 cannot be built safely without it, and it is wh
 
 *In scope*
 - A per-worker egress NetworkPolicy: DNS plus hub-mediated endpoints only, each an in-cluster Service the policy can select — a NetworkPolicy cannot name an arbitrary hostname, and resolved addresses change. So model traffic goes through a **model egress gateway** on the hub, a stable Service that forwards to the endpoints in `models:`; a `remote` worker's binding (Phase 20) names the gateway, a `local` worker's the endpoint itself. The connector proxy and the claim endpoint are hub Services already.
-- `/invoke` authentication with a short-lived, run-scoped token minted by the controller, delivered with the binding and verified by the SDK.
+- `/invoke` authentication with Phase 7's run token: the controller already presents it on every `/invoke`, and the SDK's authentication hook (Phase 11) starts verifying it against the value the worker was materialized with. No second token is minted.
 - A denied egress attempt recorded as a Track boundary event, reported through the executor (invariant 6).
 - `local` workers are out of scope: they share the controller's network identity, which ADR-0002 D11 records as the reason the trust boundary is `remote`'s.
 
@@ -876,7 +878,7 @@ The desktop embeds what M2 built: `local` is its executor, and Phase 22's `dbos`
 #### Phase 28 — The `temporal` backend
 **Issue** #110 · **Branch** `feat/cog-durability-temporal` · **Depends on** Phases 6, 8, 9 · **Size** L
 
-*In scope* — one workflow per run; the runner's step functions — Cog interaction, executor calls and Track appends — as **activities**, so workflow code stays deterministic; signals for gate decisions and cancellation; ownership across replicas from task queues; Phase 8's keyed claim for activity re-execution; Temporal's persistence on the same Postgres instance as the Track; configurable TLS to the frontend.
+*In scope* — one workflow per run; the runner's step functions — Cog interaction, executor calls and Track appends — as **activities**, so workflow code stays deterministic; signals for gate decisions and cancellation; ownership across replicas from task queues, which Phase 9's pickup hands the run to as it does for `dbos`; Phase 8's keyed claim for activity re-execution; Temporal's persistence on the same Postgres instance as the Track; configurable TLS to the frontend.
 
 *Dev and CI* — an optional `temporal` compose profile runs the Temporal CLI's `temporal server start-dev` — one process, not a cluster image — and `make controller BACKEND=temporal` uses it at level 2; `test-execution.yaml` runs both conformance suites against it; `dev-env.yaml` does not, keeping its cost rule. *Docs* — `runs.md` gains `temporal`; `frames-operations.md` adds Temporal's persistence; the chart values are described.
 
