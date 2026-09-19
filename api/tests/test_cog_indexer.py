@@ -685,6 +685,31 @@ async def test_mark_removed_marks_one_row():
         await indexer.mark_removed("no-such-source", "cogs/notes", "sha256:" + "b" * 64)
 
 
+async def test_reindex_upserts_are_targeted_and_sweep_upserts_are_not():
+    # Issue #128: the Postgres store gives a targeted upsert its own pooled
+    # connection instead of a concurrent sweep's lock session, so the
+    # lock-less reindex must mark every write it makes -- the fallback row
+    # for an unstorable card included -- while the sweep marks none.
+    flags: list[bool] = []
+
+    class RecordingStore(InMemoryCogCatalogStore):
+        def upsert(self, artifact, *, targeted=False):
+            flags.append(targeted)
+            if artifact.card is not None and artifact.repository == "cogs/transcriber":
+                raise CogCatalogDataError("DataError")
+            super().upsert(artifact, targeted=targeted)
+
+    base, _, _ = make()
+    indexer = CogIndexer(RecordingStore(), base.sources)
+
+    await indexer.reindex(SOURCE_ID, "cogs/transcriber", "sha256:" + "a" * 64)
+    assert flags == [True, True], "the reindex upsert and its failed-row fallback are both targeted"
+
+    flags.clear()
+    await indexer.sweep()
+    assert flags and all(flag is False for flag in flags), "sweep-path upserts ride the lock session"
+
+
 # ---------------------------------------------------------------------------
 # The loop
 # ---------------------------------------------------------------------------
@@ -804,9 +829,10 @@ def test_build_cog_indexing_builds_sources_and_reads_the_loop_parameters():
 def test_build_cog_indexing_refuses_a_one_connection_pool():
     from collab_hub_api.config import build_cog_catalog_store, build_cog_indexing, build_postgres_pools
 
-    # The sweep lock occupies one pooled connection for the whole sweep while
-    # reads and writes need a second; with max_size=1 every non-empty sweep
-    # would wait on its own connection and time out, silently, at runtime.
+    # The sweep occupies one pooled connection for its whole duration (the
+    # lock is held on it and the sweep's reads and writes ride it, #128);
+    # with max_size=1 that leaves nothing for API reads or webhook writes,
+    # which would wait on the sweep and time out, silently, at runtime.
     config = Config.parse(
         {
             "frames": {"postgres": {"url": "postgresql://shared/db", "pool": {"max_size": 1, "min_size": 1}}},
@@ -973,12 +999,12 @@ class _EventedStore(InMemoryCogCatalogStore):
             assert self.release_exit.wait(timeout=10)
             self.events.append("unlocked")
 
-    def upsert(self, artifact):
+    def upsert(self, artifact, *, targeted=False):
         self.write_started.set()
         assert self.release_write.wait(timeout=10)
         if self.fail_write is not None:
             raise self.fail_write
-        super().upsert(artifact)
+        super().upsert(artifact, targeted=targeted)
         self.events.append("write_done")
 
 
@@ -1505,10 +1531,10 @@ async def test_store_data_error_falls_back_to_a_failed_row():
     # representability rule the store enforces that the validation did not
     # anticipate becomes a failed row, while outages still propagate.
     class PickyStore(InMemoryCogCatalogStore):
-        def upsert(self, artifact):
+        def upsert(self, artifact, *, targeted=False):
             if artifact.card is not None:
                 raise CogCatalogDataError("UntranslatableCharacter")
-            super().upsert(artifact)
+            super().upsert(artifact, targeted=targeted)
 
     base, _, _ = make()
     store = PickyStore()

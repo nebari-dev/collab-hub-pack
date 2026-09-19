@@ -1197,7 +1197,8 @@ as present, so removal stays correct. Safety rules operators should know:
   duration (outside any transaction, so a minutes-long sweep pins no
   snapshot). Replicas starting together do not double-index: the loser logs
   `cog_index_sweep_skipped` and waits for its next interval. That connection
-  is one slot of the shared pool while a sweep runs.
+  is one slot of the shared pool while a sweep runs, and it carries the
+  sweep's reads and writes (see the fencing bullet below).
 - **Removal needs a complete picture — per repository.** Rows are marked
   removed only in repositories whose listing fully succeeded this sweep. If the
   source's *repository list* cannot be obtained, nothing is reconciled and
@@ -1251,24 +1252,26 @@ as present, so removal stays correct. Safety rules operators should know:
   itself runs on a pool worker, and those are joined at interpreter exit — so a
   permanently blocked store call means the pod needs its `SIGKILL` (the
   `terminationGracePeriodSeconds` deadline) rather than exiting on its own.
-- **One crash window is not yet closed.** The sweep lock is held on one pooled
-  connection while the sweep's reads and writes use another. If the process
-  dies mid-write, the server can drop the lock session before the write session
-  finishes, letting another replica start sweeping while the previous write is
-  still landing. Both sweeps write the same rows from the same registry, so the
-  visible effect is limited to a stale `mark_removed` set; it is nonetheless a
-  real gap, and closing it means running the sweep's writes on the session that
-  holds the lock (or fencing them with a token). Tracked as issue #128.
+- **Sweep writes ride the lock's session.** The sweep's reads and writes run
+  on the very connection the sweep lock is held on, so a sweeper that dies
+  mid-write loses the write and the lock together: the server drops both with
+  the one session, and no write of a dead sweep can land after another replica
+  has acquired the lock (issue #128). The targeted webhook writes (`reindex`
+  and `mark_removed_one`) deliberately do **not** share that session — they
+  check out their own pooled connections, so a push or delete event lands
+  concurrently with a running sweep.
 - **A doubtful lock connection is discarded, not returned.** If any step of
   taking or giving back the lock fails (setting autocommit, the acquire, the
   unlock, `RESET statement_timeout`, restoring autocommit), the connection is
   **closed** (`cog_index_lock_connection_discarded`) so the pool opens a fresh
   one instead of handing a session with an altered timeout — or one still
   holding the lock — to the next borrower.
-- **Indexing needs two pooled connections.** The sweep lock occupies one
-  connection of the shared `frames.postgres` pool for the sweep's whole
-  duration while reads and writes check out another, so the API refuses to
-  start with `cogs.index.enabled` and `frames.postgres.pool.max_size < 2`.
+- **Indexing needs two pooled connections.** The sweep occupies one connection
+  of the shared `frames.postgres` pool for its whole duration (the lock is
+  held on it and the sweep's reads and writes ride it), so the API refuses to
+  start with `cogs.index.enabled` and `frames.postgres.pool.max_size < 2`:
+  everything else — API reads, the webhook's targeted writes — needs a
+  connection while a sweep runs.
 
 Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
 non_cog / failed / removed / sources_failed / duration) and exports the same
