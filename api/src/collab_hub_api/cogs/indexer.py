@@ -20,7 +20,11 @@ Three things keep a sweep from doing damage:
 - **Single flight, cancellation included.** A sweep runs under the store's
   sweep lock (a session-level Postgres advisory lock on the shared pool), so
   replicas starting together do not double-index; the loser logs and waits
-  for the next interval. Store calls run on worker threads, and a worker
+  for the next interval. The sweep's reads and writes ride the very
+  connection the lock is held on (the store's ``_sweep_connection``,
+  issue #128), so a sweeper that dies mid-write loses the write and the lock
+  together -- a write cannot land after another replica has acquired the
+  lock. Store calls run on worker threads, and a worker
   thread cannot be interrupted -- so cancellation *drains*: a cancelled sweep
   first waits out whatever store call is in flight, then releases the lock,
   then propagates. The lock is never released while a write is still running,
@@ -61,6 +65,8 @@ Targeted entry points for the webhook receiver (#86): :meth:`CogIndexer.reindex`
 for one ``(source_id, repository, digest)`` and :meth:`CogIndexer.mark_removed`
 for a delete. Neither takes the sweep lock -- both are idempotent single-row
 writes, and a sweep running at the same time converges to the same state.
+Neither rides a running sweep's lock session either: their writes check out
+their own pooled connections, so they land concurrently with a sweep.
 """
 
 from __future__ import annotations
@@ -468,12 +474,11 @@ class CogIndexer:
         ``statement_timeout`` where the transport works, keepalives where the
         peer is gone.
 
-        **Known gap (issue #128).** If the process does die here, the
-        lock and the in-flight write are on *different* pooled connections, so
-        the server can drop the lock session first and let another replica in
-        while the old write is still landing. Nothing in this module orders
-        those two sessions; closing it needs the sweep's writes to run on the
-        session that holds the lock, or a fencing token they carry.
+        If the process does die here, the lock and any in-flight sweep write
+        are on the *same* connection (the sweep's store calls ride the lock's
+        session -- the store's ``_sweep_connection``, issue #128), so the
+        server drops them together: the write cannot land after another
+        replica has acquired the lock.
         """
 
         def run() -> None:
@@ -513,7 +518,8 @@ class CogIndexer:
         self._abandoned = []
         # The lock is taken and released on a worker thread: it is a blocking
         # database call, and the connection it occupies stays checked out for
-        # the whole sweep (see the store's sweep_lock contract).
+        # the whole sweep, carrying the sweep's reads and writes so they die
+        # with the lock session (see the store's sweep_lock contract, #128).
         lock = self._store.sweep_lock()
         try:
             try:
@@ -735,7 +741,7 @@ class CogIndexer:
             return OUTCOME_NON_COG
         return OUTCOME_FAILED
 
-    async def _store_row(self, row: CogArtifact) -> CogArtifact:
+    async def _store_row(self, row: CogArtifact, *, targeted: bool = False) -> CogArtifact:
         """Upsert the row; a card the database refuses becomes a ``failed`` row, not a poisoned sweep.
 
         The card is pre-validated (:func:`_card_unstorable`), so this catch is
@@ -743,14 +749,18 @@ class CogIndexer:
         that the validation did not anticipate. Only the store's *data* error
         is caught -- an outage raises through, because retrying every artifact
         against a dead database is not resilience.
+
+        ``targeted`` marks the lock-less :meth:`reindex` path, whose write
+        must take its own pooled connection instead of riding a concurrent
+        sweep's lock session (issue #128).
         """
 
         try:
-            await self._on_thread(self._store.upsert, row)
+            await self._on_thread(self._store.upsert, row, targeted=targeted)
             return row
         except CogCatalogDataError as exc:
             fallback = _with(row, status=STATUS_FAILED, card=None, read_errors=_errors(f"store: {type(exc).__name__}"))
-            await self._on_thread(self._store.upsert, fallback)
+            await self._on_thread(self._store.upsert, fallback, targeted=targeted)
             return fallback
 
     # -- targeted entry points (webhook receiver, #86) --------------------------
@@ -774,7 +784,7 @@ class CogIndexer:
         source = self._source(source_id)
         ref = ArtifactRef(digest=digest, tags=tuple(sorted(set(tags))), pushed_at=pushed_at)
         row = await self._read_artifact(source, repository, ref)
-        return await self._store_row(row)
+        return await self._store_row(row, targeted=True)
 
     async def mark_removed(self, source_id: str, repository: str, digest: str) -> bool:
         """Mark one artifact removed (a delete event). Returns whether a present row was marked."""

@@ -929,6 +929,107 @@ def test_mark_removed_one_only_marks_a_present_row():
     assert store.mark_removed_one(SOURCE, "cogs/a", DIGEST_A) is False
 
 
+# ---------------------------------------------------------------------------
+# Sweep writes ride the lock's session (issue #128)
+# ---------------------------------------------------------------------------
+
+
+class _LockAwareConnection(_FakeConnection):
+    """A recording fake that also answers the sweep-lock helper's statements."""
+
+    def __init__(self, results=(), *, locked: bool = True):
+        super().__init__(results)
+        self.locked = locked
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        if "advisory" in text or text.startswith(("SET ", "RESET ")):
+            self.calls.append((text, tuple(params or ())))
+            return _FakeResult([{"locked": self.locked}])
+        return super().execute(sql, params)
+
+
+class _FakeMultiDb:
+    """Hands out a fresh recording connection per checkout, remembering each.
+
+    Connection *identity* is what the #128 tests assert, so unlike ``_FakeDb``
+    this never reuses one object. ``lock_answers`` scripts what successive
+    connections answer to ``pg_try_advisory_lock`` (later checkouts answer
+    ``True``, which only matters if they are asked).
+    """
+
+    def __init__(self, lock_answers=(True,)):
+        self.connections: list[_LockAwareConnection] = []
+        self._lock_answers = list(lock_answers)
+
+    @contextmanager
+    def connection(self, timeout=None):
+        locked = self._lock_answers.pop(0) if self._lock_answers else True
+        conn = _LockAwareConnection(locked=locked)
+        self.connections.append(conn)
+        yield conn
+
+
+def test_sweep_writes_ride_the_lock_holding_session():
+    # Issue #128: while a sweep holds the lock, every sweep-path read and
+    # write runs on the lock's own connection, so a dead sweeper's writes are
+    # dropped by the server together with its lock -- there is no second
+    # session for a write to outlive the lock on.
+    db = _FakeMultiDb()
+    store = PostgresCogCatalogStore(db)
+    with store.sweep_lock() as held:
+        assert held is True
+        lock_conn = db.connections[0]
+        assert store._lock_conn is lock_conn
+        store.known(SOURCE)
+        store.upsert(artifact("a"))
+        store.update_tags(SOURCE, "cogs/a", DIGEST_A, ["v1"])
+        store.mark_removed(SOURCE, {"cogs/a": [DIGEST_A]})
+        assert len(db.connections) == 1, "no sweep-path call checked out a second connection"
+        assert not any(s.startswith("SELECT set_config") for s in lock_conn.statements), (
+            "the lock session's timeout is session-set; a transaction-local set would be an autocommit no-op"
+        )
+        assert any(s.startswith("INSERT INTO collab_cog_artifacts") for s in lock_conn.statements)
+        assert any(s.startswith("UPDATE collab_cog_artifacts") for s in lock_conn.statements)
+    assert store._lock_conn is None, "publication is withdrawn with the lock"
+    store.known(SOURCE)
+    assert len(db.connections) == 2, "after release, sweep-path calls take their own connections again"
+    assert db.connections[1].statements[0].startswith("SELECT set_config('statement_timeout'")
+
+
+def test_targeted_writes_use_their_own_connections_while_a_sweep_holds_the_lock():
+    # The webhook's lock-less entry points must work concurrently with a sweep
+    # and stay out of the lock connection's lifecycle: each takes its own
+    # pooled, statement-bounded connection instead of the lock's session.
+    db = _FakeMultiDb()
+    store = PostgresCogCatalogStore(db)
+    with store.sweep_lock() as held:
+        assert held is True
+        store.upsert(artifact("a"), targeted=True)
+        store.mark_removed_one(SOURCE, "cogs/cog-a", DIGEST_A)
+        assert len(db.connections) == 3, "each targeted write checked out its own connection"
+        for conn in db.connections[1:]:
+            assert conn.statements[0].startswith("SELECT set_config('statement_timeout'")
+        assert not any(s.startswith(("INSERT", "UPDATE")) for s in db.connections[0].statements), (
+            "nothing targeted ran on the lock's session"
+        )
+
+
+def test_a_losing_sweep_lock_neither_publishes_nor_clears_the_winners_session():
+    db = _FakeMultiDb(lock_answers=[True, False])
+    store = PostgresCogCatalogStore(db)
+    with store.sweep_lock() as held:
+        assert held is True
+        winner = db.connections[0]
+        with store.sweep_lock() as second:
+            assert second is False
+            assert store._lock_conn is winner, "a loser must not publish its own connection"
+        assert store._lock_conn is winner, "a loser's exit must not withdraw the winner's publication"
+        store.known(SOURCE)
+        assert len(db.connections) == 2 and winner.statements[-1].startswith("SELECT repository")
+    assert store._lock_conn is None
+
+
 def test_get_prefers_present_rows_and_scopes_by_source_and_repository():
     store, conn = _fake_store([[_row()]])
     found = store.get(DIGEST_A, source_id=SOURCE, repository="cogs/cog-a")
@@ -1126,3 +1227,72 @@ def test_live_concurrent_sweepers_exactly_one_wins(live_store):
         for store in stores:
             store._db.close()
     assert results.count(True) == 1 and results.count(False) == replicas - 1
+
+
+@live_postgres
+def test_live_sweep_writes_share_the_lock_sessions_backend(live_store):
+    """Issue #128, live: the sweep's write session IS the lock session.
+
+    Asserted by backend identity (``pg_backend_pid``), which is what "same
+    session" means server-side -- a write on that backend is dropped with the
+    lock if the sweeper dies. The targeted path is asserted to use a
+    *different* backend, so a webhook write lands concurrently with a sweep.
+    """
+
+    store, database = live_store
+    with store.sweep_lock() as held:
+        assert held is True
+        with database.connection() as conn:
+            row = conn.execute(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = %s AND objid = %s",
+                (COG_INDEX_LOCK_KEY >> 32, COG_INDEX_LOCK_KEY & 0xFFFFFFFF),
+            ).fetchone()
+        holder_pid = row["pid"]
+        with store._sweep_connection() as conn:
+            assert conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"] == holder_pid
+        with store._own_connection() as conn:
+            assert conn.execute("SELECT pg_backend_pid() AS pid").fetchone()["pid"] != holder_pid
+        # A write on the lock session commits statement by statement
+        # (autocommit) and is visible to other sessions mid-sweep.
+        store.upsert(artifact("a"))
+        assert store.get(digest("a")) is not None, "get() reads on an ordinary pooled connection"
+    assert store._lock_conn is None
+
+
+@live_postgres
+def test_live_sweep_write_cannot_apply_once_the_lock_session_is_dead(live_store):
+    """Kill the lock backend mid-sweep: the next sweep write fails instead of landing.
+
+    The crash window of issue #128, exercised from the lock's side: the moment
+    the server drops the lock session, another replica can acquire the lock --
+    and the old sweeper's write, riding that dead session, can no longer apply.
+    """
+
+    import psycopg
+
+    store, database = live_store
+    other = PostgresCogCatalogStore(_database(max_size=2))
+    try:
+        with pytest.raises(psycopg.Error):
+            with other.sweep_lock() as held:
+                assert held is True
+                with database.connection() as conn:
+                    row = conn.execute(
+                        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = %s AND objid = %s",
+                        (COG_INDEX_LOCK_KEY >> 32, COG_INDEX_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()
+                    conn.execute("SELECT pg_terminate_backend(%s)", (row["pid"],))
+                # The server freed the lock with the session: another replica
+                # can take it (polled -- termination is asynchronous)...
+                deadline = time.monotonic() + 10
+                acquired = False
+                while not acquired:
+                    with store.sweep_lock() as acquired:
+                        pass
+                    assert acquired or time.monotonic() < deadline, "the freed lock was never acquirable"
+                # ...while the old sweeper's write rides the dead session and
+                # dies with it instead of landing under the new holder's lock.
+                other.upsert(artifact("a"))
+        assert store.get(digest("a")) is None, "the fenced write did not land"
+    finally:
+        other._db.close()
