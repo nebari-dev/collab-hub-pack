@@ -944,15 +944,16 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
         )
     pool = config.frames.postgres.pool
     if pool.max_size < 2:
-        # A sweep holds one pooled connection for its session-level advisory
-        # lock for the sweep's whole duration and checks out a second for
-        # every read and write. With max_size=1 the sweep would wait on its
-        # own occupied connection and time out -- every time, silently, at
-        # runtime. Refuse the rollout instead.
+        # A sweep occupies one pooled connection for its whole duration: the
+        # session-level advisory lock is held on it, and the sweep's reads and
+        # writes ride it too (issue #128). With max_size=1 that is the pool's
+        # only connection gone for minutes at a time -- every API read and
+        # every webhook write would wait on the sweep and time out, silently,
+        # at runtime. Refuse the rollout instead.
         raise RuntimeError(
             "cogs.index.enabled requires frames.postgres.pool.max_size >= 2 "
-            f"(configured: {pool.max_size}): the indexer's sweep lock occupies one pooled "
-            "connection for the whole sweep while its reads and writes need another."
+            f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
+            "connection for the whole sweep while everything else needs another."
         )
     sources = build_registry_sources(list(cogs.registry_sources))
     return CogIndexing(
