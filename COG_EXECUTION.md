@@ -12,7 +12,7 @@ The hub runs **Cogs** — packaged AI workers — and **Ops** — supervised, mu
 
 - **Two locations.** A worker runs as **`local`** — a child process of the run controller, on the same OS — or **`remote`** — a Kubernetes pod. Same runner, same Cog, one configuration value; `local` first.
 - **Three durability backends.** **`none`** (no durability engine), **`dbos`** and **`temporal`**, behind one seam. **The priority is `none`**: it ships first, `dbos` is the next brought to a full implementation, `temporal` comes last.
-- **Any harness.** The hub never learns which agent harness a Cog uses. **Hermes** is the first harness Cog; **pi** and **OpenCode** follow, and any harness that speaks ACP wraps with the adapter Hermes uses. Supporting a new harness is an adapter in the Worker SDK, never a change to the hub.
+- **Any harness.** The hub never learns which agent harness a Cog uses. **Hermes** is the first harness Cog; **pi** and **OpenCode** follow, and any harness that speaks ACP wraps with the adapter Hermes uses. Supporting a new harness is an adapter in the Worker SDK, never a change to the hub. This is the decision the rest of the plan rests on (§4).
 - **Launched from Collab, and from a terminal.** The desktop submits a run, watches its Track, decides its Gates and grants connector access — on the hub first, and later on the user's own machine, through the same run API. The `collab-hub` CLI drives the same endpoints, so every feature is scriptable from the day it exists.
 - **Accountable and bounded.** Every run has a Track that names what produced each result and who signed it. Gates are declared on Op steps and decided by people. Budgets, least-privilege workloads and egress restriction hold the trust boundary.
 
@@ -67,6 +67,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 
 - **Hermes and the hub share a Python, and still not an interpreter.** `hermes-agent` requires `>=3.11,<3.14`; the API requires `>=3.13`. The harness still lives in its Cog's own environment — ADR-0001 D2 and the seam put it there, and a Cog pins its own interpreter whatever the hub runs.
 - **Collab already drives Hermes over ACP**, headlessly configured, in its own environment (Python 3.13, `hermes-agent` 0.17 with the `acp` and `mcp` extras), with tools sandboxed in Docker. Known hazard: Hermes 0.17's ACP adapter reports a failed turn as `stopReason: end_turn`.
+- **Collab's chat runs on [Ravnar](https://github.com/nebari-dev/ravnar)**, the AG-UI agent server behind [chat-pack](https://github.com/nebari-dev/chat-pack), and that is where the desktop already handles per-turn context, Frames and streaming for a conversation. Cog execution needs the same three features and does not run on Ravnar to get them: Ravnar is a chat engine, not an execution engine, and a Cog must run on the hub with no desktop code in it (decision 19).
 - **The desktop has a local Python host** above the execution package's floor, and already models local-versus-remote placement for what it runs.
 - **Both durability engines support every Python the hub does.** DBOS 2.31 and temporalio 1.32 require `>=3.10` and list 3.13 and 3.14.
 - **DBOS can checkpoint to SQLite**, so a desktop can run durably without Postgres. Temporal needs a Temporal service and cannot.
@@ -144,9 +145,9 @@ flowchart LR
 | **KubernetesCogExecutor** | The `remote` executor: a per-run Deployment, Service and NetworkPolicy, the artifact pulled by an init container. | Inside the Run controller, on a hub | Phases 18, 19 |
 | **Model egress gateway · connector proxy** | The hub Services a `remote` worker may reach, by their cluster-internal names: the gateway forwards to the endpoints in `models:` that lie outside the cluster — a model served in the same cluster is selected by the egress policy directly — and the proxy acts as the user under a grant. Both take the run token. | The hub | Phases 25, 26 |
 | **Local worker** / **Remote worker** | The same Cog package, materialized as a child process or as a pod. Nothing in the package knows which. | The controller's host / the controller's namespace | Phases 8, 18 |
-| **Worker SDK** | The seam implemented once: `POST /invoke` returning an envelope, `GET /healthz`, cancellation, the binding loader, the claim client, run-token verification. A library a Cog *may* use; the hub never imports it. | Inside a worker | Phase 12 |
+| **Worker SDK** | The seam implemented once: `POST /invoke` returning an envelope, `GET /healthz`, cancellation, the binding loader, the claim client, run-token verification — and what every harness needs per turn: the model's limits, the step's Frames in the prompt, `context-exhausted`. A library a Cog *may* use; the hub never imports it. | Inside a worker | Phase 12 |
 | **Harness adapter** | The `HarnessAdapter` protocol between the SDK and an agent harness: `start`, `interact`, `cancel`, `close`. One adapter covers a protocol family; ACP first. | Inside a worker | Phase 12 |
-| **Harness** | The agent the adapter drives: Hermes over ACP first, pi and OpenCode next. It lives in the Cog's own environment, never in the hub. | Inside a worker | Phase 13; decision 17 |
+| **Harness** | The agent the adapter drives: Hermes over ACP first, pi and OpenCode next. It lives in the Cog's own environment, never in the hub, and owns its loop: per-turn context, overflow recovery, compaction (decision 19). | Inside a worker | Phase 13; decision 17 |
 | **Local run host** | `collab-hub-execution` embedded in the desktop, serving the same Run API routes and claim transport on a bearer-gated loopback surface, with the `local` executor and `none` or `dbos` on SQLite. | The user's machine | Phase 28 |
 
 
@@ -214,7 +215,9 @@ Location and backend are independent: either location runs under any backend, an
 
 ### Harness neutrality
 
-The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and reads an envelope. "Any harness is supported" is therefore something the hub has by construction; the work is making a harness cheap to wrap. The Worker SDK (Phase 12) implements the seam once — envelope, health, keyed claim, binding, cancellation, usage — and hands the interaction to a `HarnessAdapter`. ACP comes first because it is how Collab already drives Hermes and a protocol other agent harnesses implement too, so one adapter covers a family rather than one product: Hermes is the first Cog built on it (Phase 13), pi and OpenCode the next, each a Cog package and, where the harness does not speak ACP, an adapter — never a change to the hub. The SDK is a library a Cog author *may* use; the hub requires only the seam, and an import-boundary test keeps the hub from ever depending on it.
+**The load-bearing decision.** The hub never learns which harness a Cog uses: it POSTs a task to `/invoke` and reads an envelope. "Any harness is supported" is therefore something the hub has by construction; the work is making a harness cheap to wrap. The Worker SDK (Phase 12) implements the seam once — envelope, health, keyed claim, binding, cancellation, usage — and hands the interaction to a `HarnessAdapter`. ACP comes first because it is how Collab already drives Hermes and a protocol other agent harnesses implement too, so one adapter covers a family rather than one product: Hermes is the first Cog built on it (Phase 13), pi and OpenCode the next, each a Cog package and, where the harness does not speak ACP, an adapter — never a change to the hub. The SDK is a library a Cog author *may* use; the hub requires only the seam, and an import-boundary test keeps the hub from ever depending on it.
+
+**What each harness owns, and what the seam hands every harness.** An agent loop does per-turn work the hub never sees: reserving output headroom, recovering from a context overflow, compacting history, choosing what enters each turn. Under this seam that work belongs to the harness, inside the Cog, so each harness owns it — Hermes does it in its own loop. `RunBudget` (Phase 22) is not that work: it bounds a whole run from outside. What is *not* left to each harness is what every harness needs in order to do it, and the Worker SDK hands that to all of them the same way (decision 19): the model's context window and maximum output, in the binding; the step's Frames, snapshotted at submit and placed in the prompt; one envelope error, `context-exhausted`, for an input that could not fit; and, once decision 20 settles, the harness's progress while a step runs. So none of this is rediscovered per harness. The desktop's chat solves the same problems for a conversation, on Ravnar; a Cog run solves them at this seam instead.
 
 **Python.** Each distribution declares its own floor and CI tests that floor and the newest version: the API `>=3.13`, the execution package, the Worker SDK and the CLI `>=3.11`. A Cog's environment pins its own interpreter, so none of these constrains what a harness needs.
 
@@ -424,7 +427,7 @@ Move approval out of the Cog and onto the Op step, where the glossary puts it.
 Make the Track answer "what produced this, and who signed it".
 
 *In scope*
-- Event schema v1, versioned by a `schema` field: `step_completed` carries the envelope's `binding`, `problems`, `usage` and a **reference** to the payload, not the payload inline; `gate_escalated` and `gate_decided` (each with its escalation id, the latter with the actor) brought into v1; `step_failed` carries a bounded message, the error code, the idempotency key and the worker name. Pre-v1 events still replay through a reader, with a fixture in the conformance suite.
+- Event schema v1, versioned by a `schema` field: `step_completed` carries the envelope's `binding`, `problems`, `usage`, a **reference** to the payload, not the payload inline, and the Frames the step was given, each as its id and snapshot digest — empty until Phase 11 delivers any; `gate_escalated` and `gate_decided` (each with its escalation id, the latter with the actor) brought into v1; `step_failed` carries a bounded message, the error code, the idempotency key and the worker name. Pre-v1 events still replay through a reader, with a fixture in the conformance suite.
 - Large payloads stored by reference above a size threshold.
 - Hub Track tables through `COLLAB_SCHEMA_MIGRATIONS`; the standalone store's `ensure_schema` stays for standalone and local use, and the hub never calls it.
 - `SqliteTrackStore`, so level 1 runs the API and the controller as two processes over one Track file, and the desktop has its Track later.
@@ -434,7 +437,7 @@ Make the Track answer "what produced this, and who signed it".
 *Dev and CI* — at level 2, `make psql` shows the Track tables created by migrations, and `levels-2-3` asserts the schema comes from nowhere else; at level 1 the SQLite Track lives in `dev/.local/`. *Docs* — a new `docs/cog-execution/track.md`; `docs/frames-operations.md` lists the tables.
 
 *Acceptance*
-- [ ] For any completed step, the Track alone names the Cog digest, binding, problems and usage that produced it; for any gate, who decided.
+- [ ] For any completed step, the Track alone names the Cog digest, binding, problems, usage and Frames that produced it; for any gate, who decided.
 - [ ] Status is derived from the Track after an API restart.
 - [ ] The hub's Track schema is created only by migrations.
 - [ ] In-memory, SQLite and Postgres stores all pass the Track conformance suite, including the pre-v1 fixture.
@@ -540,7 +543,7 @@ The process that advances runs, separate from the process that accepts them — 
 - On start, the controller records `interrupted` for every run it owned and did not finish, and reaps, by the pid and process group it recorded, any `local` worker of its own left behind.
 - **Signals travel through the Track.** The API records what a client asked for — `gate_decided`, `cancel_requested` — and the controller's Track watcher delivers it to the run it owns: under `none` straight to the waiting runner, under `dbos` and `temporal` as the engine's own message or signal (Phases 23, 29). Nothing calls the controller, so the API needs no route to it and no engine client.
 - Controller health and readiness.
-- A minimal `models:` configuration block — endpoint, model id, `auth_ref` — from chart values and environment, since the hub has none today (§3). It is what the controller writes the stopgap binding from until Phase 21, and what Phase 21's inventory is generated from after.
+- A minimal `models:` configuration block — endpoint, model id, `auth_ref`, and the model's context window and maximum output tokens — from chart values and environment, since the hub has none today (§3). It is what the controller writes the stopgap binding from until Phase 21, and what Phase 21's inventory is generated from after.
 
 *Dev and CI* — `make controller` — SQLite Track at level 1, Postgres at level 2, `BACKEND=` and `LOCATION=` selecting each axis — and `make op` now records intent for the controller to pick up. CI: `level-1` asserts a fake Op completes across the two processes and that killing the controller leaves the run `interrupted`; `levels-2-3` asserts two controllers never both start one run. *Docs* — `runs.md` gains the controller; the root `README.md` *Architecture* diagram gains it and its workers; the glossary's *Run pickup* entry and ADR-0002 D4, which still say `dbos` and `temporal` replace pickup, are corrected to say they take over ownership after it.
 
@@ -561,7 +564,8 @@ The primary goal, in three phases: the endpoints that launch a run, the SDK that
 State a Cog for execution, run it, read its output and errors, stop it — as endpoints Collab and any other client can use.
 
 *In scope* — under `/v1`, authenticated, with protection-map entries and OpenAPI:
-- `POST /v1/runs` — submit an Op: JSON mirroring `OpDefinition` (steps with `name`, `cog`, `entry_point`, `input`, `gate`). Until Phase 20 a step's `cog` names a package known to Phase 8's directory package source — how level 1 names `cogs/hermes` — and an unknown name is refused with 422.
+- `POST /v1/runs` — submit an Op: JSON mirroring `OpDefinition` (steps with `name`, `cog`, `entry_point`, `input`, `frames`, `gate`). Until Phase 20 a step's `cog` names a package known to Phase 8's directory package source — how level 1 names `cogs/hermes` — and an unknown name is refused with 422.
+- **A step's Frames**, by id. At submit the API checks that each exists and that the submitter can read it — 404 or 403 naming the Frame otherwise, the "verify existence and access" of apollo-desktop#690 — and snapshots its body, stored by reference like a large payload (Phase 5), with each Frame's id and snapshot digest recorded on `op_submitted`. Frames have no revisions — their history is an event log, not versions — so the snapshot is what makes a retried or resumed step see what was submitted rather than the Frame as edited since.
 - `GET /v1/runs`, `GET /v1/runs/{id}` — organization-scoped, status derived from the Track, `interrupted` included, and for a step waiting at a Gate the open escalation id a decision must name.
 - `GET /v1/runs/{id}/events` — replay from `after`, and `text/event-stream` for a live run.
 - `GET /v1/runs/{id}/steps/{step}/payload` — the output a step event references, under the run's own authorization; errors are read from `step_failed` events.
@@ -577,6 +581,7 @@ State a Cog for execution, run it, read its output and errors, stop it — as en
 - [ ] A worker commits its claim, the controller is killed before the Track records the step, and `POST .../retry` returns the original envelope with the work having run once.
 - [ ] Two conflicting decisions on one escalation: one wins, the other is a conflict; an approval naming an escalation closed by a send-back is refused as stale.
 - [ ] A member without an approver role gets 403, and a member of another organization cannot read a run's payload; every accepted decision is on the Track with its actor.
+- [ ] A step naming a Frame its submitter cannot read is refused at submit, and a retried step is given the snapshot taken at submit, not the Frame as edited since.
 - [ ] Unauthenticated requests are refused under the hardened path map.
 
 #### Phase 12 — Worker SDK and harness-neutral adapters
@@ -589,13 +594,17 @@ Implement the seam once, so wrapping a harness is an adapter rather than a serve
 - A `HarnessAdapter` protocol: `start(binding)`, `interact(task, context, signal)`, `cancel()`, `close()`.
 - `AcpHarnessAdapter`: spawns any ACP agent over stdio, runs `session/new` then `session/prompt`, and folds `session/update` notifications into `raw` and `payload`. It derives `ok` and `error` from explicit failure signals, **not from `stopReason` alone** — Hermes 0.17 reports a failed turn as `end_turn`. Permission requests outside the Cog's declared tools are denied.
 - `OpenAICompatAdapter`: one model call, no tools. It proves neutrality and is what a plain context Cog needs anyway.
+- **Frames, the same way to every harness.** The task bundle carries the step's Frame snapshots (Phase 11) and the SDK hands them to the adapter: `AcpHarnessAdapter` sends each in `session/prompt` as an embedded `resource` block (`text/markdown`, a URI naming the Frame) when the agent advertises `promptCapabilities.embeddedContext` at `initialize`, and as a text block when it does not; `OpenAICompatAdapter` sends them as context messages. A harness Cog never calls the Frames API; Frames a Cog has to find while it runs come later, through the hub-mediated Frames MCP (Phase 26).
+- **The model's limits, in the binding.** The binding file carries the model's context window and maximum output tokens, and the SDK hands them to the adapter, so a harness reserves output headroom from a number rather than a guess. The SDK does not run a harness's turns: an agent harness runs its own loop and owns its context within it (decision 19).
+- **One error for a context that did not fit.** `context-exhausted` joins the envelope's closed error-code set — `result-envelope.md` and the hub's parser change in this PR, before any worker emits it — mapped to 422: the input and Frames could not fit the bound model even after the harness's own recovery. Retrying on the same binding would not help, so a Gate or a person chooses a larger model or fewer Frames.
 - A stdlib fake ACP agent and a stdlib fake OpenAI-compatible model server, so both adapters test at level 1 without installing a harness or starting a container.
 - An import-boundary test: the API and the execution package never import the SDK. A Cog's pixi environment gets the SDK as a git dependency on this repository at a commit (decision 12).
 
-*Dev and CI* — both stdlib fakes sit in `scripts/testdata/`; `make fake-model` runs the model one at level 1; the adapter conformance suite runs in its own path-gated workflow on Python 3.11 and 3.14. *Docs* — a new `worker/README.md`: writing a Cog on the SDK, the adapter protocol, the claim and authentication hooks, and the `end_turn` hazard.
+*Dev and CI* — both stdlib fakes sit in `scripts/testdata/`; `make fake-model` runs the model one at level 1; the adapter conformance suite runs in its own path-gated workflow on Python 3.11 and 3.14. *Docs* — a new `worker/README.md`: writing a Cog on the SDK, the adapter protocol, the claim and authentication hooks, the `end_turn` hazard, and what a harness owns per turn against what the SDK hands it (decision 19); `result-envelope.md` gains `context-exhausted`.
 
 *Acceptance*
 - [ ] Both adapters pass one shared adapter conformance suite through the same seam server, on Python 3.11 and 3.14.
+- [ ] A step's Frames reach both fakes' prompts — as embedded resources or as text, as the fake ACP agent advertises — and an input larger than the binding's context window ends the step `ok: false` with `context-exhausted`.
 - [ ] A worker built on the SDK runs as a `local` worker under Phase 8's executor and honours Phase 9's claim; Phase 19's materialization later runs it unchanged.
 
 #### Phase 13 — The Hermes harness Cog, launched by the hub as a local process
@@ -606,6 +615,7 @@ The primary goal: `POST /v1/runs` on a laptop starts Hermes as a separate proces
 *In scope*
 - `cogs/hermes/` in this repository (decision 16), published as `<registry>/cogs/hermes` by the publish workflow Phase 19 adds: a pixi environment on Python 3.13 — Hermes does not support 3.14 — with `hermes-agent[acp,mcp]==0.19.0` pinned, whose `serve` is the SDK with `AcpHarnessAdapter` running `hermes acp`.
 - Hermes configured headlessly from the binding at start, **porting** the desktop's headless Hermes configuration (written for 0.17, re-verified against 0.19) rather than re-deriving it: model endpoint and key by reference.
+- **Hermes over ACP, not the desktop's chat.** The Cog drives `hermes acp` through the Worker SDK and does not reuse the desktop's chat pipeline, which runs on Ravnar and needs the desktop. Hermes runs its own agent loop, so what it keeps in context from turn to turn is Hermes' own; the Cog hands it the binding's limits as far as its configuration takes them, and the step's Frames arrive in its prompt as ACP resources (Phase 12). That needs no tools, so M3 can already ground a step in a Frame.
 - **No tools at first** (decision 14): no MCP servers configured, Hermes' terminal and file tools disabled — prompt in, envelope out. Hub-mediated MCP (Frames, connectors, restricted to hub endpoints) arrives with Phase 26's grants; Hermes' terminal backend, which would make the worker the sandbox, only once Phase 25's egress restriction and authenticated `/invoke` exist, and only for `remote`.
 - Level 1 runs it straight from `cogs/hermes` through Phase 8's directory package source — no registry — until Phase 20 installs it by digest.
 - A CI test against the stdlib fake model; one opt-in test against a real model.
@@ -614,10 +624,11 @@ The primary goal: `POST /v1/runs` on a laptop starts Hermes as a separate proces
 
 *Acceptance*
 - [ ] An Op step naming this Cog's bundled `ask`, submitted through `POST /v1/runs`, completes in a child process of the controller with a valid envelope, at level 1. (A context Cog *requiring* a harness resolving to it is Phase 21's, where resolution lives.)
-- [ ] A Hermes failure surfaces as `ok: false` with an error code, not as a silent `end_turn`.
+- [ ] A Hermes failure surfaces as `ok: false` with an error code, not as a silent `end_turn`; a turn that overflows the bound model and cannot recover surfaces as `context-exhausted`.
+- [ ] A step given a Frame completes with the Frame in Hermes' prompt, and the Track names the Frame and its snapshot digest.
 - [ ] The Cog contains nothing that knows whether it is a process or a pod.
 
-*Risk* — 0.19's ACP surface is not the 0.17 one Collab drives today; the configuration port and the `end_turn` handling are re-verified against 0.19 in the first CI run, and the pin moves only by a deliberate change.
+*Risk* — 0.19's ACP surface is not the 0.17 one Collab drives today; the configuration port, the `end_turn` handling and whether 0.19 advertises `embeddedContext` are re-verified against 0.19 in the first CI run, and the pin moves only by a deliberate change.
 
 ---
 
@@ -692,7 +703,7 @@ Needs only Phase 11, the run API, so it lands before the worker becomes a pod: f
 #### Phase 17 — Desktop run view and Gate decisions
 **Issue** apollo-desktop#719 · **Branch** `feat/run-view-gate-decisions-719` · **Depends on** Phases 4, 16 · **Size** M
 
-*In scope* — a run list and a run view rendering Track events and step payloads; a pending decision surface for escalated gates showing the envelope's `problems` and, once Phase 24 lands, Guard findings; approve, reject and send back with findings; cancel and retry; an `interrupted` run shown as such, with retry offered, and the backend and location a run runs under visible.
+*In scope* — a run list and a run view rendering Track events and step payloads; a pending decision surface for escalated gates showing the envelope's `problems` and, once Phase 24 lands, Guard findings; approve, reject and send back with findings; cancel and retry; an `interrupted` run shown as such, with retry offered, and the backend and location a run runs under visible; once decision 20 settles, a step's progress while it runs.
 
 *Dev and CI* — `make op OP=needs-review` leaves a pending decision to act on in Collab, and `make seed-org SUB=$(make -s sub)` makes the signed-in `dev` user an approver. *Docs* — the desktop's docs; `dev/README.md` gains the recipe above.
 
@@ -772,7 +783,7 @@ Pinning a Cog and proving it works happens once, not on every run.
 The hub offers, the Cog selects, the hub records and delivers — so the hub does not grow a parallel resolver (#3 thread). Since Phase 10 the controller has written the binding file from the hub's `models:` block, and Phase 12's SDK has read it; this phase retires that stopgap: the Cog's `resolve` becomes the producer, and the file the worker reads does not change.
 
 *In scope*
-- A satisfier **inventory** generated from the hub's model configuration: one descriptor model Cog per served model, carrying endpoint, model id, transport, locality and `auth_ref`.
+- A satisfier **inventory** generated from the hub's model configuration: one descriptor model Cog per served model, carrying endpoint, model id, transport, locality, `auth_ref`, and its context window and maximum output tokens, which the binding passes on so a harness sizes its turns from them.
 - Resolution invokes the installed Cog's `resolve` lifecycle entry point with that inventory, and the hub records the **binding record**. `DeclaredCapabilityResolver` becomes a test double.
 - The binding is delivered to the worker as a mounted file plus environment; secrets arrive by reference. A check refuses literal secrets in manifests and bindings.
 - The binding id appears on every step event and in the envelope's `binding`.
@@ -794,6 +805,7 @@ The hub offers, the Cog selects, the hub records and delivers — so the hub doe
 - A terminal status per dimension: `budget_exceeded` with `dimension: duration | tokens | cost`.
 - **Duration** is a hard pre-check at step boundaries plus an interaction deadline that cancels the in-flight worker through the executor.
 - **Tokens and cost** stay post-interaction accounting, documented as such; the hard per-request cap is the binding's gateway `max_tokens`.
+- A budget bounds the run from outside. It is not per-turn context management — headroom within a turn, overflow recovery and what enters each turn are the harness's (decision 19) — and `runs.md` says so, so no one reads a budget as one.
 - **Warm mode**: an `idle_timeout` per step or per Cog; a warm pool keyed by `(digest, binding id)`; `IDLE` observable in the lifecycle before teardown. One-shot runs release immediately; uninstall drains the pool.
 - `retry()` after a budget stop opens a new budget epoch, so the reconstructed budget does not trip again at once (#4 thread).
 - All of this lives in the runner's step functions, so it behaves identically under every backend.
@@ -843,7 +855,7 @@ The first durability engine behind the runner — what makes #2's "a restart doe
 
 *In scope*
 - A `Guard` protocol: `(envelope, step context) -> findings`. Guards produce findings; they never decide.
-- Built-in Guards: **Schema** (payload against the card's output schema), **Source-grounding** (quoted spans present in the step's bound Frames and sources), **Policy** (declarative organization rules plus the card's `prohibits`).
+- Built-in Guards: **Schema** (payload against the card's output schema), **Source-grounding** (quoted spans present in the Frame snapshots the step was given — Phase 11, recorded on the Track — and in its sources), **Policy** (declarative organization rules plus the card's `prohibits`).
 - An Op declares `guards` per step. Findings are recorded as `guard_evaluated` events and fed to the step's Gate. Guards run as a runner step function, so they behave the same under every backend.
 - A Cog's own `problems` are input to Guards, never their verdict.
 - A plug point for #13's downgrade verification.
@@ -916,6 +928,7 @@ The desktop embeds what M2 built: `local` is its executor, and Phase 23's `dbos`
 *In scope*
 - `collab-hub-execution` embedded in the desktop's local Python host, serving **the same run API routes as Phase 11**, and Phase 9's claim transport for its own workers, on its bearer-gated loopback surface, backed by Phase 8's `local` executor — `none` by default, Phase 23's `dbos` on SQLite selectable.
 - Hermes runs locally through the same harness Cog, with the desktop's existing Docker terminal sandbox rather than in-process tools.
+- A local Cog run stays separate from the desktop's chat, though both drive Hermes over ACP. A chat is a conversation on Ravnar, steered turn by turn, with no Track; a Cog run is a step of an Op, through the Worker SDK, with an envelope, a Track and Gates. They share the Hermes pin, its headless configuration and its ACP failure handling, not the loop that drives it; a chat that wants a Cog run starts one through this run API (decision 19).
 - Phase 16's local run target implemented; a run bound to local-only resources never reaches the hub.
 - Local Tracks stay local. Linux and macOS only, as `local` is (decision 15).
 
@@ -1023,12 +1036,13 @@ flowchart TD
 | **Every Cog execution feature reachable from a CLI, over the same REST API** | 14, 15, and each later phase's own commands |
 | **Location priority: `local` first, `remote` next, both on `none` before any durable backend** | 8, 18, 23 |
 | **The states of the Cog, a worker, a step attempt and a run, each held by one tested machine on the state pattern, early** | 3; §11 |
+| **Per-turn context, Frames and progress named once for every harness, not rediscovered per harness** | 10, 11, 12, 13, 22; decisions 19, 20 |
 | **Backend priority: `none` first, `dbos` next to a full implementation, `temporal` last** | 7, 23, 29 |
 | A lifecycle component without a durability engine (`none`) or with one (`dbos`, `temporal`) | 6, 7, 23, 29 |
 | apollo-desktop#690 — state a Cog for execution, run it, read output and errors, stop it | 11, 15, 16, 19, 20 |
 | · read a Cog, set up its environment | 8, 19, 20 (catalog from #85) |
 | · find the model | 21 (Phase 10's stopgap until then) |
-| · find Frames, data and other elements; verify existence and access | 21, 24, 26 |
+| · find Frames, data and other elements; verify existence and access | 11, 12, 21, 24, 26 |
 | · execute the Cog | 6, 7, 8, 10, 12, 13, 18 |
 | · capture and relay output | 2, 11, 15, 16 |
 | · log start, stop and errors | 5 |
@@ -1059,7 +1073,7 @@ flowchart TD
 
 ## 10. Decisions
 
-Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the phase that needs them — 4 by Phase 22, 5 by Phase 26, 7 by Phase 28, 9 once M3 lands, 8 at the next Python release.
+Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the phase that needs them — 4 by Phase 22, 5 by Phase 26, 20 by Phase 17, 7 by Phase 28, 9 once M3 lands, 8 at the next Python release.
 
 1. **Default approvers** when a Gate declares none — *decided 2026-09-16:* organization owners and platform operators, the two roles `seed-org` already grants (Phases 4, 11).
 2. **The hub's production durability backend** — *decided 2026-09-16:* `dbos` — it reuses the Track's Postgres and adds no service; the chart's production values select it once Phase 23 lands. `none` stays the default for development, tests and the desktop.
@@ -1077,8 +1091,10 @@ Opened by ADR-0002. Settled ones say so, with the date; the rest are due by the 
 14. **What the first Hermes run may do** — *decided 2026-09-16:* no tools at M3 — prompt in, envelope out. Hub-mediated MCP (Frames, connectors) follows Phase 26's grants.
 15. **Windows for `local`** — *decided 2026-09-16: no.* Linux and macOS in CI; the desktop's local run host (Phase 28) inherits the limit.
 16. **Which Hermes to pin, and where the Cog lives** — *decided 2026-09-16:* `hermes-agent` 0.19.0, and the Cog lives in this repository at `cogs/hermes/`, published with Nebi by a `publish-cogs.yaml` workflow to the registry the catalog indexes. The configuration it ports (written for 0.17) is re-verified against 0.19.
-17. **The next harness Cogs.** pi and OpenCode follow Hermes, each its own Cog under `cogs/`, in that order unless a user need reorders them; a harness that does not speak ACP gets an adapter in the SDK. Open: which ships first, and whether either needs an adapter of its own.
+17. **The next harness Cogs.** pi and OpenCode follow Hermes, each its own Cog under `cogs/`, in that order unless a user need reorders them; a harness that does not speak ACP gets an adapter in the SDK. Each owns its per-turn context as Hermes does, and gets its Frames, the model's limits and `context-exhausted` from the SDK (decision 19), so neither rediscovers them. Open: which ships first, and whether either needs an adapter of its own.
 18. **How the state machines are built** — *decided 2026-09-18:* on the [state pattern](https://en.wikipedia.org/wiki/State_pattern), one class per state behind its machine's interface, the context delegating every event to its current state (Phase 3). A transition table — what #35's `CogLifecycle` has — was the alternative; with the pattern each state owns its guards and the Track events it records, and a state added later is a class added rather than a table edited in several places.
+19. **Where per-turn context and Frames live in a Cog run** — *decided 2026-09-19:* per-turn context — output headroom, overflow recovery, compaction, what enters each turn — is the harness's, inside the Cog, and the hub never sees it; `RunBudget` bounds the run from outside. What every harness needs to do that is handed to all of them the same way by the Worker SDK: the model's context window and maximum output in the binding (Phases 10, 12, 21), the step's Frames checked and snapshotted at submit and placed in the prompt (Phases 11, 12), and `context-exhausted` for an input that cannot fit (Phase 12). Cog execution does not run on Ravnar, the desktop's chat engine: Ravnar solves these features for a conversation, a Cog run solves them at the seam, and a Cog needs no desktop code. The desktop's chat and its local Cog runs both drive Hermes over ACP and stay separate, conversational and workflow (Phase 28); they share the Hermes pin and its configuration, and a chat that needs a Cog run starts one through the run API.
+20. **Progress within a step.** The Track and the run API's stream are at step granularity: a step is one event, when it ends. A harness's progress inside a step — message chunks, tool calls and plans from ACP's `session/update` — reaches no one. Proposal: the Worker SDK may answer `/invoke` as a stream of progress lines ending with the envelope, a plain JSON answer staying valid for a Cog not built on the SDK; the controller writes the lines to a short-lived progress log beside the Track — never the Track, pruned when the step ends — and the run API's live stream interleaves them, while a replay with `after` does not return them.
 
 ## 11. Appendix — two launches, and the states of a Cog
 
