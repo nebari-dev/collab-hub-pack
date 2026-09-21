@@ -18,7 +18,7 @@ from collab_hub_execution import (
     OpDefinition,
     OpStep,
     RunBudget,
-    RunStatus,
+    RunState,
 )
 
 
@@ -55,11 +55,11 @@ def main() -> int:
 
     status = engine.submit(op)
     dump("after submit", status)
-    assert status is RunStatus.PAUSED, f"expected PAUSED at the gate, got {status}"
+    assert status is RunState.WAITING_AT_GATE, f"expected WAITING_AT_GATE, got {status}"
 
     status = engine.signal("e2e-run", {"approved": True})
     dump("after approval", status)
-    assert status is RunStatus.COMPLETED, f"expected COMPLETED after approval, got {status}"
+    assert status is RunState.COMPLETED, f"expected COMPLETED after approval, got {status}"
 
     events = [e.event_type for e in track.replay("e2e-run")]
     print("track events:", events, flush=True)

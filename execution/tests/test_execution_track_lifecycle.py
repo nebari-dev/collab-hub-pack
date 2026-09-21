@@ -5,25 +5,25 @@ import pytest
 from collab_hub_execution import (
     BudgetExceeded,
     BudgetTracker,
-    CogLifecycle,
     InMemoryTrackStore,
-    LifecycleState,
+    InvalidTransition,
     RunBudget,
-    RunStatus,
+    RunState,
     TrackEvent,
+    Worker,
+    WorkerState,
     derive_run_status,
 )
-from collab_hub_execution.lifecycle import InvalidLifecycleTransition
 
 
 def test_track_replays_in_append_order_and_derives_status():
     store = InMemoryTrackStore()
-    for kind in ("submitted", "materialized", "ready", "interaction_started", "idle", "completed"):
+    for kind in ("submitted", "run_picked_up", "materialized", "ready", "interaction_started", "idle", "completed"):
         store.append(TrackEvent(run_id="run-1", event_type=kind))
 
     events = store.replay("run-1")
-    assert [event.sequence for event in events] == list(range(1, 7))
-    assert derive_run_status(events) is RunStatus.COMPLETED
+    assert [event.sequence for event in events] == list(range(1, 8))
+    assert derive_run_status(events) is RunState.COMPLETED
     assert list(store.stream("run-1")) == list(events)
 
 
@@ -35,20 +35,17 @@ def test_track_stream_can_replay_after_a_cursor():
     assert [event.event_type for event in store.stream("run-1", after_sequence=first.sequence or 0)] == ["completed"]
 
 
-def test_lifecycle_rejects_skipped_transition():
-    lifecycle = CogLifecycle()
-    with pytest.raises(InvalidLifecycleTransition):
-        lifecycle.transition(LifecycleState.INTERACTING)
+def test_worker_rejects_skipped_transition():
+    worker = Worker.materialize("c", step="s").after
+    with pytest.raises(InvalidTransition):
+        worker.invoke(entry_point="run")
 
-    for state in (
-        LifecycleState.READY,
-        LifecycleState.INTERACTING,
-        LifecycleState.IDLE,
-        LifecycleState.TEARING_DOWN,
-        LifecycleState.TORN_DOWN,
-    ):
-        lifecycle.transition(state)
-    assert lifecycle.state is LifecycleState.TORN_DOWN
+    worker = worker.ready().after
+    worker = worker.invoke(entry_point="run").after
+    worker = worker.envelope_returned().after
+    worker = worker.tear_down(reason="one_shot").after
+    worker = worker.torn_down().after
+    assert worker.state is WorkerState.TORN_DOWN
 
 
 def test_budget_rejects_duration_and_usage_overruns():

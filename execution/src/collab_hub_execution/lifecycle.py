@@ -1,56 +1,12 @@
-"""Shared Cog lifecycle and per-run budget rules."""
+"""Per-run budget rules.
+
+A worker's lifecycle states are the worker machine in ``states/worker.py``.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
-
-
-class LifecycleState(StrEnum):
-    MATERIALIZED = "materialized"
-    READY = "ready"
-    INTERACTING = "interacting"
-    IDLE = "idle"
-    TEARING_DOWN = "tearing_down"
-    TORN_DOWN = "torn_down"
-    FAILED = "failed"
-
-
-class InvalidLifecycleTransition(ValueError):
-    """Raised when a Cog skips or reverses a lifecycle transition."""
-
-
-_TRANSITIONS = {
-    LifecycleState.MATERIALIZED: {LifecycleState.READY, LifecycleState.FAILED},
-    LifecycleState.READY: {LifecycleState.INTERACTING, LifecycleState.TEARING_DOWN, LifecycleState.FAILED},
-    LifecycleState.INTERACTING: {LifecycleState.IDLE, LifecycleState.FAILED},
-    LifecycleState.IDLE: {LifecycleState.INTERACTING, LifecycleState.TEARING_DOWN, LifecycleState.FAILED},
-    LifecycleState.TEARING_DOWN: {LifecycleState.TORN_DOWN, LifecycleState.FAILED},
-    LifecycleState.TORN_DOWN: set(),
-    LifecycleState.FAILED: set(),
-}
-
-
-class CogLifecycle:
-    """Local, per-interaction validation that a worker's states progress legally.
-
-    This is NOT the durable state machine. It is created fresh for each step and
-    only guards transition ordering within that step; it is never rehydrated. The
-    Track is the durable record of a run — recovery derives state from Track events
-    (materialized, ready, interaction_started, idle, step_completed, failed,
-    teardown_failed), not from this object. Transitions here that the Track does
-    not mirror (e.g. TORN_DOWN) are local assertions only.
-    """
-
-    def __init__(self) -> None:
-        self.state = LifecycleState.MATERIALIZED
-
-    def transition(self, target: LifecycleState) -> LifecycleState:
-        if target not in _TRANSITIONS[self.state]:
-            raise InvalidLifecycleTransition(f"cannot transition {self.state} → {target}")
-        self.state = target
-        return self.state
 
 
 @dataclass(frozen=True, slots=True)

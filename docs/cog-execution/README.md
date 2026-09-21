@@ -18,6 +18,8 @@ Contents:
   a Cog, and why nothing else crosses.
 - [The result envelope](result-envelope.md) — the shape a Cog's entry point
   returns; what Guards check, Gates read, and Tracks record.
+- [States](states.md) — the four state machines (install, worker, step
+  attempt, run): every state, every transition, and what each records.
 - [Sensitivity](sensitivity.md) — how data-sensitivity labels are born,
   propagated, and enforced (the basis of ADR-0001 D10).
 
@@ -94,6 +96,8 @@ decision, or a seam rule. A bare *Invariant N* is ADR-0001's.
     it, and asserted in CI at that level? (ADR-0002 invariant 5, D9.)
 14. Which documents did it make stale, and are they updated in the same PR?
     (ADR-0002 invariant 5, D10.)
+15. Does every change of state go through its machine, and does
+    [states](states.md) still match the code? (ADR-0002 D11.)
 
 ## How the open issues map to the ADR
 

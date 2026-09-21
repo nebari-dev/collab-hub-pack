@@ -15,7 +15,7 @@ from collab_hub_execution import (
     Problem,
     ResultEnvelope,
     RunBudget,
-    RunStatus,
+    RunState,
 )
 from collab_hub_execution.envelope import CODE_FOR_STATUS, STATUS_FOR_CODE
 from collab_hub_execution.kubernetes import _KubernetesWorker
@@ -108,7 +108,7 @@ def test_a_worker_that_builds_an_invalid_envelope_fails_durably_not_crashing_the
             return ResultEnvelope(ok=False)  # would have reached error.code with error None
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunStatus.FAILED
+    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
     failed = events(track, "env", "failed")[-1].payload
     assert failed["error"] == "EnvelopeInvalid" and "ok: false requires error" in failed["reason"]
 
@@ -140,7 +140,7 @@ def test_ok_with_problems_completes_the_step_and_records_them():
         ),
     })
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunStatus.COMPLETED
+    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.COMPLETED
     (completed,) = events(track, "env", "step_completed")
     assert completed.payload["output"] == {"answer": "draft"}
     assert completed.payload["problems"] == [
@@ -171,14 +171,14 @@ def test_each_error_code_fails_the_step_and_keeps_the_code(code):
     executor = InMemoryCogExecutor({"c": handler})
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=100))
-    assert engine.submit(op()) is RunStatus.FAILED
+    assert engine.submit(op()) is RunState.FAILED
     (failed,) = events(track, "env", "failed")
     assert failed.payload["error"] == code
     assert failed.payload["reason"] == f"{code} happened"
     assert failed.payload["step"] == "s0"
     # the failed call's spending is on the Track, and counts on retry
     assert events(track, "env", "interaction_usage")[-1].payload["usage"] == {"tokens": 7}
-    assert engine.retry("env") is RunStatus.COMPLETED
+    assert engine.retry("env") is RunState.COMPLETED
     assert engine._budget_tracker("env").tokens == 8
 
 
@@ -187,7 +187,7 @@ def test_an_error_envelope_with_problems_records_them_on_the_failure():
         "c": lambda e, v: ResultEnvelope.failure("invalid-input", "bad", problems=[Problem("input", "x")]),
     })
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunStatus.FAILED
+    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.FAILED
     (failed,) = events(track, "env", "failed")
     assert failed.payload["problems"] == [{"check": "input", "detail": "x", "severity": "error"}]
 
@@ -196,7 +196,7 @@ def test_missing_usage_under_a_budget_fails_even_in_a_valid_envelope():
     executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v)})
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=10))
-    assert engine.submit(op()) is RunStatus.FAILED
+    assert engine.submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == "UsageUnavailable"
 
 
@@ -207,7 +207,7 @@ def test_in_memory_handler_may_return_an_envelope_shaped_mapping_or_a_raw_value(
     })
     track = InMemoryTrackStore()
     definition = OpDefinition("mix", (OpStep("a", "c", "run", "x"), OpStep("b", "raw", "run", "y")))
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(definition) is RunStatus.COMPLETED
+    assert DurableWorkflowEngine(executor=executor, track=track).submit(definition) is RunState.COMPLETED
     first, second = events(track, "mix", "step_completed")
     assert first.payload["output"] == "x" and first.payload["problems"][0]["check"] == "schema"
     assert second.payload["output"] == {"answer": "y"} and "problems" not in second.payload
@@ -219,7 +219,7 @@ def test_a_worker_returning_something_else_fails_durably_as_envelope_invalid():
             return {"output": "done"}  # the pre-envelope shape
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunStatus.FAILED
+    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
     failed = events(track, "env", "failed")[-1].payload
     assert failed["error"] == "EnvelopeInvalid"
     assert failed["reason"] == "interact() must return a ResultEnvelope"
@@ -245,7 +245,7 @@ def test_http_200_envelope_is_parsed():
 def test_http_200_without_an_envelope_fails_the_step_as_envelope_invalid(body):
     worker = http_worker(lambda _: httpx.Response(200, json=body))
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunStatus.FAILED
+    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == "EnvelopeInvalid"
 
 
@@ -260,7 +260,7 @@ def test_http_error_statuses_carry_an_error_envelope_whose_code_is_kept(status, 
     envelope = worker.interact("run", "x")
     assert not envelope.ok and envelope.error.code == code and envelope.usage == {"tokens": 4}
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunStatus.FAILED
+    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == code
 
 

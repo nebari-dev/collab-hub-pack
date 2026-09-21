@@ -2,7 +2,7 @@
 
 A Track is the append-only record of one Op. Callers observe a run by reading
 the Track; status is a projection of its events, never a separately maintained
-mutable field.
+mutable field: the run machine (``states/run.py``) folded over the events.
 """
 
 from __future__ import annotations
@@ -10,29 +10,14 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from enum import StrEnum
 from threading import RLock
 from typing import Any, Protocol
 from uuid import uuid4
 
-
-class RunStatus(StrEnum):
-    UNKNOWN = "unknown"
-    SUBMITTED = "submitted"
-    RUNNING = "running"
-    MATERIALIZED = "materialized"
-    READY = "ready"
-    INTERACTING = "interacting"
-    PAUSED = "paused"
-    IDLE = "idle"
-    TEARING_DOWN = "tearing_down"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    TIMED_OUT = "timed_out"
-    BUDGET_EXCEEDED = "budget_exceeded"
+from .states.run import Run, RunState
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,34 +51,11 @@ class TrackStore(Protocol):
         """Yield new events, optionally polling until the timeout expires."""
 
 
-_STATUS_EVENTS = {
-    "op_submitted": RunStatus.SUBMITTED,
-    "submitted": RunStatus.SUBMITTED,  # replay compatibility with older Tracks
-    "step_started": RunStatus.RUNNING,
-    "materialized": RunStatus.MATERIALIZED,
-    "ready": RunStatus.READY,
-    "interaction_started": RunStatus.INTERACTING,
-    "paused": RunStatus.PAUSED,
-    "idle": RunStatus.IDLE,
-    "teardown_started": RunStatus.TEARING_DOWN,
-    # A finished step returns the run to RUNNING (it's between steps / progressing),
-    # not TEARING_DOWN — that per-step teardown is done. The final `completed`
-    # overrides this on the last step.
-    "step_completed": RunStatus.RUNNING,
-    "completed": RunStatus.COMPLETED,
-    "failed": RunStatus.FAILED,
-    "timed_out": RunStatus.TIMED_OUT,
-    "budget_exceeded": RunStatus.BUDGET_EXCEEDED,
-}
+def derive_run_status(events: Iterable[TrackEvent]) -> RunState | None:
+    """The run's state: its Track folded through the run machine; ``None`` if never submitted."""
 
-
-def derive_run_status(events: Iterator[TrackEvent] | tuple[TrackEvent, ...]) -> RunStatus:
-    """Calculate the status represented by the latest known event."""
-
-    status = RunStatus.UNKNOWN
-    for event in events:
-        status = _STATUS_EVENTS.get(event.event_type, status)
-    return status
+    run = Run.replay(events)
+    return None if run is None else run.state
 
 
 class InMemoryTrackStore:

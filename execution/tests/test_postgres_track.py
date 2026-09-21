@@ -19,7 +19,7 @@ from collab_hub_execution import (
     PostgresTrackStore,
     ResultEnvelope,
     RunBudget,
-    RunStatus,
+    RunState,
     TrackEvent,
     derive_run_status,
 )
@@ -47,13 +47,15 @@ def test_append_replay_ordering_jsonb_and_status(store):
     store.append(TrackEvent(run_id="r", event_type="submitted"))
     store.append(TrackEvent(run_id="r", event_type="op_submitted", payload={"op": {"steps": 2}}))
     store.append(TrackEvent(run_id="other", event_type="submitted"))
+    store.append(TrackEvent(run_id="r", event_type="run_picked_up"))
     store.append(TrackEvent(run_id="r", event_type="completed"))
 
     events = store.replay("r")
-    assert [e.event_type for e in events] == ["submitted", "op_submitted", "completed"]
+    assert [e.event_type for e in events] == ["submitted", "op_submitted", "run_picked_up", "completed"]
     assert [e.sequence for e in events] == sorted(e.sequence for e in events)  # stable global order
     assert events[1].payload == {"op": {"steps": 2}}  # jsonb round-trip
-    assert derive_run_status(events) is RunStatus.COMPLETED
+    # One run has one submission; the legacy `submitted` row above is only here to test ordering.
+    assert derive_run_status(events[1:]) is RunState.COMPLETED
     assert store.replay("r", after_sequence=events[0].sequence)[0].event_type == "op_submitted"
 
 
@@ -77,10 +79,10 @@ def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
         executor=InMemoryCogExecutor({"c": lambda entry, value: calls.append(value) or value}),
         track=store,
     )
-    assert engine.observe(op.run_id) is RunStatus.SUBMITTED
-    assert engine.submit(op) is RunStatus.COMPLETED
+    assert engine.observe(op.run_id) is RunState.SUBMITTED
+    assert engine.submit(op) is RunState.COMPLETED
     assert len(calls) == 1
-    assert engine.submit(op) is RunStatus.COMPLETED
+    assert engine.submit(op) is RunState.COMPLETED
     assert len(calls) == 1
 
 
@@ -96,6 +98,6 @@ def test_pause_accounting_survives_postgres_recovery(store):
         )
 
     op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
-    assert engine().submit(op) is RunStatus.PAUSED
-    assert engine().signal(op.run_id, "go") is RunStatus.BUDGET_EXCEEDED
+    assert engine().submit(op) is RunState.WAITING_AT_GATE
+    assert engine().signal(op.run_id, "go") is RunState.BUDGET_EXCEEDED
     assert engine()._budget_tracker(op.run_id).tokens == 18
