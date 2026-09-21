@@ -39,6 +39,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 - **#35** — the standalone `execution/` distribution `collab-hub-execution` (Python ≥ 3.11, depends only on `httpx`): `WorkflowEngine` and the reference `DurableWorkflowEngine`, which recovers from the Track when a caller resubmits; `CogExecutor` with in-memory and Kubernetes implementations (a per-run Deployment + Service + ingress-only NetworkPolicy, no ServiceAccount token on workers); `TrackStore` with in-memory and Postgres adapters; `CogLifecycle`, `RunBudget`; `DeclaredCapabilityResolver`; a kind E2E running a gated two-step Op (`test-execution.yaml`, `test-execution-e2e.yaml`).
 - **#111** and **#112** — Phases 0 and 1: the API runs on Python 3.13 with a CI job proving it, and ADR-0002 records the decisions the phases below depend on. **#115** moved the dev MinIO images to quay.io on the way.
 - **#120** — Phase 2: `CogWorker.interact` returns the result envelope, which the engine reads everywhere it read `{output, usage}`. `ok: false` with an `error.code` fails the step and keeps the code; `ok: true` with `problems` completes it and records them for a Gate. The envelope's invariants hold on construction as on parsing, and the worker client maps the document's HTTP statuses. `InteractionResult` is gone.
+- **#133** — Phase 3: the four state machines on the state pattern, in `collab_hub_execution.states` — a Cog's install, a worker, a step attempt and a run. The engine moves the run and worker machines and writes the records they return; a run's status is its Track replayed through the run machine, and a Track the machine could not have written is refused. `CogLifecycle` and `RunStatus` are gone: a paused run reports `WAITING_AT_GATE`, a duration stop `BUDGET_EXCEEDED`, and a revise limit of N allows N revisions. [`docs/cog-execution/states.md`](docs/cog-execution/states.md) is the reference, held to the code by a test, and ADR-0002 gains D11.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -287,7 +288,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 0 | #96 | Record the decisions for running Ops: lifecycle runner, durability backends, placement (ADR-0002) | `docs/adr-0002-cog-runs` | — | S | merged, #112 |
 | 1 | #97 | Run the API on Python 3.13 as well as 3.14 | `feat/api-python-3.13` | — | S | merged, #111 |
 | 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | merged, #120 |
-| 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | in review, #133 |
+| 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | merged, #133 |
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | not started |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | not started |
 | 6 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
@@ -379,7 +380,7 @@ Workers return `envelope: 1`; the engine reads it everywhere it read `{output, u
 - [x] The kind E2E passes with envelope-emitting workers.
 
 #### Phase 3 — State machines for the Cog, the worker, the step attempt and the run
-**Issue** #130 · **Branch** `feat/cog-state-machines` · **Depends on** Phase 2 · **Size** M · **Status** in review, #133
+**Issue** #130 · **Branch** `feat/cog-state-machines` · **Depends on** Phase 2 · **Size** M · **Status** merged as #133
 
 One machine per level of §11's state diagram, built before anything moves through them, so every later phase emits events into states that already exist instead of growing statuses of its own. It is ADR-0001 invariant 3 — "a tested lifecycle state machine with per-run budgets, timeouts, and warm/idle/teardown" — built first, since it is the reliability core everything else relies on.
 
@@ -396,10 +397,10 @@ One machine per level of §11's state diagram, built before anything moves throu
 *Dev and CI* — no new target: a library with no process of its own, like Phase 6. The transition tests run in `test-execution.yaml`; from Phase 7, `make op` prints the state each Track event moves the run to. *Docs* — a new `docs/cog-execution/states.md` takes §11's diagram and state table as the reference, and this plan's appendix points to it; the glossary gains *State machines*, naming every state, and its *Interrupted* entry, which said a retry is a new attempt, is corrected to say it continues the attempt in flight; `execution/README.md` gains *States*; the review checklist asks whether a state change goes through its machine; decision 18 becomes **ADR-0002 D11**. `test-execution.yaml` also runs when `states.md` changes on `main`.
 
 *Acceptance*
-- [ ] Every state and transition in §11 exists in exactly one machine, and nothing else does; the test holding `states.md` to the code passes.
-- [ ] Every (state, event) pair §11 does not allow raises `InvalidTransition`, naming both.
-- [ ] Replaying a run's Track events through the run machine yields its status, `INTERRUPTED` and `WAITING_AT_GATE` included, with no I/O.
-- [ ] No module outside `collab_hub_execution.states` compares or assigns a state by string.
+- [x] Every state and transition in §11 exists in exactly one machine, and nothing else does; the test holding `states.md` to the code passes.
+- [x] Every (state, event) pair §11 does not allow raises `InvalidTransition`, naming both.
+- [x] Replaying a run's Track events through the run machine yields its status, `INTERRUPTED` and `WAITING_AT_GATE` included, with no I/O.
+- [x] No module outside `collab_hub_execution.states` compares or assigns a state by string.
 
 #### Phase 4 — Gates declared on the step; human decisions as signals
 **Issue** #99 · **Branch** `feat/cog-step-gates` · **Depends on** Phases 2, 3 · **Size** M
@@ -1205,7 +1206,7 @@ What `dbos` buys: steps 8 to 25 are checkpointed, so a controller restart resume
 
 ### C. The states of a Cog
 
-"The state of a Cog" is four questions, each with its own small machine: is the Cog **installed** on this hub, is a **worker** of it up, what happened to one **step attempt** on that worker, and where is the **run** that asked. They nest: only an `INVOKABLE` Cog is materialized, a `RUNNING` run drives step attempts one at a time, and each attempt holds a worker `INTERACTING`. The names below are this plan's, in capitals; where #35's code already has a state, the table gives its spelling. **Phase 3 implements these four machines on the state pattern**, before anything moves through them, and its test holds `docs/cog-execution/states.md` — where this section becomes the reference — to the code, so a transition added here and not there, or there and not here, fails CI.
+"The state of a Cog" is four questions, each with its own small machine: is the Cog **installed** on this hub, is a **worker** of it up, what happened to one **step attempt** on that worker, and where is the **run** that asked. They nest: only an `INVOKABLE` Cog is materialized, a `RUNNING` run drives step attempts one at a time, and each attempt holds a worker `INTERACTING`. The names below are this plan's, in capitals; where #35's code already has a state, the table gives its spelling. **Phase 3 built these four machines on the state pattern** (#133), before anything moves through them, and [`docs/cog-execution/states.md`](docs/cog-execution/states.md) is now the reference: a test holds it to the code, so a transition added there and not in the code, or in the code and not there, fails CI. A change to a state or a transition is made in that document and the code together; this section keeps the plan's view of them.
 
 ```mermaid
 stateDiagram-v2
