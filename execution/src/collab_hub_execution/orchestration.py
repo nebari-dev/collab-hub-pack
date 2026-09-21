@@ -10,7 +10,7 @@ from typing import Any, Protocol
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
-from .states import Run, RunState, Transition, Worker, WorkerState
+from .states import RUN, Run, RunState, Transition, Worker
 from .track import TrackEvent, TrackStore
 
 # Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
@@ -239,27 +239,28 @@ class DurableWorkflowEngine(WorkflowEngine):
             self._append(run_id, record.event_type, **record.payload)
         return transition.after
 
-    def _run(self, run_id: str) -> Run | None:
-        return Run.replay(self.track.replay(run_id))
-
     def observe(self, run_id: str) -> RunState | None:
-        run = self._run(run_id)
+        run = Run.replay(self.track.replay(run_id))
         return None if run is None else run.state
 
-    def _submitted_definition(self, run_id: str) -> OpDefinition:
-        for event in self.track.replay(run_id):
+    # The helpers below read one snapshot of the Track, taken once per call, so a
+    # step costs no further reads of it.
+
+    @staticmethod
+    def _submitted_definition(run_id: str, events: tuple[TrackEvent, ...]) -> OpDefinition:
+        for event in events:
             if event.event_type == "op_submitted":
                 return _deserialize_op(event.payload["op"])
         raise LookupError(f"no submitted Op for run {run_id!r}")
 
-    def _completed_steps(self, run_id: str) -> set[str]:
-        return {event.payload["step"] for event in self.track.replay(run_id) if event.event_type == "step_completed"}
+    @staticmethod
+    def _completed_steps(events: tuple[TrackEvent, ...]) -> set[str]:
+        return {event.payload["step"] for event in events if event.event_type == "step_completed"}
 
-    def _budget_tracker(self, run_id: str) -> BudgetTracker | None:
+    def _budget_tracker(self, events: tuple[TrackEvent, ...]) -> BudgetTracker | None:
         """Reconstruct the run's budget from the Track so it survives restarts."""
         if self.budget is None:
             return None
-        events = self.track.replay(run_id)
         # New runs use op_submitted alone. Accept submitted for old Tracks.
         started_at = next(
             (e.occurred_at for e in events if e.event_type in ("submitted", "op_submitted")),
@@ -276,30 +277,23 @@ class DurableWorkflowEngine(WorkflowEngine):
                 tracker.cost += float(usage.get("cost", 0.0))
         return tracker
 
-    def _pause_count(self, run_id: str, step: str) -> int:
-        return sum(
-            1
-            for e in self.track.replay(run_id)
-            if e.event_type == "paused" and e.payload.get("step") == step
-        )
-
-    def _retry_count(self, run_id: str) -> int:
+    @staticmethod
+    def _retry_count(events: tuple[TrackEvent, ...]) -> int:
         # Only a retry that opens a new attempt moves the key on; one that
         # continues an interrupted attempt keeps it, so a committed claim answers.
         return sum(
-            1
-            for e in self.track.replay(run_id)
-            if e.event_type == "retry_requested" and e.payload.get("attempt", "new") == "new"
+            1 for e in events if e.event_type == "retry_requested" and e.payload.get("attempt", "new") == "new"
         )
 
-    def _signal_for(self, run_id: str, step: str) -> Any:
+    @staticmethod
+    def _signal_for(events: tuple[TrackEvent, ...], step: str) -> Any:
         """The latest durably-recorded signal value for a step, or ``_NO_SIGNAL``.
 
         Recovery re-reads the decision from the Track, so a crash after a signal
         was recorded resumes with both the original input and the signal.
         """
         value: Any = _NO_SIGNAL
-        for e in self.track.replay(run_id):
+        for e in events:
             if e.event_type == "signal_received" and e.payload.get("step") == step:
                 value = e.payload.get("value")
         return value
@@ -312,7 +306,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         if not existing:
             self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)))
         else:
-            if _canonical_op(self._submitted_definition(op.run_id)) != _canonical_op(op):
+            if _canonical_op(self._submitted_definition(op.run_id, existing)) != _canonical_op(op):
                 raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
             run = Run.replay(existing)
             if run is not None and run.state.ended:
@@ -342,25 +336,30 @@ class DurableWorkflowEngine(WorkflowEngine):
         marker that advances the per-step attempt, so each step gets a fresh key —
         the caller is asking for the work to run again.
         """
-        run = self._run(run_id)
+        events = self.track.replay(run_id)
+        run = Run.replay(events)
         state = None if run is None else run.state
-        if state is RunState.COMPLETED:
-            raise ValueError(f"run {run_id!r} completed; nothing to retry (start a new run instead)")
-        if state is RunState.BUDGET_EXCEEDED:
-            raise ValueError(f"run {run_id!r} exhausted its budget; start a new run instead")
         if run is None or not run.state.ended:
             raise ValueError(f"run {run_id!r} is not terminal (status={state}); nothing to retry")
-        op = self._submitted_definition(run_id)
+        if state is RunState.BUDGET_EXCEEDED:
+            # The run machine allows it as a new budget epoch; the engine does not until #4 builds epochs.
+            raise ValueError(f"run {run_id!r} exhausted its budget; start a new run instead")
+        if not RUN.accepts(state, "retry"):
+            done = "completed" if state is RunState.COMPLETED else f"was {state.value}"
+            raise ValueError(f"run {run_id!r} {done}; nothing to retry (start a new run instead)")
+        op = self._submitted_definition(run_id, events)
         self._record(run_id, run.retry())
         return self._advance(op)
 
     def _advance(self, op: OpDefinition) -> RunState:
-        run = self._run(op.run_id)
+        events = self.track.replay(op.run_id)
+        run = Run.replay(events)
         if run.state is RunState.SUBMITTED:
             run = self._record(op.run_id, run.pickup())
-        completed = self._completed_steps(op.run_id)
+        completed = self._completed_steps(events)
+        retries = self._retry_count(events)
         try:
-            tracker = self._budget_tracker(op.run_id)
+            tracker = self._budget_tracker(events)
         except UsageUnavailable as exc:
             run = self._record(op.run_id, run.fail(error="UsageUnavailable", reason=str(exc)))
             return run.state
@@ -379,7 +378,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             # one. `instance` identifies the materialization (so distinct steps and
             # attempts never reuse a still-terminating worker name); `key` is the
             # same identity, run-scoped, handed to the worker for dedupe.
-            attempt = self._pause_count(op.run_id, step.name) + self._retry_count(op.run_id)
+            attempt = run.escalations.get(step.name, 0) + retries
             instance = f"{_key_component(step.name)}:{attempt}"
             key = f"{_key_component(op.run_id)}:{instance}"
             self._append(op.run_id, "step_started", step=step.name, cog=step.cog, digest=step.digest, attempt=attempt)
@@ -399,7 +398,7 @@ class DurableWorkflowEngine(WorkflowEngine):
                 cog_worker = self._record(op.run_id, Worker.materialize(step.cog, step=step.name, digest=step.digest))
                 cog_worker = self._record(op.run_id, cog_worker.ready())
                 cog_worker = self._record(op.run_id, cog_worker.invoke(entry_point=step.entry_point, step=step.name))
-                signal_value = self._signal_for(op.run_id, step.name)
+                signal_value = self._signal_for(events, step.name)
                 feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
                 try:
                     invoked = True
@@ -440,7 +439,10 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # A worker we couldn't tear down may keep running/serving — that is
                 # a leak, not success. Fail the run so it is visible; durable
                 # cleanup-retry lands with the crash-safe engine backing (#1).
-                run = self._record(op.run_id, run.fail(step=step.name, error="TeardownFailed"))
+                # A failed worker's own error is kept beside it, since its teardown is not a worker move.
+                details = None if answered else {"worker_error": str(outcome[1])}
+                failed = run.fail(step=step.name, error="TeardownFailed", reason=teardown_error, details=details)
+                run = self._record(op.run_id, failed)
                 return run.state
 
             kind, detail = outcome
@@ -463,7 +465,8 @@ class DurableWorkflowEngine(WorkflowEngine):
             if kind == "pause":
                 if budget_stop is not None:
                     return self._stop_for_budget(run, step.name, budget_stop)
-                run = self._record(op.run_id, run.escalate(step=step.name, reason=detail))
+                escalation = run.escalate(step=step.name, reason=detail, revise_limit=self.max_revisions)
+                run = self._record(op.run_id, escalation)
                 return run.state
 
             envelope = detail
@@ -479,30 +482,26 @@ class DurableWorkflowEngine(WorkflowEngine):
     def _tear_down(
         self, run_id: str, worker: CogWorker, cog_worker: Worker | None, answered: bool, outcome: tuple[str, Any]
     ) -> str | None:
-        """Tear a step's worker down, moving it through its machine; the error if teardown failed.
+        """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
 
         A worker that answered — an envelope, ok or not, or a pause — goes IDLE and
-        is torn down as a one-shot. One that did not answer has failed, and the
-        executor reclaims what is left of it.
+        is torn down as a one-shot, and a teardown that fails is its machine's
+        `teardown_failed`. One that did not answer has failed: the executor reclaims
+        what is left of it, and if that fails the run's `failed` record says so.
+        ``TORN_DOWN`` is never recorded, so the engine does not move the worker there.
         """
-        if cog_worker is not None:
-            if answered and cog_worker.state is WorkerState.INTERACTING:
-                cog_worker = self._record(run_id, cog_worker.envelope_returned())
-                cog_worker = self._record(run_id, cog_worker.tear_down(reason="one_shot"))
-            elif cog_worker.state is not WorkerState.TEARING_DOWN:
-                cog_worker = self._record(run_id, cog_worker.fail(error=str(outcome[1])))
+        tearing_down = answered and cog_worker is not None
+        if tearing_down:
+            cog_worker = self._record(run_id, cog_worker.envelope_returned())
+            cog_worker = self._record(run_id, cog_worker.tear_down(reason="one_shot"))
+        elif cog_worker is not None:
+            cog_worker = self._record(run_id, cog_worker.fail(error=str(outcome[1])))
         try:
             self.executor.teardown(worker)
         except Exception as exc:  # noqa: BLE001 - never crash on cleanup
-            error = type(exc).__name__
-            if cog_worker is not None and cog_worker.state is WorkerState.TEARING_DOWN:
-                self._record(run_id, cog_worker.fail(error=error))
-            else:
-                # The worker had already failed; its cleanup failing is recorded all the same.
-                self._append(run_id, "teardown_failed", step=getattr(cog_worker, "step", None), error=error)
-            return error
-        if cog_worker is not None and cog_worker.state is WorkerState.TEARING_DOWN:
-            cog_worker.torn_down()
+            if tearing_down:
+                self._record(run_id, cog_worker.fail(error=type(exc).__name__))
+            return type(exc).__name__
         return None
 
     def _stop_for_budget(self, run: Run, step: str, exc: BudgetExceeded) -> RunState:
@@ -511,20 +510,19 @@ class DurableWorkflowEngine(WorkflowEngine):
         return run.state
 
     def signal(self, run_id: str, value: Any = None) -> RunState:
-        run = self._run(run_id)
+        events = self.track.replay(run_id)
+        run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
             raise ValueError(f"run {run_id!r} is not paused")
-        op = self._submitted_definition(run_id)
+        op = self._submitted_definition(run_id, events)
         # Persist the decision before advancing so a crash mid-resume recovers the
         # signal from the Track alongside the original input. The value may
         # legitimately be None — see _NO_SIGNAL. #35's signal re-runs the paused
         # step with its value, which is a send back; it answers whichever
         # escalation is open, since escalation ids arrive with step Gates (#99).
-        decision = run.decide(outcome="send_back", escalation=run.open_escalation, findings=value,
-                              revise_limit=self.max_revisions)
-        run = self._record(run_id, decision)
-        if run.state is not RunState.RUNNING:
-            return run.state
+        # It cannot say whether it approves, so the revise limit is not applied
+        # here but when the step escalates again (_advance), as #35 applied it.
+        self._record(run_id, run.decide(outcome="send_back", escalation=run.open_escalation, findings=value))
         return self._advance(op)
 
 

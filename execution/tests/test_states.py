@@ -72,6 +72,7 @@ SCENARIOS = [
     (CONTEXTS["run"], "pickup", {}, RunState.RUNNING),
     (CONTEXTS["run"], "cancel", {"actor": "alice"}, RunState.CANCELLED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "escalate", {"step": "s"}, RunState.WAITING_AT_GATE),
+    (replace(CONTEXTS["run"], state=RunState.RUNNING), "escalate", {"step": "s", "revise_limit": 0}, RunState.FAILED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "complete", {}, RunState.COMPLETED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "fail", {"error": "Boom"}, RunState.FAILED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "exhaust_budget", {"dimension": "cost"},
@@ -80,7 +81,7 @@ SCENARIOS = [
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "host_stopped", {"backend": "none"}, RunState.INTERRUPTED),
     (WAITING, "decide", {"outcome": "approve"}, RunState.RUNNING),
     (WAITING, "decide", {"outcome": "reject"}, RunState.REJECTED),
-    (WAITING, "decide", {"outcome": "send_back", "revise_limit": 1}, RunState.FAILED),
+    (WAITING, "decide", {"outcome": "send_back", "revise_limit": 0}, RunState.FAILED),
     (WAITING, "cancel", {"actor": "alice"}, RunState.CANCELLED),
     (WAITING, "host_stopped", {"backend": "none"}, RunState.INTERRUPTED),
     (replace(CONTEXTS["run"], state=RunState.FAILED), "retry", {}, RunState.RUNNING),
@@ -150,19 +151,29 @@ def test_a_decision_must_name_the_open_escalation():
     assert waiting.decide(outcome="approve", escalation="esc-2").after.state is RunState.RUNNING
 
 
-def test_a_send_back_past_the_revise_limit_fails_the_run_and_says_why():
+def test_revise_limit_n_allows_n_revisions_when_decisions_send_back():
     run = Run(run_id="r").pickup().after
+    for revision in (1, 2):  # the first two send backs produce revisions 1 and 2
+        run = run.escalate(step="s").after
+        run = run.decide(outcome="send_back", revise_limit=2).after
+        assert run.state is RunState.RUNNING, revision
     run = run.escalate(step="s").after
-    run = run.decide(outcome="send_back", revise_limit=2).after  # one escalation so far: allowed
-    assert run.state is RunState.RUNNING
-    run = run.escalate(step="s").after
-    stopped = run.decide(outcome="send_back", findings="fix b", revise_limit=2)
+    stopped = run.decide(outcome="send_back", findings="fix c", revise_limit=2)  # would be revision 3
     assert stopped.after.state is RunState.FAILED
     [record] = stopped.records
     assert record.event_type == "failed" and record.payload["error"] == "revise_limit_exceeded"
     assert record.payload["revise_limit"] == 2
     # An approval is never limited.
     assert run.decide(outcome="approve", revise_limit=2).after.state is RunState.RUNNING
+
+
+def test_revise_limit_n_fails_the_step_that_escalates_after_n_revisions():
+    # #35's signal cannot say whether it approves, so the engine applies the limit here, as #35 did.
+    running = replace(CONTEXTS["run"], state=RunState.RUNNING, escalations={"s": 2})
+    assert running.escalate(step="s", revise_limit=3).after.state is RunState.WAITING_AT_GATE
+    stopped = running.escalate(step="s", revise_limit=2)
+    assert stopped.after.state is RunState.FAILED
+    assert stopped.records[0].payload == {"step": "s", "error": "revise_limit_exceeded", "revise_limit": 2}
 
 
 def test_a_decision_outcome_must_be_one_of_the_three():
@@ -263,25 +274,58 @@ def test_replay_ignores_the_facts_of_steps_and_workers():
     assert derive_run_status(_track("op_submitted", "run_picked_up", *facts, "completed")) is RunState.COMPLETED
 
 
-def test_replay_re_applies_a_revise_limit_stop_with_its_recorded_limit():
-    track = _track(
+def _revise_stop(**failed):
+    return _track(
         "op_submitted", "run_picked_up",
         ("paused", {"step": "s"}), ("signal_received", {"step": "s", "value": "fix a"}),
         ("paused", {"step": "s"}),
-        ("failed", {"step": "s", "error": "revise_limit_exceeded", "revise_limit": 2, "value": "fix b"}),
+        ("failed", {"step": "s", "error": "revise_limit_exceeded", "value": "fix b", **failed}),
     )
-    assert derive_run_status(track) is RunState.FAILED
+
+
+def test_replay_re_applies_a_revise_limit_stop_with_its_recorded_limit():
+    assert derive_run_status(_revise_stop(revise_limit=1)) is RunState.FAILED
+    # The same stop, recorded when the step escalated again rather than at a decision.
+    at_escalation = _track("op_submitted", "run_picked_up", ("paused", {"step": "s"}), "signal_received",
+                           ("failed", {"step": "s", "error": "revise_limit_exceeded", "revise_limit": 1}))
+    assert derive_run_status(at_escalation) is RunState.FAILED
+
+
+@pytest.mark.parametrize("failed", [{"revise_limit": 99}, {}], ids=["limit-not-reached", "no-limit"])
+def test_a_revise_limit_stop_the_recorded_limit_does_not_produce_is_refused(failed):
+    with pytest.raises(InvalidTransition, match="records 'signal_received'"):
+        derive_run_status(_revise_stop(**failed))
 
 
 def test_a_track_the_machine_could_not_have_written_is_refused():
-    with pytest.raises(InvalidTransition):
-        derive_run_status(_track("op_submitted", "completed"))  # completed before any pickup
+    with pytest.raises(InvalidTransition):  # completed before its pickup
+        derive_run_status(_track("op_submitted", "completed", "run_picked_up"))
+    with pytest.raises(InvalidTransition, match="not an event of a run's Track"):
+        derive_run_status(_track("op_submitted", "run_picked_up", "step_complete"))  # a typo, not a fact
+    with pytest.raises(InvalidTransition, match="records 'rejected'"):  # a reject is recorded as `rejected`
+        derive_run_status(_track("op_submitted", "run_picked_up", ("paused", {"step": "s"}),
+                                 ("signal_received", {"step": "s", "outcome": "reject"})))
+    with pytest.raises(InvalidTransition, match="attempt='same'"):  # a failed run retries as a new attempt
+        derive_run_status(_track("op_submitted", "run_picked_up", ("failed", {"error": "Boom"}),
+                                 ("retry_requested", {"from_status": "failed", "attempt": "same"})))
     with pytest.raises(InvalidTransition, match="already submitted"):
         derive_run_status(_track("op_submitted", "op_submitted"))
     with pytest.raises(InvalidTransition, match="no submission"):
         derive_run_status(_track("run_picked_up"))
     with pytest.raises(InvalidTransition):
         derive_run_status(_track("op_submitted", "run_picked_up", "completed", "retry_requested"))
+
+
+@pytest.mark.parametrize("kinds,state", [
+    (("op_submitted", "step_started", "materialized", "ready", "interaction_started", "idle", "teardown_started",
+      "step_completed", "completed"), RunState.COMPLETED),
+    (("op_submitted", "step_started", ("paused", {"step": "s"})), RunState.WAITING_AT_GATE),
+    (("op_submitted", ("timed_out", {"reason": "run duration budget exceeded"})), RunState.BUDGET_EXCEEDED),
+    (("op_submitted", "completed"), RunState.COMPLETED),  # an Op with no steps
+    (("submitted", "step_started", ("failed", {"step": "s", "error": "Boom"})), RunState.FAILED),
+], ids=["completed", "paused", "timed-out-before-a-step", "no-steps", "failed"])
+def test_a_track_written_before_pickups_were_recorded_still_has_its_status(kinds, state):
+    assert derive_run_status(_track(*kinds)) is state
 
 
 def test_a_track_with_no_submission_has_no_status_and_submitted_is_the_older_name():

@@ -164,7 +164,7 @@ def test_pause_usage_and_completed_usage_survive_restart_without_double_counting
     assert engine().submit(op(count=2)) is RunState.WAITING_AT_GATE
     # 6 (pause) + 6 (resume) + 6 (next step's pause) exceeds 15.
     assert engine().signal("accounting", "go") is RunState.BUDGET_EXCEEDED
-    assert engine()._budget_tracker("accounting").tokens == 18
+    assert engine()._budget_tracker(track.replay("accounting")).tokens == 18
     assert len(executor.materialized) == 3
 
 

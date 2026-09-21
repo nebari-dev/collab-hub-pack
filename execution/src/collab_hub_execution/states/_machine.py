@@ -14,7 +14,7 @@ executor. Whoever applies the transition writes its records.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Generic, TypeVar
 
 C = TypeVar("C")
@@ -45,6 +45,11 @@ class Transition(Generic[C]):
 
     after: C
     records: tuple[Record, ...] = ()
+
+
+def move(context: C, state: State, *records: Record, **changes: Any) -> Transition[C]:
+    """The transition to ``state``: a copy of the context with its new state and data, and what to record."""
+    return Transition(replace(context, state=state, **changes), records)  # type: ignore[type-var]
 
 
 def accepts(*targets: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:

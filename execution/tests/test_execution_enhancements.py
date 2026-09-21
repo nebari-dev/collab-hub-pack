@@ -73,7 +73,10 @@ def test_duration_budget_stops_run_before_any_step_as_timed_out():
 
 
 def test_bounded_revise_loop_fails_after_max_revisions():
+    runs = []
+
     def always_pause(entry, value, *, signal=None):
+        runs.append(signal)
         raise PauseRequest("needs another revision")
 
     track = InMemoryTrackStore()
@@ -93,6 +96,58 @@ def test_bounded_revise_loop_fails_after_max_revisions():
         e.event_type == "failed" and e.payload.get("error") == "revise_limit_exceeded"
         for e in track.replay("run-revise")
     )
+    # max_revisions=2 is two revisions: the step runs three times, and fails when it asks for a third.
+    assert len(runs) == 3
+
+
+@pytest.mark.parametrize("max_revisions", [1, 2])
+def test_an_approving_signal_is_never_charged_as_a_revision(max_revisions):
+    signals = []
+
+    def reviewer(entry, value, *, signal=None):
+        signals.append(signal)
+        if signal is None or signal == "fix":
+            raise PauseRequest("review")
+        return ResultEnvelope.success({"approved": True})
+
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track,
+                                   max_revisions=max_revisions)
+    op = OpDefinition("run-approve", (OpStep("s", "c", "review", "draft"),))
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    for _ in range(max_revisions - 1):
+        assert engine.signal("run-approve", "fix") is RunState.WAITING_AT_GATE
+    # The last revision the limit allows is approved, and the run completes.
+    assert engine.signal("run-approve", {"approved": True}) is RunState.COMPLETED
+    assert signals[-1] == {"approved": True}
+
+
+@pytest.mark.parametrize("ending,state", [("rejected", "rejected"), ("cancelled", "cancelled")])
+def test_a_rejected_or_cancelled_run_is_refused_a_retry_before_anything_is_read_or_written(ending, state):
+    track = InMemoryTrackStore()
+    for kind, payload in (("op_submitted", {"op": {"run_id": "r", "steps": []}}), ("run_picked_up", {}),
+                          ("paused", {"step": "s"}), (ending, {"step": "s", "actor": "alice"})):
+        track.append(TrackEvent(run_id="r", event_type=kind, payload=payload))
+    before = track.replay("r")
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({}), track=track)
+    with pytest.raises(ValueError, match=f"was {state}; nothing to retry"):
+        engine.retry("r")
+    assert track.replay("r") == before
+
+
+def test_a_submission_reads_the_track_once_to_check_it_and_once_to_advance():
+    class CountingTrack(InMemoryTrackStore):
+        reads = 0
+
+        def replay(self, run_id, *, after_sequence=0):
+            CountingTrack.reads += 1
+            return super().replay(run_id, after_sequence=after_sequence)
+
+    track = CountingTrack()
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
+    op = OpDefinition("run-reads", tuple(OpStep(f"s{i}", "c", "run") for i in range(3)))
+    assert engine.submit(op) is RunState.COMPLETED
+    assert CountingTrack.reads == 2
 
 
 def test_step_digest_is_recorded_and_survives_restart():
@@ -497,3 +552,22 @@ def test_teardown_failure_fails_the_run_rather_than_reporting_success():
         e.event_type == "failed" and e.payload.get("error") == "TeardownFailed"
         for e in track.replay("run-td")
     )
+
+
+def test_a_failed_worker_that_cannot_be_reclaimed_is_recorded_on_the_run_not_around_its_machine():
+    class _Broken(_TeardownFailsExecutor._Worker):
+        def interact(self, entry_point, input=None, idempotency_key=None):
+            raise ConnectionError("pod went away")
+
+    class _Executor(_TeardownFailsExecutor):
+        def materialize(self, cog, run_id, instance=""):
+            return _Broken()
+
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(executor=_Executor(), track=track)
+    assert engine.submit(OpDefinition("run-lost", (OpStep("s", "c", "run"),))) is RunState.FAILED
+    events = track.replay("run-lost")
+    assert "teardown_failed" not in [e.event_type for e in events]  # the worker had already failed
+    [failed] = [e for e in events if e.event_type == "failed"]
+    assert failed.payload == {"step": "s", "error": "TeardownFailed", "reason": "RuntimeError",
+                              "worker_error": "ConnectionError"}

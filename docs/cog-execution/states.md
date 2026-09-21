@@ -101,7 +101,7 @@ stateDiagram-v2
 | `FETCHED` | the Cog | Install has pulled the package and provisioned its environment. Not invokable. A binding that cannot be admitted leaves it here, recorded. | glossary, *Install*; #106 |
 | `BOUND` | the Cog | Its requirements are resolved and the binding admitted. A failing `check` leaves it here, with the failing step recorded. | #106, #3 |
 | `INVOKABLE` | the Cog | `check` passed against the delivered binding and the catalog card is recorded; a run may name the digest. Installing starts no worker. | glossary, *Install*; ADR-0001 D5 |
-| `UNINSTALLED` | the Cog | The install and every runtime resource it created are removed, its warm pool drained. Reachable from any install state, so an install stuck before `INVOKABLE` can be removed. | #106, #4 |
+| `UNINSTALLED` | the Cog | The install and every runtime resource it created are removed, its warm pool drained. Reachable from every state in which the install holds something on the hub — `FETCHED`, `BOUND`, `INVOKABLE` — so an install stuck before `INVOKABLE` can be removed. A `PUBLISHED` Cog has nothing on the hub to remove. | #106, #4 |
 | `MATERIALIZED` | a worker | The executor has brought up the package's `serve` — a child process or a pod — and it is not answering yet. | glossary, *Materialize / worker* |
 | `READY` | a worker | `/healthz` answers; the worker can take an `/invoke`. | #1 |
 | `INTERACTING` | a worker | An `/invoke` is in flight. Cancellation and the duration deadline act here. | #1, #4 |
@@ -116,7 +116,7 @@ stateDiagram-v2
 | `OUTCOME_UNKNOWN` | a step attempt | The key was reserved and never committed: the worker was lost between the side effect and its result. Nothing acts again, an ordinary retry is refused, and a person — or an entry point the Cog declares idempotent — reconciles it. | #102, #103 |
 | `SUBMITTED` | a run | The submission is recorded; no controller has picked the run up. | #121 |
 | `RUNNING` | a run | A controller owns it and is advancing its steps. The worker's own states are not the run's: a run between steps, or with a worker idling, is `RUNNING`. | #121 |
-| `WAITING_AT_GATE` | a run | A step escalated, and the run waits for a decision naming the open escalation. A send back re-runs the step, bounded by the revise limit, past which the run ends `FAILED` with error `revise_limit_exceeded`. Until step-declared Gates (#99), it is a Cog's pause that escalates. | #99, #103 |
+| `WAITING_AT_GATE` | a run | A step escalated, and the run waits for a decision naming the open escalation. A send back re-runs the step, bounded by the revise limit: a limit of N allows N revisions, and past it the run ends `FAILED` with error `revise_limit_exceeded`. Until step-declared Gates (#99), it is a Cog's pause that escalates. | #99, #103 |
 | `COMPLETED` | a run | Every step completed, and every Gate passed or was approved. Final. | #2 |
 | `FAILED` | a run | A step's envelope came back `ok: false`, its worker failed, a step attempt ended `OUTCOME_UNKNOWN`, or a send back went past the revise limit — each recorded with its reason. Retry runs a recorded failure as a new attempt under a new key. | #101 |
 | `REJECTED` | a run | A reviewer rejected at a Gate. Final. | #99 |
@@ -172,7 +172,7 @@ record (#106).
 | Event | From → to | Records |
 |---|---|---|
 | `pickup()` | `SUBMITTED` → `RUNNING` | `run_picked_up` |
-| `escalate(step, reason, escalation)` | `RUNNING` → `WAITING_AT_GATE` | `paused` |
+| `escalate(step, reason, escalation, revise_limit)` | `RUNNING` → `WAITING_AT_GATE`; → `FAILED` when the step has already been revised `revise_limit` times | `paused`; `failed` |
 | `decide(outcome, escalation, findings, revise_limit)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
 | `complete()` | `RUNNING` → `COMPLETED` | `completed` |
 | `fail(error, step, reason, details)` | `RUNNING` → `FAILED` | `failed` |
@@ -208,8 +208,13 @@ it is unchanged. Whoever applies the transition writes the records, so every
 durability backend moves the same machines.
 
 **Guards live in the state that owns them.** A decision must name the open
-escalation (`StaleEscalation` otherwise), and a send back past the revise limit
-ends the run `FAILED`. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
+escalation (`StaleEscalation` otherwise). A revise limit of N allows N
+revisions: a send back that would produce revision N+1 ends the run `FAILED`
+instead. The engine does not apply the limit at the decision yet — #35's
+`signal()` cannot say whether it approves or sends back, so charging every
+signal would fail runs an approval completes — but when the step escalates
+again after N revisions, as #35 did; step-declared Gates (#99) move it to the
+decision. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
 opens a new one, from `BUDGET_EXCEEDED` a new budget epoch. `host_stopped` is
 refused under a backend that resumes. A cancellation and a reconciliation name
 who made them, and a worker is torn down only for a reason its state allows.
@@ -217,10 +222,22 @@ who made them, and a worker is torn down only for a reason its state allows.
 **Status from the Track.** A run's status is its Track replayed through the run
 machine (`Run.replay`, and `derive_run_status` over a Track). Each run record
 above moves the run on replay through the same handler as it did live, with the
-arguments the Track recorded; a step's and a worker's facts leave the run where
-it is. A Track the machine could not have written — a second submission, a
-`completed` before any pickup — raises `InvalidTransition` instead of becoming a
-status. The older `submitted` is read as `op_submitted`.
+arguments the Track recorded, and must record what was recorded: the same
+event, with the same outcome, attempt, error and dimension. A step's and a
+worker's facts — `step_started`, `materialized`, `ready`,
+`interaction_started`, `interaction_usage`, `idle`, `teardown_started`,
+`teardown_failed`, `step_completed` — leave the run where it is. Anything else
+raises `InvalidTransition` instead of becoming a status: an event no run
+records, a second submission, a `signal_received` that rejects, a revise-limit
+stop its recorded limit does not produce. The older `submitted` is read as
+`op_submitted`, and a Track with no `run_picked_up` at all, written before
+pickups were recorded, reads its first step start or run event as the pickup.
+
+**A worker that cannot be reclaimed.** A worker that answered and then fails to
+tear down records `teardown_failed` through its machine. One that did not answer
+has already failed; the executor still reclaims it, and if that fails the run's
+`failed` record says so — `TeardownFailed`, with the worker's own error beside
+it — since cleaning up a failed worker is not a move of its machine.
 
 **Wire values.** A state is sent as its name in lower case: `waiting_at_gate`.
 `RUN["waiting_at_gate"]` reads one back. #35's engine reported a paused run as

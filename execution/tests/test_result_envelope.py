@@ -179,7 +179,7 @@ def test_each_error_code_fails_the_step_and_keeps_the_code(code):
     # the failed call's spending is on the Track, and counts on retry
     assert events(track, "env", "interaction_usage")[-1].payload["usage"] == {"tokens": 7}
     assert engine.retry("env") is RunState.COMPLETED
-    assert engine._budget_tracker("env").tokens == 8
+    assert engine._budget_tracker(track.replay("env")).tokens == 8
 
 
 def test_an_error_envelope_with_problems_records_them_on_the_failure():

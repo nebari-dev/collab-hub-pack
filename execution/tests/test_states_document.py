@@ -47,7 +47,7 @@ def _diagram():
 def _table_states():
     text = DOCUMENT.read_text()
     section = text.split("## The states", 1)[1].split("\n## ", 1)[0]
-    return {(name, of) for name, of in re.findall(r"^\| `([A-Z_]+)` \| ([^|]+?) \|", section, re.M)}
+    return sorted(re.findall(r"^\| `([A-Z_]+)` \| ([^|]+?) \|", section, re.M))
 
 
 DIAGRAM, CROSS = _diagram()
@@ -68,5 +68,5 @@ def test_the_only_move_between_machines_is_materializing_an_invokable_cog():
 
 def test_the_state_table_lists_every_state_of_every_machine_once():
     owner = {"install": "the Cog", "worker": "a worker", "step_attempt": "a step attempt", "run": "a run"}
-    expected = {(state.name, owner[name]) for name, machine in MACHINES.items() for state in machine.states}
-    assert _table_states() == expected
+    expected = sorted((state.name, owner[name]) for name, machine in MACHINES.items() for state in machine.states)
+    assert _table_states() == expected  # a list, so a row written twice is caught

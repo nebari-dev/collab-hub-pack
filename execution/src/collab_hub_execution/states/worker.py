@@ -7,10 +7,10 @@ never recorded — the Track records a teardown that failed, not one that worked
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from ._machine import Context, Machine, Record, State, Transition, accepts
+from ._machine import Context, Machine, Record, State, Transition, accepts, move
 
 if TYPE_CHECKING:
     from .install import CogInstall
@@ -45,25 +45,22 @@ class WorkerState(State):
         return self.refuse("fail")
 
 
-def _move(worker: Worker, state: State, *records: Record, **changes: Any) -> Transition[Worker]:
-    return Transition(replace(worker, state=state, **changes), records)
-
 
 def _invoke(worker: Worker, step: str | None, entry_point: str) -> Transition[Worker]:
     step = worker.step if step is None else step
     record = Record("interaction_started", {"step": step, "entry_point": entry_point})
-    return _move(worker, WorkerState.INTERACTING, record, step=step)
+    return move(worker, WorkerState.INTERACTING, record, step=step)
 
 
 def _tear_down(state: WorkerState, worker: Worker, reason: str) -> Transition[Worker]:
     allowed = TEARDOWN_REASONS[state.name]
     if reason not in allowed:
         state.refuse("tear_down", f"{reason!r} is not a reason to tear down from {state.name}: {sorted(allowed)}")
-    return _move(worker, WorkerState.TEARING_DOWN, Record("teardown_started", {"step": worker.step, "reason": reason}))
+    return move(worker, WorkerState.TEARING_DOWN, Record("teardown_started", {"step": worker.step, "reason": reason}))
 
 
 def _fail(worker: Worker, error: str) -> Transition[Worker]:
-    return _move(worker, WorkerState.WORKER_FAILED, error=error)
+    return move(worker, WorkerState.WORKER_FAILED, error=error)
 
 
 class Materialized(WorkerState):
@@ -71,7 +68,7 @@ class Materialized(WorkerState):
 
     @accepts("READY")
     def ready(self, worker: Worker, **_: Any) -> Transition[Worker]:
-        return _move(worker, WorkerState.READY, Record("ready", {"cog": worker.cog}))
+        return move(worker, WorkerState.READY, Record("ready", {"cog": worker.cog}))
 
     @accepts("WORKER_FAILED")
     def fail(self, worker: Worker, *, error: str, **_: Any) -> Transition[Worker]:
@@ -99,7 +96,7 @@ class Interacting(WorkerState):
 
     @accepts("IDLE")
     def envelope_returned(self, worker: Worker, **_: Any) -> Transition[Worker]:
-        return _move(worker, WorkerState.IDLE, Record("idle", {"step": worker.step}))
+        return move(worker, WorkerState.IDLE, Record("idle", {"step": worker.step}))
 
     @accepts("TEARING_DOWN")
     def tear_down(self, worker: Worker, *, reason: str, **_: Any) -> Transition[Worker]:
@@ -132,13 +129,13 @@ class TearingDown(WorkerState):
 
     @accepts("TORN_DOWN")
     def torn_down(self, worker: Worker, **_: Any) -> Transition[Worker]:
-        return _move(worker, WorkerState.TORN_DOWN)
+        return move(worker, WorkerState.TORN_DOWN)
 
     @accepts("WORKER_FAILED")
     def fail(self, worker: Worker, *, error: str, **_: Any) -> Transition[Worker]:
         # A worker that could not be torn down may still be running: that is recorded.
         record = Record("teardown_failed", {"step": worker.step, "error": error})
-        return _move(worker, WorkerState.WORKER_FAILED, record, error=error)
+        return move(worker, WorkerState.WORKER_FAILED, record, error=error)
 
 
 class TornDown(WorkerState):

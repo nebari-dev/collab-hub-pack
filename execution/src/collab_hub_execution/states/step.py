@@ -6,10 +6,10 @@ outcome as ``step_completed`` or ``step_failed``, which is ``RECORDED``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
-from ._machine import Context, Machine, Record, State, Transition, accepts
+from ._machine import Context, Machine, Record, State, Transition, accepts, move
 
 
 class StepAttemptState(State):
@@ -31,9 +31,6 @@ class StepAttemptState(State):
         return self.refuse("reconcile")
 
 
-def _move(attempt: StepAttempt, state: State, *records: Record) -> Transition[StepAttempt]:
-    return Transition(replace(attempt, state=state), records)
-
 
 class Invoked(StepAttemptState):
     name = "INVOKED"
@@ -41,11 +38,11 @@ class Invoked(StepAttemptState):
     @accepts("INVOKED")
     def worker_lost(self, attempt: StepAttempt, **_: Any) -> Transition[StepAttempt]:
         # Nothing acted before the reservation, so the same key is invoked again.
-        return _move(attempt, StepAttemptState.INVOKED, Record("step_reinvoked", {"key": attempt.key}))
+        return move(attempt, StepAttemptState.INVOKED, Record("step_reinvoked", {"key": attempt.key}))
 
     @accepts("RESERVED")
     def reserve(self, attempt: StepAttempt, **_: Any) -> Transition[StepAttempt]:
-        return _move(attempt, StepAttemptState.RESERVED, Record("claim_reserved", {"key": attempt.key}))
+        return move(attempt, StepAttemptState.RESERVED, Record("claim_reserved", {"key": attempt.key}))
 
 
 class Reserved(StepAttemptState):
@@ -53,12 +50,12 @@ class Reserved(StepAttemptState):
 
     @accepts("COMMITTED")
     def commit(self, attempt: StepAttempt, **_: Any) -> Transition[StepAttempt]:
-        return _move(attempt, StepAttemptState.COMMITTED, Record("claim_committed", {"key": attempt.key}))
+        return move(attempt, StepAttemptState.COMMITTED, Record("claim_committed", {"key": attempt.key}))
 
     @accepts("OUTCOME_UNKNOWN")
     def worker_lost(self, attempt: StepAttempt, **_: Any) -> Transition[StepAttempt]:
         # The side effect may have happened: nothing may act again until someone reconciles.
-        return _move(attempt, StepAttemptState.OUTCOME_UNKNOWN, Record("outcome_unknown", {"key": attempt.key}))
+        return move(attempt, StepAttemptState.OUTCOME_UNKNOWN, Record("outcome_unknown", {"key": attempt.key}))
 
 
 class Committed(StepAttemptState):
@@ -66,7 +63,7 @@ class Committed(StepAttemptState):
 
     @accepts("RECORDED")
     def record(self, attempt: StepAttempt, **_: Any) -> Transition[StepAttempt]:
-        return _move(attempt, StepAttemptState.RECORDED)
+        return move(attempt, StepAttemptState.RECORDED)
 
 
 class OutcomeUnknown(StepAttemptState):
@@ -77,7 +74,7 @@ class OutcomeUnknown(StepAttemptState):
         if not actor:
             self.refuse("reconcile", "a reconciliation names who made it")
         record = Record("outcome_reconciled", {"key": attempt.key, "actor": actor})
-        return _move(attempt, StepAttemptState.RECORDED, record)
+        return move(attempt, StepAttemptState.RECORDED, record)
 
 
 class Recorded(StepAttemptState):

@@ -6,10 +6,10 @@ materialized (:meth:`CogInstall.require_invokable`).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
-from ._machine import Context, InvalidTransition, Machine, Record, State, Transition, accepts
+from ._machine import Context, InvalidTransition, Machine, Record, State, Transition, accepts, move
 
 
 class InstallState(State):
@@ -34,12 +34,9 @@ class InstallState(State):
         return self.refuse("uninstall")
 
 
-def _move(install: CogInstall, state: State, *records: Record, **changes: Any) -> Transition[CogInstall]:
-    return Transition(replace(install, state=state, **changes), records)
-
 
 def _uninstall(install: CogInstall) -> Transition[CogInstall]:
-    return _move(install, InstallState.UNINSTALLED, Record("uninstalled", {"reference": install.reference}))
+    return move(install, InstallState.UNINSTALLED, Record("uninstalled", {"reference": install.reference}))
 
 
 class Published(InstallState):
@@ -47,7 +44,7 @@ class Published(InstallState):
 
     @accepts("FETCHED")
     def fetch(self, install: CogInstall, **_: Any) -> Transition[CogInstall]:
-        return _move(install, InstallState.FETCHED, Record("install_fetched", {"reference": install.reference}))
+        return move(install, InstallState.FETCHED, Record("install_fetched", {"reference": install.reference}))
 
 
 class Fetched(InstallState):
@@ -56,12 +53,12 @@ class Fetched(InstallState):
     @accepts("BOUND")
     def admit_binding(self, install: CogInstall, *, binding: str, **_: Any) -> Transition[CogInstall]:
         record = Record("binding_admitted", {"reference": install.reference, "binding": binding})
-        return _move(install, InstallState.BOUND, record, binding=binding, failure=None)
+        return move(install, InstallState.BOUND, record, binding=binding, failure=None)
 
     @accepts("FETCHED")
     def refuse_binding(self, install: CogInstall, *, reason: str, **_: Any) -> Transition[CogInstall]:
         record = Record("binding_refused", {"reference": install.reference, "reason": reason})
-        return _move(install, InstallState.FETCHED, record, failure=reason)
+        return move(install, InstallState.FETCHED, record, failure=reason)
 
     @accepts("UNINSTALLED")
     def uninstall(self, install: CogInstall, **_: Any) -> Transition[CogInstall]:
@@ -74,12 +71,12 @@ class Bound(InstallState):
     @accepts("INVOKABLE")
     def check_passed(self, install: CogInstall, **_: Any) -> Transition[CogInstall]:
         record = Record("check_passed", {"reference": install.reference, "binding": install.binding})
-        return _move(install, InstallState.INVOKABLE, record, failure=None)
+        return move(install, InstallState.INVOKABLE, record, failure=None)
 
     @accepts("BOUND")
     def check_failed(self, install: CogInstall, *, step: str, reason: str, **_: Any) -> Transition[CogInstall]:
         record = Record("check_failed", {"reference": install.reference, "step": step, "reason": reason})
-        return _move(install, InstallState.BOUND, record, failure=f"{step}: {reason}")
+        return move(install, InstallState.BOUND, record, failure=f"{step}: {reason}")
 
     @accepts("UNINSTALLED")
     def uninstall(self, install: CogInstall, **_: Any) -> Transition[CogInstall]:

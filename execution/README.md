@@ -46,9 +46,11 @@ duration stop is `RunState.BUDGET_EXCEEDED`; the Track still records it as
 `timed_out`, with `dimension: duration`. The worker's own states are not the
 run's: between steps, or while a worker idles, the run is `RUNNING`.
 
-With `max_revisions`, a signal on a step that has escalated that many times
-ends the run `FAILED` with error `revise_limit_exceeded`, without running the
-step again.
+With `max_revisions=N`, a step may be revised N times: when it escalates again
+after N revisions, the run ends `FAILED` with error `revise_limit_exceeded`, as
+#35's engine did. A signal cannot say whether it approves or sends back, so the
+limit is not charged at the signal; step-declared Gates (#99) move it to the
+decision. Each call reads the Track once to act on it.
 
 ## The result envelope
 

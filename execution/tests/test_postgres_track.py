@@ -100,4 +100,4 @@ def test_pause_accounting_survives_postgres_recovery(store):
     op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     assert engine().signal(op.run_id, "go") is RunState.BUDGET_EXCEEDED
-    assert engine()._budget_tracker(op.run_id).tokens == 18
+    assert engine()._budget_tracker(store.replay(op.run_id)).tokens == 18
