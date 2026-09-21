@@ -287,7 +287,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 0 | #96 | Record the decisions for running Ops: lifecycle runner, durability backends, placement (ADR-0002) | `docs/adr-0002-cog-runs` | — | S | merged, #112 |
 | 1 | #97 | Run the API on Python 3.13 as well as 3.14 | `feat/api-python-3.13` | — | S | merged, #111 |
 | 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | merged, #120 |
-| 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | draft, #133 |
+| 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | in review, #133 |
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | not started |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | not started |
 | 6 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
@@ -379,7 +379,7 @@ Workers return `envelope: 1`; the engine reads it everywhere it read `{output, u
 - [x] The kind E2E passes with envelope-emitting workers.
 
 #### Phase 3 — State machines for the Cog, the worker, the step attempt and the run
-**Issue** #130 · **Branch** `feat/cog-state-machines` · **Depends on** Phase 2 · **Size** M · **Status** draft, #133
+**Issue** #130 · **Branch** `feat/cog-state-machines` · **Depends on** Phase 2 · **Size** M · **Status** in review, #133
 
 One machine per level of §11's state diagram, built before anything moves through them, so every later phase emits events into states that already exist instead of growing statuses of its own. It is ADR-0001 invariant 3 — "a tested lifecycle state machine with per-run budgets, timeouts, and warm/idle/teardown" — built first, since it is the reliability core everything else relies on.
 
