@@ -127,4 +127,4 @@ Bare decision and invariant numbers are ADR-0001's.
 | #110 Temporal backend | ADR-0002 D1, D3 | The same conformance suites as the other backends. |
 | #125 the `collab-hub` CLI | ADR-0002 D4, D7 | A client over the REST API, authentication first; it imports no hub package. |
 | #126 CLI run commands | ADR-0002 D4, D7 | Every run API endpoint behind a command; later work adds its own commands, not another client. |
-| #130 state machines | ADR-0001 invariant 3; ADR-0002 D3 | One machine per level (install, worker, step attempt, run) on the state pattern; run status is the Track replayed through the run machine. |
+| #130 state machines | ADR-0001 invariant 3; ADR-0002 D3, D11 | One machine per level (install, worker, step attempt, run) on the state pattern; run status is the Track replayed through the run machine. |
