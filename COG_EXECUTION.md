@@ -40,6 +40,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 - **#111** and **#112** — Phases 0 and 1: the API runs on Python 3.13 with a CI job proving it, and ADR-0002 records the decisions the phases below depend on. **#115** moved the dev MinIO images to quay.io on the way.
 - **#120** — Phase 2: `CogWorker.interact` returns the result envelope, which the engine reads everywhere it read `{output, usage}`. `ok: false` with an `error.code` fails the step and keeps the code; `ok: true` with `problems` completes it and records them for a Gate. The envelope's invariants hold on construction as on parsing, and the worker client maps the document's HTTP statuses. `InteractionResult` is gone.
 - **#133** — Phase 3: the four state machines on the state pattern, in `collab_hub_execution.states` — a Cog's install, a worker, a step attempt and a run. The engine moves the run and worker machines and writes the records they return; a run's status is its Track replayed through the run machine, and a Track the machine could not have written is refused. `CogLifecycle` and `RunStatus` are gone: a paused run reports `WAITING_AT_GATE`, a duration stop `BUDGET_EXCEEDED`, and a revise limit of N allows N revisions. [`docs/cog-execution/states.md`](docs/cog-execution/states.md) is the reference, held to the code by a test, and ADR-0002 gains D11.
+- **#134** — Phase 4: every Op step has a Gate, evaluated over the step's envelope, and a Cog can no longer pause a run — `PauseRequest` and `signal()` are gone. An escalation is recorded with its attempt, envelope and approvers under an id minted over both; `decide()` answers it as an actor, approve completing the step with the envelope its approver saw, reject ending the run `REJECTED`, send back re-running the step with the findings, and a decision on a closed escalation refused.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -289,7 +290,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 1 | #97 | Run the API on Python 3.13 as well as 3.14 | `feat/api-python-3.13` | — | S | merged, #111 |
 | 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | merged, #120 |
 | 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | merged, #133 |
-| 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | not started |
+| 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | not started |
 | 6 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
 | 7 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 6 | L | not started |
@@ -403,25 +404,25 @@ One machine per level of §11's state diagram, built before anything moves throu
 - [x] No module outside `collab_hub_execution.states` compares or assigns a state by string.
 
 #### Phase 4 — Gates declared on the step; human decisions as signals
-**Issue** #99 · **Branch** `feat/cog-step-gates` · **Depends on** Phases 2, 3 · **Size** M
+**Issue** #99 · **Branch** `feat/cog-step-gates` · **Depends on** Phases 2, 3 · **Size** M · **Status** merged as #134
 
 Move approval out of the Cog and onto the Op step, where the glossary puts it.
 
 *In scope*
-- `OpStep.gate`: a declared policy over the envelope (and, from Phase 24, Guard findings) with three outcomes — `pass`, `pass_with_problems`, `escalate`. Default: any `problem` with severity `error` escalates.
+- `OpStep.gate`: a declared policy over the envelope (and, from Phase 24, Guard findings) with three outcomes — `pass`, `pass_with_problems`, `escalate`. Every step has one, and a step that declares none gets the default: any `problem` with severity `error` escalates. The policy is a threshold — `never`, `error`, `warn` (any problem) or `always`, a sign-off on every result — and it is part of the Op recorded at submission.
 - Each escalation gets an **escalation id**, minted over the step attempt and the envelope that escalated, and recorded with it. It is what a decision answers, so a decision is bound to the revision its reviewer actually saw; a send back closes it and the next escalation on that step gets a new one.
-- A decision signal `{escalation, actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit. A decision naming a closed escalation is refused as stale rather than applied to whatever is open now.
+- A decision signal `{escalation, actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve completes the step with the envelope its approver saw — the step does not run again — and advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit. The engine's `decide(run, escalation, actor, outcome, findings)` replaces `signal()`, and `open_escalation(run)` says what a run waits on. A decision naming a closed escalation is refused as stale rather than applied to whatever is open now.
 - Every move above is an event on Phase 3's run machine — `escalate`, `decide` — so `WAITING_AT_GATE` and the stale-escalation refusal are the machine's, not code in this phase.
 - A Gate declares `approvers` (roles); one that declares none is decided by organization owners and platform operators (decision 1). The engine records the decision; Phase 5 versions it and Phase 11 authorizes it.
-- `PauseRequest` and the worker `{"pause": true}` leave the protocol; the E2E fixture becomes a step-declared Gate.
+- `PauseRequest` and the worker `{"pause": true}` leave the protocol — an answer asking to pause is not an envelope, and fails the step; the E2E fixture becomes a step-declared sign-off Gate that the driver sends back once and approves.
 
 *Dev and CI* — the fake Cog set Phase 7 introduces includes `needs-review`, whose output carries an `error` problem, so the default Gate policy escalates without the Cog asking to pause. *Docs* — `execution/README.md` loses `PauseRequest`; the glossary's Gate entry gains the outcomes and decisions; `op-cog-seam.md` states that a Cog cannot pause a run.
 
 *Acceptance*
-- [ ] A Cog cannot pause a run; only a step's Gate can.
-- [ ] approve, reject and send back each drive the run as stated; send back past the revise limit ends the run `FAILED` with reason `revise_limit_exceeded`.
-- [ ] Each decision is recorded with its escalation id, actor, outcome, findings, and the envelope it decided on.
-- [ ] A decision naming an escalation that a send back has closed is refused, and the run is unchanged.
+- [x] A Cog cannot pause a run; only a step's Gate can.
+- [x] approve, reject and send back each drive the run as stated; send back past the revise limit ends the run `FAILED` with reason `revise_limit_exceeded`.
+- [x] Each decision is recorded with its escalation id, actor, outcome, findings, and the envelope it decided on.
+- [x] A decision naming an escalation that a send back has closed is refused, and the run is unchanged.
 
 #### Phase 5 — The Track as the accountability record
 **Issue** #5 · **Branch** `feat/cog-track-record-5` · **Depends on** Phases 2, 3, 4 · **Size** M
