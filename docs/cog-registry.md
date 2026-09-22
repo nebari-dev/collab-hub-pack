@@ -93,6 +93,13 @@ hunt through 401s on the first sweep. A username without a password (or the
 reverse) is refused for the same reason: it is the shape a half-mounted
 Secret produces.
 
+Surrounding whitespace is removed from every resolved value, on purpose: a
+Secret created with `--from-file` carries the file's trailing newline, and
+forwarding it verbatim fails authentication at the registry with an error
+that names nothing useful. Inline values are treated the same way, so both
+routes yield the same bytes. A whitespace-only value counts as empty. A
+credential whose surrounding whitespace is significant is not supported.
+
 Why indirection rather than an indexed override such as
 `COLLAB_HUB_API__COGS__REGISTRY_SOURCES__0__CREDENTIALS__PASSWORD`: the
 pydantic-settings release the API pins does not layer index-style variables
@@ -147,6 +154,32 @@ every source.
 
 With no sources and the indexer off, the chart renders only the `enabled`
 flag, so a deployment without Cogs carries no other `cogs` environment.
+
+## How the rules stay in step
+
+The refusals above exist in three layers: `values.schema.json` (structure
+and grammar), `templates/cogs-validations.yaml` (cross-field rules, at render
+time) and the API's `config.py` / `cogs/registry.py` (at startup). One
+fixture keeps them from drifting: `scripts/testdata/chart/cogs-negative-cases.yaml`
+holds every refused configuration once, in two forms — the chart values and
+the `cogs` settings the chart renders from them — and two consumers read it.
+
+- `scripts/chart_rules_parity.py`, run by `scripts/chart_render_tests.sh` in
+  the lint workflow, renders each case and asserts the chart refuses it with
+  the expected message; renders it again with the schema skipped and the
+  validations template removed and asserts the Deployment's settings equal the
+  fixture's settings form, so the two forms are proven to describe one
+  configuration; and asserts every `fail` in the validations template fired
+  for some case.
+- `api/tests/test_config_cogs.py` feeds the settings form to `Config` and
+  asserts the API refuses it with the expected message — or, for the rules
+  that can only live in the chart (an empty `existingSecret`, ids that
+  collide once derived into variable names, `extraEnv`, the CA key), that the
+  API *accepts* what the chart would have rendered, with the fixture recording
+  why the rule cannot be mirrored.
+
+A rule added to one layer without a case fails the coverage check; a case
+added without the rule in every layer fails that layer's test.
 
 ## Worked example: one Harbor source
 

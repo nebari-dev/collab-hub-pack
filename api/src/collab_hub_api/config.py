@@ -517,9 +517,7 @@ class FramesServiceAccessConfig(BaseModel):
                 )
         duplicates = {name for name in self.grant_on_acceptance if self.grant_on_acceptance.count(name) > 1}
         if duplicates:
-            raise ValueError(
-                f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once"
-            )
+            raise ValueError(f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once")
         return self
 
 
@@ -710,6 +708,12 @@ class CogIndexConfig(BaseModel):
     real registry is a self-inflicted outage, not a tuning choice.
     """
 
+    # extra="forbid" mirrors values.schema.json's additionalProperties: false.
+    # Without it a misspelled key (``interval_secs``) is dropped and the
+    # default runs, which is a silent misconfiguration of exactly the kind
+    # the chart refuses at render time.
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = False
     interval_seconds: int = Field(default=300, ge=COGS_INDEX_INTERVAL_MIN_SECONDS, le=COGS_INDEX_INTERVAL_MAX_SECONDS)
     run_on_startup: bool = True
@@ -752,6 +756,16 @@ def _pull_secret_from_env(
     log. ``SecretStr`` reprs as ``**********`` wherever it is echoed, so no
     downstream error path — this model's, a nested one's, or the settings
     class's — can carry the value.
+
+    The value is stored with surrounding whitespace removed, deliberately and
+    on purpose rather than by accident: inline values already are (the
+    ``_strip`` validators on ``CogRegistryCredentials`` and ``WebConfig``), a
+    Secret created with ``--from-file`` carries the file's trailing newline,
+    and forwarding that verbatim fails authentication with an error that
+    names nothing useful. A ``SecretStr`` bypasses the model's own strip, so
+    the policy is applied here, once, for the environment route — both
+    routes yield the same bytes. A credential whose surrounding whitespace is
+    significant is not supported; docs/cog-registry.md says so.
     """
 
     if env_field not in container:
@@ -826,7 +840,11 @@ class CogsConfig(BaseModel):
     later with a different exception type.
     """
 
-    model_config = ConfigDict(hide_input_in_errors=True)
+    # extra="forbid": the chart's values.schema.json refuses unknown ``cogs``
+    # keys, and a bare-process deployment deserves the same — ``indx:`` would
+    # otherwise leave the indexer silently off. scripts/testdata/chart/
+    # cogs-negative-cases.yaml holds this rule once for both sides.
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
 
     registry_sources: list[CogRegistrySourceConfig] = Field(default_factory=list)
     index: CogIndexConfig = Field(default_factory=CogIndexConfig)
@@ -1146,9 +1164,7 @@ def build_service_access_granter(config: BaseConfig) -> ServiceAccessGranter:
             f"nothing grants is a typo in one of the two lists, and the harmless-looking "
             f"reading -- an unused entry -- is the one that leaves the real path unmapped."
         )
-    malformed = sorted(
-        path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id
-    )
+    malformed = sorted(path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id)
     if malformed:
         raise RuntimeError(
             f"frames.service_access.keycloak.group_ids has no usable id for {malformed}. "

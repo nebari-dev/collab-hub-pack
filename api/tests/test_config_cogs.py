@@ -8,8 +8,10 @@ settings load", which is the whole point of validating in config.py.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config, resolve_cogs_source_secrets
@@ -28,6 +30,17 @@ def static_source(**overrides) -> dict:
 
 def parse_cogs(**cogs) -> Config:
     return Config.parse({"cogs": cogs})
+
+
+# One fixture holds every refused configuration in chart-values form and in
+# the settings form the chart renders from it; scripts/chart_rules_parity.py
+# proves the two forms equivalent (with helm) and this file feeds the settings
+# form to Config. See the fixture's header.
+NEGATIVE_CASES = Path(__file__).resolve().parents[2] / "scripts" / "testdata" / "chart" / "cogs-negative-cases.yaml"
+
+
+def negative_cases() -> list[dict]:
+    return yaml.safe_load(NEGATIVE_CASES.read_text())["cases"]
 
 
 # --- Defaults and the enabled/sources coupling -------------------------------
@@ -120,13 +133,51 @@ def test_credentials_and_webhook_resolve_from_named_env_vars(monkeypatch):
 
     assert source.credentials.configured
     assert source.credentials.username == "robot$cogs+indexer"
-    # The model's own strip applies to the resolved value too.
+    # Surrounding whitespace is removed on the env route as it is inline; the
+    # policy and its test are below (test_surrounding_whitespace_...).
     assert source.credentials.password.get_secret_value() == "robot-secret-value"
     assert source.webhook_secret.get_secret_value() == "hook-secret-value"
     # The built model's repr masks the secrets (SecretStr); the error-text
     # guarantee is a separate test below.
     assert "robot-secret-value" not in repr(source)
     assert "hook-secret-value" not in repr(source)
+
+
+def test_surrounding_whitespace_is_trimmed_the_same_on_both_routes(monkeypatch):
+    """One whitespace policy for a secret, however it arrives.
+
+    Inline values are stripped by the registry models' own validators (as
+    ``WebConfig`` strips its client and session secrets). A value read from
+    the environment is inserted as a ``SecretStr``, which those validators
+    pass through, so the resolver applies the same strip. The case that
+    matters operationally is the trailing newline a ``--from-file`` Secret
+    carries: verbatim, it would fail authentication at the registry with an
+    error naming nothing useful. Whitespace-only stays "empty" (tested
+    above); a credential whose surrounding whitespace is significant is not
+    supported, and the docs say so.
+    """
+
+    monkeypatch.setenv("PW", " robot-secret-value\n")
+    monkeypatch.setenv("HOOK", "\thook-secret-value\n")
+
+    [from_env] = parse_cogs(
+        registry_sources=[
+            harbor_source(credentials={"username": "robot", "password_env": "PW"}, webhook_secret_env="HOOK")
+        ]
+    ).cogs.registry_sources
+    [inline] = parse_cogs(
+        registry_sources=[
+            harbor_source(
+                credentials={"username": "robot", "password": " robot-secret-value\n"},
+                webhook_secret="\thook-secret-value\n",
+            )
+        ]
+    ).cogs.registry_sources
+
+    assert from_env.credentials.password.get_secret_value() == "robot-secret-value"
+    assert inline.credentials.password.get_secret_value() == "robot-secret-value"
+    assert from_env.webhook_secret.get_secret_value() == "hook-secret-value"
+    assert inline.webhook_secret.get_secret_value() == "hook-secret-value"
 
 
 def test_inline_username_with_password_from_env(monkeypatch):
@@ -355,3 +406,44 @@ def test_index_style_env_override_is_not_a_supported_route(monkeypatch):
     [source] = Config().cogs.registry_sources
 
     assert source.credentials.password.get_secret_value() == "inline-secret"
+
+
+# --- Parity with the chart: the same refusals, from one fixture ---------------
+
+
+def test_negative_case_fixture_is_well_formed():
+    cases = negative_cases()
+    names = [case["name"] for case in cases]
+
+    assert len(names) == len(set(names)), "duplicate case names"
+    for case in cases:
+        assert "chart_error" in case, case["name"]
+        assert ("app_error" in case) != ("why_chart_only" in case), (
+            f"{case['name']}: exactly one of app_error / why_chart_only"
+        )
+        if "app_error" in case:
+            assert "settings" in case, f"{case['name']}: app_error needs a settings form"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [case for case in negative_cases() if "settings" in case],
+    ids=lambda case: case["name"],
+)
+def test_the_api_agrees_with_the_chart_on_each_refusal(case, monkeypatch):
+    """The API side of scripts/chart_rules_parity.py.
+
+    A case with ``app_error`` is refused by both layers; a case with
+    ``why_chart_only`` is refused by the chart but must be *accepted* here,
+    because it is what the chart would have rendered — asserting acceptance
+    is what keeps the reason in ``why_chart_only`` honest.
+    """
+
+    for name, value in case.get("env", {}).items():
+        monkeypatch.setenv(name, value)
+
+    if "app_error" in case:
+        with pytest.raises(ValidationError, match=case["app_error"]):
+            Config.parse({"cogs": case["settings"]})
+    else:
+        Config.parse({"cogs": case["settings"]})

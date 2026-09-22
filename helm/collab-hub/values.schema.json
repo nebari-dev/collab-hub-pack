@@ -1215,31 +1215,34 @@
         },
         "url": {
           "type": "string",
-          "pattern": "^https?://[^/?#@]+([/?#].*)?$"
+          "pattern": "^https?://[^/?#@]+(/[^?#]*)?$"
         },
         "apiUrl": {
           "type": "string",
-          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
+          "pattern": "^$|^https?://[^/?#@]+(/[^?#]*)?$"
         },
         "tokenUrl": {
           "type": "string",
-          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
+          "pattern": "^$|^https?://[^/?#@]+(/[^?#]*)?$"
         },
         "projects": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*$"
           }
         },
         "repositories": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:\\.|_|__|-+)[a-z0-9]+)*)*$",
+            "maxLength": 255
           }
         },
         "indexUrl": {
           "type": "string",
-          "pattern": "^$|^https?://[^/?#@]+([/?#].*)?$"
+          "pattern": "^$|^https?://[^/?#@]+(/[^?#]*)?$"
         },
         "caBundlePath": {
           "type": "string"

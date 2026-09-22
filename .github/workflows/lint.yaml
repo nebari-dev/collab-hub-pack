@@ -121,7 +121,8 @@ jobs:
         run: python3 -m pip install --quiet pyyaml
 
       - name: Chart render tests
-        # Positive renders with assertions on the output, plus every
-        # fail-the-render rule in templates/cogs-validations.yaml and the
-        # schema's rejection of unknown keys.
+        # Positive renders with assertions on the output, plus every refused
+        # configuration in scripts/testdata/chart/cogs-negative-cases.yaml —
+        # the fixture api/tests/test_config_cogs.py also reads, so the schema,
+        # the validations template and config.py cannot drift unnoticed.
         run: scripts/chart_render_tests.sh

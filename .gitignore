@@ -5,6 +5,7 @@
 dev/.cache/
 
 # Helm
+.chart-parity-*/
 examples/wrap-existing-chart/chart/charts/
 *.tgz
 

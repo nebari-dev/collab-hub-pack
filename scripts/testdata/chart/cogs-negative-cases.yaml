@@ -1,0 +1,512 @@
+# Every configuration the Cog registry block refuses, written once (issue #87).
+#
+# The same rules live in three layers: values.schema.json (structure and
+# grammar), templates/cogs-validations.yaml (cross-field rules, at render
+# time) and the API's config.py / cogs/registry.py (at startup). This fixture
+# is what keeps them from drifting. Each case carries the refused
+# configuration in two forms:
+#
+#   values    the chart values an operator would write
+#   settings  the `cogs` settings the chart renders from those values, as the
+#             API's Config receives them (snake_case; Secret indirections as
+#             the *_env names the chart derives)
+#
+# and two consumers read it:
+#
+#   scripts/chart_rules_parity.py (via chart_render_tests.sh, lint workflow)
+#     renders `values` and asserts the chart refuses it with `chart_error`
+#     (and, when `template_error` is set, that the template alone refuses it
+#     with the schema skipped); then renders again with the schema skipped
+#     and the validations template removed and asserts the rendered JSON
+#     equals `settings`, so the two forms are proven to describe the same
+#     configuration. It also asserts every `fail` in cogs-validations.yaml is
+#     exercised by some case here.
+#   api/tests/test_config_cogs.py
+#     feeds `settings` to Config and asserts the API refuses it with
+#     `app_error`; or, for a rule that can only live in the chart, that the
+#     API accepts what the chart would have rendered, with `why_chart_only`
+#     recording the reason. `env` names variables the test sets first, for
+#     cases whose settings carry a Secret indirection.
+#
+# Fields: name, layers (schema|template, informational), values, chart_error
+# (regex over helm's output), template_error (optional regex, asserted with
+# --skip-schema-validation), settings (optional), env (optional), exactly one
+# of app_error (regex over the ValidationError) / why_chart_only, and
+# compare_render (default true; false where the chart drops the offending key
+# so there is no equivalent JSON to compare).
+#
+# Adding a rule to one layer without a case here fails the coverage check;
+# adding a case here without the rule in every layer fails that layer's test.
+
+cases:
+  # --- cross-field rules mirrored in the template and the API -----------------
+
+  - name: index enabled with zero sources
+    layers: [template]
+    values:
+      cogs:
+        index: {enabled: true}
+    chart_error: 'cogs.index.enabled=true with no cogs.registry.sources'
+    settings:
+      index: {enabled: true}
+    app_error: 'cogs.index.enabled is true but cogs.registry_sources is empty'
+
+  - name: duplicate source id
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+            - {id: public, kind: static, url: https://other.example.com, repositories: [cogs/beta]}
+    chart_error: 'reuses an id'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        - {id: public, kind: static, url: https://other.example.com, repositories: [cogs/beta]}
+    app_error: 'reuses id'
+
+  - name: harbor without projects
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: h, kind: harbor, url: https://harbor.example.com}
+    chart_error: 'needs at least one entry in projects'
+    settings:
+      registry_sources:
+        - {id: h, kind: harbor, url: https://harbor.example.com}
+    app_error: 'requires at least one entry in projects'
+
+  - name: static without repositories or indexUrl
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: s, kind: static, url: https://registry.example.com}
+    chart_error: 'needs repositories and/or indexUrl'
+    settings:
+      registry_sources:
+        - {id: s, kind: static, url: https://registry.example.com}
+    app_error: 'requires repositories and/or index_url'
+
+  - name: harbor with repositories
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs], repositories: [cogs/x]}
+    chart_error: 'does not read repositories or indexUrl'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs], repositories: [cogs/x]}
+    app_error: 'does not read repositories'
+
+  - name: harbor with indexUrl
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: harbor-main
+              kind: harbor
+              url: https://harbor.example.com
+              projects: [cogs]
+              indexUrl: https://harbor.example.com/catalog.v1.json
+    chart_error: 'does not read repositories or indexUrl'
+    settings:
+      registry_sources:
+        - id: harbor-main
+          kind: harbor
+          url: https://harbor.example.com
+          projects: [cogs]
+          index_url: https://harbor.example.com/catalog.v1.json
+    app_error: 'does not read index_url'
+
+  - name: static with projects
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], projects: [cogs]}
+    chart_error: 'does not read projects or apiUrl'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], projects: [cogs]}
+    app_error: 'does not read projects'
+
+  - name: static with apiUrl
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: public
+              kind: static
+              url: https://registry.example.com
+              repositories: [cogs/alpha]
+              apiUrl: http://registry.svc:5000
+    chart_error: 'does not read projects or apiUrl'
+    settings:
+      registry_sources:
+        - id: public
+          kind: static
+          url: https://registry.example.com
+          repositories: [cogs/alpha]
+          api_url: http://registry.svc:5000
+    app_error: 'does not read api_url'
+
+  - name: static with a webhook block
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: public
+              kind: static
+              url: https://registry.example.com
+              repositories: [cogs/alpha]
+              webhook: {existingSecret: x}
+    chart_error: 'has no webhook'
+    settings:
+      registry_sources:
+        - id: public
+          kind: static
+          url: https://registry.example.com
+          repositories: [cogs/alpha]
+          webhook_secret_env: COLLAB_HUB_COGS_SOURCE_PUBLIC_WEBHOOK_SECRET
+    env:
+      COLLAB_HUB_COGS_SOURCE_PUBLIC_WEBHOOK_SECRET: hook-secret-value
+    app_error: 'has no webhook; webhook_secret is not read'
+
+  # --- URLs embedding credentials: schema and template both refuse; the API too --
+
+  - name: url with embedded credentials
+    layers: [schema, template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: s, kind: static, url: 'https://robot:REVIEW_SYNTHETIC@registry.example.com', repositories: [cogs/alpha]}
+    chart_error: 'embeds a username or password|pattern'
+    template_error: 'embeds a username or password'
+    settings:
+      registry_sources:
+        - {id: s, kind: static, url: 'https://robot:REVIEW_SYNTHETIC@registry.example.com', repositories: [cogs/alpha]}
+    app_error: 'must not embed a username or password'
+
+  - name: apiUrl with embedded credentials
+    layers: [schema, template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: harbor-main
+              kind: harbor
+              url: https://harbor.example.com
+              projects: [cogs]
+              apiUrl: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc'
+    chart_error: 'embeds a username or password|pattern'
+    template_error: 'embeds a username or password'
+    settings:
+      registry_sources:
+        - id: harbor-main
+          kind: harbor
+          url: https://harbor.example.com
+          projects: [cogs]
+          api_url: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc'
+    app_error: 'must not embed a username or password'
+
+  - name: tokenUrl with embedded credentials
+    layers: [schema, template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: harbor-main
+              kind: harbor
+              url: https://harbor.example.com
+              projects: [cogs]
+              tokenUrl: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc/service/token'
+    chart_error: 'embeds a username or password|pattern'
+    template_error: 'embeds a username or password'
+    settings:
+      registry_sources:
+        - id: harbor-main
+          kind: harbor
+          url: https://harbor.example.com
+          projects: [cogs]
+          token_url: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc/service/token'
+    app_error: 'must not embed a username or password'
+
+  - name: indexUrl with embedded credentials
+    layers: [schema, template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: public
+              kind: static
+              url: https://registry.example.com
+              repositories: [cogs/alpha]
+              indexUrl: 'https://robot:REVIEW_SYNTHETIC@registry.example.com/catalog.v1.json'
+    chart_error: 'embeds a username or password|pattern'
+    template_error: 'embeds a username or password'
+    settings:
+      registry_sources:
+        - id: public
+          kind: static
+          url: https://registry.example.com
+          repositories: [cogs/alpha]
+          index_url: 'https://robot:REVIEW_SYNTHETIC@registry.example.com/catalog.v1.json'
+    app_error: 'must not embed a username or password'
+
+  # --- structure and grammar: schema, mirrored by the API's own validators -------
+
+  - name: unknown cogs key
+    layers: [schema]
+    values:
+      cogs:
+        bogus: 1
+    chart_error: 'bogus.*not allowed'
+    settings:
+      bogus: 1
+    app_error: 'bogus'
+    compare_render: false   # the chart renders nothing for a key it does not know
+
+  - name: unknown source key
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], repos: [x]}
+    chart_error: 'repos.*not allowed'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], repos: [x]}
+    app_error: 'repos'
+    compare_render: false   # the JSON helper renders only the keys it knows
+
+  - name: unknown kind
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: quay, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: 'kind'
+    settings:
+      registry_sources:
+        - {id: public, kind: quay, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: 'kind'
+
+  - name: missing url
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: s, kind: static, repositories: [cogs/alpha]}
+    chart_error: "url is required|missing propert(y|ies).*url"
+    settings:
+      registry_sources:
+        - {id: s, kind: static, url: null, repositories: [cogs/alpha]}
+    app_error: 'url\s+Input should be a valid string'
+
+  - name: id with an uppercase letter
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: Public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: 'id.*pattern'
+    settings:
+      registry_sources:
+        - {id: Public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: 'must match'
+
+  - name: url that is not http(s)
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'ftp://registry.example.com', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'ftp://registry.example.com', repositories: [cogs/alpha]}
+    app_error: 'must be an http\(s\) URL'
+
+  - name: url with a query string
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://registry.example.com/?x=1', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://registry.example.com/?x=1', repositories: [cogs/alpha]}
+    app_error: 'must not carry a query or fragment'
+
+  - name: project name with a slash
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs/x]}
+    chart_error: 'projects.*pattern'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs/x]}
+    app_error: 'is not a registry project name'
+
+  - name: repository path with uppercase letters
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [Cogs/Alpha]}
+    chart_error: 'repositories.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [Cogs/Alpha]}
+    app_error: 'is not an OCI repository path'
+
+  - name: request timeout over the limit
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], requestTimeoutSeconds: 61}
+    chart_error: 'requestTimeoutSeconds.*(maximum|less than or equal)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], request_timeout_seconds: 61}
+    app_error: 'less than or equal to 60'
+
+  - name: sweep interval below the floor
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        index: {enabled: true, intervalSeconds: 1}
+    chart_error: 'intervalSeconds.*(minimum|greater than or equal)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      index: {enabled: true, interval_seconds: 1}
+    app_error: 'greater than or equal to 10'
+
+  # --- rules that can only live in the chart ------------------------------------
+  # The API accepts what the chart would have rendered; why_chart_only says why
+  # the rule cannot be mirrored.
+
+  - name: credentials block with an empty Secret name
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: harbor-main
+              kind: harbor
+              url: https://harbor.example.com
+              projects: [cogs]
+              credentials: {existingSecret: ''}
+    chart_error: 'credentials.existingSecret is empty'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs]}
+    why_chart_only: >-
+      An empty name mounts nothing, so the API receives an anonymous source
+      and cannot tell that a credential was intended.
+
+  - name: webhook block with an empty Secret name
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - id: harbor-main
+              kind: harbor
+              url: https://harbor.example.com
+              projects: [cogs]
+              webhook: {existingSecret: ''}
+    chart_error: 'webhook.existingSecret is empty'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs]}
+    why_chart_only: >-
+      An empty name mounts nothing, so the API receives a source without a
+      webhook secret and cannot tell that one was intended.
+
+  - name: ids colliding after env-name derivation
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: pub.lic, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+            - {id: pub-lic, kind: static, url: https://other.example.com, repositories: [cogs/beta]}
+    chart_error: 'same Secret env var names'
+    settings:
+      registry_sources:
+        - {id: pub.lic, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        - {id: pub-lic, kind: static, url: https://other.example.com, repositories: [cogs/beta]}
+    why_chart_only: >-
+      Distinct ids are valid to the API. The collision is in the chart's
+      derived variable names: had both sources named a Secret they would read
+      the same variables, and the API sees only the names, not how they were
+      derived.
+
+  - name: CA ConfigMap with an empty key
+    layers: [template]
+    values:
+      cogs:
+        caBundle: {configMap: ca, key: ''}
+    chart_error: 'cogs.caBundle.key must name'
+    settings: {}
+    why_chart_only: >-
+      The bundle is mounted by the chart; the API receives only a file path
+      per source, and a source with no path uses system trust.
+
+  - name: extraEnv may not set a cogs setting
+    layers: [template]
+    values:
+      api:
+        deployment:
+          extraEnv:
+            - {name: COLLAB_HUB_API__COGS__INDEX__ENABLED, value: 'true'}
+    chart_error: 'may not set COLLAB_HUB_API__COGS__INDEX__ENABLED'
+    why_chart_only: >-
+      extraEnv is the chart's escape hatch around its own rendering; the API
+      cannot know which of its variables the chart rendered and which were
+      appended.
+    compare_render: false   # the appended variable duplicates the chart's own
+
+  - name: extraEnv may not set a source Secret variable
+    layers: [template]
+    values:
+      api:
+        deployment:
+          extraEnv:
+            - {name: COLLAB_HUB_COGS_SOURCE_X_PASSWORD, value: pw}
+    chart_error: 'may not set COLLAB_HUB_COGS_SOURCE_X_PASSWORD'
+    why_chart_only: >-
+      A literal value under a derived Secret variable name would bypass the
+      Secret mount; the API reads the variable and cannot tell a mounted value
+      from an appended one.
+    compare_render: false
