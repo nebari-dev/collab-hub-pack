@@ -764,8 +764,10 @@ def _pull_secret_from_env(
     and forwarding that verbatim fails authentication with an error that
     names nothing useful. A ``SecretStr`` bypasses the model's own strip, so
     the policy is applied here, once, for the environment route — both
-    routes yield the same bytes. A credential whose surrounding whitespace is
-    significant is not supported; docs/cog-registry.md says so.
+    routes yield the same bytes for string input (a ``SecretStr`` handed to
+    ``Config.parse`` programmatically is taken as is; no operator route does
+    that). A credential whose surrounding whitespace is significant is not
+    supported; docs/cog-registry.md says so.
     """
 
     if env_field not in container:

@@ -30,13 +30,31 @@
 #
 # Fields: name, layers (schema|template, informational), values, chart_error
 # (regex over helm's output), template_error (optional regex, asserted with
-# --skip-schema-validation), settings (optional), env (optional), exactly one
+# --skip-schema-validation so the template refuses on its own), schema_error
+# (optional regex, asserted with the validations template removed so the
+# schema refuses on its own), settings (optional), env (optional), exactly one
 # of app_error (regex over the ValidationError) / why_chart_only, and
 # compare_render (default true; false where the chart drops the offending key
 # so there is no equivalent JSON to compare).
 #
-# Adding a rule to one layer without a case here fails the coverage check;
-# adding a case here without the rule in every layer fails that layer's test.
+# `accepted` lists configurations at the boundary that every layer must let
+# through: the full chart renders them, the rendered settings equal the
+# fixture's settings form, and Config accepts them.
+#
+# Normalization is the one deliberate asymmetry. The chart validates values
+# as written; the API normalizes first (strips surrounding whitespace, and
+# urlsplit lowercases the scheme). So ` cogs ` or `HTTPS://…` fails the
+# render but would be accepted by a bare process. A values file is authored,
+# and the render refuses what the API would have silently corrected.
+#
+# What the coverage check does and does not prove: every fail() literal in
+# cogs-validations.yaml must have fired for some case, so a template rule
+# added without a case fails here. Schema and API rules have no automatic
+# inventory — this file enumerates them, and a new one needs a case added by
+# hand (a case without the rule in every layer fails that layer's test).
+# API-only checks the chart cannot express (credentials both-or-neither, a
+# *_env name that is blank, unset or conflicts with an inline value) are
+# tested directly in api/tests/test_config_cogs.py, not here.
 
 cases:
   # --- cross-field rules mirrored in the template and the API -----------------
@@ -194,6 +212,7 @@ cases:
             - {id: s, kind: static, url: 'https://robot:REVIEW_SYNTHETIC@registry.example.com', repositories: [cogs/alpha]}
     chart_error: 'embeds a username or password|pattern'
     template_error: 'embeds a username or password'
+    schema_error: 'url.*pattern'
     settings:
       registry_sources:
         - {id: s, kind: static, url: 'https://robot:REVIEW_SYNTHETIC@registry.example.com', repositories: [cogs/alpha]}
@@ -212,6 +231,7 @@ cases:
               apiUrl: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc'
     chart_error: 'embeds a username or password|pattern'
     template_error: 'embeds a username or password'
+    schema_error: 'apiUrl.*pattern'
     settings:
       registry_sources:
         - id: harbor-main
@@ -234,6 +254,7 @@ cases:
               tokenUrl: 'http://robot:REVIEW_SYNTHETIC@harbor-core.svc/service/token'
     chart_error: 'embeds a username or password|pattern'
     template_error: 'embeds a username or password'
+    schema_error: 'tokenUrl.*pattern'
     settings:
       registry_sources:
         - id: harbor-main
@@ -256,6 +277,7 @@ cases:
               indexUrl: 'https://robot:REVIEW_SYNTHETIC@registry.example.com/catalog.v1.json'
     chart_error: 'embeds a username or password|pattern'
     template_error: 'embeds a username or password'
+    schema_error: 'indexUrl.*pattern'
     settings:
       registry_sources:
         - id: public
@@ -275,7 +297,7 @@ cases:
     chart_error: 'bogus.*not allowed'
     settings:
       bogus: 1
-    app_error: 'bogus'
+    app_error: 'bogus\s+Extra inputs are not permitted'
     compare_render: false   # the chart renders nothing for a key it does not know
 
   - name: unknown source key
@@ -289,7 +311,7 @@ cases:
     settings:
       registry_sources:
         - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], repos: [x]}
-    app_error: 'repos'
+    app_error: 'repos\s+Extra inputs are not permitted'
     compare_render: false   # the JSON helper renders only the keys it knows
 
   - name: unknown kind
@@ -299,11 +321,11 @@ cases:
         registry:
           sources:
             - {id: public, kind: quay, url: https://registry.example.com, repositories: [cogs/alpha]}
-    chart_error: 'kind'
+    chart_error: 'kind.*(one of|enum)'
     settings:
       registry_sources:
         - {id: public, kind: quay, url: https://registry.example.com, repositories: [cogs/alpha]}
-    app_error: 'kind'
+    app_error: "kind\\s+Input should be 'harbor' or 'static'"
 
   - name: missing url
     layers: [schema]
@@ -411,6 +433,175 @@ cases:
       index: {enabled: true, interval_seconds: 1}
     app_error: 'greater than or equal to 10'
 
+  - name: url with an out-of-range port
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://registry.example.com:99999', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://registry.example.com:99999', repositories: [cogs/alpha]}
+    app_error: 'has an invalid port'
+
+  - name: url with no host
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://:443', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://:443', repositories: [cogs/alpha]}
+    app_error: 'must be an http\(s\) URL with a host'
+
+  - name: url with a broken IPv6 literal
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://[broken', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://[broken', repositories: [cogs/alpha]}
+    app_error: 'Invalid IPv6 URL'
+
+  - name: url with an empty query
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://registry.example.com/?', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://registry.example.com/?', repositories: [cogs/alpha]}
+    app_error: 'must not carry a query or fragment'
+
+  - name: duplicate repositories
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha, cogs/alpha]}
+    chart_error: 'repositories.*equal'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha, cogs/alpha]}
+    app_error: "lists 'cogs/alpha' twice"
+
+  - name: duplicate projects
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs, cogs]}
+    chart_error: 'projects.*equal'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs, cogs]}
+    app_error: "lists 'cogs' twice"
+
+  - name: missing id
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: "missing propert(y|ies).*id"
+    settings:
+      registry_sources:
+        - {id: null, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: 'id\s+Input should be a valid string'
+
+  - name: missing kind
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: "missing propert(y|ies).*kind"
+    settings:
+      registry_sources:
+        - {id: public, kind: null, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: "kind\\s+Input should be 'harbor' or 'static'"
+
+  - name: empty id
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: '', kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: 'id.*pattern'
+    settings:
+      registry_sources:
+        - {id: '', kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: 'registry source id must not be empty'
+
+  - name: id over 64 characters
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    chart_error: 'id.*maxLength'
+    settings:
+      registry_sources:
+        - {id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+    app_error: 'at most 64 characters'
+
+  - name: request timeout of zero
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], requestTimeoutSeconds: 0}
+    chart_error: 'requestTimeoutSeconds.*(exclusiveMinimum|greater than)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], request_timeout_seconds: 0}
+    app_error: 'greater than 0'
+
+  - name: sweep interval above the ceiling
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        index: {enabled: true, intervalSeconds: 90000}
+    chart_error: 'intervalSeconds.*(maximum|less than or equal)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      index: {enabled: true, interval_seconds: 90000}
+    app_error: 'less than or equal to 86400'
+
+  - name: unknown index key
+    layers: [schema]
+    values:
+      cogs:
+        index: {intervalSecs: 5}
+    chart_error: 'intervalSecs.*not allowed'
+    settings:
+      index: {intervalSecs: 5}
+    app_error: 'intervalSecs\s+Extra inputs are not permitted'
+    compare_render: false   # the chart renders nothing for a key it does not know
+
   # --- rules that can only live in the chart ------------------------------------
   # The API accepts what the chart would have rendered; why_chart_only says why
   # the rule cannot be mirrored.
@@ -510,3 +701,37 @@ cases:
       Secret mount; the API reads the variable and cannot tell a mounted value
       from an appended one.
     compare_render: false
+
+# --- configurations at the boundary that every layer must accept -------------
+# The full chart renders each, the rendered settings equal `settings`, and
+# Config accepts them. These pin the schema against becoming stricter than the
+# API by accident (ports, IPv6 literals, in-cluster hostnames, dotted project
+# names, paths).
+accepted:
+  - name: ports, an IPv6 literal, in-cluster names, a dotted project, a path
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: edge.a, kind: static, url: 'https://registry.example.com:65535/v2', repositories: [cogs/alpha, team/cog-beta.v2]}
+            - {id: edge-b, kind: static, url: 'https://[::1]:5000', indexUrl: 'https://[::1]:5000/catalog.v1.json'}
+            - id: harbor_c
+              kind: harbor
+              url: https://harbor.example.com
+              apiUrl: http://harbor-core.harbor.svc.cluster.local:80
+              tokenUrl: http://harbor-core.harbor.svc.cluster.local:80/service/token
+              projects: [cogs, team.x]
+              requestTimeoutSeconds: 60
+        index: {enabled: true, intervalSeconds: 10}
+    settings:
+      registry_sources:
+        - {id: edge.a, kind: static, url: 'https://registry.example.com:65535/v2', repositories: [cogs/alpha, team/cog-beta.v2]}
+        - {id: edge-b, kind: static, url: 'https://[::1]:5000', index_url: 'https://[::1]:5000/catalog.v1.json'}
+        - id: harbor_c
+          kind: harbor
+          url: https://harbor.example.com
+          api_url: http://harbor-core.harbor.svc.cluster.local:80
+          token_url: http://harbor-core.harbor.svc.cluster.local:80/service/token
+          projects: [cogs, team.x]
+          request_timeout_seconds: 60
+      index: {enabled: true, interval_seconds: 10}

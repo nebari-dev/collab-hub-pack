@@ -214,7 +214,10 @@ def _http_url(value: str, *, field_name: str) -> str:
         parts.port  # noqa: B018 - raises for a non-numeric or out-of-range port
     except ValueError:
         raise ValueError(f"{field_name} has an invalid port, got {value!r}") from None
-    if parts.query or parts.fragment:
+    if parts.query or parts.fragment or "?" in value or "#" in value:
+        # The literal check catches an empty query or fragment (``.../?``),
+        # which urlsplit reports as "" — the chart's schema refuses the
+        # delimiter itself, and the two must agree.
         raise ValueError(f"{field_name} must not carry a query or fragment, got {value!r}")
     return value.rstrip("/")
 

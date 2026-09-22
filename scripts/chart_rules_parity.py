@@ -20,9 +20,18 @@ every case:
    lets the API test stand in for "the chart's JSON is refused at startup"
    without needing helm.
 
-Finally, every ``fail`` in templates/cogs-validations.yaml must have fired
-during step 1 for some case, so a rule added to the template without a case
-is caught here, and a case added without its rule fails step 1.
+When ``schema_error`` is set, render with the validations template removed
+but the schema on: the schema must refuse on its own, so a rule that exists
+in both layers is proven in each.
+
+Then every ``fail`` in templates/cogs-validations.yaml must have fired during
+step 1 for some case, so a rule added to the template without a case is
+caught here, and a case added without its rule fails step 1. Schema and API
+rules have no such inventory; the fixture enumerates them by hand.
+
+Finally the fixture's ``accepted`` configurations — boundaries every layer
+must let through — are rendered with the full chart and compared the same
+way, so the schema cannot drift stricter than the API unnoticed.
 
 Driven by scripts/chart_render_tests.sh. Needs PyYAML and a helm on PATH (or
 ``--helm "docker run --rm -v $PWD:$PWD -w $PWD alpine/helm"``; the scratch
@@ -150,6 +159,17 @@ def check_case(
             return
         collected.append(out)
 
+    if schema_error := case.get("schema_error"):
+        rendered, out = run_helm(helm, bare_chart, values_file)
+        if rendered:
+            report.fail(
+                name, f"rendered with the template removed; the schema should refuse on its own: {schema_error}"
+            )
+            return
+        if not re.search(schema_error, out):
+            report.fail(name, f"with the template removed, failed for another reason: {first_lines(out)}")
+            return
+
     if case.get("compare_render", True) and "settings" in case:
         rendered, out = run_helm(helm, bare_chart, values_file, "--skip-schema-validation")
         if not rendered:
@@ -166,6 +186,29 @@ def check_case(
             )
             return
 
+    report.ok(name)
+
+
+def check_accepted(case: dict[str, Any], *, helm: list[str], chart: Path, scratch: Path, report: Reporter) -> None:
+    """A boundary configuration every layer must let through: full chart renders it, settings match."""
+
+    name = f"accepted: {case['name']}"
+    values_file = scratch / f"accepted-{re.sub(r'[^a-z0-9]+', '-', case['name'].lower())}.yaml"
+    values_file.write_text(yaml.safe_dump(case["values"], sort_keys=False))
+    rendered, out = run_helm(helm, chart, values_file)
+    if not rendered:
+        report.fail(name, f"the chart refused a configuration every layer must accept: {first_lines(out)}")
+        return
+    got = rendered_cogs(out)
+    want = normalized_settings(case["settings"])
+    if got != want:
+        report.fail(
+            name,
+            "the chart renders different settings than the fixture's `settings` form:\n"
+            f"     rendered: {json.dumps(got, sort_keys=True)}\n"
+            f"     fixture:  {json.dumps(want, sort_keys=True)}",
+        )
+        return
     report.ok(name)
 
 
@@ -232,7 +275,9 @@ def main() -> int:
         print("--helm is empty: pass the helm command (e.g. --helm helm, or a docker wrapper)", file=sys.stderr)
         return 2
     chart = args.chart.resolve()
-    cases = yaml.safe_load(args.fixture.read_text())["cases"]
+    fixture = yaml.safe_load(args.fixture.read_text())
+    cases = fixture["cases"]
+    accepted = fixture.get("accepted", [])
     report = Reporter()
     check_manifest_shape(cases, report)
 
@@ -255,13 +300,18 @@ def main() -> int:
                 collected=collected,
             )
         check_template_coverage(chart, collected, report)
+        for case in accepted:
+            check_accepted(case, helm=helm, chart=chart, scratch=scratch, report=report)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
     if report.failures:
         print(f"\n{report.failures} chart rule parity check(s) failed")
         return 1
-    print(f"\nall {len(cases)} negative cases refused by the chart and consistent with their settings form")
+    print(
+        f"\nall {len(cases)} negative cases refused by the chart and consistent with their settings form; "
+        f"{len(accepted)} accepted boundary case(s) render"
+    )
     return 0
 
 

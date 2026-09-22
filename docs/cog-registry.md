@@ -178,8 +178,26 @@ the `cogs` settings the chart renders from them — and two consumers read it.
   API *accepts* what the chart would have rendered, with the fixture recording
   why the rule cannot be mirrored.
 
-A rule added to one layer without a case fails the coverage check; a case
-added without the rule in every layer fails that layer's test.
+The fixture also lists **accepted** boundary configurations (ports, IPv6
+literals, in-cluster hostnames, dotted project names) that the full chart
+must render and the API must accept, so the schema cannot drift stricter than
+the API unnoticed.
+
+What this does and does not guarantee: every `fail` in the validations
+template must fire for some case, so a template rule added without a case
+fails the run. Schema and API rules have no automatic inventory — the fixture
+enumerates them, and a new one needs a case added by hand; a case without the
+rule in every layer fails that layer's test. Checks the chart cannot express
+(credentials both-or-neither, a `*_env` name that is blank, unset, or
+conflicts with an inline value) are tested directly in
+`api/tests/test_config_cogs.py`.
+
+Normalization is the one deliberate asymmetry. The chart validates values as
+written; the API normalizes first (surrounding whitespace is stripped, and the
+URL scheme is case-folded by the parser). So `projects: [" cogs "]` or
+`url: HTTPS://…` fails the render but would be accepted by a bare process. A
+values file is authored, and the render refuses what the API would have
+silently corrected.
 
 ## Worked example: one Harbor source
 

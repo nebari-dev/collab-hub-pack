@@ -43,6 +43,10 @@ def negative_cases() -> list[dict]:
     return yaml.safe_load(NEGATIVE_CASES.read_text())["cases"]
 
 
+def accepted_cases() -> list[dict]:
+    return yaml.safe_load(NEGATIVE_CASES.read_text()).get("accepted", [])
+
+
 # --- Defaults and the enabled/sources coupling -------------------------------
 
 
@@ -447,3 +451,18 @@ def test_the_api_agrees_with_the_chart_on_each_refusal(case, monkeypatch):
             Config.parse({"cogs": case["settings"]})
     else:
         Config.parse({"cogs": case["settings"]})
+
+
+@pytest.mark.parametrize("case", accepted_cases(), ids=lambda case: case["name"])
+def test_the_api_accepts_each_boundary_configuration_the_chart_renders(case):
+    """The API side of the fixture's ``accepted`` section.
+
+    The chart side proves these render and that the rendered settings equal
+    this form; here the same form must build a Config. Together they pin the
+    schema against drifting stricter than the API (ports, IPv6 literals,
+    in-cluster hostnames, dotted project names).
+    """
+
+    cogs = Config.parse({"cogs": case["settings"]}).cogs
+
+    assert [source.id for source in cogs.registry_sources] == [s["id"] for s in case["settings"]["registry_sources"]]
