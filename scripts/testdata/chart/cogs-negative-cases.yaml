@@ -41,11 +41,17 @@
 # through: the full chart renders them, the rendered settings equal the
 # fixture's settings form, and Config accepts them.
 #
-# Normalization is the one deliberate asymmetry. The chart validates values
-# as written; the API normalizes first (strips surrounding whitespace, and
+# Two deliberate asymmetries, both in the direction of the chart refusing
+# what the API would take. (1) Normalization: the chart validates values as
+# written; the API normalizes first (strips surrounding whitespace, and
 # urlsplit lowercases the scheme). So ` cogs ` or `HTTPS://…` fails the
-# render but would be accepted by a bare process. A values file is authored,
-# and the render refuses what the API would have silently corrected.
+# render but would be accepted by a bare process. (2) Host grammar: the API
+# accepts whatever urlsplit parses — internationalized hostnames, IPvFuture
+# literals (`[v1.foo]`), hostnames with characters outside [A-Za-z0-9._-] —
+# and the chart does not. A values file is authored, and the render refuses
+# what the API would have silently corrected or tolerated. Zone-scoped IPv6
+# literals (`[fe80::1%25eth0]`) and zero-padded or empty ports are accepted
+# by both.
 #
 # What the coverage check does and does not prove: every fail() literal in
 # cogs-validations.yaml must have fired for some case, so a template rule
@@ -769,6 +775,8 @@ accepted:
             - {id: edge-b, kind: static, url: 'https://[::1]:5000', indexUrl: 'https://[::1]:5000/catalog.v1.json'}
             - {id: edge-c, kind: static, url: 'https://[2001:db8::1]:443/v2', repositories: [cogs/alpha]}
             - {id: edge-d, kind: static, url: 'https://[::ffff:10.0.0.1]', repositories: [cogs/alpha]}
+            - {id: edge-e, kind: static, url: 'https://[fe80::1%25eth0]:5000', repositories: [cogs/alpha]}
+            - {id: edge-f, kind: static, url: 'https://registry.example.com:00080', repositories: [cogs/alpha]}
             - id: harbor_c
               kind: harbor
               url: https://harbor.example.com
@@ -783,6 +791,8 @@ accepted:
         - {id: edge-b, kind: static, url: 'https://[::1]:5000', index_url: 'https://[::1]:5000/catalog.v1.json'}
         - {id: edge-c, kind: static, url: 'https://[2001:db8::1]:443/v2', repositories: [cogs/alpha]}
         - {id: edge-d, kind: static, url: 'https://[::ffff:10.0.0.1]', repositories: [cogs/alpha]}
+        - {id: edge-e, kind: static, url: 'https://[fe80::1%25eth0]:5000', repositories: [cogs/alpha]}
+        - {id: edge-f, kind: static, url: 'https://registry.example.com:00080', repositories: [cogs/alpha]}
         - id: harbor_c
           kind: harbor
           url: https://harbor.example.com

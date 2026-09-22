@@ -192,12 +192,15 @@ rule in every layer fails that layer's test. Checks the chart cannot express
 conflicts with an inline value) are tested directly in
 `api/tests/test_config_cogs.py`.
 
-Normalization is the one deliberate asymmetry. The chart validates values as
+Two asymmetries are deliberate, both in the direction of the chart refusing
+what the API would take. Normalization: the chart validates values as
 written; the API normalizes first (surrounding whitespace is stripped, and the
-URL scheme is case-folded by the parser). So `projects: [" cogs "]` or
-`url: HTTPS://…` fails the render but would be accepted by a bare process. A
-values file is authored, and the render refuses what the API would have
-silently corrected.
+URL scheme is case-folded by the parser), so `projects: [" cogs "]` or
+`url: HTTPS://…` fails the render but would be accepted by a bare process.
+Host grammar: the API accepts whatever its URL parser does — internationalized
+hostnames, IPvFuture literals, hostnames with characters outside
+`[A-Za-z0-9._-]` — and the chart does not. A values file is authored, and the
+render refuses what the API would have silently corrected or tolerated.
 
 ## Worked example: one Harbor source
 
