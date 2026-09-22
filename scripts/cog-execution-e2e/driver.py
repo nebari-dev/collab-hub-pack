@@ -38,7 +38,8 @@ def main() -> int:
         poll_interval=2,
     )
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=25))
+    # Three interactions of 10 tokens: research, the review, and its revision.
+    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=35))
 
     op = OpDefinition(
         "e2e-run",
