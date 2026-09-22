@@ -602,6 +602,58 @@ cases:
     app_error: 'intervalSecs\s+Extra inputs are not permitted'
     compare_render: false   # the chart renders nothing for a key it does not know
 
+  - name: bracketed host that is not an IPv6 address
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://[1234]', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://[1234]', repositories: [cogs/alpha]}
+    app_error: 'does not appear to be an IPv4 or IPv6 address'
+
+  - name: IPv6 literal with two compressions
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://[1::2::3]', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://[1::2::3]', repositories: [cogs/alpha]}
+    app_error: 'does not appear to be an IPv4 or IPv6 address'
+
+  - name: IPv4 address in brackets
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: 'https://[127.0.0.1]', repositories: [cogs/alpha]}
+    chart_error: 'url.*pattern'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: 'https://[127.0.0.1]', repositories: [cogs/alpha]}
+    app_error: 'IPv4 address cannot be in brackets'
+
+  - name: apiUrl with an out-of-range port
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs], apiUrl: 'http://harbor-core.svc:70000'}
+    chart_error: 'apiUrl'
+    settings:
+      registry_sources:
+        - {id: harbor-main, kind: harbor, url: https://harbor.example.com, projects: [cogs], api_url: 'http://harbor-core.svc:70000'}
+    app_error: 'api_url has an invalid port'
+
   # --- rules that can only live in the chart ------------------------------------
   # The API accepts what the chart would have rendered; why_chart_only says why
   # the rule cannot be mirrored.
@@ -715,6 +767,8 @@ accepted:
           sources:
             - {id: edge.a, kind: static, url: 'https://registry.example.com:65535/v2', repositories: [cogs/alpha, team/cog-beta.v2]}
             - {id: edge-b, kind: static, url: 'https://[::1]:5000', indexUrl: 'https://[::1]:5000/catalog.v1.json'}
+            - {id: edge-c, kind: static, url: 'https://[2001:db8::1]:443/v2', repositories: [cogs/alpha]}
+            - {id: edge-d, kind: static, url: 'https://[::ffff:10.0.0.1]', repositories: [cogs/alpha]}
             - id: harbor_c
               kind: harbor
               url: https://harbor.example.com
@@ -727,6 +781,8 @@ accepted:
       registry_sources:
         - {id: edge.a, kind: static, url: 'https://registry.example.com:65535/v2', repositories: [cogs/alpha, team/cog-beta.v2]}
         - {id: edge-b, kind: static, url: 'https://[::1]:5000', index_url: 'https://[::1]:5000/catalog.v1.json'}
+        - {id: edge-c, kind: static, url: 'https://[2001:db8::1]:443/v2', repositories: [cogs/alpha]}
+        - {id: edge-d, kind: static, url: 'https://[::ffff:10.0.0.1]', repositories: [cogs/alpha]}
         - id: harbor_c
           kind: harbor
           url: https://harbor.example.com
