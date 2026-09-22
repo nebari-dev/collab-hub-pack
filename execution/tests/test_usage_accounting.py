@@ -9,7 +9,7 @@ from collab_hub_execution import (
     InMemoryTrackStore,
     OpDefinition,
     OpStep,
-    PauseRequest,
+    Problem,
     ResultEnvelope,
     RunBudget,
     RunState,
@@ -149,11 +149,11 @@ def test_worker_must_return_declared_result_type():
     assert failed["reason"] == "interact() must return a ResultEnvelope"
 
 
-def test_pause_usage_and_completed_usage_survive_restart_without_double_counting():
+def test_escalated_usage_and_completed_usage_survive_restart_without_double_counting():
     def handler(entry, value, *, signal=_NO_SIGNAL):
-        if signal is _NO_SIGNAL:
-            raise PauseRequest("feedback", usage={"tokens": 6})
-        return ResultEnvelope.success(value, usage={"tokens": 6})
+        # A first answer has an error problem, so the step's default Gate escalates it.
+        problems = [Problem("review", "needs another look")] if signal is _NO_SIGNAL else []
+        return ResultEnvelope.success(value, usage={"tokens": 6}, problems=problems)
 
     executor = InMemoryCogExecutor({"c": handler})
     track = InMemoryTrackStore()
@@ -162,15 +162,17 @@ def test_pause_usage_and_completed_usage_survive_restart_without_double_counting
         return DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
 
     assert engine().submit(op(count=2)) is RunState.WAITING_AT_GATE
-    # 6 (pause) + 6 (resume) + 6 (next step's pause) exceeds 15.
-    assert engine().signal("accounting", "go") is RunState.BUDGET_EXCEEDED
+    escalation = engine().open_escalation("accounting")["escalation"]
+    # 6 (escalated) + 6 (sent back) + 6 (next step, which would escalate) exceeds 15.
+    assert engine().decide("accounting", escalation=escalation, actor="alice", outcome="send_back",
+                           findings=["go"]) is RunState.BUDGET_EXCEEDED
     assert engine()._budget_tracker(track.replay("accounting")).tokens == 18
     assert len(executor.materialized) == 3
 
 
-def test_pause_without_usage_fails_when_spending_is_bounded():
+def test_a_result_that_would_escalate_without_usage_fails_when_spending_is_bounded():
     def handler(entry, value):
-        raise PauseRequest("feedback")
+        return ResultEnvelope.success(value, problems=[Problem("review", "needs another look")])
 
     engine = DurableWorkflowEngine(
         executor=InMemoryCogExecutor({"c": handler}), track=InMemoryTrackStore(), budget=RunBudget(max_tokens=15),

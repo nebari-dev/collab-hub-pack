@@ -16,7 +16,7 @@ durability is Track-based recovery, not distributed ownership:
   Kubernetes workers do not persist keys, so a replaced worker re-runs the side
   effect. Terminal runs are immutable; failed runs can be retried explicitly.
   Runs that exhausted a duration/token/cost budget require a new run id.
-- **Caller-driven recovery.** submit(), signal(), and retry() are synchronous.
+- **Caller-driven recovery.** submit(), decide(), and retry() are synchronous.
   After a process restart, a caller must resubmit the same incomplete Op. This
   package provides no startup reconciliation or background recovery loop.
 
@@ -42,6 +42,7 @@ from .envelope import (
     Problem,
     ResultEnvelope,
 )
+from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, escalation_id
 from .kubernetes import KubernetesCogExecutor, cog_slug, label_value, resource_name
 from .lifecycle import (
     BudgetExceeded,
@@ -53,7 +54,6 @@ from .orchestration import (
     InMemoryCogExecutor,
     OpDefinition,
     OpStep,
-    PauseRequest,
     UsageUnavailable,
     WorkflowEngine,
 )
@@ -113,7 +113,10 @@ __all__ = [
     "UsageUnavailable",
     "OpDefinition",
     "OpStep",
-    "PauseRequest",
+    "DEFAULT_APPROVERS",
+    "Gate",
+    "GateOutcome",
+    "escalation_id",
     "WorkflowEngine",
     "KubernetesCogExecutor",
     "cog_slug",

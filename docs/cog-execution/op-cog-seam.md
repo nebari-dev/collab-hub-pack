@@ -121,7 +121,8 @@ possible for free as long as the orchestrator only ever touches the seam.
 - A step's gate consumes the Cog's result envelope (payload + problems);
   Guard failures and integrity problems are surfaced to the gate, never
   retried silently. The gate is declared on the step; the Cog does not
-  implement approval loops.
+  implement approval loops, and it cannot pause a run — an answer asking to
+  pause is not an envelope, and fails the step.
 - Hub-specific requirements on Cogs (envelope shape, io values, entry-point
   forms) live in the hub's published capability list, not in the Cog spec.
 - Model Cogs are shared services that context Cogs bind to via resolution;

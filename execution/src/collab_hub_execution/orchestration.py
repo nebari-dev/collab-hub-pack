@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
+from .gates import Gate, GateOutcome, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
 from .states import RUN, Run, RunState, Transition, Worker
 from .track import TrackEvent, TrackStore
@@ -54,16 +55,16 @@ def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None
     if raw is not None and not isinstance(raw, Mapping):
         raise UsageUnavailable("usage must be an object")
     usage = dict(raw) if raw is not None else {}
-    for field in ("tokens", "cost"):
-        if field not in usage:
-            if budget is not None and getattr(budget, f"max_{field}") is not None:
-                raise UsageUnavailable(f"missing {field} usage for configured budget")
+    for name in ("tokens", "cost"):
+        if name not in usage:
+            if budget is not None and getattr(budget, f"max_{name}") is not None:
+                raise UsageUnavailable(f"missing {name} usage for configured budget")
             continue
-        value = usage[field]
-        valid = type(value) is int if field == "tokens" else type(value) in (int, float)
+        value = usage[name]
+        valid = type(value) is int if name == "tokens" else type(value) in (int, float)
         if not valid or value < 0 or (type(value) is float and not math.isfinite(value)):
-            raise UsageUnavailable(f"invalid {field} usage")
-        if field == "cost":
+            raise UsageUnavailable(f"invalid {name} usage")
+        if name == "cost":
             try:
                 finite = math.isfinite(value)
             except OverflowError:
@@ -75,13 +76,14 @@ def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None
 
 @dataclass(frozen=True, slots=True)
 class OpStep:
-    """One interaction with a Cog entry point."""
+    """One interaction with a Cog entry point, and the Gate that decides on its result."""
 
     name: str
     cog: str
     entry_point: str
     input: Any = None
     digest: str | None = None
+    gate: Gate = field(default_factory=Gate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,21 +92,6 @@ class OpDefinition:
 
     run_id: str
     steps: tuple[OpStep, ...]
-
-
-class PauseRequest(Exception):
-    """A Cog's request for an external signal before continuing.
-
-    Transitional. A pause is a Gate's decision, declared on the Op step, never
-    something a Cog asks for; this leaves the protocol when step-declared Gates
-    land (#99). Until then the reference worker's ``{"pause": true}`` answer is
-    surfaced through it.
-    """
-
-    def __init__(self, reason: str, *, usage: Mapping[str, Any] | None = None) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.usage = usage
 
 
 class CogWorker(Protocol):
@@ -116,13 +103,14 @@ class CogWorker(Protocol):
 
         Return the result envelope (``envelope.py``): ``payload`` is the Cog's
         output and ``usage`` its accounting, never hidden inside the payload.
-        A PauseRequest carries usage for the interaction that paused.
+        A Cog cannot pause a run: its problems go to the step's Gate, which
+        decides whether a person looks at the result.
 
         ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
         re-drives the same incomplete step with the *same* key, and an explicit
-        retry or resume after a pause uses a *new* key. ``input`` always contains
-        the step's original input; ``signal`` carries external feedback separately
-        and is omitted until supplied, including when its explicit value is None.
+        retry or a send back at a Gate uses a *new* key. ``input`` always contains
+        the step's original input; ``signal`` carries a send back's findings
+        separately and is omitted until a step is sent back.
         A worker that persists results by key can turn the
         replay into a no-op — but that durability is the worker's to provide. The
         reference and Kubernetes workers here do NOT persist keys across pod
@@ -153,8 +141,10 @@ class WorkflowEngine(Protocol):
     def submit(self, op: OpDefinition) -> RunState:
         """Start or recover an Op."""
 
-    def signal(self, run_id: str, value: Any = None) -> RunState:
-        """Resume an Op waiting at a Gate with an external value."""
+    def decide(
+        self, run_id: str, *, escalation: str, actor: str, outcome: str, findings: Sequence[Any] = ()
+    ) -> RunState:
+        """Answer the escalation a run waits on: approve, reject or send back."""
 
     def observe(self, run_id: str) -> RunState | None:
         """Return the run's state reconstructed from the Track; ``None`` if never submitted."""
@@ -203,8 +193,8 @@ class _Worker:
 class DurableWorkflowEngine(WorkflowEngine):
     """An engine whose recovery source is exclusively the Track.
 
-    Experimental: interfaces may change. submit(), signal(), and retry() run
-    synchronously until completion, pause, or failure. After a process restart,
+    Experimental: interfaces may change. submit(), decide(), and retry() run
+    synchronously until the run completes, fails, or waits at a Gate. After a process restart,
     a caller must resubmit the same Op; no background recovery loop is provided.
 
     Single-owner by assumption: it holds no cross-replica lease, so the same run
@@ -287,16 +277,49 @@ class DurableWorkflowEngine(WorkflowEngine):
 
     @staticmethod
     def _signal_for(events: tuple[TrackEvent, ...], step: str) -> Any:
-        """The latest durably-recorded signal value for a step, or ``_NO_SIGNAL``.
+        """The findings of the latest send back of a step, or ``_NO_SIGNAL``.
 
-        Recovery re-reads the decision from the Track, so a crash after a signal
-        was recorded resumes with both the original input and the signal.
+        Recovery re-reads the decision from the Track, so a crash after a send
+        back was recorded re-runs the step with both its input and the findings.
         """
         value: Any = _NO_SIGNAL
         for e in events:
-            if e.event_type == "signal_received" and e.payload.get("step") == step:
+            if (e.event_type == "signal_received" and e.payload.get("step") == step
+                    and e.payload.get("outcome", "send_back") == "send_back"):
                 value = e.payload.get("value")
         return value
+
+    @staticmethod
+    def _approved(events: tuple[TrackEvent, ...], step: str) -> Mapping[str, Any] | None:
+        """The escalation of a step that was approved and is not yet completed, or ``None``.
+
+        An approval completes the step with the envelope the approver saw, so
+        a crash between recording the approval and completing the step completes
+        it on recovery rather than running it again.
+        """
+        escalated: Mapping[str, Any] | None = None
+        approved: Mapping[str, Any] | None = None
+        for e in events:
+            if e.payload.get("step") != step:
+                continue
+            if e.event_type == "paused":
+                escalated, approved = e.payload, None
+            elif e.event_type == "signal_received":
+                approved = escalated if e.payload.get("outcome") == "approve" else None
+            elif e.event_type == "step_completed":
+                approved = None
+        return approved
+
+    def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
+        """What a run waiting at a Gate waits on — the escalation id, the envelope, who may decide — or ``None``."""
+        events = self.track.replay(run_id)
+        run = Run.replay(events)
+        if run is None or run.state is not RunState.WAITING_AT_GATE:
+            return None
+        return next(
+            e.payload for e in reversed(events)
+            if e.event_type == "paused" and e.payload.get("escalation") == run.open_escalation
+        )
 
     def submit(self, op: OpDefinition) -> RunState:
         names = [step.name for step in op.steps]
@@ -315,7 +338,7 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # is a deliberate act — call retry().
                 return run.state
             if run is not None and run.state is RunState.WAITING_AT_GATE:
-                # A run waiting at a Gate resumes only through signal(), which
+                # A run waiting at a Gate resumes only through decide(), which
                 # carries the decision. Re-submitting must not re-invoke the gated
                 # step behind the gate's back with its original input. A decision
                 # already recorded moved the run back to RUNNING, so a crash between
@@ -366,12 +389,19 @@ class DurableWorkflowEngine(WorkflowEngine):
         for step in op.steps:
             if step.name in completed:
                 continue
+            approved = self._approved(events, step.name)
+            if approved is not None:
+                # The approver saw this envelope, so it is the step's result; the step does not run again.
+                envelope = ResultEnvelope.parse(approved["envelope"])
+                self._append(op.run_id, "step_completed", step=step.name, output=envelope.payload,
+                             usage=approved.get("usage"), escalation=approved["escalation"], **_recorded(envelope))
+                continue
             if tracker is not None:
                 try:
                     tracker.check()
                 except BudgetExceeded as exc:
                     return self._stop_for_budget(run, step.name, exc)
-            # attempt = prior pauses (revisions) + explicit retries, NOT the
+            # attempt = prior escalations (revisions) + explicit retries, NOT the
             # step_started count: a crash before the outcome is recorded re-runs
             # with the SAME instance/key (a durable worker can dedupe the replay),
             # while an explicit retry() bumps the attempt so it re-runs under a fresh
@@ -400,21 +430,15 @@ class DurableWorkflowEngine(WorkflowEngine):
                 cog_worker = self._record(op.run_id, cog_worker.invoke(entry_point=step.entry_point, step=step.name))
                 signal_value = self._signal_for(events, step.name)
                 feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
-                try:
-                    invoked = True
-                    result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
-                    if not isinstance(result, ResultEnvelope):
-                        raise EnvelopeInvalid("interact() must return a ResultEnvelope")
-                    answered = True
-                    # ok with problems is not a failure: the step completes and a
-                    # Gate decides what the problems mean. ok: false is one.
-                    outcome = ("ok", result) if result.ok else ("error", result)
-                    raw_usage = result.usage
-                except PauseRequest as pause:
-                    answered = True
-                    outcome = ("pause", pause.reason)
-                    raw_usage = pause.usage
-                usage = _validate_usage(raw_usage, self.budget)
+                invoked = True
+                result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
+                if not isinstance(result, ResultEnvelope):
+                    raise EnvelopeInvalid("interact() must return a ResultEnvelope")
+                answered = True
+                # ok with problems is not a failure: the step's Gate decides what
+                # the problems mean. ok: false is one.
+                outcome = ("ok", result) if result.ok else ("error", result)
+                usage = _validate_usage(result.usage, self.budget)
                 self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=usage)
             except UsageUnavailable as exc:
                 # Persist unknown accounting so recovery/retry cannot forget it.
@@ -462,14 +486,19 @@ class DurableWorkflowEngine(WorkflowEngine):
                     tracker.consume(tokens=(usage or {}).get("tokens", 0), cost=(usage or {}).get("cost", 0.0))
                 except BudgetExceeded as exc:
                     budget_stop = exc
-            if kind == "pause":
+            envelope = detail
+            verdict, why = step.gate.evaluate(envelope)
+            if verdict is GateOutcome.ESCALATE:
                 if budget_stop is not None:
                     return self._stop_for_budget(run, step.name, budget_stop)
-                escalation = run.escalate(step=step.name, reason=detail, revise_limit=self.max_revisions)
-                run = self._record(op.run_id, escalation)
+                details = {
+                    "attempt": attempt, "envelope": envelope.to_dict(), "usage": usage,
+                    "approvers": list(step.gate.deciders), "gate": step.gate.escalate,
+                }
+                eid = escalation_id(op.run_id, step.name, attempt, envelope)
+                run = self._record(op.run_id, run.escalate(step=step.name, reason=why, escalation=eid, details=details))
                 return run.state
 
-            envelope = detail
             # `output` keeps the Track's current key; the versioned event schema
             # that renames it and stores large payloads by reference is #5.
             self._append(op.run_id, "step_completed", step=step.name, output=envelope.payload, usage=usage,
@@ -484,7 +513,7 @@ class DurableWorkflowEngine(WorkflowEngine):
     ) -> str | None:
         """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
 
-        A worker that answered — an envelope, ok or not, or a pause — goes IDLE and
+        A worker that answered — with an envelope, ok or not — goes IDLE and
         is torn down as a one-shot, and a teardown that fails is its machine's
         `teardown_failed`. One that did not answer has failed: the executor reclaims
         what is left of it, and if that fails the run's `failed` record says so.
@@ -509,20 +538,31 @@ class DurableWorkflowEngine(WorkflowEngine):
         run = self._record(run.run_id, run.exhaust_budget(dimension=exc.dimension, step=step, reason=str(exc)))
         return run.state
 
-    def signal(self, run_id: str, value: Any = None) -> RunState:
+    def decide(
+        self, run_id: str, *, escalation: str, actor: str, outcome: str, findings: Sequence[Any] = ()
+    ) -> RunState:
+        """Answer the escalation a run waits on: ``approve``, ``reject`` or ``send_back``.
+
+        The decision names the escalation it answers; one naming an escalation
+        that is no longer open raises ``StaleEscalation`` and changes nothing.
+        Approve completes the step with the envelope the approver saw, reject
+        ends the run ``REJECTED``, and send back re-runs the step with the
+        findings as its signal, up to ``max_revisions`` revisions. The decision is
+        recorded before the run advances, so a crash after it resumes from it.
+        Who may decide is the run API's to check (#103); the engine records who did.
+        """
+        if not actor:
+            raise ValueError("a decision names its actor")
         events = self.track.replay(run_id)
         run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
-            raise ValueError(f"run {run_id!r} is not paused")
+            raise ValueError(f"run {run_id!r} is not waiting at a Gate")
         op = self._submitted_definition(run_id, events)
-        # Persist the decision before advancing so a crash mid-resume recovers the
-        # signal from the Track alongside the original input. The value may
-        # legitimately be None — see _NO_SIGNAL. #35's signal re-runs the paused
-        # step with its value, which is a send back; it answers whichever
-        # escalation is open, since escalation ids arrive with step Gates (#99).
-        # It cannot say whether it approves, so the revise limit is not applied
-        # here but when the step escalates again (_advance), as #35 applied it.
-        self._record(run_id, run.decide(outcome="send_back", escalation=run.open_escalation, findings=value))
+        decision = run.decide(outcome=outcome, escalation=escalation, findings=list(findings), actor=actor,
+                              revise_limit=self.max_revisions)
+        run = self._record(run_id, decision)
+        if run.state is not RunState.RUNNING:
+            return run.state
         return self._advance(op)
 
 
@@ -541,6 +581,7 @@ def _serialize_op(op: OpDefinition) -> dict[str, Any]:
                 "entry_point": step.entry_point,
                 "input": step.input,
                 "digest": step.digest,
+                "gate": step.gate.to_dict(),
             }
             for step in op.steps
         ],
@@ -557,6 +598,7 @@ def _deserialize_op(value: dict[str, Any]) -> OpDefinition:
                 entry_point=step["entry_point"],
                 input=step.get("input"),
                 digest=step.get("digest"),
+                gate=Gate.from_dict(step.get("gate")),
             )
             for step in value["steps"]
         ),

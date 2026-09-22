@@ -1,13 +1,11 @@
 """Minimal Cog worker for the kind E2E: serves /healthz and /invoke (stdlib only).
 
 /invoke answers with a version-1 result envelope
-(docs/cog-execution/result-envelope.md): ``payload`` echoes the input, ``usage``
-reports tokens, ``problems`` is empty.
+(docs/cog-execution/result-envelope.md): ``payload`` echoes the input and the
+signal a send back delivered, ``usage`` reports tokens, ``problems`` is empty.
 
-Pause fixture: a Cog whose COG_ID contains "gated" pauses until a separate
-signal carries ``{"approved": true}``. This exercises transport and recovery;
-it does not implement the Op-owned Gate policy defined in docs/GLOSSARY.md, and
-it leaves once Gates are declared on the step (#99).
+The Cog never asks to pause: whether a person reviews its result is the Op
+step's Gate, declared by the driver.
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 COG_ID = os.environ.get("COG_ID", "unknown")
-GATED = "gated" in COG_ID
 # Idempotency: a replayed key returns the prior result without repeating the side
 # effect. In-process here (a fresh pod starts empty); a real Cog persists this.
 _SEEN: dict[str, dict] = {}
@@ -47,10 +44,6 @@ class Handler(BaseHTTPRequestHandler):
         entry, value = payload.get("entry_point"), payload.get("input")
         key = payload.get("idempotency_key")
         signal = payload.get("signal")
-        approved = isinstance(signal, dict) and signal.get("approved") is True
-        if GATED and not approved:
-            self._send(200, {"pause": True, "reason": f"{COG_ID} awaiting approval", "usage": {"tokens": 0}})
-            return
         if key is not None and key in _SEEN:  # replayed key -> no repeated side effect
             self._send(200, _SEEN[key])
             return

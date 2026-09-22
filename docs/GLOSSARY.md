@@ -47,7 +47,16 @@ check*, not a Guard — see below.
 **Gate.** The decision point on a step: ok / ok-with-problems / escalate
 to a human (whitepaper §5). Gates consume the envelope (payload and
 problems) and Guard findings. Gates decide; Cogs never do. A gate is
-declared on the Op step, not implemented inside the Cog.
+declared on the Op step, not implemented inside the Cog, and a Cog cannot
+pause a run. Its outcomes are `pass`, `pass_with_problems` and `escalate`;
+by default any problem with severity `error` escalates. An escalation has
+an id minted over the step attempt and the envelope, and names who may
+decide it (its `approvers`, organization owners and platform operators when
+it names none). A decision answers one escalation, as an actor, with an
+outcome — **approve** completes the step with the result the approver saw,
+**reject** ends the run `REJECTED`, **send back** re-runs the step with the
+findings — and a decision on an escalation that is no longer open is
+refused as stale. (ADR-0002 D8; [states](cog-execution/states.md).)
 
 **Track.** The durable, append-only record of a run: which Cogs ran under
 which bindings, which Guards and Gates fired, who approved, what came out

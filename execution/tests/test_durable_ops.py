@@ -1,10 +1,10 @@
 from collab_hub_execution import (
     DurableWorkflowEngine,
+    Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
     OpDefinition,
     OpStep,
-    PauseRequest,
     RunState,
 )
 
@@ -29,23 +29,20 @@ def test_multi_step_op_interacts_with_each_cog_and_completes():
     assert [event.event_type for event in track.replay("run-1")].count("step_completed") == 2
 
 
-def test_paused_op_resumes_from_track_after_engine_restart():
-    state = {"paused": True}
-
-    def handler(entry, value, *, signal=None):
-        if state["paused"]:
-            raise PauseRequest("needs approval")
-        return value
-
+def test_a_run_waiting_at_a_gate_is_approved_by_another_engine_after_a_restart():
+    calls = []
     track = InMemoryTrackStore()
-    op = OpDefinition("run-2", (OpStep("approval", "human-gated", "approve", "work"),))
-    first = DurableWorkflowEngine(executor=InMemoryCogExecutor({"human-gated": handler}), track=track)
-    assert first.submit(op) is RunState.WAITING_AT_GATE
+    op = OpDefinition("run-2", (OpStep("draft", "writer", "write", "work", gate=Gate(escalate="always")),))
 
-    state["paused"] = False
-    restarted = DurableWorkflowEngine(executor=InMemoryCogExecutor({"human-gated": handler}), track=track)
-    assert restarted.signal("run-2", "approved") is RunState.COMPLETED
-    assert restarted.observe("run-2") is RunState.COMPLETED
+    def engine():
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"writer": lambda e, v: calls.append(v) or v}),
+                                     track=track)
+
+    assert engine().submit(op) is RunState.WAITING_AT_GATE
+    escalation = engine().open_escalation("run-2")["escalation"]
+    assert engine().decide("run-2", escalation=escalation, actor="alice", outcome="approve") is RunState.COMPLETED
+    assert engine().observe("run-2") is RunState.COMPLETED
+    assert calls == ["work"]  # approved as it was: the step did not run again
 
 
 def test_engine_failure_is_recorded_and_worker_is_torn_down():

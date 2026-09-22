@@ -72,7 +72,6 @@ SCENARIOS = [
     (CONTEXTS["run"], "pickup", {}, RunState.RUNNING),
     (CONTEXTS["run"], "cancel", {"actor": "alice"}, RunState.CANCELLED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "escalate", {"step": "s"}, RunState.WAITING_AT_GATE),
-    (replace(CONTEXTS["run"], state=RunState.RUNNING), "escalate", {"step": "s", "revise_limit": 0}, RunState.FAILED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "complete", {}, RunState.COMPLETED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "fail", {"error": "Boom"}, RunState.FAILED),
     (replace(CONTEXTS["run"], state=RunState.RUNNING), "exhaust_budget", {"dimension": "cost"},
@@ -167,13 +166,19 @@ def test_revise_limit_n_allows_n_revisions_when_decisions_send_back():
     assert run.decide(outcome="approve", revise_limit=2).after.state is RunState.RUNNING
 
 
-def test_revise_limit_n_fails_the_step_that_escalates_after_n_revisions():
-    # #35's signal cannot say whether it approves, so the engine applies the limit here, as #35 did.
-    running = replace(CONTEXTS["run"], state=RunState.RUNNING, escalations={"s": 2})
-    assert running.escalate(step="s", revise_limit=3).after.state is RunState.WAITING_AT_GATE
-    stopped = running.escalate(step="s", revise_limit=2)
-    assert stopped.after.state is RunState.FAILED
-    assert stopped.records[0].payload == {"step": "s", "error": "revise_limit_exceeded", "revise_limit": 2}
+def test_an_escalation_records_what_the_gate_escalated_on_and_a_decision_who_made_it():
+    running = replace(CONTEXTS["run"], state=RunState.RUNNING)
+    details = {"attempt": 0, "envelope": {"envelope": 1, "ok": True}, "approvers": ["owner", "operator"]}
+    escalated = running.escalate(step="s", reason="a problem with severity error", escalation="esc-1", details=details)
+    assert escalated.records[0].payload == {"step": "s", "reason": "a problem with severity error", **details,
+                                            "escalation": "esc-1"}
+    decided = escalated.after.decide(outcome="approve", escalation="esc-1", actor="alice", findings=["fine"])
+    assert decided.records[0].payload == {"step": "s", "outcome": "approve", "value": ["fine"],
+                                          "escalation": "esc-1", "actor": "alice"}
+    # The actor replays with the decision.
+    track = _track("op_submitted", "run_picked_up", ("paused", {"step": "s", "escalation": "esc-1"}),
+                   ("signal_received", decided.records[0].payload))
+    assert derive_run_status(track) is RunState.RUNNING
 
 
 def test_a_decision_outcome_must_be_one_of_the_three():
