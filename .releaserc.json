@@ -1,0 +1,31 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/changelog",
+      { "changelogFile": "CHANGELOG.md" }
+    ],
+    [
+      "@semantic-release/exec",
+      { "prepareCmd": "python3 scripts/release/bump-version.py ${nextRelease.version}" }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["CHANGELOG.md", "helm/collab-hub/Chart.yaml", "api/pyproject.toml"],
+        "message": "chore(release): ${nextRelease.version}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "successComment": false,
+        "failComment": false,
+        "releasedLabels": false
+      }
+    ]
+  ]
+}

@@ -1,0 +1,35 @@
+name: PR Title
+
+# The squash commit that lands on main takes its message from the PR title,
+# and semantic-release derives the version, changelog and release notes from
+# those messages. This check makes the title machine-parseable before the PR
+# can merge. No third-party action: the contract is one regex, asserted here.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-title:
+    name: Conventional-commit PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # type(optional-scope)!: description  — types cover the release
+          # mapping (feat = minor, fix/perf = patch, ! or BREAKING CHANGE =
+          # major) plus the non-releasing housekeeping types.
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
+          if printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "PR title is conventional: $TITLE"
+          else
+            echo "::error::PR title is not a conventional commit: '$TITLE'"
+            echo "Expected: type(scope)?: description — e.g. 'feat(agents): add hub model labels'."
+            echo "Types: feat fix perf refactor docs test build ci chore style revert."
+            exit 1
+          fi
