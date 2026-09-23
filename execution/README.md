@@ -60,7 +60,11 @@ passes, passes with its problems recorded, or escalates.
 
 An escalation records the step, the attempt, the envelope, the Gate's reason
 and its approvers, under an escalation id minted over the attempt and the
-envelope; `open_escalation(run_id)` returns it. `decide(run_id, escalation=,
+envelope; `open_escalation(run_id)` returns it, and is on the engine contract
+beside `decide()` so a caller can find what a decision must name. An escalation
+recorded before Gates existed has no id, envelope or approvers: it reads with
+those fields empty, a decision names its id as `None`, and an approval runs the
+step again, since no envelope was recorded to complete it with. `decide(run_id, escalation=,
 actor=, outcome=, findings=)` answers it:
 
 - `approve` completes the step with the envelope the approver saw — the step
@@ -69,6 +73,9 @@ actor=, outcome=, findings=)` answers it:
 - `send_back` re-runs the step with the findings as its `signal`, under a new
   attempt key, and its next result goes through the Gate again, with a new
   escalation id.
+
+`findings` is a sequence of findings, and one string is refused rather than
+sent back as its characters; `None` is no findings at all.
 
 A decision naming an escalation that is no longer open raises
 `StaleEscalation` and changes nothing, so a late approval never approves a

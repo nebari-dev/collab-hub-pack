@@ -43,9 +43,13 @@ class Gate:
     def __post_init__(self) -> None:
         if self.escalate not in POLICIES:
             raise ValueError(f"a Gate escalates one of {POLICIES}, not {self.escalate!r}")
-        if isinstance(self.approvers, str) or not all(isinstance(r, str) and r for r in self.approvers):
+        if isinstance(self.approvers, (str, bytes)):
+            raise ValueError("a Gate's approvers are a sequence of role names, not one string")
+        # Read the sequence once: a generator read twice would validate and then be empty.
+        approvers = tuple(self.approvers)
+        if not all(isinstance(role, str) and role for role in approvers):
             raise ValueError("a Gate's approvers are a sequence of role names")
-        object.__setattr__(self, "approvers", tuple(self.approvers))
+        object.__setattr__(self, "approvers", approvers)
 
     @property
     def deciders(self) -> tuple[str, ...]:
@@ -71,7 +75,8 @@ class Gate:
         """The Gate a step was submitted with; a step recorded before Gates has the default one."""
         if value is None:
             return cls()
-        return cls(escalate=value.get("escalate", "error"), approvers=tuple(value.get("approvers", ())))
+        # The recorded value goes through the same validation as a declared one.
+        return cls(escalate=value.get("escalate", "error"), approvers=value.get("approvers", ()))
 
 
 def escalation_id(run_id: str, step: str, attempt: int, envelope: ResultEnvelope) -> str:

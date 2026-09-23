@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
-from .gates import Gate, GateOutcome, escalation_id
+from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
 from .states import RUN, Run, RunState, Transition, Worker
 from .track import TrackEvent, TrackStore
@@ -72,6 +72,26 @@ def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None
             if not finite:
                 raise UsageUnavailable("invalid cost usage")
     return {key: usage[key] for key in ("tokens", "cost") if key in usage} if raw is not None else None
+
+
+def _escalation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """One escalation as a caller reads it, filled in for a Track written before Gates.
+
+    An escalation recorded before Gates carries only the step and the reason: the
+    Cog asked for the pause, so there is no id, no envelope and no approvers. It
+    still answers to a decision — naming its id, ``None`` — and an approval re-runs
+    the step, since no envelope was recorded to complete it with.
+    """
+    return {
+        "escalation": payload.get("escalation"),
+        "step": payload.get("step"),
+        "reason": payload.get("reason"),
+        "attempt": payload.get("attempt"),
+        "envelope": payload.get("envelope"),
+        "usage": payload.get("usage"),
+        "approvers": payload.get("approvers", list(DEFAULT_APPROVERS)),
+        "gate": payload.get("gate", Gate().escalate),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,8 +161,12 @@ class WorkflowEngine(Protocol):
     def submit(self, op: OpDefinition) -> RunState:
         """Start or recover an Op."""
 
+    def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
+        """What a run waiting at a Gate waits on, or ``None``: what ``decide`` answers."""
+
     def decide(
-        self, run_id: str, *, escalation: str, actor: str, outcome: str, findings: Sequence[Any] = ()
+        self, run_id: str, *, escalation: str | None, actor: str, outcome: str,
+        findings: Sequence[Any] | None = (),
     ) -> RunState:
         """Answer the escalation a run waits on: approve, reject or send back."""
 
@@ -223,10 +247,17 @@ class DurableWorkflowEngine(WorkflowEngine):
     def _append(self, run_id: str, event_type: str, **payload: Any) -> None:
         self.track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=payload))
 
-    def _record(self, run_id: str, transition: Transition[Any]) -> Any:
-        """Write what a transition reports, and return the context after it."""
+    def _record(self, run_id: str, transition: Transition[Any], *, into: list[TrackEvent] | None = None) -> Any:
+        """Write what a transition reports, and return the context after it.
+
+        ``into`` collects the events written, so a caller that already holds a
+        snapshot of the Track can advance on it without reading it again.
+        """
         for record in transition.records:
-            self._append(run_id, record.event_type, **record.payload)
+            event = self.track.append(TrackEvent(run_id=run_id, event_type=record.event_type,
+                                                 payload=dict(record.payload)))
+            if into is not None:
+                into.append(event)
         return transition.after
 
     def observe(self, run_id: str) -> RunState | None:
@@ -295,7 +326,8 @@ class DurableWorkflowEngine(WorkflowEngine):
 
         An approval completes the step with the envelope the approver saw, so
         a crash between recording the approval and completing the step completes
-        it on recovery rather than running it again.
+        it on recovery rather than running it again. An escalation recorded before
+        Gates has no envelope to complete from, so its approval re-runs the step.
         """
         escalated: Mapping[str, Any] | None = None
         approved: Mapping[str, Any] | None = None
@@ -305,7 +337,8 @@ class DurableWorkflowEngine(WorkflowEngine):
             if e.event_type == "paused":
                 escalated, approved = e.payload, None
             elif e.event_type == "signal_received":
-                approved = escalated if e.payload.get("outcome") == "approve" else None
+                approved_now = e.payload.get("outcome") == "approve" and escalated is not None
+                approved = escalated if approved_now and escalated.get("envelope") is not None else None
             elif e.event_type == "step_completed":
                 approved = None
         return approved
@@ -316,18 +349,19 @@ class DurableWorkflowEngine(WorkflowEngine):
         run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
             return None
-        return next(
+        return _escalation(next(
             e.payload for e in reversed(events)
             if e.event_type == "paused" and e.payload.get("escalation") == run.open_escalation
-        )
+        ))
 
     def submit(self, op: OpDefinition) -> RunState:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
             raise ValueError(f"Op {op.run_id!r} has duplicate step names: {names}")
         existing = self.track.replay(op.run_id)
+        written: list[TrackEvent] = []
         if not existing:
-            self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)))
+            self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)), into=written)
         else:
             if _canonical_op(self._submitted_definition(op.run_id, existing)) != _canonical_op(op):
                 raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
@@ -344,7 +378,7 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # already recorded moved the run back to RUNNING, so a crash between
                 # recording it and advancing resumes below, like a mid-step crash.
                 return run.state
-        return self._advance(op)
+        return self._advance(op, (*existing, *written))
 
     def retry(self, run_id: str) -> RunState:
         """Re-drive an unsuccessfully-ended run from its first incomplete step.
@@ -371,11 +405,13 @@ class DurableWorkflowEngine(WorkflowEngine):
             done = "completed" if state is RunState.COMPLETED else f"was {state.value}"
             raise ValueError(f"run {run_id!r} {done}; nothing to retry (start a new run instead)")
         op = self._submitted_definition(run_id, events)
-        self._record(run_id, run.retry())
-        return self._advance(op)
+        written: list[TrackEvent] = []
+        self._record(run_id, run.retry(), into=written)
+        return self._advance(op, (*events, *written))
 
-    def _advance(self, op: OpDefinition) -> RunState:
-        events = self.track.replay(op.run_id)
+    def _advance(self, op: OpDefinition, events: tuple[TrackEvent, ...] | None = None) -> RunState:
+        # The caller passes the Track it has already read, so one call reads it once.
+        events = self.track.replay(op.run_id) if events is None else events
         run = Run.replay(events)
         if run.state is RunState.SUBMITTED:
             run = self._record(op.run_id, run.pickup())
@@ -539,7 +575,8 @@ class DurableWorkflowEngine(WorkflowEngine):
         return run.state
 
     def decide(
-        self, run_id: str, *, escalation: str, actor: str, outcome: str, findings: Sequence[Any] = ()
+        self, run_id: str, *, escalation: str | None, actor: str, outcome: str,
+        findings: Sequence[Any] | None = (),
     ) -> RunState:
         """Answer the escalation a run waits on: ``approve``, ``reject`` or ``send_back``.
 
@@ -553,17 +590,21 @@ class DurableWorkflowEngine(WorkflowEngine):
         """
         if not actor:
             raise ValueError("a decision names its actor")
+        if isinstance(findings, (str, bytes)):
+            # One string is a finding, not a sequence of them; listing it would send back its characters.
+            raise ValueError("findings are a sequence of findings, not one string")
         events = self.track.replay(run_id)
         run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
             raise ValueError(f"run {run_id!r} is not waiting at a Gate")
         op = self._submitted_definition(run_id, events)
-        decision = run.decide(outcome=outcome, escalation=escalation, findings=list(findings), actor=actor,
+        decision = run.decide(outcome=outcome, escalation=escalation, findings=list(findings or ()), actor=actor,
                               revise_limit=self.max_revisions)
-        run = self._record(run_id, decision)
+        written: list[TrackEvent] = []
+        run = self._record(run_id, decision, into=written)
         if run.state is not RunState.RUNNING:
             return run.state
-        return self._advance(op)
+        return self._advance(op, (*events, *written))
 
 
 def _canonical_op(op: OpDefinition) -> str:

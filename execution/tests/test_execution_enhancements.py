@@ -139,19 +139,31 @@ def test_a_rejected_or_cancelled_run_is_refused_a_retry_before_anything_is_read_
     assert track.replay("r") == before
 
 
-def test_a_submission_reads_the_track_once_to_check_it_and_once_to_advance():
-    class CountingTrack(InMemoryTrackStore):
-        reads = 0
+class CountingTrack(InMemoryTrackStore):
+    """Counts how often a call reads the run's Track."""
 
-        def replay(self, run_id, *, after_sequence=0):
-            CountingTrack.reads += 1
-            return super().replay(run_id, after_sequence=after_sequence)
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
 
+    def replay(self, run_id, *, after_sequence=0):
+        self.reads += 1
+        return super().replay(run_id, after_sequence=after_sequence)
+
+
+def test_a_call_reads_the_track_once_and_advances_on_what_it_read_and_wrote():
     track = CountingTrack()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
-    op = OpDefinition("run-reads", tuple(OpStep(f"s{i}", "c", "run") for i in range(3)))
-    assert engine.submit(op) is RunState.COMPLETED
-    assert CountingTrack.reads == 2
+
+    def reviewer(entry, value, *, signal=None):
+        return ResultEnvelope.success(value) if signal else _review(value)
+
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track)
+    op = OpDefinition("run-reads", (OpStep("s0", "c", "run"), OpStep("s1", "c", "run", gate=Gate(escalate="never"))))
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    assert track.reads == 1
+    track.reads = 0
+    assert _decide(engine, "run-reads", "send_back", "again") is RunState.COMPLETED
+    assert track.reads == 2  # open_escalation, then the decision, which advances on what it wrote
 
 
 def test_step_digest_is_recorded_and_survives_restart():

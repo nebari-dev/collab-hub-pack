@@ -2,7 +2,8 @@
 
 /invoke answers with a version-1 result envelope
 (docs/cog-execution/result-envelope.md): ``payload`` echoes the input and the
-signal a send back delivered, ``usage`` reports tokens, ``problems`` is empty.
+findings that a send back delivered as its signal, ``usage`` reports tokens,
+and ``problems`` is empty.
 
 The Cog never asks to pause: whether a person reviews its result is the Op
 step's Gate, declared by the driver.
