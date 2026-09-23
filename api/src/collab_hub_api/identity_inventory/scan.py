@@ -122,7 +122,7 @@ CARRIERS: tuple[Carrier, ...] = (
     Carrier(
         id="frame.legacy_owner",
         location="frame metadata sidecar (S3 and local FS): legacy scalar `owner`",
-        written_by="pre-`owners` records, migrated on read by store.normalize_metadata",
+        written_by="pre-`owners` records, migrated on read by frames.codec.normalize_metadata",
         provenance=FOUND_HERE,
         acl=True,
     ),
@@ -457,7 +457,7 @@ def scan_frame_sidecar(
     model would refuse to load.
 
     The legacy ``owner`` scalar is promoted **exactly** where
-    ``store.normalize_metadata`` promotes it: only when the ``owners`` *key is
+    ``frames.codec.normalize_metadata`` promotes it: only when the ``owners`` *key is
     absent*. A sidecar holding ``{"owners": [], "owner": "alice"}`` is ownerless
     to the service, so it must be ownerless here too — reading it more
     generously would clear a frame that is already unmanageable. Where the two
@@ -496,7 +496,7 @@ def scan_frame_sidecar(
     if isinstance(legacy_owner, str) and legacy_owner.strip():
         record("frame.legacy_owner", "owner", legacy_owner)
         if "owners" not in metadata:
-            # Exactly store.normalize_metadata's condition: the scalar is
+            # Exactly frames.codec.normalize_metadata's condition: the scalar is
             # promoted only when there is no `owners` key at all.
             owners.append(legacy_owner)
         elif not owners:

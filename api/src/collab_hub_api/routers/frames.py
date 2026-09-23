@@ -13,9 +13,11 @@ from ..dependencies import (
     get_group_store,
     get_history_store,
 )
+from ..frames import error_codes
 from ..frames.access import can_manage, can_read, can_read_group
 from ..frames.active_state import ActiveFrameStore, ActiveStateUnavailableError
 from ..frames.auth import AuthContext, get_auth_context
+from ..frames.codec import FrameDecodeError
 from ..frames.groups import (
     FrameGroup,
     FrameGroupNotFoundError,
@@ -792,3 +794,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(HistoryUnavailableError)
     async def history_unavailable_handler(_request: Request, exc: HistoryUnavailableError):
         return error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "history_unavailable", str(exc))
+
+    @app.exception_handler(FrameDecodeError)
+    async def frame_decode_handler(_request: Request, _exc: FrameDecodeError):
+        # The object exists but is unreadable: a structured 500, never a 404.
+        return error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_codes.FRAME_DECODE_ERROR,
+            "Stored frame could not be decoded",
+        )

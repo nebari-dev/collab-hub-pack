@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -15,8 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from . import codec
 from .models import (
-    FRAME_METADATA_SCHEMA_VERSION,
     Frame,
     FrameMetadata,
     Suggestion,
@@ -81,45 +80,6 @@ def readers_after_visibility(visibility: Visibility, current_readers: list[str])
 
 
 logger = logging.getLogger("frames_server.store")
-
-
-def normalize_metadata(metadata: dict) -> dict:
-    """Apply backward-compatible defaults to persisted Frame metadata.
-
-    Legacy records carry a single ``owner`` field; migrate it to ``owners`` and
-    ``created_by`` and drop the now-unknown key (``extra="forbid"`` would reject
-    a leftover ``owner``). New governance fields default conservatively so
-    migrated Frames stay owner-only until an owner publishes them.
-
-    Also repairs the reader/visibility invariant on read: a record persisted with
-    a non-empty ``readers`` list under an ``internal``/``public`` visibility (e.g.
-    written under the earlier "readers restrict internal" semantics) is coerced
-    to ``private`` here, so it can never *widen* to whole-tenant/cross-tenant
-    access once ``can_read`` stops consulting readers on the internal/public
-    branches. Readers only ever apply to ``private`` (Spec 1 §3.3).
-    """
-
-    metadata.setdefault("schema_version", FRAME_METADATA_SCHEMA_VERSION)
-    metadata.setdefault("org_id", "dev-org")
-    metadata.setdefault("workspace_id", "default")
-    metadata.setdefault("name", metadata["id"])
-    if "owner" in metadata:
-        owner = metadata.pop("owner")
-        if "owners" not in metadata:
-            metadata["owners"] = [owner]
-        metadata.setdefault("created_by", owner)
-    owners = metadata.get("owners") or []
-    metadata.setdefault("created_by", owners[0] if owners else "")
-    metadata.setdefault("description", "")
-    metadata.setdefault("visibility", Visibility.private.value)
-    metadata.setdefault("published", False)
-    metadata.setdefault("readers", [])
-    metadata.setdefault("group_ids", [])
-    # Reader/visibility invariant: non-empty readers ⟹ private. Repairs legacy
-    # contradictory records so they never widen access on read.
-    if metadata["readers"]:
-        metadata["visibility"] = Visibility.private.value
-    return metadata
 
 
 def metadata_matches_filters(
@@ -336,11 +296,11 @@ class LocalFsFrameStore(FrameStore):
         body_path = frame_dir / "body.md"
         if not metadata_path.exists() or not body_path.exists():
             raise FrameNotFoundError(frame_id)
-        with metadata_path.open(encoding="utf-8") as file:
-            metadata = json.load(file)
-        metadata = normalize_metadata(metadata)
-        body = body_path.read_text(encoding="utf-8")
-        return Frame(**metadata, body=body)
+        return codec.decode_frame(
+            metadata_path.read_bytes(),
+            body_path.read_bytes(),
+            frame_id=frame_id,
+        )
 
     def create_frame(
         self,
@@ -499,18 +459,20 @@ class LocalFsFrameStore(FrameStore):
         frame_dir.mkdir(parents=True, exist_ok=True)
         body_path = frame_dir / "body.md"
         metadata_path = frame_dir / "metadata.json"
-        body_path.write_text(frame.body, encoding="utf-8")
-        payload = frame.model_dump(mode="json", exclude={"body"})
-        self._write_json(metadata_path, payload)
+        body_path.write_bytes(codec.encode_body(frame))
+        self._write_bytes(metadata_path, codec.encode_metadata(frame))
 
-    def _write_json(self, path: Path, payload: dict) -> None:
-        """Atomically replace a JSON sidecar on local filesystems."""
+    def _write_bytes(self, path: Path, data: bytes) -> None:
+        """Atomically replace a sidecar on local filesystems.
+
+        Writes the codec-produced bytes verbatim (trailing newline included) so
+        the on-disk format is owned entirely by the codec.
+        """
 
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-                json.dump(payload, tmp, indent=2)
-                tmp.write("\n")
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(data)
             os.replace(tmp_name, path)
         finally:
             if os.path.exists(tmp_name):
@@ -637,8 +599,7 @@ class S3FrameStore(FrameStore):
             if code in {"NoSuchKey", "404", "NotFound"}:
                 raise FrameNotFoundError(frame_id) from exc
             raise
-        metadata = json.loads(metadata_obj["Body"].read().decode("utf-8"))
-        return FrameMetadata(**normalize_metadata(metadata))
+        return codec.decode_metadata(metadata_obj["Body"].read(), frame_id=frame_id)
 
     def _read_frame_with_metadata_etag(self, frame_id: str) -> tuple[Frame, str]:
         try:
@@ -655,10 +616,12 @@ class S3FrameStore(FrameStore):
             if code in {"NoSuchKey", "404", "NotFound"}:
                 raise FrameNotFoundError(frame_id) from exc
             raise
-        metadata = json.loads(metadata_obj["Body"].read().decode("utf-8"))
-        metadata = normalize_metadata(metadata)
-        body = body_obj["Body"].read().decode("utf-8")
-        return Frame(**metadata, body=body), metadata_obj["ETag"]
+        frame = codec.decode_frame(
+            metadata_obj["Body"].read(),
+            body_obj["Body"].read(),
+            frame_id=frame_id,
+        )
+        return frame, metadata_obj["ETag"]
 
     def create_frame(
         self,
@@ -807,21 +770,15 @@ class S3FrameStore(FrameStore):
         return closed
 
     def _write_frame(self, frame: Frame) -> None:
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=self._key(frame.id, "body.md"),
-            Body=frame.body.encode("utf-8"),
-            ContentType="text/markdown; charset=utf-8",
-        )
+        self._write_body(frame)
         self._write_metadata(frame)
 
     def _write_metadata(self, frame: Frame, metadata_etag: str | None = None) -> None:
-        payload = json.dumps(frame.model_dump(mode="json", exclude={"body"}), indent=2)
         kwargs = {
             "Bucket": self.bucket,
             "Key": self._key(frame.id, "metadata.json"),
-            "Body": f"{payload}\n".encode("utf-8"),
-            "ContentType": "application/json",
+            "Body": codec.encode_metadata(frame),
+            "ContentType": codec.METADATA_CONTENT_TYPE,
         }
         if metadata_etag is not None:
             kwargs["IfMatch"] = metadata_etag
@@ -831,8 +788,8 @@ class S3FrameStore(FrameStore):
         self.s3.put_object(
             Bucket=self.bucket,
             Key=self._key(frame.id, "body.md"),
-            Body=frame.body.encode("utf-8"),
-            ContentType="text/markdown; charset=utf-8",
+            Body=codec.encode_body(frame),
+            ContentType=codec.BODY_CONTENT_TYPE,
         )
 
     def _retry_metadata_update(

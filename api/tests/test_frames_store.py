@@ -12,6 +12,7 @@ import pytest
 from collab_hub_api.frames.models import (
     FRAME_METADATA_SCHEMA_VERSION,
     Frame,
+    FrameMetadata,
     SuggestionStatus,
     Visibility,
 )
@@ -430,3 +431,81 @@ def test_s3_list_frames_still_applies_filters():
 
     assert store.list_frames("org-a", "workspace-a", owner="alice")
     assert store.list_frames("other-org", "workspace-a") == []
+
+
+class CapturingFakeS3:
+    """In-memory S3 client that round-trips the exact bytes it is handed.
+
+    Stores whatever ``put_object`` writes and serves it back verbatim from
+    ``get_object`` so a write→read cycle exercises the real encode *and* decode
+    paths (no shortcut through a hand-built payload).
+    """
+
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+
+    def put_object(self, Bucket, Key, Body, ContentType, **kwargs):  # noqa: N803 - boto3 casing
+        del Bucket, ContentType, kwargs
+        self.objects[Key] = Body
+
+    def get_object(self, Bucket, Key):  # noqa: N803 - boto3 casing
+        del Bucket
+        if Key not in self.objects:
+            raise FakeS3ClientError("NoSuchKey", 404)
+        return {"Body": io.BytesIO(self.objects[Key]), "ETag": '"etag"'}
+
+
+def _capturing_s3_store(fake: CapturingFakeS3) -> S3FrameStore:
+    store = S3FrameStore.__new__(S3FrameStore)
+    store.bucket = "bucket"
+    store.prefix = "frames"
+    store.client_error = FakeS3ClientError
+    store.s3 = fake
+    return store
+
+
+def test_s3_store_round_trips_a_frame_through_the_codec():
+    """A frame written to S3 reads back equal, exercising encode and decode.
+
+    Covers the real ``_read_frame_with_metadata_etag`` path (both objects fetched
+    and handed to the codec), which the ETag-retry tests stub out.
+    """
+
+    fake = CapturingFakeS3()
+    store = _capturing_s3_store(fake)
+    frame = make_frame(frame_id="b" * 32).model_copy(
+        update={"name": "Café Playbook", "body": "hello café ☕"}
+    )
+
+    store._write_frame(frame)
+
+    assert store.get_frame(frame.id) == frame
+    assert store._read_metadata(frame.id) == FrameMetadata(**frame.model_dump(exclude={"body"}))
+
+
+def test_local_and_s3_backends_write_identical_bytes(tmp_path):
+    """Issue #60 requirement (c): both backends persist the same bytes.
+
+    Writing one Frame — with a non-ASCII name, so ``ensure_ascii`` escaping is in
+    play — through each backend must produce byte-identical ``metadata.json`` and
+    ``body.md``. The shared codec is what guarantees it.
+    """
+
+    frame = make_frame(frame_id="a" * 32).model_copy(
+        update={"name": "Café Playbook", "body": "hello café ☕"}
+    )
+
+    local = LocalFsFrameStore(tmp_path)
+    local._write_frame(frame)
+    local_metadata = (tmp_path / frame.id / "metadata.json").read_bytes()
+    local_body = (tmp_path / frame.id / "body.md").read_bytes()
+
+    fake = CapturingFakeS3()
+    s3 = S3FrameStore.__new__(S3FrameStore)
+    s3.bucket = "bucket"
+    s3.prefix = "frames"
+    s3.s3 = fake
+    s3._write_frame(frame)
+
+    assert fake.objects[f"frames/{frame.id}/metadata.json"] == local_metadata
+    assert fake.objects[f"frames/{frame.id}/body.md"] == local_body

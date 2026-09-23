@@ -1252,3 +1252,20 @@ async def test_owner_cannot_manage_frame_cross_tenant(client):
     )
     assert owned.status_code == 200
     assert owned.json()["name"] == "Renamed"
+
+
+async def test_corrupt_metadata_returns_structured_500(client, tmp_path):
+    """A corrupt sidecar surfaces as a structured 500, never a 404.
+
+    The object exists but is unreadable; mapping it to 404 would tell the client
+    the frame is gone. The codec's FrameDecodeError carries the distinction.
+    """
+
+    frame = await create_frame(client)
+    metadata_path = tmp_path / "frames" / frame["id"] / "metadata.json"
+    metadata_path.write_text("{not valid json", encoding="utf-8")
+
+    response = await client.get(f"/v1/frames/{frame['id']}", cookies=auth_cookie("alice"))
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "frame_decode_error"
