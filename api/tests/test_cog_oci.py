@@ -203,7 +203,7 @@ class FakeRegistry:
         assert MEDIA_TYPE_OCI_INDEX in request.headers["Accept"]
         try:
             media_type = json.loads(body).get("mediaType", MEDIA_TYPE_OCI_MANIFEST)
-        except ValueError, AttributeError:
+        except (ValueError, AttributeError):
             media_type = MEDIA_TYPE_OCI_MANIFEST
         headers = {"Content-Type": media_type}
         if self.send_content_digest:

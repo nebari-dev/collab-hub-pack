@@ -888,6 +888,11 @@ async def test_app_shutdown_is_bounded_when_the_sweep_is_stuck(tmp_path, monkeyp
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
     assert store.events == ["entered", "unlocked"]
+    # The lifespan could not close the executor while the task might still
+    # submit its unlock; it must do so once the task has finished.
+    executor = app.state.cog_indexer._executor
+    with pytest.raises(RuntimeError, match="shutdown"):
+        executor.submit(lambda: None)
 
 
 async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdown(tmp_path, monkeypatch):
