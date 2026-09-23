@@ -72,7 +72,7 @@ jobs:
           fi
           echo "correctly refused"
 
-      - name: make api serves frames with no token
+      - name: make api serves frames and the Cog catalog with no token
         run: |
           set -euo pipefail
           make -C dev api > /tmp/api.log 2>&1 &
@@ -98,6 +98,15 @@ jobs:
 
           # Level 1 keeps frames on disk and everything else in memory.
           test -d dev/.local/frames || { echo "no local frame store"; exit 1; }
+
+          # The Cog catalog read API (#85) answers from the in-memory catalog:
+          # an empty page and an empty compatibility view, not a 503.
+          page=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs)
+          [ "$page" = '{"items":[],"limit":50,"offset":0,"next_offset":null}' ] \
+            || { echo "GET /v1/cogs returned $page"; exit 1; }
+          view=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs/catalog.v1.json)
+          [ "$view" = '{"schemaVersion":1,"repositories":[]}' ] \
+            || { echo "GET /v1/cogs/catalog.v1.json returned $view"; exit 1; }
 
       - name: make clean removes the scratch state
         run: |
@@ -146,6 +155,15 @@ jobs:
           # 503 at level 1, 200 here. This is the whole point of level 2.
           code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/frame-groups)
           [ "$code" = "200" ] || { echo "frame-groups returned $code, expected 200"; exit 1; }
+
+          # The Cog catalog on Postgres (migration 7): every filter the list
+          # route builds, so the SQL itself runs against a real server here.
+          code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
+                   'http://127.0.0.1:8000/v1/cogs?kind=complete&publisher=p&requires=c&provides=x&accepts=a&produces=b&q=50%25_&source_id=s&offset=1')
+          [ "$code" = "200" ] || { echo "filtered /v1/cogs returned $code, expected 200"; exit 1; }
+          view=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs/catalog.v1.json)
+          [ "$view" = '{"schemaVersion":1,"repositories":[]}' ] \
+            || { echo "GET /v1/cogs/catalog.v1.json returned $view"; exit 1; }
 
           pkill -f "collab_hub_api" || true
           sleep 2

@@ -204,6 +204,11 @@ combination, but not restating the list is the better habit.)
   append an override rather than restate the map.
 - `defaultAccess` applies where no rule matches. Keep it `authenticated`: a
   route that ships without its own auth dependency then fails closed.
+- The API routes under `/v1` — frames, tasks, the Cog catalog (`/v1/cogs`,
+  [cog-registry.md](cog-registry.md#read-api)) — need no entry: the default
+  covers them, and each also carries its own auth dependency. That dependency
+  is why a `public` entry for one of them does not make it anonymous;
+  anonymous Cog discovery would be a code change, not a map entry.
 
 ### Why `/web` and `/invite` ship public
 

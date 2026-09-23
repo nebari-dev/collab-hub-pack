@@ -10,6 +10,7 @@ from fastapi import Request
 from .frames.account_provisioning import DisabledServiceAccessGranter
 
 if TYPE_CHECKING:
+    from .cogs.catalog import CogCatalogStore
     from .frames.account_provisioning import ServiceAccessGranter
     from .frames.active_state import ActiveFrameStore
     from .frames.audit_log import AuditLog
@@ -59,6 +60,10 @@ def get_audit_log(request: Request) -> AuditLog:
 
 def get_usage_store(request: Request) -> UsageStore:
     return request.app.state.usage_store
+
+
+def get_cog_catalog_store(request: Request) -> CogCatalogStore:
+    return request.app.state.cog_catalog_store
 
 
 def get_task_store(request: Request) -> InMemoryTaskStore | PostgresTaskStore:

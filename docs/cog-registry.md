@@ -9,14 +9,16 @@ why the registry stays swappable — are documented in
 `api/src/collab_hub_api/cogs/registry.py`; the configuration surface is
 [#87](https://github.com/nebari-dev/collab-hub-pack/issues/87).
 
-> **Status.** This page describes the configuration surface and the chart
-> wiring. Consuming it at runtime — the indexer sweep ([#84]) and the Cog read
-> API ([#85]) — lands separately; today the API validates the block at startup
-> (and refuses to start on the errors described below) but no sweep runs and
-> no registry is contacted.
+> **Status.** This page describes the configuration surface, the chart
+> wiring, and the [read API](#read-api) clients discover Cogs through. The
+> indexer sweep ([#84]) consumes the block at runtime and the read API
+> ([#85]) serves what it indexed; the webhook receiver ([#86]) lands
+> separately. The API validates the block at startup and refuses to start on
+> the errors described below.
 
 [#84]: https://github.com/nebari-dev/collab-hub-pack/issues/84
 [#85]: https://github.com/nebari-dev/collab-hub-pack/issues/85
+[#86]: https://github.com/nebari-dev/collab-hub-pack/issues/86
 
 Two rules shape everything below:
 
@@ -154,6 +156,115 @@ every source.
 
 With no sources and the indexer off, the chart renders only the `enabled`
 flag, so a deployment without Cogs carries no other `cogs` environment.
+
+## Read API
+
+`api/src/collab_hub_api/routers/cogs.py` serves the catalog the indexer
+fills. It is read-only and answers from what was captured at index time: it
+never contacts a registry and never proxies blobs, so an install goes client
+→ registry with the pinned reference it hands out. The catalog is
+registry-agnostic — the answers are the same whichever adapter indexed a row.
+
+| Route | Answers |
+| --- | --- |
+| `GET /v1/cogs` | Current Cogs, one entry per `cog_id`: its newest present version, with its card. Filtered and paged (below). |
+| `GET /v1/cogs/{cog_id}` | The Cog's current entry plus `versions`: every indexed location of every version (digest, version, tags, `pushed_at`, `indexed_at`, `source_id`, repository, reference, `removed_at`), newest first, removed ones included. |
+| `GET /v1/cogs/{cog_id}/versions/{digest}` | The exact card indexed for that digest — what an install pins. |
+| `GET /v1/cogs/{cog_id}/versions/{digest}/cog.md` | The Markdown body of the version's `COG.md` (after its frontmatter), `text/markdown`, as captured at index time. The frontmatter is on the card (`frontmatter`, `frontmatter_raw`). |
+| `GET /v1/cogs/{cog_id}/versions/{digest}/reference` | The **install reference** `{"reference": "<host>/<repository>@sha256:…", "source_id", "repository", "digest", "present", "locations"}` — ready for `nebi import`. |
+| `GET /v1/cogs/catalog.v1.json` | **Transitional** compatibility view, below. |
+
+Every entry carries the digest, the location (`source_id`, `repository`,
+`reference`), `tags`, `pushed_at`, `indexed_at`, `removed_at` and the `card`
+— the bundle reader's output verbatim. The OpenAPI document (`/docs`) types
+the card's top-level keys; `profile`, `frontmatter`, `io` and the other
+structures the reader passes through stay open, because the card is the
+Cog's own declarations, not a hub schema.
+
+**Identity is the digest.** `cog_id` (`<publisher>/<name>`, so it contains a
+`/` — send it as is or percent-encoded) and `name` are search keys. "Newest"
+is by `pushed_at` (unknown last), then `indexed_at`.
+
+**Removed artifacts** are hidden from `GET /v1/cogs` and from the current
+entry of `GET /v1/cogs/{cog_id}`, but every `…/versions/{digest}` route still
+answers for them with `removed_at` set: installs and runs pin digests, and
+the row outlives the artifact. A Cog whose every version was removed is a 404
+at `GET /v1/cogs/{cog_id}` and stays reachable by digest. Non-Cog artifacts,
+failed reads and cards without an `id` never appear.
+
+**Filters** (`GET /v1/cogs`, all optional, combined with AND):
+
+| Parameter | Matches |
+| --- | --- |
+| `kind` | the card's `kind`, exactly |
+| `publisher` | the card's `publisher`, exactly |
+| `provides` | an entry of the card's `provides` |
+| `requires` | a capability named in the card's `requires` |
+| `accepts` / `produces` | an io type in the card's `io.accepts` / `io.produces` |
+| `q` | a case-insensitive substring of the Cog's `name` or `description` (`%` and `_` are literal) |
+| `source_id` | only this registry source |
+
+`source_id` scopes the choice: the newest version is picked among that
+source's rows. Every other filter tests the Cog's **current** version, never
+an older one — a Cog that dropped a capability in its latest release does not
+list under it — so a listed entry is always the card `GET /v1/cogs/{cog_id}`
+serves. The card filters are `jsonb` containment over the stored card, which
+the GIN index on `card` serves.
+
+**Paging.** `limit` (default 50, at most 200) and `offset` (default 0), as
+the task routes page. The page is `{"items": [...], "limit", "offset",
+"next_offset"}`, ordered by `cog_id` in code-point order; `next_offset` is
+the `offset` of the next page, or `null` on the last one.
+
+**Errors** use the API envelope `{"error": {"code", "message"}}`:
+`cog_not_found` and `cog_version_not_found` (404 — including a digest that is
+indexed, but as another Cog's), `cog_catalog_unavailable` (503 — no database
+is configured; an empty catalog is never invented), `validation_error` (422 —
+an out-of-range parameter, or a digest that is not `sha256:` followed by 64
+lowercase hex digits; a well-formed digest the catalog does not hold is a
+404), and `unauthorized` (401).
+
+**Auth.** Every route requires an authenticated caller, like the frames
+routes, and `/v1/cogs` is an API prefix of the path-protection map, so a
+refusal under the hardened map keeps the envelope. A `security.paths` entry
+marking `/v1/cogs` public does **not** open anonymous discovery on its own:
+the routes' auth dependency still requires a caller. That would be a code
+change.
+
+### `catalog.v1.json` (transitional)
+
+`GET /v1/cogs/catalog.v1.json` renders the index in the shape of the static
+`catalog.v1.json` that clients read before the hub had a catalog, so a client
+can switch its catalog URL before it grows new logic:
+
+```json
+{"schemaVersion": 1, "repositories": [
+  {"namespace": "cogs", "name": "cog-audio-transcriber-1a2b", "description": "…"}
+]}
+```
+
+One entry per repository path holding a present, indexed Cog: `namespace` is
+the path's first segment, `name` the rest, `description` the newest
+version's card description (empty when it has none). Entries are sorted by
+path and deduplicated across sources — the shape carries no registry host
+and no digest, so the same path in two sources is one entry, and a client
+reading it still resolves repositories against the registry it already knows.
+A single-segment repository path has no namespace and is left out. The hub's
+own `static` source parses this document, so a hub can index another hub's
+view.
+
+It is **transitional**: it exists for the switch-over and will be removed
+once clients read `GET /v1/cogs`. Build nothing new on it.
+
+### Level 1
+
+`make api` keeps the catalog in process memory
+(`COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory`, a development override
+with no chart value), so the read API answers 200 with an empty catalog at
+level 1; with a `static` source and `cogs.index.enabled` the in-memory
+catalog can be filled by a real sweep. Every other level, and every
+deployment, keeps the catalog in the shared `frames.postgres`. See
+[`dev/README.md`](../dev/README.md#level-1--the-api-alone).
 
 ## How the rules stay in step
 

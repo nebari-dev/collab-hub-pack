@@ -8,7 +8,12 @@ import l2sl
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-from .cogs.catalog import CogCatalogStore, PostgresCogCatalogStore, UnavailableCogCatalogStore
+from .cogs.catalog import (
+    CogCatalogStore,
+    InMemoryCogCatalogStore,
+    PostgresCogCatalogStore,
+    UnavailableCogCatalogStore,
+)
 from .cogs.indexer import CogIndexer
 from .cogs.registry import CogRegistrySourceConfig, build_registry_sources
 from .frames.account_provisioning import DisabledServiceAccessGranter, ServiceAccessGranter
@@ -794,6 +799,23 @@ class CogIndexConfig(BaseModel):
     run_on_startup: bool = True
 
 
+class CogCatalogConfig(BaseModel):
+    """Where the Cog catalog lives (#85).
+
+    ``backend`` is a development override only, like ``frames.groups.backend``:
+    ``"memory"`` keeps the catalog in the process (``make api``, level 1, so
+    the read API answers without a database); empty -- the default -- rides
+    the shared ``frames.postgres``, or refuses with 503 when there is none.
+    Deliberately no chart value: an in-memory catalog is process-local, so on
+    a deployment every replica would list something different and forget it
+    all on restart.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["", "memory"] = ""
+
+
 COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("username_env", "username", False),
     ("password_env", "password", True),
@@ -925,6 +947,7 @@ class CogsConfig(BaseModel):
 
     registry_sources: list[CogRegistrySourceConfig] = Field(default_factory=list)
     index: CogIndexConfig = Field(default_factory=CogIndexConfig)
+    catalog: CogCatalogConfig = Field(default_factory=CogCatalogConfig)
 
     @field_validator("registry_sources", mode="before")
     @classmethod
@@ -1101,11 +1124,13 @@ def build_cog_catalog_store(config: BaseConfig, pools: PostgresPools) -> CogCata
     Always built, whether or not indexing is enabled -- the catalog read API
     stays up on a deployment that only reads a catalog another replica or an
     out-of-band job fills. The table is created by the ``collab_`` migration
-    runner (version 11), so there is no ``auto_migrate`` argument here. No
-    ``memory`` override in config: tests construct ``InMemoryCogCatalogStore``
-    directly.
+    runner (version 11), so there is no ``auto_migrate`` argument here.
+    ``cogs.catalog.backend=memory`` is the development override (#85) that
+    lets level 1 of ``dev/`` serve the read API with no database.
     """
 
+    if config.cogs.catalog.backend == "memory":
+        return InMemoryCogCatalogStore()
     url = config.frames.postgres.url
     if url:
         return PostgresCogCatalogStore(pools.database(url))

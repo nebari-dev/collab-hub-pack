@@ -151,11 +151,19 @@ class KnownArtifact:
 class CatalogFilter:
     """Filters for :meth:`CogCatalogStore.list_current`.
 
+    ``source_id`` **scopes** the listing: the newest row per ``cog_id`` is
+    chosen among that source's rows. Every other filter **tests the chosen
+    row** -- a Cog is listed when its *current* card matches, never because
+    an older version once did -- so a listed entry is always the card the
+    Cog's own detail view serves.
+
     ``provides``/``requires``/``accepts``/``produces`` are containment filters
     over the structured card (``card @> ...``), which is what the GIN index
     on ``card`` serves. ``requires`` names a capability
     (``card.requires[*].capability``); ``provides`` an entry of
     ``card.provides``; ``accepts``/``produces`` entries of ``card.io``.
+    ``q`` is a case-insensitive substring of the ``name`` column or the
+    card's ``description``; ``%`` and ``_`` in it are literal.
     """
 
     kind: str | None = None
@@ -165,6 +173,7 @@ class CatalogFilter:
     requires: str | None = None
     accepts: str | None = None
     produces: str | None = None
+    q: str | None = None
 
     def containment(self) -> dict[str, Any] | None:
         """The JSON document the card must contain, or ``None`` when no card filter is set."""
@@ -286,12 +295,26 @@ class CogCatalogStore(ABC):
         filters: CatalogFilter | None = None,
         *,
         limit: int = DEFAULT_LIST_LIMIT,
+        offset: int = 0,
     ) -> list[CogArtifact]:
-        """The newest present, indexed row per ``cog_id``, filtered.
+        """The newest present, indexed row per ``cog_id``, filtered, ordered by ``cog_id``.
 
         "Newest" is by ``pushed_at`` (unknown last), then ``indexed_at``.
         Non-Cog and failed rows, rows without a ``cog_id``, and removed rows
-        never appear here.
+        never appear here. The newest row is chosen first (within
+        ``filters.source_id`` when given) and the remaining filters test that
+        row; see :class:`CatalogFilter`. ``offset`` skips that many entries of
+        the ordered result, for paging.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_repositories(self) -> list[CogArtifact]:
+        """The newest present, indexed row (with a ``cog_id``) per repository path, ordered by path.
+
+        Repositories of the same path in different sources collapse to one
+        entry. What the ``catalog.v1.json`` compatibility view is built from.
         """
 
         raise NotImplementedError
@@ -307,6 +330,35 @@ def _bounded_limit(limit: int) -> int:
     if limit < 1:
         raise ValueError("limit must be at least 1")
     return min(limit, MAX_LIST_LIMIT)
+
+
+def _checked_offset(offset: int) -> int:
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    return offset
+
+
+def like_pattern(text: str) -> str:
+    """``text`` as an ``ILIKE`` substring pattern with its wildcards escaped (backslash escape)."""
+
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _description_text(card: Mapping[str, Any] | None) -> str | None:
+    # Mirrors ``card->>'description'``: a string as itself, JSON null or a
+    # missing key as NULL, anything else as its JSON text.
+    value = (card or {}).get("description")
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def matches_query(name: str | None, card: Mapping[str, Any] | None, q: str) -> bool:
+    """The in-memory ``q`` test: case-insensitive substring of ``name`` or the card's ``description``."""
+
+    needle = q.lower()
+    return any(needle in text.lower() for text in (name, _description_text(card)) if text is not None)
 
 
 def _sort_key(artifact: CogArtifact) -> tuple:
@@ -442,7 +494,10 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def locations(self, digest) -> list[CogArtifact]:
         raise self._refuse()
 
-    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT) -> list[CogArtifact]:
+    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT, offset=0) -> list[CogArtifact]:
+        raise self._refuse()
+
+    def list_repositories(self) -> list[CogArtifact]:
         raise self._refuse()
 
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
@@ -565,27 +620,42 @@ class InMemoryCogCatalogStore(CogCatalogStore):
         rows.sort(key=lambda row: (row.source_id, row.repository))
         return rows
 
-    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT) -> list[CogArtifact]:
-        limit = _bounded_limit(limit)
-        filters = filters or CatalogFilter()
-        needle = filters.containment()
+    def _present_cogs(self) -> list[CogArtifact]:
         with self._lock:
-            rows = [
+            return [
                 row
                 for row in self._rows.values()
-                if row.removed_at is None
-                and row.status == STATUS_INDEXED
-                and row.cog_id is not None
-                and (filters.kind is None or row.kind == filters.kind)
-                and (filters.publisher is None or row.publisher == filters.publisher)
-                and (filters.source_id is None or row.source_id == filters.source_id)
-                and (needle is None or json_contains(row.card, needle))
+                if row.removed_at is None and row.status == STATUS_INDEXED and row.cog_id is not None
             ]
+
+    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT, offset=0) -> list[CogArtifact]:
+        limit = _bounded_limit(limit)
+        offset = _checked_offset(offset)
+        filters = filters or CatalogFilter()
+        needle = filters.containment()
+        rows = [row for row in self._present_cogs() if filters.source_id is None or row.source_id == filters.source_id]
         rows.sort(key=_sort_key)
         newest: dict[str, CogArtifact] = {}
         for row in rows:
             newest.setdefault(row.cog_id, row)  # type: ignore[arg-type]
-        return sorted(newest.values(), key=lambda row: (row.cog_id or "", _sort_key(row)))[:limit]
+        matching = [
+            row
+            for row in newest.values()
+            if (filters.kind is None or row.kind == filters.kind)
+            and (filters.publisher is None or row.publisher == filters.publisher)
+            and (needle is None or json_contains(row.card, needle))
+            and (filters.q is None or matches_query(row.name, row.card, filters.q))
+        ]
+        matching.sort(key=lambda row: row.cog_id or "")
+        return matching[offset : offset + limit]
+
+    def list_repositories(self) -> list[CogArtifact]:
+        rows = self._present_cogs()
+        rows.sort(key=lambda row: (row.repository, *_sort_key(row)))
+        newest: dict[str, CogArtifact] = {}
+        for row in rows:
+            newest.setdefault(row.repository, row)
+        return [newest[repository] for repository in sorted(newest)]
 
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         with self._lock:
@@ -877,48 +947,84 @@ class PostgresCogCatalogStore(CogCatalogStore):
             ).fetchall()
         return [_row_to_artifact(row) for row in rows]
 
-    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT) -> list[CogArtifact]:
+    def list_current(self, filters=None, *, limit=DEFAULT_LIST_LIMIT, offset=0) -> list[CogArtifact]:
         from psycopg.types.json import Jsonb
 
         limit = _bounded_limit(limit)
+        offset = _checked_offset(offset)
         filters = filters or CatalogFilter()
         needle = filters.containment()
-        sql, params = self.current_query(filters, needle, limit)
+        sql, params = self.current_query(filters, needle, limit, offset)
         with self._db.connection() as conn:
             rows = conn.execute(sql, [Jsonb(p) if isinstance(p, dict) else p for p in params]).fetchall()
         return [_row_to_artifact(row) for row in rows]
 
     @staticmethod
-    def current_query(filters: CatalogFilter, needle: dict[str, Any] | None, limit: int) -> tuple[str, list[Any]]:
+    def current_query(
+        filters: CatalogFilter, needle: dict[str, Any] | None, limit: int, offset: int = 0
+    ) -> tuple[str, list[Any]]:
         """The ``list_current`` statement, exposed so a live test can EXPLAIN it.
 
-        The card filter is a single ``card @> %s`` -- the operator the GIN
-        index (``jsonb_path_ops``) exists for. Everything else is an equality
-        on an indexed or cheap column.
+        Two stages, so a filter tests each Cog's *current* row rather than
+        selecting an older version that happens to match: the inner
+        ``DISTINCT ON (cog_id)`` picks the newest present row per Cog (scoped
+        by ``source_id`` when given), the outer ``WHERE`` filters those rows.
+        The card filter is ``card @> %s`` -- the operator the GIN index
+        (``jsonb_path_ops``) exists for -- applied twice: inside, as a
+        candidate prefilter on ``cog_id`` the index answers (a Cog whose
+        current card matches has at least one matching row, so it is never
+        dropped), and outside, as the test itself. Everything else is an
+        equality on an indexed or cheap column, or the ``q`` substring match.
+        The page is ordered by ``cog_id`` in the ``"C"`` collation (code-point
+        order), the order the in-memory store uses, so paging is identical
+        on both and independent of the database's locale.
         """
 
-        clauses = ["removed_at IS NULL", f"status = '{STATUS_INDEXED}'", "cog_id IS NOT NULL"]
+        inner = ["removed_at IS NULL", f"status = '{STATUS_INDEXED}'", "cog_id IS NOT NULL"]
         params: list[Any] = []
-        for column, value in (
-            ("kind", filters.kind),
-            ("publisher", filters.publisher),
-            ("source_id", filters.source_id),
-        ):
+        if filters.source_id is not None:
+            inner.append("source_id = %s")
+            params.append(filters.source_id)
+        if needle is not None:
+            inner.append("cog_id IN (SELECT cog_id FROM collab_cog_artifacts WHERE card @> %s)")
+            params.append(needle)
+        outer: list[str] = []
+        for column, value in (("kind", filters.kind), ("publisher", filters.publisher)):
             if value is not None:
-                clauses.append(f"{column} = %s")
+                outer.append(f"{column} = %s")
                 params.append(value)
         if needle is not None:
-            clauses.append("card @> %s")
+            outer.append("card @> %s")
             params.append(needle)
-        params.append(limit)
+        if filters.q is not None:
+            outer.append("(name ILIKE %s ESCAPE '\\' OR card->>'description' ILIKE %s ESCAPE '\\')")
+            pattern = like_pattern(filters.q)
+            params.extend([pattern, pattern])
+        params.extend([limit, offset])
         sql = f"""
-            SELECT DISTINCT ON (cog_id) {_COLUMNS}
-            FROM collab_cog_artifacts
-            WHERE {" AND ".join(clauses)}
-            ORDER BY cog_id, pushed_at DESC NULLS LAST, indexed_at DESC, source_id, repository, digest
-            LIMIT %s
+            SELECT {_COLUMNS} FROM (
+                SELECT DISTINCT ON (cog_id) {_COLUMNS}
+                FROM collab_cog_artifacts
+                WHERE {" AND ".join(inner)}
+                ORDER BY cog_id, pushed_at DESC NULLS LAST, indexed_at DESC, source_id, repository, digest
+            ) AS current_cogs
+            WHERE {" AND ".join(outer) or "TRUE"}
+            ORDER BY cog_id COLLATE "C"
+            LIMIT %s OFFSET %s
         """
         return sql, params
+
+    def list_repositories(self) -> list[CogArtifact]:
+        with self._db.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT ON (repository) {_COLUMNS} FROM collab_cog_artifacts
+                WHERE removed_at IS NULL AND status = '{STATUS_INDEXED}' AND cog_id IS NOT NULL
+                ORDER BY repository, pushed_at DESC NULLS LAST, indexed_at DESC, source_id, digest
+                """
+            ).fetchall()
+        # Code-point order, as the in-memory store sorts, whatever the locale.
+        return sorted((_row_to_artifact(row) for row in rows), key=lambda row: row.repository)
 
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         with self._db.connection() as conn:

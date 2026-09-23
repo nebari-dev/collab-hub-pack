@@ -43,6 +43,9 @@ API_PATH_PREFIXES = (
     "/v1/task-devices",
     "/v1/task-notifications",
     "/v1/task-runs",
+    # The Cog catalog read API (issue #85): its 404 and 503 states carry
+    # machine-readable codes (`cog_not_found`, `cog_catalog_unavailable`).
+    "/v1/cogs",
     # The invitation surface (issue #89). Its terminal states are carried
     # entirely by the error envelope's machine-readable `code` — the
     # acceptance page renders "the link expired" and "sign in with the other

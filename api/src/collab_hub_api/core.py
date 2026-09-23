@@ -69,6 +69,7 @@ from .routers import (
     admin,
     admin_api,
     admin_ui,
+    cogs,
     connectors,
     frame_groups,
     frames,
@@ -711,6 +712,7 @@ def make_app(config: BaseConfig) -> FastAPI:
     user_directory.register_exception_handlers(app)
     usage.register_exception_handlers(app)
     invitations.register_exception_handlers(app)
+    cogs.register_exception_handlers(app)
     app.include_router(frames.router, prefix="/v1")
     app.include_router(user_directory.router, prefix="/v1")
     app.include_router(frames.router, include_in_schema=False)
@@ -724,6 +726,9 @@ def make_app(config: BaseConfig) -> FastAPI:
     app.include_router(tasks.devices_router, prefix="/v1")
     app.include_router(tasks.notifications_router, prefix="/v1")
     app.include_router(tasks.runs_router, prefix="/v1")
+    # The Cog catalog read API (#85). /v1 only: it post-dates the unprefixed
+    # legacy mounts, so there is no old client to keep answering.
+    app.include_router(cogs.router, prefix="/v1")
 
     if config.web.enabled:
         # The browser surface (issue #88): session sign-in and the page

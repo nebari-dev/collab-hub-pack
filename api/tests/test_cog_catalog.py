@@ -41,6 +41,8 @@ from collab_hub_api.cogs.catalog import (
     card_search_fields,
     contains_nul,
     json_contains,
+    like_pattern,
+    matches_query,
 )
 from collab_hub_api.frames.collab_schema import COLLAB_SCHEMA_LOCK_KEY, run_collab_schema_migrations
 from collab_hub_api.frames.db import FRAMES_SERVER_SCHEMA_LOCK_KEY
@@ -278,6 +280,86 @@ def test_list_current_filters(store):
     assert ids(kind="model", requires="model-registry/example") == []
 
 
+def test_list_current_filters_test_the_current_version_not_an_older_one(store):
+    # v1 declared the capability and the kind; v2, the newest, dropped both.
+    # Listing by them must not resurrect v1 as the Cog's "current" entry.
+    store.upsert(
+        artifact("1", pushed_at=T0, document=card(version="1.0.0", kind="model", requires=["gpu/any"])),
+    )
+    store.upsert(artifact("2", pushed_at=T0 + timedelta(days=1), document=card(version="2.0.0")))
+
+    assert [row.version for row in store.list_current()] == ["2.0.0"]
+    assert store.list_current(CatalogFilter(requires="gpu/any")) == []
+    assert store.list_current(CatalogFilter(kind="model")) == []
+
+
+def test_list_current_source_id_scopes_the_choice_of_newest(store):
+    store.upsert(artifact("1", source_id="mirror", pushed_at=T0, document=card(version="1.0.0")))
+    store.upsert(artifact("2", pushed_at=T0 + timedelta(days=1), document=card(version="2.0.0")))
+
+    assert [row.version for row in store.list_current()] == ["2.0.0"]
+    assert [row.version for row in store.list_current(CatalogFilter(source_id="mirror"))] == ["1.0.0"]
+
+
+def test_list_current_q_matches_name_or_description_case_insensitively(store):
+    described = card("example/transcriber")
+    described["description"] = "Turns AUDIO into 100% timestamped text"
+    store.upsert(artifact("a", repository="cogs/transcriber", document=described))
+    store.upsert(artifact("b", repository="cogs/notes", document=card("example/notes_v2")))
+
+    def ids(q: str) -> list[str]:
+        return [row.cog_id for row in store.list_current(CatalogFilter(q=q))]
+
+    assert ids("TRANSCRIBER") == ["example/transcriber"], "the name"
+    assert ids("audio") == ["example/transcriber"], "the description"
+    assert ids("100%") == ["example/transcriber"]
+    assert ids("%") == ["example/transcriber"], "% is literal, not a wildcard"
+    assert ids("s_v") == ["example/notes_v2"], "_ is literal, not a wildcard"
+    assert ids("zzz") == []
+
+
+def test_matches_query_mirrors_description_text_for_non_string_values():
+    assert matches_query(None, {"description": 42}, "42")
+    assert not matches_query(None, {"description": None}, "none")
+    assert not matches_query(None, None, "x")
+
+
+def test_like_pattern_escapes_wildcards_and_the_escape_character():
+    assert like_pattern("a%b_c\\d") == "%a\\%b\\_c\\\\d%"
+
+
+def test_list_current_pages_in_cog_id_order_with_offset(store):
+    for index in range(5):
+        store.upsert(artifact(f"{index}", repository=f"cogs/c{index}", document=card(f"example/c{index}")))
+
+    def page(offset: int, limit: int = 2) -> list[str]:
+        return [row.cog_id for row in store.list_current(limit=limit, offset=offset)]
+
+    assert page(0) == ["example/c0", "example/c1"]
+    assert page(2) == ["example/c2", "example/c3"]
+    assert page(4) == ["example/c4"]
+    assert page(5) == []
+    with pytest.raises(ValueError):
+        store.list_current(offset=-1)
+
+
+def test_list_repositories_is_one_newest_present_cog_row_per_path(store):
+    store.upsert(artifact("1", repository="cogs/a", pushed_at=T0, document=card("example/a", version="1")))
+    store.upsert(
+        artifact("2", repository="cogs/a", pushed_at=T0 + timedelta(days=1), document=card("example/a", version="2"))
+    )
+    # The same path in another source collapses into the same entry.
+    store.upsert(artifact("3", source_id="mirror", repository="cogs/a", pushed_at=T0, document=card("example/a")))
+    store.upsert(artifact("4", repository="cogs/b", document=card("example/b")))
+    store.upsert(artifact("5", repository="cogs/gone", document=card("example/gone")))
+    store.mark_removed_one(SOURCE, "cogs/gone", digest("5"))
+    store.upsert(artifact("6", repository="images/nginx", status=STATUS_NON_COG))
+    store.upsert(artifact("7", repository="cogs/broken", status=STATUS_FAILED))
+
+    rows = store.list_repositories()
+    assert [(row.repository, row.version) for row in rows] == [("cogs/a", "2"), ("cogs/b", "1.0.0")]
+
+
 def test_list_current_limit_is_bounded_at_the_boundary(store):
     # MAX_LIST_LIMIT + 5 distinct cog_ids, so the cap is proven at its actual
     # boundary rather than inferred from a five-row set.
@@ -316,6 +398,7 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.get(digest("a")),
         lambda: store.locations(digest("a")),
         lambda: store.list_current(),
+        lambda: store.list_repositories(),
         lambda: store.list_versions("x"),
     ):
         with pytest.raises(CogCatalogUnavailableError):
@@ -613,6 +696,67 @@ def test_live_containment_filters_match_and_use_the_gin_index(live_store):
     assert '(card @> \'{"requires": [{"capability": "media/ffmpeg"}]}\'::jsonb)' in plan, plan
     assert "Index Scan" in plan and "Seq Scan" not in plan, plan
     assert "collab_cog_artifacts_card_idx" in bare, bare
+
+
+def _exercise_read_api_listing(store) -> None:
+    """The listing semantics the read API (#85) relies on, run against either backend."""
+
+    # example/a: v1 required a capability and was a model; v2 (newest) is neither.
+    store.upsert(
+        artifact(
+            "1",
+            repository="cogs/a",
+            pushed_at=T0,
+            document=card("example/a", version="1", kind="model", requires=["gpu/any"]),
+        )
+    )
+    store.upsert(
+        artifact("2", repository="cogs/a", pushed_at=T0 + timedelta(days=1), document=card("example/a", version="2"))
+    )
+    # An older copy of example/a in another source, under the same path.
+    store.upsert(
+        artifact("3", source_id="mirror", repository="cogs/a", pushed_at=T0, document=card("example/a", version="1"))
+    )
+    described = card("example/B_tool")
+    described["description"] = "Handles 100% of AUDIO"
+    store.upsert(artifact("4", repository="cogs/B", document=described))
+    store.upsert(artifact("5", repository="cogs/c", document=card("example/c")))
+    store.upsert(artifact("6", repository="cogs/gone", document=card("example/gone")))
+    store.mark_removed_one(SOURCE, "cogs/gone", digest("6"))
+    store.upsert(artifact("7", repository="images/nginx", status=STATUS_NON_COG))
+
+    def ids(filters=None, **kwargs) -> list[str]:
+        return [row.cog_id for row in store.list_current(filters, **kwargs)]
+
+    # Code-point order: "B" sorts before "a", whatever the database locale.
+    assert ids() == ["example/B_tool", "example/a", "example/c"]
+    assert [row.version for row in store.list_current(CatalogFilter(q="example/a"))] == []  # q is not the id
+    assert ids(CatalogFilter(requires="gpu/any")) == [], "filters test the current version"
+    assert ids(CatalogFilter(kind="model")) == []
+    assert [row.version for row in store.list_current(CatalogFilter(source_id="mirror"))] == ["1"]
+    assert ids(CatalogFilter(q="audio")) == ["example/B_tool"]
+    assert ids(CatalogFilter(q="b_T")) == ["example/B_tool"]
+    assert ids(CatalogFilter(q="0%")) == ["example/B_tool"]
+    assert ids(CatalogFilter(q="%")) == ["example/B_tool"], "% is literal"
+    assert ids(CatalogFilter(q="a_")) == [], "_ is literal"
+    assert ids(limit=2) == ["example/B_tool", "example/a"]
+    assert ids(limit=2, offset=2) == ["example/c"]
+    assert ids(limit=2, offset=3) == []
+    assert [(row.repository, row.version) for row in store.list_repositories()] == [
+        ("cogs/B", "1.0.0"),
+        ("cogs/a", "2"),
+        ("cogs/c", "1.0.0"),
+    ]
+
+
+def test_read_api_listing_semantics_in_memory(store):
+    _exercise_read_api_listing(store)
+
+
+@live_postgres
+def test_live_read_api_listing_semantics(live_store):
+    store, _ = live_store
+    _exercise_read_api_listing(store)
 
 
 @live_postgres
@@ -1055,13 +1199,46 @@ def test_list_current_builds_the_filters_it_is_given():
     sql, params = conn.calls[0]
     assert "DISTINCT ON (cog_id)" in sql and "card @> %s" in sql
     assert "removed_at IS NULL" in sql and "kind = %s" in sql and "publisher = %s" in sql
-    assert params[-1] == 5, "the bounded limit is the last parameter"
+    assert params[-2:] == (5, 0), "the bounded limit, then the offset, close the parameters"
+
+
+def test_list_current_collapses_before_it_filters_and_pages_in_code_point_order():
+    store, conn = _fake_store([[]])
+    filters = CatalogFilter(source_id="mirror", kind="model", provides="x", q="50%")
+    store.list_current(filters, limit=3, offset=6)
+    sql, params = conn.calls[0]
+    inner, _, outer = sql.partition(") AS current_cogs")
+    # source_id scopes the choice of the newest row; the rest test that row.
+    assert "source_id = %s" in inner and "kind = %s" not in inner
+    assert "kind = %s" in outer and "card @> %s" in outer
+    # The card filter is also a GIN-served candidate prefilter inside.
+    assert "cog_id IN (SELECT cog_id FROM collab_cog_artifacts WHERE card @> %s)" in inner
+    assert "name ILIKE %s ESCAPE '\\' OR card->>'description' ILIKE %s ESCAPE '\\'" in outer
+    assert 'ORDER BY cog_id COLLATE "C" LIMIT %s OFFSET %s' in outer
+    needle = {"provides": ["x"]}
+    unwrapped = tuple(getattr(param, "obj", param) for param in params)  # Jsonb wraps the needle
+    assert unwrapped == ("mirror", needle, "model", needle, "%50\\%%", "%50\\%%", 3, 6)
 
 
 def test_list_current_without_filters_still_excludes_removed_rows():
     store, conn = _fake_store([[]])
     assert store.list_current() == []
     assert "removed_at IS NULL" in conn.statements[0] and "card @>" not in conn.statements[0]
+    assert "WHERE TRUE" in conn.statements[0]
+
+
+def test_list_current_refuses_a_negative_offset_before_touching_the_database():
+    store, conn = _fake_store()
+    with pytest.raises(ValueError):
+        store.list_current(offset=-1)
+    assert conn.calls == []
+
+
+def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order():
+    store, conn = _fake_store([[_row(repository="cogs/b"), _row(repository="cogs/B")]])
+    assert [row.repository for row in store.list_repositories()] == ["cogs/B", "cogs/b"]
+    sql = conn.statements[0]
+    assert "DISTINCT ON (repository)" in sql and "removed_at IS NULL" in sql and "cog_id IS NOT NULL" in sql
 
 
 def test_list_versions_orders_newest_first_and_can_include_removed():
