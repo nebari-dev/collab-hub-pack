@@ -318,10 +318,12 @@ def test_list_current_q_matches_name_or_description_case_insensitively(store):
     assert ids("zzz") == []
 
 
-def test_matches_query_mirrors_description_text_for_non_string_values():
-    assert matches_query(None, {"description": 42}, "42")
-    assert not matches_query(None, {"description": None}, "none")
+def test_matches_query_only_reads_string_descriptions():
+    assert matches_query(None, {"description": "Café au lait"}, "café")
+    for description in (42, None, ["café"], {"text": "café"}, True):
+        assert not matches_query(None, {"description": description}, "caf"), description
     assert not matches_query(None, None, "x")
+    assert matches_query("cog-café", None, "CAF")
 
 
 def test_like_pattern_escapes_wildcards_and_the_escape_character():
@@ -724,12 +726,21 @@ def _exercise_read_api_listing(store) -> None:
     store.upsert(artifact("6", repository="cogs/gone", document=card("example/gone")))
     store.mark_removed_one(SOURCE, "cogs/gone", digest("6"))
     store.upsert(artifact("7", repository="images/nginx", status=STATUS_NON_COG))
+    # Structured descriptions never match q, whatever their text would be.
+    for seed, description in (("8", ["café", "AUDIO"]), ("9", {"text": "café AUDIO"}), ("0", 1000)):
+        odd = card(f"example/odd-{seed}")
+        odd["description"] = description
+        store.upsert(artifact(seed, repository=f"odd/o{seed}", document=odd))
 
     def ids(filters=None, **kwargs) -> list[str]:
         return [row.cog_id for row in store.list_current(filters, **kwargs)]
 
+    odd = ["example/odd-0", "example/odd-8", "example/odd-9"]
     # Code-point order: "B" sorts before "a", whatever the database locale.
-    assert ids() == ["example/B_tool", "example/a", "example/c"]
+    assert ids() == ["example/B_tool", "example/a", "example/c", *odd]
+    assert ids(CatalogFilter(q="café")) == []
+    assert ids(CatalogFilter(q="100")) == ["example/B_tool"], "not the numeric description 1000"
+    assert ids(CatalogFilter(q="odd-8")) == ["example/odd-8"], "the name still matches"
     assert [row.version for row in store.list_current(CatalogFilter(q="example/a"))] == []  # q is not the id
     assert ids(CatalogFilter(requires="gpu/any")) == [], "filters test the current version"
     assert ids(CatalogFilter(kind="model")) == []
@@ -740,12 +751,15 @@ def _exercise_read_api_listing(store) -> None:
     assert ids(CatalogFilter(q="%")) == ["example/B_tool"], "% is literal"
     assert ids(CatalogFilter(q="a_")) == [], "_ is literal"
     assert ids(limit=2) == ["example/B_tool", "example/a"]
-    assert ids(limit=2, offset=2) == ["example/c"]
-    assert ids(limit=2, offset=3) == []
+    assert ids(limit=2, offset=2) == ["example/c", "example/odd-0"]
+    assert ids(limit=2, offset=6) == []
     assert [(row.repository, row.version) for row in store.list_repositories()] == [
         ("cogs/B", "1.0.0"),
         ("cogs/a", "2"),
         ("cogs/c", "1.0.0"),
+        ("odd/o0", "1.0.0"),
+        ("odd/o8", "1.0.0"),
+        ("odd/o9", "1.0.0"),
     ]
 
 
@@ -1213,11 +1227,16 @@ def test_list_current_collapses_before_it_filters_and_pages_in_code_point_order(
     assert "kind = %s" in outer and "card @> %s" in outer
     # The card filter is also a GIN-served candidate prefilter inside.
     assert "cog_id IN (SELECT cog_id FROM collab_cog_artifacts WHERE card @> %s)" in inner
-    assert "name ILIKE %s ESCAPE '\\' OR card->>'description' ILIKE %s ESCAPE '\\'" in outer
+    assert (
+        "(name ILIKE %s ESCAPE %s OR (jsonb_typeof(card->'description') = 'string'"
+        " AND card->>'description' ILIKE %s ESCAPE %s))"
+    ) in outer
+    assert "'\\'" not in sql, "the escape character is bound, not a literal"
     assert 'ORDER BY cog_id COLLATE "C" LIMIT %s OFFSET %s' in outer
     needle = {"provides": ["x"]}
     unwrapped = tuple(getattr(param, "obj", param) for param in params)  # Jsonb wraps the needle
-    assert unwrapped == ("mirror", needle, "model", needle, "%50\\%%", "%50\\%%", 3, 6)
+    pattern = "%50\\%%"
+    assert unwrapped == ("mirror", needle, "model", needle, pattern, "\\", pattern, "\\", 3, 6)
 
 
 def test_list_current_without_filters_still_excludes_removed_rows():

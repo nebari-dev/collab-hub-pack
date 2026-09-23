@@ -512,6 +512,9 @@ def make_app(config: BaseConfig) -> FastAPI:
             return get_caller_identity(request)
         return get_auth_context(request)
 
+    # The same map, readable by a route that honors a `public` entry itself
+    # (the Cog catalog's anonymous discovery, issue #85).
+    app.state.path_rules = tuple(config.security.paths)
     app.add_middleware(
         PathProtectionMiddleware,
         rules=config.security.paths,

@@ -154,8 +154,9 @@ class CatalogFilter:
     ``source_id`` **scopes** the listing: the newest row per ``cog_id`` is
     chosen among that source's rows. Every other filter **tests the chosen
     row** -- a Cog is listed when its *current* card matches, never because
-    an older version once did -- so a listed entry is always the card the
-    Cog's own detail view serves.
+    an older version once did -- so without ``source_id`` a listed entry is
+    always the card the Cog's own detail view serves (with it, the entry is
+    the newest *in that source*, which may be older).
 
     ``provides``/``requires``/``accepts``/``produces`` are containment filters
     over the structured card (``card @> ...``), which is what the GIN index
@@ -163,7 +164,9 @@ class CatalogFilter:
     (``card.requires[*].capability``); ``provides`` an entry of
     ``card.provides``; ``accepts``/``produces`` entries of ``card.io``.
     ``q`` is a case-insensitive substring of the ``name`` column or the
-    card's ``description``; ``%`` and ``_`` in it are literal.
+    card's ``description`` when that is a JSON string (a structured
+    description never matches); ``%`` and ``_`` in it are literal. Case
+    folding is guaranteed identical across backends for ASCII only.
     """
 
     kind: str | None = None
@@ -345,20 +348,23 @@ def like_pattern(text: str) -> str:
     return f"%{escaped}%"
 
 
-def _description_text(card: Mapping[str, Any] | None) -> str | None:
-    # Mirrors ``card->>'description'``: a string as itself, JSON null or a
-    # missing key as NULL, anything else as its JSON text.
-    value = (card or {}).get("description")
-    if value is None or isinstance(value, str):
-        return value
-    return json.dumps(value)
+LIKE_ESCAPE = "\\"
+"""The escape character :func:`like_pattern` uses, bound as a parameter (``ESCAPE %s``) so the
+statement does not depend on the server's ``standard_conforming_strings`` setting."""
 
 
 def matches_query(name: str | None, card: Mapping[str, Any] | None, q: str) -> bool:
-    """The in-memory ``q`` test: case-insensitive substring of ``name`` or the card's ``description``."""
+    """The in-memory ``q`` test: case-insensitive substring of ``name`` or a *string* card ``description``.
 
+    A description that is not a JSON string never matches, in either backend
+    (the SQL checks ``jsonb_typeof``): rendering structured values as text is
+    where the two backends would disagree. Case-folding is ``str.lower`` here
+    and ``ILIKE`` there -- identical for ASCII, locale-dependent beyond it.
+    """
+
+    description = (card or {}).get("description")
     needle = q.lower()
-    return any(needle in text.lower() for text in (name, _description_text(card)) if text is not None)
+    return any(needle in text.lower() for text in (name, description) if isinstance(text, str))
 
 
 def _sort_key(artifact: CogArtifact) -> tuple:
@@ -997,9 +1003,12 @@ class PostgresCogCatalogStore(CogCatalogStore):
             outer.append("card @> %s")
             params.append(needle)
         if filters.q is not None:
-            outer.append("(name ILIKE %s ESCAPE '\\' OR card->>'description' ILIKE %s ESCAPE '\\')")
+            outer.append(
+                "(name ILIKE %s ESCAPE %s OR (jsonb_typeof(card->'description') = 'string'"
+                " AND card->>'description' ILIKE %s ESCAPE %s))"
+            )
             pattern = like_pattern(filters.q)
-            params.extend([pattern, pattern])
+            params.extend([pattern, LIKE_ESCAPE, pattern, LIKE_ESCAPE])
         params.extend([limit, offset])
         sql = f"""
             SELECT {_COLUMNS} FROM (

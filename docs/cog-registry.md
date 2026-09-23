@@ -176,10 +176,11 @@ registry-agnostic — the answers are the same whichever adapter indexed a row.
 
 Every entry carries the digest, the location (`source_id`, `repository`,
 `reference`), `tags`, `pushed_at`, `indexed_at`, `removed_at` and the `card`
-— the bundle reader's output verbatim. The OpenAPI document (`/docs`) types
-the card's top-level keys; `profile`, `frontmatter`, `io` and the other
-structures the reader passes through stay open, because the card is the
-Cog's own declarations, not a hub schema.
+— the bundle reader's output, served verbatim. The OpenAPI document (`/docs`)
+lists and describes every top-level key the reader emits but types none of
+them: the card is the Cog's own declarations, not a hub schema, and a
+publisher's odd value (a numeric `id`, say) is served as declared rather than
+failing the response. Clients must tolerate unexpected shapes.
 
 **Identity is the digest.** `cog_id` (`<publisher>/<name>`, so it contains a
 `/` — send it as is or percent-encoded) and `name` are search keys. "Newest"
@@ -201,14 +202,15 @@ failed reads and cards without an `id` never appear.
 | `provides` | an entry of the card's `provides` |
 | `requires` | a capability named in the card's `requires` |
 | `accepts` / `produces` | an io type in the card's `io.accepts` / `io.produces` |
-| `q` | a case-insensitive substring of the Cog's `name` or `description` (`%` and `_` are literal) |
+| `q` | a case-insensitive substring of the Cog's `name`, or of its `description` when that is a string (`%` and `_` are literal; case folding is guaranteed for ASCII, locale-dependent beyond it) |
 | `source_id` | only this registry source |
 
 `source_id` scopes the choice: the newest version is picked among that
 source's rows. Every other filter tests the Cog's **current** version, never
 an older one — a Cog that dropped a capability in its latest release does not
-list under it — so a listed entry is always the card `GET /v1/cogs/{cog_id}`
-serves. The card filters are `jsonb` containment over the stored card, which
+list under it — so without `source_id` a listed entry is always the card
+`GET /v1/cogs/{cog_id}` serves. With `source_id` it is the newest version *in
+that source*, which may be older than the one the detail route shows. The card filters are `jsonb` containment over the stored card, which
 the GIN index on `card` serves.
 
 **Paging.** `limit` (default 50, at most 200) and `offset` (default 0), as
@@ -224,12 +226,26 @@ an out-of-range parameter, or a digest that is not `sha256:` followed by 64
 lowercase hex digits; a well-formed digest the catalog does not hold is a
 404), and `unauthorized` (401).
 
-**Auth.** Every route requires an authenticated caller, like the frames
-routes, and `/v1/cogs` is an API prefix of the path-protection map, so a
-refusal under the hardened map keeps the envelope. A `security.paths` entry
-marking `/v1/cogs` public does **not** open anonymous discovery on its own:
-the routes' auth dependency still requires a caller. That would be a code
-change.
+**Auth.** Every route requires an authenticated caller by default, like the
+frames routes, and `/v1/cogs` is an API prefix of the path-protection map, so
+a refusal under the hardened map keeps the envelope. **Anonymous discovery is
+a `security.paths` entry**, not a code change:
+
+```yaml
+security:
+  paths:
+    - path: /v1/cogs
+      match: prefix
+      access: public
+```
+
+The routes admit a request without credentials when the rule deciding its
+path is `public` and sits at or below `/v1/cogs` — so an `exact` rule can
+open just `/v1/cogs/catalog.v1.json`. A broader public rule (`/` or `/v1`
+prefix) does not open the catalog, and neither does `defaultAccess: public`
+on its own (the unconfigured default), so nothing becomes anonymous by
+accident. These are the only API routes that honor a `public` entry this
+way; every other `/v1` route requires a caller whatever the map says.
 
 ### `catalog.v1.json` (transitional)
 

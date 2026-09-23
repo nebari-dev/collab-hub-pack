@@ -13,6 +13,7 @@ import base64
 import json
 from dataclasses import fields
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -20,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 from test_cog_bundle import read_fixture
 
 from collab_hub_api.cogs.adapters.static import parse_index_document
-from collab_hub_api.cogs.bundle import CogCard
+from collab_hub_api.cogs.bundle import CogCard, read_cog_bundle
 from collab_hub_api.cogs.catalog import (
     STATUS_FAILED,
     STATUS_INDEXED,
@@ -30,7 +31,7 @@ from collab_hub_api.cogs.catalog import (
     UnavailableCogCatalogStore,
     card_search_fields,
 )
-from collab_hub_api.cogs.models import CogCardModel
+from collab_hub_api.cogs.models import CARD_SCHEMA
 from collab_hub_api.config import Config, recommended_path_rules
 from collab_hub_api.core import make_app
 
@@ -335,7 +336,7 @@ async def test_version_is_the_exact_card_for_that_digest(api):
 
     assert (old["version"], old["card"]["version"]) == ("0.1.0", "0.1.0")
     assert (new["version"], new["card"]["description"]) == ("0.2.0", "Now with speaker turns.")
-    assert old["card"] == CogCardModel.model_validate(fixture_card("pixi-complete")).model_dump(mode="json")
+    assert old["card"] == json.loads(json.dumps(fixture_card("pixi-complete"))), "served verbatim"
 
 
 async def test_removed_version_is_reachable_by_digest(api):
@@ -561,24 +562,120 @@ async def test_openapi_documents_every_route_and_the_card_schema(api):
         "limit",
         "offset",
     }
-    card_schema = spec["components"]["schemas"]["CogCardModel"]
+    card_schema = spec["components"]["schemas"]["CogEntry"]["properties"]["card"]
+    assert card_schema["title"] == "CogCard" and card_schema["additionalProperties"] is True
     assert {"id", "name", "description", "version", "kind", "publisher", "provides", "requires", "io"} <= set(
         card_schema["properties"]
     )
+    assert all("type" not in prop for prop in card_schema["properties"].values()), "documented, not enforced"
 
 
-def test_the_card_model_types_exactly_the_keys_the_reader_emits():
-    # A reader key added without the model (or the reverse) fails here, so
-    # the OpenAPI card schema cannot drift from what the store holds.
-    assert list(CogCardModel.model_fields) == [field.name for field in fields(CogCard)]
+def test_the_card_schema_names_exactly_the_keys_the_reader_emits():
+    # A reader key added without a schema entry (or the reverse) fails here,
+    # so the OpenAPI description cannot drift from what the store holds. Only
+    # names: the values are the Cog's own and are deliberately not typed.
+    assert list(CARD_SCHEMA["properties"]) == [field.name for field in fields(CogCard)]
+
+
+def _yaml_model_files(**replacements: bytes) -> dict[str, bytes]:
+    root = Path(__file__).parent / "fixtures" / "cogs" / "yaml-model"
+    files = {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}
+    for name, (old, new) in replacements.items():
+        assert old in files[name]
+        files[name] = files[name].replace(old, new)
+    return files
+
+
+async def test_a_card_with_values_of_unexpected_types_is_served_verbatim_not_a_500(api):
+    client, store = api
+    # Reader -> store -> API: a profile declaring a numeric id. The reader
+    # keeps 42, the store's search key is "42", and the card still says 42.
+    numeric = read_cog_bundle(_yaml_model_files(**{"cog.yaml": (b"id: example/cog-small-model", b"id: 42")})).to_dict()
+    assert numeric["id"] == 42
+    store.upsert(row("1", numeric, repository="cogs/numeric"))
+    # And a stored card whose reader-shaped keys have the wrong shapes.
+    odd = fixture_card("pixi-context", ops="not-a-mapping", errors="one string", card="one", requires={"x": 1})
+    store.upsert(row("2", odd, repository="cogs/odd"))
+    store.upsert(row("3", fixture_card("pixi-complete"), repository="cogs/fine"))
+
+    page = await client.get("/v1/cogs")
+    assert page.status_code == 200, page.text
+    cards = {item["cog_id"]: item["card"] for item in page.json()["items"]}
+    assert set(cards) == {"42", NOTES, TRANSCRIBER}, "one odd card never takes the page down"
+    assert cards["42"] == json.loads(json.dumps(numeric))
+    assert cards[NOTES] == json.loads(json.dumps(odd))
+
+    for path in ("/v1/cogs/42", f"/v1/cogs/42/versions/{digest('1')}", f"/v1/cogs/{NOTES}/versions/{digest('2')}"):
+        response = await client.get(path)
+        assert response.status_code == 200, path
+    assert (await client.get(f"/v1/cogs/{NOTES}")).json()["card"]["ops"] == "not-a-mapping"
 
 
 @pytest.mark.parametrize("name", ["pixi-complete", "pixi-context", "yaml-model", "draft", "version-conflict", "prog"])
-def test_every_fixture_card_survives_the_response_model_unchanged(name):
-    document = read_fixture(name).to_dict()
-    assert CogCardModel.model_validate(document).model_dump(mode="json") == json.loads(json.dumps(document))
+async def test_every_fixture_card_is_served_unchanged(api, name):
+    client, store = api
+    document = fixture_card(name, id=f"example/{name}")
+    store.upsert(row("1", document, repository="cogs/x"))
+    served = (await client.get(f"/v1/cogs/example/{name}/versions/{digest('1')}")).json()["card"]
+    assert served == json.loads(json.dumps(document))
 
 
-def test_a_key_a_newer_reader_adds_is_kept_rather_than_dropped():
-    document = read_fixture("yaml-model").to_dict() | {"future_key": {"x": 1}}
-    assert CogCardModel.model_validate(document).model_dump()["future_key"] == {"x": 1}
+async def test_a_key_a_newer_reader_adds_is_kept_rather_than_dropped(api):
+    client, store = api
+    store.upsert(row("1", fixture_card("yaml-model") | {"future_key": {"x": 1}}, repository="cogs/m"))
+    assert (await client.get(f"/v1/cogs/{MODEL}")).json()["card"]["future_key"] == {"x": 1}
+
+
+# --- anonymous discovery through security.paths --------------------------------
+
+
+def _map(*rules: dict) -> dict:
+    return {
+        "paths": [rule.model_dump() for rule in recommended_path_rules()] + list(rules),
+        "default_access": "authenticated",
+    }
+
+
+PUBLIC_COGS = {"path": "/v1/cogs", "match": "prefix", "access": "public"}
+
+
+@pytest.mark.parametrize("path", ["/v1/cogs", f"/v1/cogs/{MODEL}", "/v1/cogs/catalog.v1.json"])
+async def test_a_public_rule_for_the_catalog_opens_anonymous_discovery(tmp_path, monkeypatch, path):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        app.state.cog_catalog_store.upsert(row("1", fixture_card("yaml-model"), repository="cogs/m"))
+        client.cookies.clear()
+        response = await client.get(path)
+        assert response.status_code == 200, response.text
+        # Opening the catalog opens nothing else.
+        assert (await client.get("/v1/frames")).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "security",
+    [
+        None,  # unconfigured: default_access is "public", yet no rule says so for the catalog
+        _map(),  # the hardened default
+        _map({"path": "/v1/cogs", "match": "prefix", "access": "authenticated"}),
+        {"paths": [{"path": "/", "match": "prefix", "access": "public"}], "default_access": "authenticated"},
+        {"paths": [{"path": "/v1", "match": "prefix", "access": "public"}], "default_access": "public"},
+    ],
+    ids=["unconfigured", "hardened", "authenticated-rule", "broad-root-public", "broad-v1-public"],
+)
+@pytest.mark.parametrize("path", ["/v1/cogs", f"/v1/cogs/{MODEL}", "/v1/cogs/catalog.v1.json"])
+async def test_without_a_public_catalog_rule_anonymous_requests_are_refused(tmp_path, monkeypatch, security, path):
+    app, client = await _client(tmp_path, monkeypatch, security=security)
+    async with app.router.lifespan_context(app), client:
+        client.cookies.clear()
+        response = await client.get(path)
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "unauthorized"
+
+
+async def test_an_exact_public_rule_opens_only_that_route(tmp_path, monkeypatch):
+    rule = {"path": "/v1/cogs/catalog.v1.json", "match": "exact", "access": "public"}
+    app, client = await _client(tmp_path, monkeypatch, security=_map(rule))
+    async with app.router.lifespan_context(app), client:
+        client.cookies.clear()
+        assert (await client.get("/v1/cogs/catalog.v1.json")).status_code == 200
+        assert (await client.get("/v1/cogs")).status_code == 401

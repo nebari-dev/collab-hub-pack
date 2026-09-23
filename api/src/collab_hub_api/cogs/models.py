@@ -1,11 +1,12 @@
 """Response models of the Cog catalog read API (issue #85).
 
-:class:`CogCardModel` types the top-level keys the bundle reader emits
-(:class:`~.bundle.CogCard`) and nothing else: the card is the Cog's own
-declarations, not a hub-invented schema (ADR-0001 D9), so structures the
-reader passes through as it found them (``profile``, ``frontmatter``,
-``io``, ``provides``, ...) stay open here too. ``extra="allow"`` keeps a
-key a newer reader adds from being dropped on the way out.
+The card is served **as stored**: an open JSON object, never re-validated.
+The store keeps the bundle reader's output verbatim (ADR-0001 D9: the card
+is the Cog's own declarations, not a hub-invented schema), and the reader
+passes publisher values through as it found them -- a profile may declare
+``id: 42``, and the card says ``42``. A typed response model would turn one
+such card into a failed response for every page it appears on, so the types
+live in the OpenAPI description (:data:`CARD_SCHEMA`) and nowhere else.
 
 The rest wrap a card with what only the catalog knows -- where the artifact
 lives and when it was seen -- because identity is the digest, and the card
@@ -14,56 +15,53 @@ itself does not carry one.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, WithJsonSchema
 
+from .bundle import CogCard
 from .catalog import CogArtifact
 
+_CARD_KEY_NOTES = {
+    "card": "Card format version (1).",
+    "manifest": "Bundle-relative path of the manifest COG.md names.",
+    "id": "The Cog id, usually `<publisher>/<name>`: a search key, not identity.",
+    "version": "The declared version.",
+    "kind": "`complete`, `model`, `harness`, `context`, `prog`, ...",
+    "provides": "What the Cog provides (usually a list of strings).",
+    "requires": "Required capabilities (usually a list of `{capability, locality, satisfiers}`).",
+    "io": "Declared io types (usually `{accepts: [...], produces: [...]}`).",
+    "entry_points": "Declared entry points (usually a list of objects).",
+    "ops": "Entry points by audience (usually `{usage: [...], lifecycle: [...]}`).",
+    "name": "The frontmatter name.",
+    "description": "The frontmatter description.",
+    "publisher": "The frontmatter publisher.",
+    "frontmatter": "The COG.md frontmatter, parsed.",
+    "frontmatter_raw": "The COG.md frontmatter, verbatim.",
+    "profile": "The whole profile the manifest declares, as structured data.",
+    "profile_raw": "The profile file, verbatim.",
+    "body": "The Markdown body of COG.md, after its frontmatter.",
+    "errors": "Every problem the reader found (usually a list of strings).",
+    "warnings": "Non-fatal findings (usually a list of strings).",
+}
 
-class CogCardModel(BaseModel):
-    """A Cog's catalog card, exactly as the bundle reader produced it at index time."""
+CARD_SCHEMA: dict[str, Any] = {
+    "title": "CogCard",
+    "type": "object",
+    "description": (
+        "A Cog's catalog card: the bundle reader's output as captured at index time, served verbatim. "
+        "The keys below are the ones the reader emits, in its order; their values are the Cog's own "
+        "declarations and are not validated here, so a client must tolerate unexpected shapes. "
+        "Keys a newer reader adds appear too."
+    ),
+    "properties": {field.name: {"description": _CARD_KEY_NOTES.get(field.name, "")} for field in fields(CogCard)},
+    "additionalProperties": True,
+}
+"""The OpenAPI schema of the card: every key the reader emits, documented, none type-enforced."""
 
-    model_config = ConfigDict(extra="allow")
-
-    # Build-tool keys, in the order the Cog build tooling's `card --json` prints them.
-    card: int = 1
-    manifest: str | None = Field(default=None, description="Bundle-relative path of the manifest COG.md names.")
-    audience_inferred: bool = False
-    provides: Any = Field(default_factory=list)
-    locality: Any = None
-    model: dict[str, Any] | None = None
-    id: str | None = Field(default=None, description="The Cog id (`<publisher>/<name>`); a search key, not identity.")
-    version: Any = None
-    kind: Any = None
-    summary: str = ""
-    owner: Any = None
-    license: Any = None
-    io: Any = Field(default=None, description="Declared `accepts` / `produces` io types.")
-    entry_points: list[dict[str, Any]] = Field(default_factory=list)
-    ops: dict[str, list[str]] = Field(default_factory=lambda: {"usage": [], "lifecycle": []})
-    requires: list[dict[str, Any]] = Field(default_factory=list)
-    prohibits: Any = Field(default_factory=list)
-    input_contract: Any = None
-    output_contract: Any = None
-    envelope: int | None = None
-    fixtures: Any = Field(default_factory=list)
-
-    # Hub-side keys.
-    name: str | None = None
-    description: str | None = None
-    publisher: str | None = None
-    manifest_schema: str | None = None
-    profile_status: str = "missing"
-    profile_schema: str | None = None
-    frontmatter: dict[str, Any] = Field(default_factory=dict)
-    frontmatter_raw: str = ""
-    profile: dict[str, Any] | None = None
-    profile_raw: str = ""
-    body: str = Field(default="", description="The Markdown body of COG.md, after its frontmatter.")
-    errors: list[str] = Field(default_factory=list, description="Every problem the reader found.")
-    warnings: list[str] = Field(default_factory=list)
+CardDocument = Annotated[dict[str, Any], WithJsonSchema(CARD_SCHEMA)]
 
 
 class CogVersion(BaseModel):
@@ -100,15 +98,11 @@ class CogEntry(CogVersion):
     """One version's location plus its card."""
 
     cog_id: str
-    card: CogCardModel
+    card: CardDocument
 
     @classmethod
     def of(cls, row: CogArtifact) -> CogEntry:
-        return cls(
-            **CogVersion.of(row).model_dump(),
-            cog_id=row.cog_id or "",
-            card=CogCardModel.model_validate(row.card or {}),
-        )
+        return cls(**CogVersion.of(row).model_dump(), cog_id=row.cog_id or "", card=row.card or {})
 
 
 class CogListPage(BaseModel):

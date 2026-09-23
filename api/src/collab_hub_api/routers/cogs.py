@@ -22,9 +22,15 @@ so ``catalog.v1.json`` is never read as a Cog id. A malformed digest is a
 422 (request validation, like every other malformed path value here); a
 well-formed digest the catalog does not hold for that Cog is a 404.
 
-Authenticated like the frames routes. Anonymous discovery is not a
-``security.paths`` entry alone: the route dependency still requires a
-caller, whatever the path map says.
+Authenticated by default, like the frames routes. A deployment that wants
+anonymous discovery adds a ``security.paths`` entry: when the rule that
+decides a request's path is ``public`` **and** sits at or below
+``/v1/cogs`` (so a broad ``/`` or ``/v1`` rule never opens it by accident),
+:func:`get_catalog_caller` admits the request without credentials. A path
+no rule matches never counts, whatever ``default_access`` says -- an
+unconfigured server's default is ``public``. This is the only route family
+that honors a ``public`` entry this way; the others require a caller
+regardless.
 """
 
 from __future__ import annotations
@@ -54,11 +60,35 @@ from ..cogs.models import (
 )
 from ..dependencies import get_cog_catalog_store
 from ..frames.auth import AuthContext, get_auth_context
+from ..path_protection import request_path, winning_rule
 from .frames import error_response
 
 router = APIRouter(prefix="/cogs", tags=["cogs"])
 
-AuthDep = Annotated[AuthContext, Depends(get_auth_context)]
+COGS_PATH = "/v1/cogs"
+
+
+def _within_cogs(rule_path: str) -> bool:
+    base = rule_path.rstrip("/")
+    return base == COGS_PATH or base.startswith(COGS_PATH + "/")
+
+
+def get_catalog_caller(request: Request) -> AuthContext | None:
+    """The caller, or ``None`` for an anonymous request a ``public`` catalog rule admits.
+
+    Consults the same protection map the middleware enforces
+    (``app.state.path_rules``, resolved by :func:`~..path_protection.winning_rule`).
+    Anything else -- no matching rule, an ``authenticated`` rule, a ``public``
+    rule broader than ``/v1/cogs`` -- is exactly :func:`get_auth_context`.
+    """
+
+    rule = winning_rule(request_path(request), getattr(request.app.state, "path_rules", ()))
+    if rule is not None and rule.access == "public" and _within_cogs(rule.path):
+        return None
+    return get_auth_context(request)
+
+
+AuthDep = Annotated[AuthContext | None, Depends(get_catalog_caller)]
 CatalogDep = Annotated[CogCatalogStore, Depends(get_cog_catalog_store)]
 
 DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
@@ -130,8 +160,10 @@ def list_cogs(
     """One entry per `cog_id`: its newest present version, ordered by `cog_id`.
 
     `source_id` scopes which versions are considered; every other filter
-    tests that newest version, so an entry is always the card
-    `GET /v1/cogs/{cog_id}` serves. Removed artifacts, non-Cog artifacts and
+    tests that newest version, so without `source_id` an entry is always the
+    card `GET /v1/cogs/{cog_id}` serves (with it, the newest in that source,
+    which may be older). `q` matches `name` or a string `description`,
+    case-insensitively for ASCII. Removed artifacts, non-Cog artifacts and
     failed reads never appear.
     """
 

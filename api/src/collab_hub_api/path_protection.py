@@ -93,8 +93,8 @@ def _specificity(rule: PathRule) -> tuple[int, int]:
     return (1 if rule.match == "exact" else 0, len(rule.path.rstrip("/")))
 
 
-def resolve_access(path: str, rules: Iterable[PathRule], default_access: PathAccess) -> PathAccess:
-    """Return the access level configured for ``path``."""
+def winning_rule(path: str, rules: Iterable[PathRule]) -> PathRule | None:
+    """The rule that decides ``path``, or ``None`` when no rule matches it (the default applies)."""
 
     best: PathRule | None = None
     for rule in rules:
@@ -104,6 +104,13 @@ def resolve_access(path: str, rules: Iterable[PathRule], default_access: PathAcc
         # append an override instead of rewriting the built-in map.
         if best is None or _specificity(rule) >= _specificity(best):
             best = rule
+    return best
+
+
+def resolve_access(path: str, rules: Iterable[PathRule], default_access: PathAccess) -> PathAccess:
+    """Return the access level configured for ``path``."""
+
+    best = winning_rule(path, rules)
     return best.access if best is not None else default_access
 
 

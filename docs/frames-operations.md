@@ -1172,7 +1172,9 @@ digest)`. It rides the same shared `frames.postgres.url` and the same
   ([cog-registry.md](cog-registry.md#read-api)) uses for
   requires/provides/io; plain indexes cover `cog_id`, `kind` and `removed_at`.
   With no `frames.postgres.url` the read API answers `503
-  cog_catalog_unavailable` rather than an empty catalog.
+  cog_catalog_unavailable` rather than an empty catalog, unless the
+  development override `cogs.catalog.backend=memory` is set (level 1 of
+  `dev/`; no chart value).
 - **`status`** is `indexed` (the reader produced a card — a draft or a Cog with
   a broken profile is still a Cog and lists with what it declared, its errors
   mirrored into `read_errors`), `non_cog` (the manifest carries no `COG.md` and
