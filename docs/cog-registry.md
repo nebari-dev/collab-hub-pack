@@ -220,8 +220,9 @@ the `offset` of the next page, or `null` on the last one.
 
 **Errors** use the API envelope `{"error": {"code", "message"}}`:
 `cog_not_found` and `cog_version_not_found` (404 — including a digest that is
-indexed, but as another Cog's), `cog_catalog_unavailable` (503 — no database
-is configured; an empty catalog is never invented), `validation_error` (422 —
+indexed, but as another Cog's), `cog_catalog_unavailable` (503 — neither
+Postgres nor the development memory backend is configured; an empty catalog
+is never invented), `validation_error` (422 —
 an out-of-range parameter, or a digest that is not `sha256:` followed by 64
 lowercase hex digits; a well-formed digest the catalog does not hold is a
 404), and `unauthorized` (401).
