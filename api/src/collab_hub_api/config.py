@@ -1,11 +1,14 @@
+import os
 import re
 import sys
+from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from .cogs.registry import CogRegistrySourceConfig
 from .frames.account_provisioning import DisabledServiceAccessGranter, ServiceAccessGranter
 from .frames.active_state import (
     ActiveFrameStore,
@@ -514,9 +517,7 @@ class FramesServiceAccessConfig(BaseModel):
                 )
         duplicates = {name for name in self.grant_on_acceptance if self.grant_on_acceptance.count(name) > 1}
         if duplicates:
-            raise ValueError(
-                f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once"
-            )
+            raise ValueError(f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once")
         return self
 
 
@@ -693,6 +694,190 @@ class TasksConfig(BaseModel):
     auto_migrate: bool = False
 
 
+COGS_INDEX_INTERVAL_MIN_SECONDS = 10
+COGS_INDEX_INTERVAL_MAX_SECONDS = 24 * 3600
+
+
+class CogIndexConfig(BaseModel):
+    """How often the Cog indexer sweeps the configured registry sources (#84).
+
+    ``enabled`` is the only switch that changes what the deployment *does*:
+    off, the read API stays up and serves whatever the index already holds,
+    and no registry is contacted. The interval floor exists because a sweep
+    lists every repository of every source; a one-second loop against a
+    real registry is a self-inflicted outage, not a tuning choice.
+    """
+
+    # extra="forbid" mirrors values.schema.json's additionalProperties: false.
+    # Without it a misspelled key (``interval_secs``) is dropped and the
+    # default runs, which is a silent misconfiguration of exactly the kind
+    # the chart refuses at render time.
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_seconds: int = Field(default=300, ge=COGS_INDEX_INTERVAL_MIN_SECONDS, le=COGS_INDEX_INTERVAL_MAX_SECONDS)
+    run_on_startup: bool = True
+
+
+COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
+    ("username_env", "username", False),
+    ("password_env", "password", True),
+)
+"""``credentials`` indirections: ``<name>_env`` names the environment variable holding ``<name>``.
+
+The third element says whether the value is a secret (wrapped in ``SecretStr``
+on insertion) or plain data like a robot account name.
+"""
+
+COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD = ("webhook_secret_env", "webhook_secret", True)
+
+
+def _pull_secret_from_env(
+    container: dict[str, Any],
+    env_field: str,
+    field: str,
+    *,
+    secret: bool,
+    label: str,
+    environ: Mapping[str, str],
+) -> None:
+    """Replace ``container[env_field]`` (an env var name) with ``container[field]`` (its value).
+
+    Refuses an ambiguous entry that carries both, and a name whose variable is
+    unset or blank — which is exactly what a missing Secret mount, a wrong
+    ``key`` in ``existingSecret``, or an empty Secret value looks like from
+    inside the pod. Failing here names the variable, so the fix is a values
+    change and not a search through adapter 401s on the first sweep.
+
+    A secret is inserted as a ``SecretStr``, never a plain string. Validation
+    runs *after* this and pydantic quotes the offending input in its error
+    text; a source whose username is missing would otherwise put the resolved
+    password into a ValidationError that ``__main__`` lets reach the startup
+    log. ``SecretStr`` reprs as ``**********`` wherever it is echoed, so no
+    downstream error path — this model's, a nested one's, or the settings
+    class's — can carry the value.
+
+    The value is stored with surrounding whitespace removed, deliberately and
+    on purpose rather than by accident: inline values already are (the
+    ``_strip`` validators on ``CogRegistryCredentials`` and ``WebConfig``), a
+    Secret created with ``--from-file`` carries the file's trailing newline,
+    and forwarding that verbatim fails authentication with an error that
+    names nothing useful. A ``SecretStr`` bypasses the model's own strip, so
+    the policy is applied here, once, for the environment route — both
+    routes yield the same bytes for string input (a ``SecretStr`` handed to
+    ``Config.parse`` programmatically is taken as is; no operator route does
+    that). A credential whose surrounding whitespace is significant is not
+    supported; docs/cog-registry.md says so.
+    """
+
+    if env_field not in container:
+        return
+    name = container.pop(env_field)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{label}.{env_field} must name an environment variable, got {name!r}")
+    name = name.strip()
+    if container.get(field):
+        raise ValueError(
+            f"{label} sets both {field} and {env_field}: the inline value and the environment "
+            f"indirection disagree about where the secret lives, so neither is trusted. Keep one."
+        )
+    value = environ.get(name)
+    if value is None or not value.strip():
+        state = "not set" if value is None else "empty"
+        raise ValueError(
+            f"{label}.{env_field} names {name}, which is {state} in the environment. With the Helm "
+            f"chart this means the Secret named in the source's existingSecret is missing or has no "
+            f"value under the configured key; the API refuses to start rather than run unauthenticated."
+        )
+    value = value.strip()
+    container[field] = SecretStr(value) if secret else value
+
+
+def resolve_cogs_source_secrets(raw: Any, index: int, environ: Mapping[str, str]) -> Any:
+    """Resolve one raw registry-source mapping's ``*_env`` indirections in place of the secrets.
+
+    Why indirection at all: the source list travels to the process as one JSON
+    environment variable (pydantic-settings parses complex fields that way),
+    while passwords and webhook secrets must come from Kubernetes Secrets and
+    never be rendered into values or that JSON. pydantic-settings does not
+    layer ``..._SOURCES__0__CREDENTIALS__PASSWORD`` over a JSON list — measured
+    on 2.14: the index form is silently ignored when the list is JSON, and
+    rejected as ``list_type`` when it is not — so each source instead names the
+    variable to read. The chart derives the names deterministically from the
+    source id (``COLLAB_HUB_COGS_SOURCE_<ID>_PASSWORD`` and friends, see
+    values.yaml) and mounts the Secret keys under them.
+
+    Anything that is not a mapping is returned untouched: an already-built
+    :class:`CogRegistrySourceConfig` has nothing to resolve, and a wrong type
+    is pydantic's error to report.
+    """
+
+    if not isinstance(raw, dict):
+        return raw
+    raw = dict(raw)
+    label = f"cogs.registry_sources[{index}] ({raw.get('id')!r})"
+    credentials = raw.get("credentials")
+    if isinstance(credentials, dict):
+        credentials = dict(credentials)
+        raw["credentials"] = credentials
+        for env_field, field, secret in COGS_SOURCE_SECRET_ENV_FIELDS:
+            _pull_secret_from_env(
+                credentials, env_field, field, secret=secret, label=f"{label}.credentials", environ=environ
+            )
+    env_field, field, secret = COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD
+    _pull_secret_from_env(raw, env_field, field, secret=secret, label=label, environ=environ)
+    return raw
+
+
+class CogsConfig(BaseModel):
+    """The Cog registry block (#87): which registries are indexed, and how.
+
+    Per-source rules (kind shape, URL grammar, credentials both-or-neither)
+    belong to :class:`~.cogs.registry.CogRegistrySourceConfig` and run when
+    each entry is built. What lives here is what no single source can see:
+    duplicate ids across the list, and an indexer that is switched on with
+    nothing to index. ``build_registry_sources`` re-checks duplicates when the
+    adapters are instantiated; this copy exists so the failure happens at
+    settings load with the rest of the configuration errors, not one step
+    later with a different exception type.
+    """
+
+    # extra="forbid": the chart's values.schema.json refuses unknown ``cogs``
+    # keys, and a bare-process deployment deserves the same — ``indx:`` would
+    # otherwise leave the indexer silently off. scripts/testdata/chart/
+    # cogs-negative-cases.yaml holds this rule once for both sides.
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
+
+    registry_sources: list[CogRegistrySourceConfig] = Field(default_factory=list)
+    index: CogIndexConfig = Field(default_factory=CogIndexConfig)
+
+    @field_validator("registry_sources", mode="before")
+    @classmethod
+    def _resolve_secret_env(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [resolve_cogs_source_secrets(raw, index, os.environ) for index, raw in enumerate(value)]
+
+    @model_validator(mode="after")
+    def _check_across_sources(self) -> Self:
+        seen: dict[str, int] = {}
+        for index, source in enumerate(self.registry_sources):
+            if source.id in seen:
+                raise ValueError(
+                    f"cogs.registry_sources[{index}] reuses id {source.id!r}, already taken by "
+                    f"registry_sources[{seen[source.id]}]: the id is stored with every indexed row, "
+                    "so two sources sharing one would make their artifacts indistinguishable"
+                )
+            seen[source.id] = index
+        if self.index.enabled and not self.registry_sources:
+            raise ValueError(
+                "cogs.index.enabled is true but cogs.registry_sources is empty: an indexer with nothing "
+                "to index is a misconfiguration, not an idle worker. Add a source or set enabled=false "
+                "(the read API stays up either way)."
+            )
+        return self
+
+
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -703,10 +888,19 @@ class BaseConfig(BaseSettings):
     connectors: ConnectorsConfig = Field(default_factory=ConnectorsConfig)
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
+    cogs: CogsConfig = Field(default_factory=CogsConfig)
 
 
 class Config(BaseConfig):
-    model_config = SettingsConfigDict(env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__")
+    # hide_input_in_errors at the outermost model: it is this class's config,
+    # not a nested model's, that decides whether pydantic quotes the offending
+    # input in a ValidationError, and the input here is the whole settings
+    # tree — Postgres URLs with passwords, client secrets, resolved registry
+    # credentials. __main__ lets that error reach the startup log. Field
+    # names and constraint messages remain; only the echoed value goes.
+    model_config = SettingsConfigDict(
+        env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -972,9 +1166,7 @@ def build_service_access_granter(config: BaseConfig) -> ServiceAccessGranter:
             f"nothing grants is a typo in one of the two lists, and the harmless-looking "
             f"reading -- an unused entry -- is the one that leaves the real path unmapped."
         )
-    malformed = sorted(
-        path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id
-    )
+    malformed = sorted(path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id)
     if malformed:
         raise RuntimeError(
             f"frames.service_access.keycloak.group_ids has no usable id for {malformed}. "

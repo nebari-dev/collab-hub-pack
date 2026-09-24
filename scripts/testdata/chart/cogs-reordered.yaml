@@ -1,0 +1,18 @@
+# The three-sources fixture with the middle source removed and the remaining
+# two reversed: every attachment must follow its source, not its position.
+cogs:
+  registry:
+    sources:
+      - id: tail-two
+        kind: harbor
+        url: https://tail.example.com
+        projects: [cogs]
+        webhook:
+          existingSecret: hook-c
+          secretKey: token
+      - id: harbor-main
+        kind: harbor
+        url: https://harbor.example.com
+        projects: [cogs]
+        credentials:
+          existingSecret: robot-a

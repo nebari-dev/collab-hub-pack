@@ -364,6 +364,51 @@ spec:
                   name: {{ .Values.userDirectory.keycloak.existingSecret | quote }}
                   key: {{ .Values.userDirectory.keycloak.clientSecretKey | quote }}
             {{- end }}
+            {{- /*
+              Cog registry (issue #87). The enabled flag always renders so the
+              deployment states its intent; the tuning and the source list
+              render only when there is something for them to govern, which
+              keeps a deployment without Cogs free of cogs env beyond that one
+              line. Secrets are never in the JSON: each source's Secret keys
+              are mounted as their own env vars below, under the names the JSON
+              points at (see _helpers.tpl "collab-hub.cogs-source-env-name").
+            */}}
+            - name: COLLAB_HUB_API__COGS__INDEX__ENABLED
+              value: {{ .Values.cogs.index.enabled | quote }}
+            {{- if .Values.cogs.index.enabled }}
+            - name: COLLAB_HUB_API__COGS__INDEX__INTERVAL_SECONDS
+              value: {{ .Values.cogs.index.intervalSeconds | quote }}
+            - name: COLLAB_HUB_API__COGS__INDEX__RUN_ON_STARTUP
+              value: {{ .Values.cogs.index.runOnStartup | quote }}
+            {{- end }}
+            {{- if .Values.cogs.registry.sources }}
+            - name: COLLAB_HUB_API__COGS__REGISTRY_SOURCES
+              value: {{ include "collab-hub.cogs-registry-sources" . | quote }}
+            {{- range .Values.cogs.registry.sources }}
+            {{- $sourceId := .id }}
+            {{- $credentials := .credentials | default dict }}
+            {{- with $credentials.existingSecret }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "USERNAME") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $credentials.usernameKey | default "username" | quote }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "PASSWORD") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $credentials.passwordKey | default "password" | quote }}
+            {{- end }}
+            {{- $webhook := .webhook | default dict }}
+            {{- with $webhook.existingSecret }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "WEBHOOK_SECRET") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $webhook.secretKey | default "secret" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.api.deployment.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -374,6 +419,11 @@ spec:
           volumeMounts:
             - name: frames-storage
               mountPath: {{ .Values.frames.storage.mountPath }}
+            {{- if .Values.cogs.caBundle.configMap }}
+            - name: cogs-ca-bundle
+              mountPath: {{ include "collab-hub.cogs-ca-bundle-mount-path" . }}
+              readOnly: true
+            {{- end }}
           startupProbe:
             httpGet:
               port: {{ .Values.api.service.targetPort }}
@@ -396,4 +446,12 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.cogs.caBundle.configMap }}
+        - name: cogs-ca-bundle
+          configMap:
+            name: {{ .Values.cogs.caBundle.configMap | quote }}
+            items:
+              - key: {{ .Values.cogs.caBundle.key | quote }}
+                path: {{ .Values.cogs.caBundle.key | quote }}
+        {{- end }}
 {{- end }}

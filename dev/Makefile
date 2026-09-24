@@ -536,6 +536,8 @@ test: ## Run the API test suite
 lint: ## Lint the Helm chart and validate the rendered manifests
 	helm lint $(ROOT)/helm/collab-hub
 	helm template $(ROOT)/helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
+	helm template $(ROOT)/helm/collab-hub -f $(ROOT)/helm/collab-hub/ci/cogs-values.yaml | kubeconform -strict -ignore-missing-schemas -
+	$(ROOT)/scripts/chart_render_tests.sh
 
 clean: ## Remove local frame content and caches (leaves docker volumes alone)
 	rm -rf $(LOCAL)
