@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import socket
 import sys
 import threading
@@ -212,6 +213,57 @@ async def test_mcp_tools_preserve_auth_scope_active_fallback_and_resource(tmp_pa
     # all three same-workspace frames remain persisted.
     assert len(store.list_frames(auth.org_id, auth.workspace_id)) == 3
     assert store.get_frame(first.id).body == "# Brand\nUse short words."
+
+
+@pytest.mark.anyio
+async def test_get_active_frames_skips_a_corrupt_frame(tmp_path, caplog):
+    """One corrupt active Frame must not break the whole get_active_frames call.
+
+    The active set is walked frame by frame; an undecodable sidecar is skipped
+    (and logged) so the caller still receives every readable active Frame, the
+    same tolerance already applied to a stale id the caller can no longer read.
+    """
+
+    store = LocalFsFrameStore(tmp_path)
+    active_store = InMemoryActiveFrameStore()
+    auth = AuthContext(user="alice", home_org_id="org-a", workspace_id="workspace-a")
+    good = store.create_frame(
+        org_id=auth.org_id,
+        workspace_id=auth.workspace_id,
+        created_by="alice",
+        owners=["alice"],
+        name="Good",
+        description="",
+        visibility=Visibility.private,
+        tags=["brand"],
+        body="# Good",
+    )
+    bad = store.create_frame(
+        org_id=auth.org_id,
+        workspace_id=auth.workspace_id,
+        created_by="alice",
+        owners=["alice"],
+        name="Bad",
+        description="",
+        visibility=Visibility.private,
+        tags=["brand"],
+        body="# Bad",
+    )
+    active_store.set_active_frame_ids(auth.org_id, auth.workspace_id, auth.user, [good.id, bad.id])
+    (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
+    mcp = create_mcp_server(store, active_store=active_store)
+
+    token = current_auth_context.set(auth)
+    try:
+        with caplog.at_level(logging.WARNING, logger="frames_server.mcp"):
+            active = parse_tool_result(await mcp.call_tool("get_active_frames", {}))
+    finally:
+        current_auth_context.reset(token)
+
+    assert [item["id"] for item in active["frames"]] == [good.id]
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert bad.id in warnings[0].getMessage()
 
 
 @pytest.mark.anyio

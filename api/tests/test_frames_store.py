@@ -404,6 +404,56 @@ def test_s3_read_metadata_reraises_errors_that_are_not_missing_objects():
         store.list_frames("org-a", "workspace-a")
 
 
+def test_s3_list_frames_skips_a_corrupt_frame(caplog):
+    """A corrupt sidecar must not fail the whole page: skip it and log the skip.
+
+    The object exists but is undecodable, so ``_read_metadata`` raises
+    ``FrameDecodeError``. A direct GET of that frame still surfaces a 500; here,
+    in a list, one bad sidecar must not hide every healthy frame.
+    """
+
+    ids = [f"{index:032x}" for index in range(4)]
+    corrupt = ids[2]
+
+    class CorruptingFakeS3(RecordingFakeS3):
+        def get_object(self, Bucket: str, Key: str):  # noqa: N803 - boto3 casing
+            if Key.split("/")[-2] == corrupt:
+                with self._lock:
+                    self.requested.append(Key)
+                return {"Body": io.BytesIO(b"{not valid json"), "ETag": '"etag"'}
+            return super().get_object(Bucket, Key)
+
+    fake = CorruptingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
+    store = _s3_store_with(fake)
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.store"):
+        listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == sorted(set(ids) - {corrupt})
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert corrupt in warnings[0].getMessage()
+
+
+def test_local_list_frames_skips_a_corrupt_frame(tmp_path, caplog):
+    """The local backend isolates a corrupt sidecar the same way S3 does."""
+
+    good = make_frame(frame_id="a" * 32)
+    bad = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(good)
+    store._write_frame(bad)
+    (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.store"):
+        listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == [good.id]
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert bad.id in warnings[0].getMessage()
+
+
 def test_s3_store_sizes_the_connection_pool_to_the_read_fan_out():
     """Botocore's default pool of 10 would serialise the surplus list workers."""
 

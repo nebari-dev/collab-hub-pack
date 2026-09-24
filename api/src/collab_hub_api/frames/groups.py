@@ -23,6 +23,7 @@ The membership is fully queryable from the group side (``GET /frame-groups`` and
 
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -31,6 +32,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .codec import FrameDecodeError
 from .db import locked_schema_connection
 from .models import (
     DESCRIPTION_MAX_LENGTH,
@@ -42,6 +44,8 @@ from .models import (
     validate_frame_id,
 )
 from .store import FrameNotFoundError, FrameStore, utc_now
+
+logger = logging.getLogger("frames_server.groups")
 
 FRAME_GROUP_SCHEMA_VERSION = 1
 
@@ -197,6 +201,18 @@ def compute_derived(group: FrameGroup, store: FrameStore) -> tuple[bool, Visibil
         try:
             frame = store.get_frame(frame_id)
         except FrameNotFoundError:
+            all_published = False
+            continue
+        except FrameDecodeError:
+            # A corrupt member is undecodable, not merely absent: count it as
+            # not-published (like a missing member) so the group stays owner-only
+            # rather than failing the whole projection. Unlike an ordinary
+            # delete, corruption is unexpected, so log it.
+            logger.warning(
+                "Frame %s in group %s could not be decoded; treated as unpublished",
+                frame_id,
+                group.id,
+            )
             all_published = False
             continue
         if not frame.published:

@@ -192,6 +192,28 @@ async def test_group_with_unpublished_member_is_owner_only(client):
     assert (await client.get(f"/v1/frame-groups/{group['id']}", cookies=auth_cookie("bob"))).status_code == 404
 
 
+async def test_group_with_corrupt_member_stays_owner_only(client, tmp_path):
+    """A corrupt member must not fail the whole group projection.
+
+    The projection reads every member; one undecodable sidecar is treated as a
+    not-published member (like a missing one) so the group degrades to owner-only
+    instead of 500-ing the group read.
+    """
+
+    a = await create_frame(client, visibility="internal")
+    b = await create_frame(client, name="B", visibility="internal")
+    await publish(client, a["id"])
+    await publish(client, b["id"])
+    group = await create_group(client, frame_ids=[a["id"], b["id"]], visibility="internal")
+
+    # Both members published -> without corruption this group reads all_published.
+    (tmp_path / "frames" / b["id"] / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    owner_view = await client.get(f"/v1/frame-groups/{group['id']}", cookies=auth_cookie("alice"))
+    assert owner_view.status_code == 200
+    assert owner_view.json()["all_published"] is False
+
+
 async def test_internal_group_readable_once_all_members_published(client):
     # Members must be at least as broad as the group, or effective_visibility caps it.
     a = await create_frame(client, visibility="internal")

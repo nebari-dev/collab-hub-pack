@@ -271,6 +271,15 @@ class LocalFsFrameStore(FrameStore):
                 frame = self.get_frame(path.name)
             except FrameNotFoundError:
                 continue
+            except codec.FrameDecodeError:
+                # Corrupt/unreadable sidecar: skip it here so one bad frame
+                # cannot fail the whole page. It still surfaces as a 500 on a
+                # direct GET of this frame; logged so the rate is measurable.
+                logger.warning(
+                    "Frame %s listed but could not be decoded; omitted from this page",
+                    path.name,
+                )
+                continue
             item = frame_metadata(frame)
             if not metadata_matches_filters(
                 item,
@@ -553,6 +562,15 @@ class S3FrameStore(FrameStore):
                 # something other than ordinary deletes is removing objects.
                 logger.warning(
                     "Frame %s listed but not readable; omitted from this page",
+                    frame_id,
+                )
+                return None
+            except codec.FrameDecodeError:
+                # Corrupt/unreadable sidecar: skip it here so one bad frame
+                # cannot fail the whole page. It still surfaces as a 500 on a
+                # direct GET of this frame; logged so the rate is measurable.
+                logger.warning(
+                    "Frame %s listed but could not be decoded; omitted from this page",
                     frame_id,
                 )
                 return None
