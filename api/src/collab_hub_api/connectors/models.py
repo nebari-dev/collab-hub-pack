@@ -321,8 +321,8 @@ class SlackDmsResponse(UntrustedConnectorResponse):
     next_cursor: str = ""
 
 
+# No channel_id here: the read response already has it once at the top.
 class SlackMessage(BaseModel):
-    channel_id: str
     ts: str
     user_id: str = ""
     text: str = ""

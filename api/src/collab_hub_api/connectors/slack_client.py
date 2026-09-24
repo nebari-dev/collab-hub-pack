@@ -155,7 +155,7 @@ class SlackClient:
         if cursor:
             params["cursor"] = cursor
         payload = await self._get_json("/conversations.history", params=params, operation="conversation read")
-        return _messages_page(payload, channel_id)
+        return _messages_page(payload)
 
     async def read_thread(
         self,
@@ -175,7 +175,7 @@ class SlackClient:
         if cursor:
             params["cursor"] = cursor
         payload = await self._get_json("/conversations.replies", params=params, operation="thread read")
-        return _messages_page(payload, channel_id)
+        return _messages_page(payload)
 
     async def _require_channel(self, channel_id: str) -> None:
         try:
@@ -291,13 +291,13 @@ class SlackClient:
         return payload
 
 
-def _messages_page(payload: dict, channel_id: str) -> tuple[list[SlackMessage], bool, str]:
+def _messages_page(payload: dict) -> tuple[list[SlackMessage], bool, str]:
     messages = payload.get("messages", [])
     if not isinstance(messages, list):
         messages = []
     next_cursor = payload.get("response_metadata", {}).get("next_cursor", "") or ""
     return (
-        [_message(item, channel_id) for item in messages],
+        [_message(item) for item in messages],
         bool(payload.get("has_more", False)),
         next_cursor,
     )
@@ -334,9 +334,8 @@ def _dm_name(item: dict) -> str:
     return ""
 
 
-def _message(item: dict, channel_id: str) -> SlackMessage:
+def _message(item: dict) -> SlackMessage:
     return SlackMessage(
-        channel_id=channel_id,
         ts=str(item.get("ts", "")),
         user_id=str(item.get("user") or item.get("bot_id") or ""),
         text=sanitize_slack_text(str(item.get("text", "") or "")),

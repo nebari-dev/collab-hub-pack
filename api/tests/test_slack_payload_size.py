@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 from httpx import Response
 
+from collab_hub_api.connectors.models import SlackReadResponse
 from collab_hub_api.connectors.slack_client import SEARCH_SNIPPET_CHARS, SlackClient
 
 
@@ -97,3 +98,20 @@ async def test_full_text_of_a_cut_search_hit_is_reachable_through_a_read(monkeyp
     messages, _, _ = await slack.read_conversation(channel_id=hit.channel_id, limit=1, oldest=hit.ts, latest=hit.ts)
 
     assert [message.text for message in messages] == [LONG_TEXT]
+
+
+async def test_read_messages_do_not_repeat_the_channel_id(monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        messages = [{"ts": f"1790000000.00000{i}", "user": "U0001", "text": "hello"} for i in range(3)]
+        return Response(200, json={"ok": True, "messages": messages, "has_more": False})
+
+    _install_mock_client(monkeypatch, handler)
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    messages, has_more, next_cursor = await slack.read_conversation(channel_id="C0001", limit=10)
+    response = SlackReadResponse(channel_id="C0001", messages=messages, has_more=has_more, next_cursor=next_cursor)
+
+    # The channel id appears once, at the top of the response, not on every message.
+    assert response.model_dump_json().count("C0001") == 1
