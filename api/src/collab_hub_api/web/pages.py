@@ -26,6 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import get_route_path
 
 from .surface import STYLE_ASSET_PATH as STYLE_PATH
+from .surface import WEB_LOGO_PATH as LOGO_PATH
 
 logger = logging.getLogger("frames_server.web")
 
@@ -48,10 +49,17 @@ SECURITY_HEADERS = {
 intermediary treats the whole surface alike."""
 
 CONTENT_SECURITY_POLICY = (
-    "default-src 'none'; style-src 'self'; img-src 'none'; "
+    "default-src 'none'; style-src 'self'; img-src 'self'; "
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
 """No script source at all: the surface serves none, so none may run.
+
+``img-src`` is ``'self'`` rather than ``'none'``: these pages carry the product
+wordmark, served from this origin by the route that serves the stylesheet.
+Widened by exactly one source, and not to a brand CDN -- a page that fetches
+its own chrome from a third party hands that third party a view of who is
+opening it.
+
 ``form-action 'self'`` keeps a markup-injection bug from redirecting a POST
 (and the CSRF token in it) off-origin. Documents only — assets get the plain
 security headers.
@@ -65,6 +73,36 @@ never to add a script source here.
 """
 
 PAGE_HEADERS = {**SECURITY_HEADERS, "Content-Security-Policy": CONTENT_SECURITY_POLICY}
+
+ADMIN_PANEL_CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+"""The admin panel's policy: still ``default-src 'none'``, widened to ``'self'``.
+
+The second exception to the no-script rule, and the first that is a whole
+subtree rather than one page. It is stated as a full policy rather than as a
+diff against :data:`CONTENT_SECURITY_POLICY`, so that reading this constant
+tells you everything the panel is permitted to do.
+
+What it does **not** contain is the point:
+
+* no ``'unsafe-inline'`` and no ``'unsafe-eval'`` -- the panel is a built
+  bundle, so every script and stylesheet is a file on this origin;
+* no external origin anywhere, fonts included. The typeface is bundled into
+  the build rather than fetched from a font CDN, which keeps this policy free
+  of third-party hosts and lets a hub with no internet egress render normally;
+* ``form-action 'none'``, because the panel submits no HTML forms at all -- it
+  writes over ``fetch`` to same-origin JSON. The pages that do post forms keep
+  ``form-action 'self'``; this one can afford to forbid it outright.
+
+``connect-src 'self'`` is what lets the panel call its own API, and naming it
+explicitly (rather than relying on a wider ``default-src``) means an attempt to
+exfiltrate to another origin is refused by the browser.
+"""
+
+ADMIN_PANEL_HEADERS = {**SECURITY_HEADERS, "Content-Security-Policy": ADMIN_PANEL_CONTENT_SECURITY_POLICY}
 
 
 def headers_for_path(path: str) -> dict[str, str]:
@@ -81,6 +119,13 @@ def headers_for_path(path: str) -> dict[str, str]:
     SHA-256 script digest and ``connect-src 'self'``.
     """
 
+    from .surface import on_admin_panel
+
+    if on_admin_panel(path):
+        # Scoped to the panel's own document and bundle files, not to all of
+        # ``/admin``: the policy below forbids form submission outright, which
+        # the operator invitation page could not live under.
+        return ADMIN_PANEL_HEADERS
     return _script_page_headers().get(path, PAGE_HEADERS)
 
 
@@ -108,8 +153,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
 h1 { font-size: 1.35rem; margin: 0 0 1rem; }
 p { margin: 0 0 0.9rem; }
 a { color: #3452d9; }
-.brand { color: #666; font-size: 0.8rem; letter-spacing: 0.08em;
-         text-transform: uppercase; margin-bottom: 2rem; }
+.brand { margin-bottom: 2rem; }
+.brand img { height: 2rem; width: auto; display: block; }
 .identity { color: #666; font-size: 0.85rem; margin-top: 3rem;
             border-top: 1px solid #ddd; padding-top: 1rem; }
 .identity form { display: inline; }
@@ -118,8 +163,7 @@ button { font: inherit; background: #3452d9; color: #fff; border: 0;
 button.link { background: none; color: #3452d9; padding: 0;
               text-decoration: underline; }
 dl { margin: 0 0 1rem; }
-dt { color: #666; font-size: 0.8rem; text-transform: uppercase;
-     letter-spacing: 0.05em; margin-top: 0.75rem; }
+dt { color: #666; font-size: 0.8rem; margin-top: 0.75rem; }
 dd { margin: 0.15rem 0 0; }
 h2 { font-size: 1.05rem; margin: 2rem 0 0.75rem; }
 label { display: block; font-size: 0.8rem; color: #666; margin-bottom: 0.25rem; }
@@ -132,6 +176,10 @@ th { text-align: left; color: #666; font-weight: 600; }
 th, td { border-bottom: 1px solid #ddd; padding: 0.4rem 0.5rem 0.4rem 0; }
 form.inline { display: inline; }
 @media (prefers-color-scheme: dark) {
+  /* The only wordmark that ships is navy and vanishes on a dark background;
+     flattening and inverting gives a white mark of the same shape. The panel
+     and the desktop client do the same. */
+  .brand img { filter: brightness(0) invert(1); }
   body { color: #e8e8f0; }
   .brand, .identity, dt, label, th { color: #9a9aa8; }
   .identity { border-top-color: #3a3a48; }
@@ -260,7 +308,7 @@ def render_page(
 <link rel="stylesheet" href="{html.escape(root_path)}{STYLE_PATH}">
 </head>
 <body>
-<div class="brand">Collab Hub Collab</div>
+<div class="brand"><img src="{html.escape(root_path)}{LOGO_PATH}" alt="OpenTeams Collab"></div>
 <main>
 {body}
 {footer}

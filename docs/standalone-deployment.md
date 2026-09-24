@@ -231,12 +231,17 @@ hole. Unhardened installs never see these entries at all: the chart passes
 `PATHS="[]"` and `DEFAULT_ACCESS="public"` when `security.enforce` resolves
 false.
 
-`/admin` is listed **ahead of its routes**. The startup check asks nothing of a
-routeless prefix, so this is not the check demanding it — it is merge ordering.
-The operator page (nebari-dev/collab-hub-pack#91) adds `/admin` routes without
-a values change, so with the entry on neither side, a hardened install refuses
-to start in the window between that merge and a follow-up. An unused public
-prefix is inert; a broken `release/public` is not.
+`/admin` was listed ahead of its routes for merge ordering: the operator page
+(nebari-dev/collab-hub-pack#91) added `/admin` routes without a values change,
+so with the entry on neither side a hardened install would have refused to
+start between the two merges. `/admin` now serves the admin panel (`/admin/`,
+`/admin/assets/*` and the JSON API under `/admin/api/*`) on an install that
+enables the web surface and resolves organizations from membership
+(`frames.auth.orgSource` `membership` or `single`), plus the operator
+invitation page when `orgSource` is `membership`. These routes authenticate
+themselves with the web session, the CSRF token and the operator check. On
+any other install `/admin` has no routes and is inert, like the two entries
+above. See [Configuring the admin panel](#configuring-the-admin-panel).
 
 `/org` stays **absent**: it is routeless with no change adding routes to it, so
 there is no merge for an early entry to be early for. It arrives with #92.
@@ -377,6 +382,70 @@ refuses them two ways:
 Gateway-only installs are unaffected in both cases — that is where the dev and
 smoke-test workflows that need these switches actually run.
 
+## Configuring the admin panel
+
+The admin panel at `/admin` ships in the image: the Docker build copies the
+built bundle to `/var/collab-hub-api/admin-ui-dist` and sets
+`COLLAB_HUB_API__WEB__ADMIN_UI_DIST` to that path. It mounts when both of
+these hold:
+
+- the web surface is enabled (see [web-surface.md](web-surface.md#deploying-it));
+- `frames.auth.orgSource` is `membership` or `single`.
+
+Role changes, connector switches, model access and the audit log also need the
+shared `frames.postgres` URL, and the Users section needs `userDirectory`
+enabled, since it lists people from Keycloak. An endpoint whose dependency is
+missing answers 503 with an `*_unavailable` error, and the rest of the panel
+keeps working.
+
+The chart has no values for the panel's own settings, so they are set through
+`api.deployment.extraEnv`, which the chart renders verbatim after its own
+environment block and which therefore accepts `valueFrom`. The names follow the
+API's settings: prefix `COLLAB_HUB_API__`, with `__` between nested keys.
+`group_ids` and `model_groups` are maps, and pydantic-settings reads a map from
+one variable holding a JSON object.
+
+```yaml
+api:
+  deployment:
+    extraEnv:
+      # Members of this group hold the operator role (sign-in sync).
+      - name: COLLAB_HUB_API__WEB__ADMIN_GROUP
+        value: /collab-admins
+      # The serving layer's origin; the panel reads <origin>/v1/models.
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__CATALOG_BASE_URL
+        value: https://models.example.com
+      # The model-access client: a third confidential client in the realm.
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__KEYCLOAK__TOKEN_URL
+        value: https://keycloak.example.com/realms/nebari/protocol/openid-connect/token
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__KEYCLOAK__ADMIN_API_BASE_URL
+        value: https://keycloak.example.com/admin/realms/nebari
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__KEYCLOAK__CLIENT_ID
+        value: collab-model-access
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__KEYCLOAK__CLIENT_SECRET
+        valueFrom:
+          secretKeyRef:
+            name: collab-model-access
+            key: client-secret
+      # Group path to Keycloak group id. Only these groups can be changed.
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__GROUP_IDS
+        value: '{"/models/example-model": "0b4c1f6e-0000-4000-8000-000000000001"}'
+      # Model id to the group path that gates it.
+      - name: COLLAB_HUB_API__FRAMES__MODEL_ACCESS__MODEL_GROUPS
+        value: '{"example-model": "/models/example-model"}'
+```
+
+`COLLAB_HUB_API__WEB__ADMIN_GROUP` works only when the ID token carries a
+`groups` claim. Add a group membership mapper (or the `groups` client scope)
+to the web surface's client in Keycloak. A missing claim changes nobody's
+role, so without the mapper the setting does nothing.
+
+The model-access client's service account must hold `Groups/view-members`,
+`Groups/manage-membership` and `Users/manage-group-membership`, and must not
+hold `Groups/manage-members`. Keep it separate from the `userDirectory` and
+`frames.serviceAccess` clients. The reasons, and what each change records, are
+in [frames-operations.md](frames-operations.md#model-access-from-the-admin-panel).
+
 ## Identity and data-store separation (register R16/R18)
 
 The chart provides the knobs; the values that satisfy the requirements live in
@@ -394,9 +463,13 @@ a chart test:
   chart those appear only as `frames.auth.bearer.*` / `frames.auth.idToken.*`
   URLs and as `userDirectory.keycloak.*`; whether the issuer behind them
   actually follows the convention is a property of the live identity provider.
-  Confirm it there, or record the deviation, before exposing a host. A
-  second, confidential Keycloak client for the browser authorization-code flow
-  joins `apollo-desktop` in the same realm when the web surface ships.
+  Confirm it there, or record the deviation, before exposing a host. The web
+  surface adds a second, confidential Keycloak client for the browser
+  authorization-code flow in the same realm as `apollo-desktop`, and the admin
+  panel's model access adds a third: a confidential service-account client
+  that lists and changes model-group membership
+  (`frames.model_access.keycloak.*`, see
+  [Configuring the admin panel](#configuring-the-admin-panel)).
 
 Any path marked `authenticated` needs a verifiable token: set
 `frames.auth.idToken.jwksUrl` (browsers) and `frames.auth.bearer.jwksUrl`

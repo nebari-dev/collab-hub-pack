@@ -24,6 +24,9 @@ The API is a FastAPI service exposing:
 - **User directory** — org/workspace identity resolved from Keycloak.
 - **Scheduled tasks**, **usage**, and an **MCP server** exposing the above to
   MCP-speaking clients.
+- **Admin panel**: a browser app at `/admin` where operators manage model
+  access, operator roles, connectors and invitations, and read hub usage and
+  the audit log.
 
 ## Prerequisites
 
@@ -85,13 +88,20 @@ The dev-auth shortcut needs **all three** of `FRAMES_UNSAFE_AUTH_ENABLED`,
 `DEV_AUTH_ENABLED` and `DEV_AUTH_USER`; setting only the last authenticates
 nothing and every route answers 401. `make api` sets them for you.
 
-To run the test suite:
+To run the test suites:
 
 ```sh
 cd api
 uv sync --group test
-uv run pytest
+uv run pytest                                # the API (Python)
+
+cd admin-ui
+npm ci --ignore-scripts && npm test          # the admin panel (Vitest)
 ```
+
+CI runs both: the `test` job runs pytest against a real Postgres service, and
+the `admin-ui` job runs `npm ci`, `npm audit`, the typecheck, Vitest and the
+production build.
 
 ## Documentation
 

@@ -24,7 +24,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response, status
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 
 from ..dependencies import get_active_frame_store, get_history_store, get_usage_store
 from ..frames.active_state import ActiveFrameStore, ActiveStateUnavailableError
@@ -282,8 +282,8 @@ def get_usage_summary(
     history_store: HistoryStoreDep,
     active_store: ActiveStoreDep,
     user: UserFilterDep = None,
-    since: Annotated[datetime | None, Query()] = None,
-    until: Annotated[datetime | None, Query()] = None,
+    since: Annotated[AwareDatetime | None, Query()] = None,
+    until: Annotated[AwareDatetime | None, Query()] = None,
 ) -> UsageSummaryResponse:
     """Return the caller's workspace usage roll-up for an optional time window.
 
@@ -312,8 +312,8 @@ def get_my_usage(
     usage_store: UsageStoreDep,
     history_store: HistoryStoreDep,
     active_store: ActiveStoreDep,
-    since: Annotated[datetime | None, Query()] = None,
-    until: Annotated[datetime | None, Query()] = None,
+    since: Annotated[AwareDatetime | None, Query()] = None,
+    until: Annotated[AwareDatetime | None, Query()] = None,
 ) -> UsageSummaryResponse:
     """Return the usage roll-up narrowed to the calling user."""
 

@@ -30,6 +30,21 @@ uv sync --group test        # install runtime + test deps
 uv run pytest               # run the test suite
 ```
 
+Tests that need a live Postgres skip unless `COLLAB_HUB_TEST_POSTGRES_URL`
+points at a throwaway database (they drop and recreate every `collab_`
+table). CI's `test` job starts a Postgres service and sets it, so those tests
+run there.
+
+The admin panel is a Vite and React app in [`api/admin-ui/`](api/admin-ui/)
+with its own Vitest suite. It needs Node (CI uses Node 24):
+
+```sh
+cd api/admin-ui
+npm ci --ignore-scripts     # install exactly what package-lock.json pins
+npm test                    # run the Vitest suite
+npm run typecheck           # tsc, as CI runs it
+```
+
 The API supports **Python 3.13 and later**. `api/.python-version` pins 3.14,
 the version the image runs, and CI runs the suite on 3.13 as well
 (`Test (Python 3.13)`). To reproduce that job, prefix the commands with
@@ -52,7 +67,7 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
 
 - Open an issue first for anything non-trivial, and link it from the PR with a
   closing keyword (`Fixes #123`).
-- CI (`lint`, `test`) must pass. Add tests with your change: unit tests for new
+- CI (`lint`, `test`, including the `admin-ui` job) must pass. Add tests with your change: unit tests for new
   functionality, regression tests for bug fixes.
 - A [code owner](.github/CODEOWNERS) must approve before merge. Take PRs out of
   draft before requesting code-owner review.

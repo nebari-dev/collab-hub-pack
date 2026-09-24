@@ -1,0 +1,35 @@
+/**
+ * Ending the session, through the route the rest of the surface already uses.
+ *
+ * `POST /web/signout` is the existing sign-out, and it clears the session
+ * cookie server-side. The server-rendered pages reach it with an HTML form; the
+ * panel posts it with `fetch` instead, because its Content-Security-Policy sets
+ * `form-action 'none'` and should keep doing so -- a surface that submits no
+ * forms is a surface a markup-injection bug cannot use to post anywhere.
+ *
+ * `require_csrf` reads the `X-CSRF-Token` header before it falls back to form
+ * fields, so this needs nothing new on the server.
+ */
+
+export const SIGNOUT_URL = "../web/signout";
+export const SIGNED_OUT_URL = "../web/signed-out";
+
+/**
+ * Where to go once signed out, or `null` if the server did not confirm it.
+ *
+ * The signed-out page is static and cannot tell anyone their session
+ * survived, so a sign-out that failed must not end there: the session cookie
+ * may still be live, and the person would leave believing otherwise.
+ */
+export async function signOut(csrfToken: string, fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  try {
+    const response = await fetchImpl(SIGNOUT_URL, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-CSRF-Token": csrfToken },
+    });
+    return response.ok || (response.status >= 300 && response.status < 400) ? SIGNED_OUT_URL : null;
+  } catch {
+    return null;
+  }
+}

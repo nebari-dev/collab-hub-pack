@@ -315,3 +315,27 @@ def test_keycloak_user_directory_client_pages_raw_user_records():
     # and widening that public response model is not issue #65's business.
     assert second_page[0]["createdTimestamp"] == 1700000000000
     assert [request.method for request in seen] == ["POST", "GET", "GET"]
+
+
+def test_keycloak_user_search_can_start_past_the_first_page():
+    """``first`` is Keycloak's offset; without it only the top N are reachable."""
+
+    params: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/protocol/openid-connect/token"):
+            return httpx.Response(200, json={"access_token": "service-token", "expires_in": 300})
+        params.append(dict(request.url.params))
+        return httpx.Response(200, json=[])
+
+    client = KeycloakUserDirectoryClient(
+        token_url="https://keycloak.example/realms/hub/protocol/openid-connect/token",
+        admin_api_base_url="https://keycloak.example/admin/realms/hub",
+        client_id="nexus-user-directory",
+        client_secret="secret",
+        transport=httpx.MockTransport(handler),
+    )
+    client.search_users("ali", limit=10, first=40)
+    client.close()
+
+    assert params == [{"first": "40", "max": "10", "search": "ali"}]

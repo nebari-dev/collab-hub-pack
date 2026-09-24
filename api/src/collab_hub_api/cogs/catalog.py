@@ -1,7 +1,7 @@
 """The Cog catalog: where indexed artifacts live (issue #84).
 
 One row per ``(source_id, repository, digest)`` in ``collab_cog_artifacts``,
-created by migration version 7 of :mod:`..frames.collab_schema` -- never by
+created by migration version 11 of :mod:`..frames.collab_schema` -- never by
 this module, which carries no DDL. Identity is the digest: ``cog_id`` and
 ``name`` are search keys read from the Cog's own declarations, and the
 repository path is not identity (published repository names carry an id
@@ -622,7 +622,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
     """The catalog over ``collab_cog_artifacts`` on the shared pool.
 
     No ``_ensure_schema``: the table is created by the versioned, lock-guarded
-    runner in :mod:`..frames.collab_schema` (version 7). A store that also
+    runner in :mod:`..frames.collab_schema` (version 11). A store that also
     emitted DDL would reintroduce the unlocked ``CREATE TABLE IF NOT EXISTS``
     race that runner exists to remove.
     """

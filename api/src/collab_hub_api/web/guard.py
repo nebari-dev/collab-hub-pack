@@ -52,7 +52,7 @@ from ..frames.observability import REQUEST_COUNT, UNMATCHED_PATH_LABEL, access_l
 from .authz import on_web_surface, signin_redirect_target
 from .pages import SECURITY_HEADERS, authorization_unavailable_page, page_response
 from .session import SESSION_COOKIE
-from .surface import PUBLIC_WEB_PATHS, WEB_SURFACE_PREFIXES
+from .surface import PUBLIC_WEB_PATHS, WEB_SURFACE_PREFIXES, answers_json
 
 logger = logging.getLogger("frames_server.web")
 
@@ -89,9 +89,18 @@ class WebSessionGuardMiddleware:
 
         session = _session_or_none(scope, path)
         if session is _UNAVAILABLE:
+            if answers_json(path):
+                await _deny_json(scope, send, status_code=503, error="authorization is unavailable")
+                return
             await _deny_http(scope, send)
             return
         if session is None:
+            if answers_json(path):
+                # A redirect would be followed by `fetch`, and the panel would
+                # receive the sign-in page with status 200 -- an unauthenticated
+                # caller being told, in effect, that everything is fine.
+                await _deny_json(scope, send, status_code=401, error="authentication required")
+                return
             await _redirect_to_signin(scope, send, path)
             return
 
@@ -211,6 +220,24 @@ async def _redirect_to_signin(scope: Scope, send: Send, path: str) -> None:
     response = RedirectResponse(
         signin_redirect_target(root_path, _next_target(scope, path)),
         status_code=303,
+        headers=dict(REFUSAL_HEADERS),
+    )
+    await response(scope, _empty_receive, send)
+
+
+async def _deny_json(scope: Scope, send: Send, *, status_code: int, error: str) -> None:
+    """Refuse an admin-API request in the shape its caller can read.
+
+    The body carries a fixed reason word and nothing else: the panel decides
+    what to show from the status, and a refusal is not the place to describe
+    the deployment's authorization wiring to an unauthenticated caller.
+    """
+
+    from starlette.responses import JSONResponse
+
+    response = JSONResponse(
+        {"error": error},
+        status_code=status_code,
         headers=dict(REFUSAL_HEADERS),
     )
     await response(scope, _empty_receive, send)
