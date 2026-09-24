@@ -31,6 +31,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .codec import FrameDecodeError, undecodable_frame_log
 from .db import locked_schema_connection
 from .models import (
     DESCRIPTION_MAX_LENGTH,
@@ -197,6 +198,13 @@ def compute_derived(group: FrameGroup, store: FrameStore) -> tuple[bool, Visibil
         try:
             frame = store.get_frame(frame_id)
         except FrameNotFoundError:
+            all_published = False
+            continue
+        except FrameDecodeError as exc:
+            # A corrupt member is undecodable, not merely absent: count it as
+            # not-published (like a missing member) so the group stays owner-only
+            # rather than failing the whole projection.
+            undecodable_frame_log.skipped(exc, context=f"group {group.id} projection")
             all_published = False
             continue
         if not frame.published:

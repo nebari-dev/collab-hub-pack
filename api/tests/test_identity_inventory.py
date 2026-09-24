@@ -314,7 +314,7 @@ def test_frame_with_no_owners_at_all_is_reported(index: DirectoryIndex) -> None:
 
 
 def test_legacy_owner_scalar_is_promoted_only_when_the_owners_key_is_absent(index: DirectoryIndex) -> None:
-    """BLOCKER 3: match ``store.normalize_metadata`` exactly.
+    """BLOCKER 3: match ``frames.codec.normalize_metadata`` exactly.
 
     The service promotes the scalar only when there is no ``owners`` key at
     all. Reading it more generously would clear a frame the service already

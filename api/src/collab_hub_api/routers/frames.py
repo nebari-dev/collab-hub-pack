@@ -13,9 +13,11 @@ from ..dependencies import (
     get_group_store,
     get_history_store,
 )
+from ..frames import error_codes
 from ..frames.access import can_manage, can_read, can_read_group
 from ..frames.active_state import ActiveFrameStore, ActiveStateUnavailableError
 from ..frames.auth import AuthContext, get_auth_context
+from ..frames.codec import FrameDecodeError, undecodable_frame_log
 from ..frames.groups import (
     FrameGroup,
     FrameGroupNotFoundError,
@@ -59,6 +61,7 @@ from ..frames.store import FrameNotFoundError, FrameStore, SuggestionNotFoundErr
 router = APIRouter(tags=["frames"])
 
 history_logger = logging.getLogger("frames_server.history")
+frames_logger = logging.getLogger("frames_server.frames")
 
 AuthDep = Annotated[AuthContext, Depends(get_auth_context)]
 StoreDep = Annotated[FrameStore, Depends(get_frames_store)]
@@ -764,8 +767,22 @@ def set_active_frames(
     store: StoreDep,
     active_store: ActiveStoreDep,
 ) -> ActiveFramesResponse:
+    # The UI resends the whole set on every toggle. A frame already in the
+    # stored set was checked when it was added, so if it has since become
+    # undecodable it is kept rather than failing the PUT: toggles keep working,
+    # nothing is silently dropped, and it is active again once repaired. (MCP
+    # reads skip it meanwhile.) A newly added corrupt frame has never been
+    # checked, so it still raises and the handler returns a 500 naming it.
+    already_active = set(active_store.get_active_frame_ids(auth.org_id, auth.workspace_id, auth.user))
     for frame_id in payload.frame_ids:
-        require_readable_frame(store.get_frame(frame_id), auth)
+        try:
+            frame = store.get_frame(frame_id)
+        except FrameDecodeError as exc:
+            if frame_id not in already_active:
+                raise
+            undecodable_frame_log.skipped(exc, context="active-frames update")
+            continue
+        require_readable_frame(frame, auth)
     frame_ids = active_store.set_active_frame_ids(auth.org_id, auth.workspace_id, auth.user, payload.frame_ids)
     audit_event("active_frames_update", request, user=auth.user)
     return ActiveFramesResponse(
@@ -792,3 +809,16 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(HistoryUnavailableError)
     async def history_unavailable_handler(_request: Request, exc: HistoryUnavailableError):
         return error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "history_unavailable", str(exc))
+
+    @app.exception_handler(FrameDecodeError)
+    async def frame_decode_handler(_request: Request, exc: FrameDecodeError):
+        # The object exists but is unreadable: a structured 500, never a 404.
+        # Handling the error suppresses Starlette's traceback log, so record
+        # the frame and cause here or the operator has nothing to repair from.
+        frames_logger.error("Frame %s could not be decoded", exc.frame_id, exc_info=exc)
+        return error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_codes.FRAME_DECODE_ERROR,
+            "Stored frame could not be decoded",
+            details={"frame_id": exc.frame_id},
+        )

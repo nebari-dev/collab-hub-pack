@@ -9,9 +9,11 @@ from datetime import UTC, datetime
 
 import pytest
 
+from collab_hub_api.frames import codec
 from collab_hub_api.frames.models import (
     FRAME_METADATA_SCHEMA_VERSION,
     Frame,
+    FrameMetadata,
     SuggestionStatus,
     Visibility,
 )
@@ -403,6 +405,104 @@ def test_s3_read_metadata_reraises_errors_that_are_not_missing_objects():
         store.list_frames("org-a", "workspace-a")
 
 
+def test_s3_list_frames_skips_a_corrupt_frame(caplog):
+    """A corrupt sidecar must not fail the whole page: skip it and log the skip.
+
+    The object exists but is undecodable, so ``_read_metadata`` raises
+    ``FrameDecodeError``. A direct GET of that frame still surfaces a 500; here,
+    in a list, one bad sidecar must not hide every healthy frame.
+    """
+
+    ids = [f"{index:032x}" for index in range(4)]
+    corrupt = ids[2]
+
+    class CorruptingFakeS3(RecordingFakeS3):
+        def get_object(self, Bucket: str, Key: str):  # noqa: N803 - boto3 casing
+            if Key.split("/")[-2] == corrupt:
+                with self._lock:
+                    self.requested.append(Key)
+                return {"Body": io.BytesIO(b"{not valid json"), "ETag": '"etag"'}
+            return super().get_object(Bucket, Key)
+
+    fake = CorruptingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
+    store = _s3_store_with(fake)
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
+        listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == sorted(set(ids) - {corrupt})
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert corrupt in warnings[0].getMessage()
+
+
+def test_local_list_frames_skips_a_corrupt_frame(tmp_path, caplog):
+    """The local backend isolates a corrupt sidecar the same way S3 does."""
+
+    good = make_frame(frame_id="a" * 32)
+    bad = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(good)
+    store._write_frame(bad)
+    (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
+        listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == [good.id]
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert bad.id in warnings[0].getMessage()
+
+
+def test_local_list_frames_keeps_a_frame_whose_body_is_corrupt(tmp_path):
+    """List reads metadata only, on both backends, so a bad body.md never hides a frame.
+
+    S3 lists from metadata.json alone; the local list used to decode the body
+    too, so the same corrupt frame vanished locally but not on S3. It must stay
+    listed (discoverable) while a direct GET surfaces the decode error.
+    """
+
+    good = make_frame(frame_id="a" * 32)
+    bad_body = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(good)
+    store._write_frame(bad_body)
+    (tmp_path / bad_body.id / "body.md").write_bytes(b"\xff\xfe")
+
+    listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == [good.id, bad_body.id]
+    with pytest.raises(codec.FrameDecodeError):
+        store.get_frame(bad_body.id)
+
+
+def test_local_list_frames_keeps_a_frame_with_metadata_but_no_body(tmp_path):
+    """Parity with S3, which discovers frames by their metadata.json key alone."""
+
+    frame = make_frame(frame_id="a" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(frame)
+    (tmp_path / frame.id / "body.md").unlink()
+
+    assert [item.id for item in store.list_frames("org-a", "workspace-a")] == [frame.id]
+
+
+def test_repeated_lists_warn_about_a_corrupt_frame_once(tmp_path, caplog):
+    """A corrupt frame is skipped on every list; only the first skip warns."""
+
+    bad = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(bad)
+    (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
+        for _ in range(5):
+            assert store.list_frames("org-a", "workspace-a") == []
+
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+
 def test_s3_store_sizes_the_connection_pool_to_the_read_fan_out():
     """Botocore's default pool of 10 would serialise the surplus list workers."""
 
@@ -430,3 +530,81 @@ def test_s3_list_frames_still_applies_filters():
 
     assert store.list_frames("org-a", "workspace-a", owner="alice")
     assert store.list_frames("other-org", "workspace-a") == []
+
+
+class CapturingFakeS3:
+    """In-memory S3 client that round-trips the exact bytes it is handed.
+
+    Stores whatever ``put_object`` writes and serves it back verbatim from
+    ``get_object`` so a write→read cycle exercises the real encode *and* decode
+    paths (no shortcut through a hand-built payload).
+    """
+
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+
+    def put_object(self, Bucket, Key, Body, ContentType, **kwargs):  # noqa: N803 - boto3 casing
+        del Bucket, ContentType, kwargs
+        self.objects[Key] = Body
+
+    def get_object(self, Bucket, Key):  # noqa: N803 - boto3 casing
+        del Bucket
+        if Key not in self.objects:
+            raise FakeS3ClientError("NoSuchKey", 404)
+        return {"Body": io.BytesIO(self.objects[Key]), "ETag": '"etag"'}
+
+
+def _capturing_s3_store(fake: CapturingFakeS3) -> S3FrameStore:
+    store = S3FrameStore.__new__(S3FrameStore)
+    store.bucket = "bucket"
+    store.prefix = "frames"
+    store.client_error = FakeS3ClientError
+    store.s3 = fake
+    return store
+
+
+def test_s3_store_round_trips_a_frame_through_the_codec():
+    """A frame written to S3 reads back equal, exercising encode and decode.
+
+    Covers the real ``_read_frame_with_metadata_etag`` path (both objects fetched
+    and handed to the codec), which the ETag-retry tests stub out.
+    """
+
+    fake = CapturingFakeS3()
+    store = _capturing_s3_store(fake)
+    frame = make_frame(frame_id="b" * 32).model_copy(
+        update={"name": "Café Playbook", "body": "hello café ☕"}
+    )
+
+    store._write_frame(frame)
+
+    assert store.get_frame(frame.id) == frame
+    assert store._read_metadata(frame.id) == FrameMetadata(**frame.model_dump(exclude={"body"}))
+
+
+def test_local_and_s3_backends_write_identical_bytes(tmp_path):
+    """Issue #60 requirement (c): both backends persist the same bytes.
+
+    Writing one Frame — with a non-ASCII name, so ``ensure_ascii`` escaping is in
+    play — through each backend must produce byte-identical ``metadata.json`` and
+    ``body.md``. The shared codec is what guarantees it.
+    """
+
+    frame = make_frame(frame_id="a" * 32).model_copy(
+        update={"name": "Café Playbook", "body": "hello café ☕"}
+    )
+
+    local = LocalFsFrameStore(tmp_path)
+    local._write_frame(frame)
+    local_metadata = (tmp_path / frame.id / "metadata.json").read_bytes()
+    local_body = (tmp_path / frame.id / "body.md").read_bytes()
+
+    fake = CapturingFakeS3()
+    s3 = S3FrameStore.__new__(S3FrameStore)
+    s3.bucket = "bucket"
+    s3.prefix = "frames"
+    s3.s3 = fake
+    s3._write_frame(frame)
+
+    assert fake.objects[f"frames/{frame.id}/metadata.json"] == local_metadata
+    assert fake.objects[f"frames/{frame.id}/body.md"] == local_body
