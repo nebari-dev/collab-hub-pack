@@ -61,7 +61,15 @@ def _message(rng: random.Random, i: int, long_share: float) -> dict:
     }
 
 
+def _history(seed: int, count: int = 200) -> list[dict]:
+    """A fixed channel history, oldest first, so paged reads can be checked for gaps."""
+    rng = random.Random(seed)
+    return [_message(rng, i, long_share=0.05) for i in range(count)]
+
+
 def _fake_slack(seed: int):
+    history = _history(seed)
+
     def handler(request: httpx.Request) -> httpx.Response:
         rng = random.Random(seed)
         path = request.url.path
@@ -77,11 +85,25 @@ def _fake_slack(seed: int):
                 matches.append(m)
             return httpx.Response(200, json={"ok": True, "messages": {"matches": matches, "paging": {"pages": 1}}})
         if path.endswith("/conversations.history") or path.endswith("/conversations.replies"):
-            limit = int(request.url.params.get("limit", "50"))
-            messages = [_message(rng, i, long_share=0.05) for i in range(limit)]
+            params = request.url.params
+            limit = int(params.get("limit", "50"))
+            if path.endswith("/conversations.history"):
+                # Newest first, honoring an inclusive ``latest``.
+                latest = params.get("latest")
+                pool = [m for m in reversed(history) if not latest or float(m["ts"]) <= float(latest)]
+            else:
+                # Oldest first, honoring an inclusive ``oldest``.
+                oldest = params.get("oldest")
+                pool = [m for m in history if not oldest or float(m["ts"]) >= float(oldest)]
+            page = pool[:limit]
             return httpx.Response(
                 200,
-                json={"ok": True, "messages": messages, "has_more": False, "response_metadata": {"next_cursor": ""}},
+                json={
+                    "ok": True,
+                    "messages": page,
+                    "has_more": len(pool) > limit,
+                    "response_metadata": {"next_cursor": ""},
+                },
             )
         return httpx.Response(404, json={"ok": False, "error": "unknown_method"})
 
@@ -91,6 +113,24 @@ def _fake_slack(seed: int):
 def _report(label: str, response) -> None:
     size = len(response.model_dump_json())
     print(f"{label:<34} {size:>10,} chars   ~{size // 4:>8,} tokens")
+
+
+async def _read_everything(read_page, make_response) -> None:
+    """Page through all 200 messages, following next_cursor, and check nothing is lost."""
+    seen: list[str] = []
+    sizes: list[int] = []
+    cursor = ""
+    while True:
+        messages, has_more, cursor = await read_page(cursor)
+        seen.extend(message.ts for message in messages)
+        sizes.append(len(make_response(messages, has_more, cursor).model_dump_json()))
+        if not has_more or not cursor:
+            break
+    complete = len(seen) == 200 and len(set(seen)) == 200
+    print(
+        f"  -> all 200 messages in {len(sizes)} page(s), largest page {max(sizes):,} chars, "
+        f"{'no gaps or repeats' if complete else f'PROBLEM: got {len(seen)} ({len(set(seen))} unique)'}"
+    )
 
 
 async def main() -> None:
@@ -108,20 +148,30 @@ async def main() -> None:
             hits, next_page = await slack.search_page(query="release", limit=limit)
             _report(f"search, {limit} hits", SlackSearchResponse(hits=hits, next_page=next_page))
 
-        for limit in (50, 200):
-            messages, has_more, cursor = await slack.read_conversation(channel_id=CHANNEL_ID, limit=limit)
-            _report(
-                f"channel read, {limit} messages",
-                SlackReadResponse(channel_id=CHANNEL_ID, messages=messages, has_more=has_more, next_cursor=cursor),
+        def read_response(messages, has_more, cursor):
+            return SlackReadResponse(channel_id=CHANNEL_ID, messages=messages, has_more=has_more, next_cursor=cursor)
+
+        def thread_response(messages, has_more, cursor):
+            return SlackThreadReadResponse(
+                channel_id=CHANNEL_ID, message_ts=THREAD_TS, messages=messages, has_more=has_more, next_cursor=cursor
             )
 
+        for limit in (50, 200):
+            messages, has_more, cursor = await slack.read_conversation(channel_id=CHANNEL_ID, limit=limit)
+            _report(f"channel read, {limit} messages", read_response(messages, has_more, cursor))
+
+        async def channel_page(cursor):
+            return await slack.read_conversation(channel_id=CHANNEL_ID, limit=200, cursor=cursor)
+
+        await _read_everything(channel_page, read_response)
+
         messages, has_more, cursor = await slack.read_thread(channel_id=CHANNEL_ID, message_ts=THREAD_TS, limit=200)
-        _report(
-            "thread read, 200 messages",
-            SlackThreadReadResponse(
-                channel_id=CHANNEL_ID, message_ts=THREAD_TS, messages=messages, has_more=has_more, next_cursor=cursor
-            ),
-        )
+        _report("thread read, 200 messages", thread_response(messages, has_more, cursor))
+
+        async def thread_page(cursor):
+            return await slack.read_thread(channel_id=CHANNEL_ID, message_ts=THREAD_TS, limit=200, cursor=cursor)
+
+        await _read_everything(thread_page, thread_response)
     finally:
         httpx.AsyncClient = original
 
