@@ -73,7 +73,7 @@ from ..cogs.models import (
     CogVersion,
 )
 from ..dependencies import get_cog_catalog_store
-from ..frames.auth import AuthContext, NoOrganizationError, get_auth_context, get_id_token
+from ..frames.auth import AuthContext, NoOrganizationError, get_auth_context
 from ..path_protection import request_path, winning_rule
 from .frames import error_response
 
@@ -88,14 +88,17 @@ def _within_cogs(rule_path: str) -> bool:
 
 
 def presents_credentials(request: Request) -> bool:
-    """Whether the request tries to authenticate: an ``IdToken-*`` cookie or any ``Authorization`` header.
+    """Whether the request tries to authenticate: an ``IdToken-*`` cookie or an ``Authorization`` header.
 
-    The cookie is what :func:`get_auth_context` reads first; any
-    ``Authorization`` value counts, whatever its scheme, because a client
-    that sent one meant to be someone.
+    Presence, not value: an empty or whitespace ``Authorization`` header and
+    an ``IdToken-*`` cookie with no value are credentials the verifier
+    rejects, not their absence, so they keep their 401. The cookie-name rule
+    is the one :func:`~..frames.auth.get_id_token` applies; any
+    ``Authorization`` scheme counts, because a client that sent one meant to
+    be someone.
     """
 
-    return bool(get_id_token(request)) or bool(request.headers.get("Authorization", "").strip())
+    return "authorization" in request.headers or any(name.startswith("IdToken-") for name in request.cookies)
 
 
 def get_catalog_caller(request: Request) -> AuthContext | None:

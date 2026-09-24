@@ -891,8 +891,11 @@ async def test_anonymous_catalog_v1_is_unchanged(tmp_path, monkeypatch):
         {"cookies": {"IdToken-test": "not-a-token"}},
         {"headers": {"Authorization": "Bearer not-a-token"}},
         {"headers": {"Authorization": "Basic YWxpY2U6c2VjcmV0"}},
+        {"headers": {"Authorization": ""}},
+        {"headers": {"Authorization": "   "}},
+        {"cookies": {"IdToken-test": ""}},
     ],
-    ids=["garbage-cookie", "garbage-bearer", "other-scheme"],
+    ids=["garbage-cookie", "garbage-bearer", "other-scheme", "empty-header", "blank-header", "empty-cookie"],
 )
 @pytest.mark.parametrize("path", [*REDACTED_ROUTES, "/v1/cogs/catalog.v1.json"])
 async def test_under_a_public_rule_rejected_credentials_are_a_401_not_anonymous(

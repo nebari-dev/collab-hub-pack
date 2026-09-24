@@ -211,8 +211,12 @@ combination, but not restating the list is the better habit.)
   ([cog-registry.md](cog-registry.md#read-api)). Under that rule a request
   with no credentials gets the anonymous view. It omits `source_id` and the
   cards' reader diagnostics (`errors`, `warnings`), and refuses the
-  `source_id` filter with 422 `validation_error`. So does a valid subject
-  with no organization. Credentials the API accepts get the full answer.
+  `source_id` filter with 422 `validation_error`. So does a signed-in
+  subject for whom membership resolution finds no organization (platform
+  operators without one are accepted callers and get the full answer).
+  Credentials the API accepts get the full answer, and an `Authorization`
+  header or `IdToken-*` cookie that is present but empty counts as rejected
+  credentials, not as none.
   Credentials it rejects, including a JWKS it cannot reach, get 401 as
   anywhere else. For every caller, `GET /v1/cogs` list items carry a
   trimmed card without `body`, `profile_raw` and `frontmatter_raw`, which
