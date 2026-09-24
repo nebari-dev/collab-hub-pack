@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
@@ -1269,3 +1270,87 @@ async def test_corrupt_metadata_returns_structured_500(client, tmp_path):
 
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "frame_decode_error"
+
+
+async def test_corrupt_frame_500_is_logged_with_the_frame_id_and_cause(client, tmp_path, caplog):
+    """The 500 handler must leave a server-side record of what failed to decode.
+
+    Before the typed error, Starlette logged the raw traceback; a registered
+    handler suppresses that, so it must log the frame id and cause itself.
+    """
+
+    frame = await create_frame(client)
+    (tmp_path / "frames" / frame["id"] / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR):
+        response = await client.get(f"/v1/frames/{frame['id']}", cookies=auth_cookie("alice"))
+
+    assert response.status_code == 500
+    assert response.json()["error"]["details"] == {"frame_id": frame["id"]}
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and frame["id"] in r.getMessage()]
+    assert len(errors) == 1
+    assert isinstance(errors[0].exc_info[1].__cause__, json.JSONDecodeError)
+
+
+async def test_an_already_active_corrupt_frame_does_not_block_toggles(client, tmp_path):
+    """The UI resends the whole set on every toggle; a corrupt active frame must not lock it.
+
+    Frames already in the stored set were checked when they were added, so a
+    decode failure on one of them is tolerated: it stays in the set (nothing
+    silently lost, and it is active again once repaired) while the toggle
+    applies. Unticking it needs no read at all.
+    """
+
+    a = await create_frame(client)
+    b = await create_frame(client)
+    c = await create_frame(client)
+    first = await client.put(
+        "/v1/active-frames", cookies=auth_cookie("alice"), json={"frame_ids": [a["id"], b["id"]]}
+    )
+    assert first.status_code == 200
+    metadata_path = tmp_path / "frames" / b["id"] / "metadata.json"
+    healthy = metadata_path.read_bytes()
+    metadata_path.write_text("{not valid json", encoding="utf-8")
+
+    toggled = await client.put(
+        "/v1/active-frames",
+        cookies=auth_cookie("alice"),
+        json={"frame_ids": [a["id"], b["id"], c["id"]]},
+    )
+    assert toggled.status_code == 200
+    assert toggled.json()["frame_ids"] == [a["id"], b["id"], c["id"]]
+
+    # Once repaired, b is simply active again; no re-adding needed.
+    metadata_path.write_bytes(healthy)
+    stored = await client.get("/v1/active-frames", cookies=auth_cookie("alice"))
+    assert stored.json()["frame_ids"] == [a["id"], b["id"], c["id"]]
+
+    unticked = await client.put(
+        "/v1/active-frames", cookies=auth_cookie("alice"), json={"frame_ids": [a["id"], c["id"]]}
+    )
+    assert unticked.json()["frame_ids"] == [a["id"], c["id"]]
+
+
+async def test_adding_a_corrupt_frame_to_the_active_set_names_it_in_the_500(client, tmp_path):
+    """A frame not yet active has never been checked, so a corrupt one fails loudly."""
+
+    a = await create_frame(client)
+    b = await create_frame(client)
+    first = await client.put("/v1/active-frames", cookies=auth_cookie("alice"), json={"frame_ids": [a["id"]]})
+    assert first.status_code == 200
+    (tmp_path / "frames" / b["id"] / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    added = await client.put(
+        "/v1/active-frames",
+        cookies=auth_cookie("alice"),
+        json={"frame_ids": [a["id"], b["id"]]},
+    )
+
+    assert added.status_code == 500
+    assert added.json()["error"] == {
+        "code": "frame_decode_error",
+        "message": "Stored frame could not be decoded",
+        "details": {"frame_id": b["id"]},
+    }
+    stored = await client.get("/v1/active-frames", cookies=auth_cookie("alice"))
+    assert stored.json()["frame_ids"] == [a["id"]]

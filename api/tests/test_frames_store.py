@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from collab_hub_api.frames import codec
 from collab_hub_api.frames.models import (
     FRAME_METADATA_SCHEMA_VERSION,
     Frame,
@@ -426,7 +427,7 @@ def test_s3_list_frames_skips_a_corrupt_frame(caplog):
     fake = CorruptingFakeS3({frame_id: _metadata_payload(frame_id) for frame_id in ids})
     store = _s3_store_with(fake)
 
-    with caplog.at_level(logging.WARNING, logger="frames_server.store"):
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
         listed = store.list_frames("org-a", "workspace-a")
 
     assert [item.id for item in listed] == sorted(set(ids) - {corrupt})
@@ -445,13 +446,61 @@ def test_local_list_frames_skips_a_corrupt_frame(tmp_path, caplog):
     store._write_frame(bad)
     (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="frames_server.store"):
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
         listed = store.list_frames("org-a", "workspace-a")
 
     assert [item.id for item in listed] == [good.id]
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert bad.id in warnings[0].getMessage()
+
+
+def test_local_list_frames_keeps_a_frame_whose_body_is_corrupt(tmp_path):
+    """List reads metadata only, on both backends, so a bad body.md never hides a frame.
+
+    S3 lists from metadata.json alone; the local list used to decode the body
+    too, so the same corrupt frame vanished locally but not on S3. It must stay
+    listed (discoverable) while a direct GET surfaces the decode error.
+    """
+
+    good = make_frame(frame_id="a" * 32)
+    bad_body = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(good)
+    store._write_frame(bad_body)
+    (tmp_path / bad_body.id / "body.md").write_bytes(b"\xff\xfe")
+
+    listed = store.list_frames("org-a", "workspace-a")
+
+    assert [item.id for item in listed] == [good.id, bad_body.id]
+    with pytest.raises(codec.FrameDecodeError):
+        store.get_frame(bad_body.id)
+
+
+def test_local_list_frames_keeps_a_frame_with_metadata_but_no_body(tmp_path):
+    """Parity with S3, which discovers frames by their metadata.json key alone."""
+
+    frame = make_frame(frame_id="a" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(frame)
+    (tmp_path / frame.id / "body.md").unlink()
+
+    assert [item.id for item in store.list_frames("org-a", "workspace-a")] == [frame.id]
+
+
+def test_repeated_lists_warn_about_a_corrupt_frame_once(tmp_path, caplog):
+    """A corrupt frame is skipped on every list; only the first skip warns."""
+
+    bad = make_frame(frame_id="b" * 32)
+    store = LocalFsFrameStore(tmp_path)
+    store._write_frame(bad)
+    (tmp_path / bad.id / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
+        for _ in range(5):
+            assert store.list_frames("org-a", "workspace-a") == []
+
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 def test_s3_store_sizes_the_connection_pool_to_the_read_fan_out():

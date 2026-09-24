@@ -255,7 +255,7 @@ async def test_get_active_frames_skips_a_corrupt_frame(tmp_path, caplog):
 
     token = current_auth_context.set(auth)
     try:
-        with caplog.at_level(logging.WARNING, logger="frames_server.mcp"):
+        with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
             active = parse_tool_result(await mcp.call_tool("get_active_frames", {}))
     finally:
         current_auth_context.reset(token)

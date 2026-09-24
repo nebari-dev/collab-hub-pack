@@ -21,7 +21,6 @@ from .models import (
     Suggestion,
     SuggestionStatus,
     Visibility,
-    frame_metadata,
 )
 
 
@@ -268,19 +267,14 @@ class LocalFsFrameStore(FrameStore):
             if not path.is_dir():
                 continue
             try:
-                frame = self.get_frame(path.name)
+                item = self._read_metadata(path.name)
             except FrameNotFoundError:
                 continue
-            except codec.FrameDecodeError:
-                # Corrupt/unreadable sidecar: skip it here so one bad frame
-                # cannot fail the whole page. It still surfaces as a 500 on a
-                # direct GET of this frame; logged so the rate is measurable.
-                logger.warning(
-                    "Frame %s listed but could not be decoded; omitted from this page",
-                    path.name,
-                )
+            except codec.FrameDecodeError as exc:
+                # One corrupt sidecar must not fail the whole list; a direct
+                # GET of it still surfaces the structured 500.
+                codec.undecodable_frame_log.skipped(exc, context="frame list")
                 continue
-            item = frame_metadata(frame)
             if not metadata_matches_filters(
                 item,
                 org_id,
@@ -298,6 +292,20 @@ class LocalFsFrameStore(FrameStore):
 
         with self._frame_lock(frame_id):
             return self._read_frame(frame_id)
+
+    def _read_metadata(self, frame_id: str) -> FrameMetadata:
+        """Read one Frame's metadata *without* its Markdown body.
+
+        Mirrors ``S3FrameStore._read_metadata``: listing needs only the
+        sidecar, so a missing or corrupt ``body.md`` never hides a frame from
+        one backend's list while the other still shows it.
+        """
+
+        metadata_path = self._frame_dir(frame_id) / "metadata.json"
+        with self._frame_lock(frame_id):
+            if not metadata_path.exists():
+                raise FrameNotFoundError(frame_id)
+            return codec.decode_metadata(metadata_path.read_bytes(), frame_id=frame_id)
 
     def _read_frame(self, frame_id: str) -> Frame:
         frame_dir = self._frame_dir(frame_id)
@@ -561,18 +569,14 @@ class S3FrameStore(FrameStore):
                 # Logged so the rate is measurable: a steady stream means
                 # something other than ordinary deletes is removing objects.
                 logger.warning(
-                    "Frame %s listed but not readable; omitted from this page",
+                    "Frame %s listed but not readable; omitted from the list",
                     frame_id,
                 )
                 return None
-            except codec.FrameDecodeError:
-                # Corrupt/unreadable sidecar: skip it here so one bad frame
-                # cannot fail the whole page. It still surfaces as a 500 on a
-                # direct GET of this frame; logged so the rate is measurable.
-                logger.warning(
-                    "Frame %s listed but could not be decoded; omitted from this page",
-                    frame_id,
-                )
+            except codec.FrameDecodeError as exc:
+                # One corrupt sidecar must not fail the whole list; a direct
+                # GET of it still surfaces the structured 500.
+                codec.undecodable_frame_log.skipped(exc, context="frame list")
                 return None
 
         ordered = sorted(frame_ids)

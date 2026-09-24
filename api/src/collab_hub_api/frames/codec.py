@@ -18,6 +18,10 @@ of these rewrites every stored sidecar and every S3 ETag, so
 from __future__ import annotations
 
 import json
+import logging
+import threading
+import time
+from collections.abc import Callable
 
 from pydantic import ValidationError
 
@@ -33,6 +37,13 @@ from .models import (
 METADATA_CONTENT_TYPE = "application/json"
 BODY_CONTENT_TYPE = "text/markdown; charset=utf-8"
 
+#: How often a frame that is *still* corrupt re-warns when skipped. Fan-out
+#: reads (lists, group projections, active sets) hit a corrupt frame on every
+#: request; warning each time would bury the signal.
+UNDECODABLE_WARN_INTERVAL_SECONDS = 3600.0
+
+logger = logging.getLogger("frames_server.codec")
+
 
 class FrameCodecError(RuntimeError):
     """Base for errors translating between stored bytes and Frame models."""
@@ -42,8 +53,10 @@ class FrameDecodeError(FrameCodecError):
     """Stored Frame bytes could not be decoded into a valid model.
 
     Wraps the underlying ``json.JSONDecodeError``, ``UnicodeDecodeError``,
-    ``KeyError`` (a sidecar with no ``id``), or pydantic ``ValidationError``; the
-    original is preserved as ``__cause__``.
+    ``KeyError`` (a sidecar with no ``id``), or pydantic ``ValidationError``;
+    the original is preserved as ``__cause__``. ``TypeError`` is deliberately
+    *not* wrapped: it signals a code defect, not bad stored data, and must not
+    be skipped as a corrupt frame.
 
     Deliberately **not** a ``FrameNotFoundError``: the object exists but is
     unreadable, so this must surface as a 500, never a 404.
@@ -79,8 +92,10 @@ def normalize_metadata(metadata: dict) -> dict:
         if "owners" not in metadata:
             metadata["owners"] = [owner]
         metadata.setdefault("created_by", owner)
-    owners = metadata.get("owners") or []
-    metadata.setdefault("created_by", owners[0] if owners else "")
+    owners = metadata.get("owners")
+    # A non-list ``owners`` is corrupt data; leave it for validation to reject
+    # rather than indexing into it here.
+    metadata.setdefault("created_by", owners[0] if isinstance(owners, list) and owners else "")
     metadata.setdefault("description", "")
     metadata.setdefault("visibility", Visibility.private.value)
     metadata.setdefault("published", False)
@@ -111,20 +126,34 @@ def encode_body(frame: Frame) -> bytes:
     return frame.body.encode("utf-8")
 
 
-def _decode_metadata_dict(data: bytes, frame_id: str | None) -> dict:
-    """Decode stored metadata bytes to a normalized dict.
+def _decode_sidecar(data: bytes, frame_id: str | None) -> dict:
+    """Decode stored metadata bytes to a normalized dict: the gate both decoders share.
 
-    Raises ``FrameDecodeError`` (with the underlying cause preserved) on invalid
-    UTF-8, invalid JSON, a non-object top level, or a sidecar missing ``id``.
+    Raises :class:`FrameDecodeError` (with the cause preserved) on invalid
+    UTF-8, invalid JSON, a non-object top level, a sidecar missing ``id``, or a
+    sidecar carrying a ``body`` key. The body lives in its own blob; a ``body``
+    in the sidecar would otherwise clash with it in ``decode_frame`` while
+    ``decode_metadata`` rejected it, so listing and GET would disagree.
     """
 
-    metadata = json.loads(data)
-    if not isinstance(metadata, dict):
+    try:
+        metadata = json.loads(data)
+        if not isinstance(metadata, dict):
+            raise FrameDecodeError(
+                "Stored frame metadata is not a JSON object",
+                frame_id=frame_id,
+            )
+        if "body" in metadata:
+            raise FrameDecodeError(
+                "Stored frame metadata must not carry a body",
+                frame_id=frame_id,
+            )
+        return normalize_metadata(metadata)
+    except (json.JSONDecodeError, UnicodeDecodeError, KeyError) as exc:
         raise FrameDecodeError(
-            "Stored frame metadata is not a JSON object",
+            "Stored frame metadata could not be decoded",
             frame_id=frame_id,
-        )
-    return normalize_metadata(metadata)
+        ) from exc
 
 
 def decode_metadata(data: bytes, *, frame_id: str | None = None) -> FrameMetadata:
@@ -134,10 +163,10 @@ def decode_metadata(data: bytes, *, frame_id: str | None = None) -> FrameMetadat
     metadata; the original error is preserved as ``__cause__``.
     """
 
+    metadata = _decode_sidecar(data, frame_id)
     try:
-        metadata = _decode_metadata_dict(data, frame_id)
-        return FrameMetadata(**metadata)
-    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValidationError) as exc:
+        return FrameMetadata.model_validate(metadata)
+    except ValidationError as exc:
         raise FrameDecodeError(
             "Stored frame metadata could not be decoded",
             frame_id=frame_id,
@@ -152,11 +181,54 @@ def decode_frame(metadata: bytes, body: bytes, *, frame_id: str | None = None) -
     ``__cause__``.
     """
 
+    md = _decode_sidecar(metadata, frame_id)
     try:
-        md = _decode_metadata_dict(metadata, frame_id)
-        return Frame(**md, body=body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValidationError) as exc:
+        # Validated once, from a dict: never ``**`` kwargs, which raise a raw
+        # TypeError on a clashing key before validation runs.
+        return Frame.model_validate({**md, "body": body.decode("utf-8")})
+    except (UnicodeDecodeError, ValidationError) as exc:
         raise FrameDecodeError(
             "Stored frame could not be decoded",
             frame_id=frame_id,
         ) from exc
+
+
+class UndecodableFrameLog:
+    """The one place a fan-out read reports a corrupt frame it skipped.
+
+    Lists, group projections, and active-frame reads all skip an undecodable
+    frame rather than failing the whole response. They report the skip here so
+    the wording and the rate limit cannot drift between call sites: the first
+    skip of a frame warns with the cause attached, repeats within
+    ``UNDECODABLE_WARN_INTERVAL_SECONDS`` log at DEBUG, and a frame that is
+    still corrupt after the interval warns again.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._last_warned: dict[str | None, float] = {}
+        self._lock = threading.Lock()
+
+    def skipped(self, exc: FrameDecodeError, *, context: str) -> None:
+        now = self._clock()
+        with self._lock:
+            last = self._last_warned.get(exc.frame_id)
+            warn = last is None or now - last >= UNDECODABLE_WARN_INTERVAL_SECONDS
+            if warn:
+                self._last_warned[exc.frame_id] = now
+        if warn:
+            logger.warning(
+                "Frame %s could not be decoded; skipped in %s",
+                exc.frame_id,
+                context,
+                exc_info=exc,
+            )
+        else:
+            logger.debug("Frame %s could not be decoded; skipped in %s", exc.frame_id, context)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._last_warned.clear()
+
+
+undecodable_frame_log = UndecodableFrameLog()

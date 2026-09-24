@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 
 import pytest
@@ -212,6 +213,44 @@ async def test_group_with_corrupt_member_stays_owner_only(client, tmp_path):
     owner_view = await client.get(f"/v1/frame-groups/{group['id']}", cookies=auth_cookie("alice"))
     assert owner_view.status_code == 200
     assert owner_view.json()["all_published"] is False
+
+
+async def test_corrupt_member_warns_once_across_group_reads(client, tmp_path, caplog):
+    """Every group read projects every member; a corrupt one must not warn per request."""
+
+    a = await create_frame(client, visibility="internal")
+    b = await create_frame(client, name="B", visibility="internal")
+    groups = [await create_group(client, name=f"G{i}", frame_ids=[a["id"], b["id"]]) for i in range(3)]
+    (tmp_path / "frames" / b["id"] / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="frames_server.codec"):
+        for _ in range(3):
+            for group in groups:
+                read = await client.get(f"/v1/frame-groups/{group['id']}", cookies=auth_cookie("alice"))
+                assert read.status_code == 200
+            assert (await client.get("/v1/frame-groups", cookies=auth_cookie("alice"))).status_code == 200
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert b["id"] in warnings[0].getMessage()
+
+
+async def test_creating_a_group_with_a_corrupt_member_names_it_in_the_500(client, tmp_path):
+    """The caller chose these members, so a corrupt one fails loudly, not silently dropped."""
+
+    a = await create_frame(client)
+    b = await create_frame(client, name="B")
+    (tmp_path / "frames" / b["id"] / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    response = await client.post(
+        "/v1/frame-groups",
+        cookies=auth_cookie("alice"),
+        json={"name": "Bundle", "visibility": "private", "frame_ids": [a["id"], b["id"]]},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["details"] == {"frame_id": b["id"]}
+    assert (await client.get("/v1/frame-groups", cookies=auth_cookie("alice"))).json() == []
 
 
 async def test_internal_group_readable_once_all_members_published(client):
