@@ -344,6 +344,8 @@ class SlackSearchHit(BaseModel):
     user_id: str = ""
     author_name: str = ""
     text: str = ""
+    # True when the text was shortened. Read the message by its ts to get the full text.
+    truncated: bool = False
 
 
 class SlackSearchRequest(BaseModel):

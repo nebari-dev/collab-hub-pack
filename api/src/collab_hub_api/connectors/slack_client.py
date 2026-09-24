@@ -12,6 +12,9 @@ DM_TYPES = ["im", "mpim"]
 MAX_LIST_PAGE_SIZE = 200
 MAX_LIST_PAGES = 5
 MAX_CHANNEL_AUTHORIZATION_PAGES = 25
+# Search results only show the first 500 characters of each message.
+# The full message can still be fetched with a read.
+SEARCH_SNIPPET_CHARS = 500
 
 # ``auth.test`` errors that mean the brokered token is not a usable Slack Web API
 # user token -- e.g. Keycloak brokered an OpenID sign-in/identity token instead of an
@@ -342,8 +345,17 @@ def _message(item: dict, channel_id: str) -> SlackMessage:
     )
 
 
+def _snippet(text: str, limit: int) -> tuple[str, bool]:
+    """Cut the text down to `limit` characters and say whether anything was cut."""
+    if len(text) <= limit:
+        return text, False
+    return text[:limit].rstrip() + "…", True
+
+
 def _search_hit(item: dict) -> SlackSearchHit:
     channel = item.get("channel") or {}
+    # Clean the text first, then shorten it, so we never cut a Slack link in half.
+    text, truncated = _snippet(sanitize_slack_text(str(item.get("text", "") or "")), SEARCH_SNIPPET_CHARS)
     return SlackSearchHit(
         channel_id=str(channel.get("id", "") or ""),
         channel_name=str(channel.get("name", "") or ""),
@@ -352,7 +364,8 @@ def _search_hit(item: dict) -> SlackSearchHit:
         ts=str(item.get("ts", "")),
         user_id=str(item.get("user", "") or ""),
         author_name=str(item.get("username", "") or ""),
-        text=sanitize_slack_text(str(item.get("text", "") or "")),
+        text=text,
+        truncated=truncated,
     )
 
 
