@@ -95,8 +95,8 @@ uv run pytest
 
 ## Documentation
 
-Setup and reference docs — connector setup, Frames, operations — live in
-[`docs/`](docs/).
+Setup and reference docs — connector setup, Frames, operations, the
+[Cog registry](docs/cog-registry.md) — live in [`docs/`](docs/).
 
 The basis for Cog and Op execution — vocabulary, the Op–Cog seam, the
 result envelope, the sensitivity model — is in

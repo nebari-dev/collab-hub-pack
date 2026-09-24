@@ -111,3 +111,18 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Validate rendered manifests (Cog registry fixture)
+        # One Harbor source with robot + webhook Secrets, one static source,
+        # a CA bundle, indexer on: the shape docs/cog-registry.md documents.
+        run: helm template helm/collab-hub -f helm/collab-hub/ci/cogs-values.yaml | kubeconform -strict -ignore-missing-schemas -
+
+      - name: Install PyYAML for the render assertions
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Chart render tests
+        # Positive renders with assertions on the output, plus every refused
+        # configuration in scripts/testdata/chart/cogs-negative-cases.yaml —
+        # the fixture api/tests/test_config_cogs.py also reads, so the schema,
+        # the validations template and config.py cannot drift unnoticed.
+        run: scripts/chart_render_tests.sh

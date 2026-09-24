@@ -647,3 +647,68 @@ userDirectory:
     clientIdKey: client-id
     # -- Key in existingSecret containing the Keycloak client secret.
     clientSecretKey: client-secret
+
+cogs:
+  # The Cog registry integration: which OCI registries the hub indexes for
+  # Cogs, how it authenticates to them, and how often it sweeps. Everything
+  # under `registry.sources` reaches the API as ONE JSON environment variable
+  # (COLLAB_HUB_API__COGS__REGISTRY_SOURCES); secrets never do. Each source's
+  # `credentials.existingSecret` / `webhook.existingSecret` is mounted as its
+  # own env vars, named deterministically from the source id:
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_USERNAME
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_PASSWORD
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_WEBHOOK_SECRET
+  # where <ID> is the id upper-cased with every character outside [A-Z0-9]
+  # replaced by "_" (harbor-main -> HARBOR_MAIN). The JSON carries only those
+  # *names* (`credentials.password_env` etc.); the API reads the variables at
+  # startup and refuses to start if one is missing or empty. Two ids that map
+  # to the same <ID> fail the render. See docs/cog-registry.md.
+  registry:
+    # -- Registry sources to index, in order. Each entry:
+    #   id: stable identifier stored with every indexed row (lowercase, [a-z0-9._-], max 64)
+    #   kind: "harbor" (enumerate projects via Harbor's REST API, translate its
+    #         webhooks) or "static" (a fixed repository list and/or a
+    #         catalog.v1.json index; generic OCI only)
+    #   url: external registry URL; its host is the identity in <host>/<repo>@<digest>
+    #   apiUrl: optional in-cluster URL for the listing API and OCI endpoints (harbor only)
+    #   tokenUrl: optional in-cluster bearer-token endpoint for the OCI client
+    #   projects: Harbor projects to enumerate (harbor: at least one)
+    #   repositories: OCI repository paths to index (static)
+    #   indexUrl: catalog.v1.json URL listing repositories (static)
+    #   caBundlePath: per-source CA bundle path; defaults to cogs.caBundle when that is set
+    #   requestTimeoutSeconds: HTTP timeout, default 10
+    #   credentials:
+    #     existingSecret: Secret holding the robot/service credential (required if the block is present)
+    #     usernameKey: key in that Secret, default "username"
+    #     passwordKey: key in that Secret, default "password"
+    #   webhook:
+    #     existingSecret: Secret holding the shared webhook secret (harbor only)
+    #     secretKey: key in that Secret, default "secret"
+    # Example:
+    #   - id: harbor-main
+    #     kind: harbor
+    #     url: https://harbor.example.com
+    #     apiUrl: http://harbor-core.harbor.svc.cluster.local:80
+    #     projects: [cogs]
+    #     credentials:
+    #       existingSecret: collab-hub-harbor-robot
+    #     webhook:
+    #       existingSecret: collab-hub-harbor-webhook
+    sources: []
+  caBundle:
+    # -- ConfigMap holding the CA certificate(s) that signed the registries'
+    # gateway-issued certificates (dev clusters run a private CA). Mounted
+    # read-only at /etc/collab-hub/cogs-ca and passed to every source that
+    # does not set its own caBundlePath. Empty means system trust only.
+    configMap: ""
+    # -- Key in that ConfigMap holding the PEM bundle.
+    key: ca.crt
+  index:
+    # -- Whether the indexer sweeps the configured sources. Off leaves the
+    # Cog read API up and static (it serves what the index already holds);
+    # on with zero sources fails the render and the API's startup.
+    enabled: false
+    # -- Seconds between sweeps (10..86400).
+    intervalSeconds: 300
+    # -- Whether a sweep runs when the API starts, before the first interval.
+    runOnStartup: true
