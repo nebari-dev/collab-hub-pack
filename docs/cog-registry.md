@@ -260,10 +260,19 @@ on its own (the unconfigured default), so nothing becomes anonymous by
 accident. These are the only API routes that honor a `public` entry this
 way; every other `/v1` route requires a caller whatever the map says.
 
-Under such a rule credentials are optional, not ignored: a caller who
-presents valid ones gets the full answer. Missing or invalid credentials,
-or a subject with no organization, get the **anonymous view** rather than a
-401 or 403. That view leaves out what discovery does not need:
+Under such a rule credentials are optional, not ignored. What a request
+gets depends on what it presents:
+
+| The request | Answer |
+| --- | --- |
+| No credentials: no `IdToken-*` cookie and no `Authorization` header | The **anonymous view** (below) |
+| Credentials the API accepts, the same check the frames routes use | The full answer. That includes a platform operator with no organization, whom the check accepts. |
+| Credentials the API rejects: malformed, expired, an unsupported scheme, or a verifier that cannot run (no JWKS configured, JWKS unreachable) | 401 `unauthorized`, as on any other route; never the anonymous view |
+| A valid subject with no organization, where the check answers 403 `no_organization` | The anonymous view: a public page needs no organization |
+
+Any other failure, an unavailable organization store for instance,
+propagates as it would elsewhere. The anonymous view leaves out what
+discovery does not need:
 
 - `source_id`, everywhere it appears: on list items, the detail entry and
   its `versions`, the version entry, and the reference and its `locations`.
@@ -274,7 +283,10 @@ or a subject with no organization, get the **anonymous view** rather than a
 The pinned `reference` (`<host>/<repository>@<digest>`) and `repository`
 stay: a client must know where to pull from. An anonymous `source_id` filter
 is refused with 422 `validation_error` rather than answered, since filtering
-by a value the caller cannot see would let it probe for source ids.
+by a value the caller cannot see would let it probe for source ids. The
+refusal is decided on the raw query string, before any other parameter is
+validated, so an empty or over-long value is refused the same way and the
+value is never echoed in the error details.
 `catalog.v1.json` carries neither and is the same for every caller. The
 OpenAPI schemas mark these fields "omitted for anonymous callers" and do not
 list `source_id` as required.

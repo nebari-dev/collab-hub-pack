@@ -38,7 +38,9 @@ anywhere and no reader diagnostics on cards -- internal source names and
 failure strings are more than discovery needs. The pinned ``reference``
 stays, since a client must know where to pull from, and the ``source_id``
 filter is refused (422) rather than answered, so its values cannot be
-probed.
+probed. "Anonymous" means no credentials were presented (or a valid subject
+with no organization); presented credentials that are rejected are a 401,
+as on every other route.
 """
 
 from __future__ import annotations
@@ -71,7 +73,7 @@ from ..cogs.models import (
     CogVersion,
 )
 from ..dependencies import get_cog_catalog_store
-from ..frames.auth import AuthContext, get_auth_context
+from ..frames.auth import AuthContext, NoOrganizationError, get_auth_context, get_id_token
 from ..path_protection import request_path, winning_rule
 from .frames import error_response
 
@@ -85,31 +87,83 @@ def _within_cogs(rule_path: str) -> bool:
     return base == COGS_PATH or base.startswith(COGS_PATH + "/")
 
 
+def presents_credentials(request: Request) -> bool:
+    """Whether the request tries to authenticate: an ``IdToken-*`` cookie or any ``Authorization`` header.
+
+    The cookie is what :func:`get_auth_context` reads first; any
+    ``Authorization`` value counts, whatever its scheme, because a client
+    that sent one meant to be someone.
+    """
+
+    return bool(get_id_token(request)) or bool(request.headers.get("Authorization", "").strip())
+
+
 def get_catalog_caller(request: Request) -> AuthContext | None:
     """The caller, or ``None`` for an anonymous request a ``public`` catalog rule admits.
 
     Consults the same protection map the middleware enforces
     (``app.state.path_rules``, resolved by :func:`~..path_protection.winning_rule`).
-    Under a ``public`` catalog rule credentials are optional: a caller who
-    presents valid ones is still resolved (and gets the unredacted answer),
-    and credentials that resolve to no caller -- missing, invalid, or a
-    subject with no organization -- give the anonymous view rather than an
-    error, so a stale cookie cannot close a public page. Anything else -- no
-    matching rule, an ``authenticated`` rule, a ``public`` rule broader than
-    ``/v1/cogs`` -- is exactly :func:`get_auth_context`.
+    Under a ``public`` catalog rule credentials are optional, not ignored:
+
+    - no credentials at all: anonymous (``None``), unless the dev shortcut
+      names a caller;
+    - credentials :func:`get_auth_context` accepts: that caller, and the full
+      answer;
+    - credentials it rejects (401): the 401, exactly as the frames routes
+      answer -- a bad token and a verifier that cannot run (no JWKS, JWKS
+      unreachable) both surface as 401 there, and neither may pass for an
+      anonymous visit;
+    - a valid subject with no organization (:class:`NoOrganizationError`,
+      403): anonymous, since a public page needs no organization;
+    - anything else propagates.
+
+    Anything else -- no matching rule, an ``authenticated`` rule, a ``public``
+    rule broader than ``/v1/cogs`` -- is exactly :func:`get_auth_context`.
     """
 
     rule = winning_rule(request_path(request), getattr(request.app.state, "path_rules", ()))
     if rule is not None and rule.access == "public" and _within_cogs(rule.path):
         try:
             return get_auth_context(request)
+        except NoOrganizationError:
+            return None
         except HTTPException as exc:
-            # 401: no usable credential; 403: NoOrganizationError. Anything
-            # else (an unavailable organization store, say) still propagates.
-            if exc.status_code in (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN):
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED and not presents_credentials(request):
                 return None
             raise
     return get_auth_context(request)
+
+
+ANONYMOUS_REFUSED_FILTERS = ("source_id",)
+"""List filters an anonymous caller may not pass: they name values it never sees."""
+
+
+def get_listing_caller(request: Request) -> AuthContext | None:
+    """:func:`get_catalog_caller`, refusing an anonymous caller's :data:`ANONYMOUS_REFUSED_FILTERS` first.
+
+    A dependency runs before the route's own query validation, so the
+    refusal is decided on the raw query string: an empty or over-long value
+    is refused the same way, and never reaches the generic 422 handler,
+    which would echo it back in ``details``.
+    """
+
+    caller = get_catalog_caller(request)
+    if caller is None:
+        refused = [name for name in ANONYMOUS_REFUSED_FILTERS if name in request.query_params]
+        if refused:
+            # Filtering by a value the caller may not see would let it probe
+            # for source ids by watching which requests return items.
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("query", name),
+                        "msg": f"{name} is not available to anonymous callers",
+                    }
+                    for name in refused
+                ]
+            )
+    return caller
 
 
 @dataclass(frozen=True)
@@ -132,6 +186,7 @@ class Redaction:
 
 
 AuthDep = Annotated[AuthContext | None, Depends(get_catalog_caller)]
+ListingAuthDep = Annotated[AuthContext | None, Depends(get_listing_caller)]
 CatalogDep = Annotated[CogCatalogStore, Depends(get_cog_catalog_store)]
 
 DIGEST_PATTERN = r"^sha256:[a-f0-9]{64}$"
@@ -185,7 +240,7 @@ def _version_locations(store: CogCatalogStore, cog_id: str, digest: str) -> list
     summary="List current Cogs",
 )
 def list_cogs(
-    _auth: AuthDep,
+    _auth: ListingAuthDep,
     store: CatalogDep,
     kind: Annotated[str | None, _filter("The card's `kind` (e.g. `complete`, `model`, `context`).")] = None,
     publisher: Annotated[str | None, _filter("The card's `publisher`, exactly.")] = None,
@@ -218,19 +273,7 @@ def list_cogs(
     failed reads never appear.
     """
 
-    redaction = Redaction.for_caller(_auth)
-    if redaction.anonymous and source_id is not None:
-        # Filtering by a value the caller may not see would let it probe for
-        # source ids by watching which requests return items.
-        raise RequestValidationError(
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("query", "source_id"),
-                    "msg": "source_id is not available to anonymous callers",
-                }
-            ]
-        )
+    # An anonymous source_id never gets here: get_listing_caller refused it.
     filters = CatalogFilter(
         kind=kind,
         publisher=publisher,
@@ -250,7 +293,7 @@ def list_cogs(
         offset=offset,
         next_offset=offset + limit if len(rows) > limit else None,
     )
-    return redaction.respond(page)
+    return Redaction.for_caller(_auth).respond(page)
 
 
 @router.get(

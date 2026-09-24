@@ -15,11 +15,13 @@ from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import jwt
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from test_cog_bundle import read_fixture
+from test_frames_auth_jwks import KEY_1_JWK, KEY_1_PEM, _JWKSEndpoint
 
 from collab_hub_api.cogs.adapters.static import parse_index_document
 from collab_hub_api.cogs.bundle import CogCard, read_cog_bundle
@@ -35,6 +37,7 @@ from collab_hub_api.cogs.catalog import (
 from collab_hub_api.cogs.models import ANONYMOUS_CARD_OMITTED_KEYS, CARD_SCHEMA, LIST_CARD_OMITTED_KEYS, list_card
 from collab_hub_api.config import Config, recommended_path_rules
 from collab_hub_api.core import make_app
+from collab_hub_api.frames import auth
 from collab_hub_api.frames.auth import NoOrganizationError
 from collab_hub_api.routers import cogs as cogs_router
 
@@ -756,6 +759,16 @@ def _keys(value) -> set[str]:
     return set()
 
 
+def _count(value, name: str) -> int:
+    """How many times ``name`` is a mapping key in a JSON document, cards excluded."""
+
+    if isinstance(value, list):
+        return sum(_count(child, name) for child in value)
+    if isinstance(value, dict):
+        return (name in value) + sum(_count(child, name) for key, child in value.items() if key != "card")
+    return 0
+
+
 def _cards(document: dict) -> list[dict]:
     return [item["card"] for item in document.get("items", [document]) if "card" in item]
 
@@ -787,7 +800,10 @@ async def test_anonymous_answers_carry_no_source_id_and_no_reader_diagnostics(tm
         assert anonymous.status_code == 200, anonymous.text
 
     full, redacted = signed_in.json(), anonymous.json()
-    assert "source_id" in _keys(full), "a signed-in caller sees every source id"
+    locations = full.get("items", []) + full.get("versions", []) + full.get("locations", [])
+    expected = len(locations) + (0 if "items" in full else 1)
+    assert expected >= 1
+    assert _count(full, "source_id") == expected, "a signed-in caller sees every source id"
     assert "source_id" not in _keys(redacted)
     for card in _cards(full):
         assert set(ANONYMOUS_CARD_OMITTED_KEYS) <= set(card)
@@ -825,14 +841,37 @@ async def test_an_anonymous_source_id_filter_is_refused(tmp_path, monkeypatch):
             TRANSCRIBER
         ]
         client.cookies.clear()
-        for value in ("mirror", "no-such-source"):
-            response = await client.get(f"/v1/cogs?source_id={value}")
-            assert response.status_code == 422, value
+        long_value = "probe-" + "x" * 600  # past the filter's 512-character limit
+        for query, value in [
+            ("source_id=mirror", "mirror"),
+            ("source_id=no-such-source", "no-such-source"),
+            ("source_id=", None),
+            (f"source_id={long_value}", long_value),
+            # Refused before parameter validation, so another bad parameter
+            # does not route the value through the generic, echoing 422.
+            (f"source_id={long_value}&limit=0", long_value),
+            (f"limit=0&source_id={long_value}&q=", long_value),
+            (f"source_id=mirror&source_id={long_value}", long_value),
+        ]:
+            response = await client.get(f"/v1/cogs?{query}")
+            assert response.status_code == 422, query
             error = response.json()["error"]
             assert error["code"] == "validation_error"
-            assert [detail["loc"] for detail in error["details"]] == [["query", "source_id"]]
-            assert value not in response.text, "the probed value is not echoed"
+            assert error["details"] == [
+                {
+                    "type": "value_error",
+                    "loc": ["query", "source_id"],
+                    "msg": "source_id is not available to anonymous callers",
+                }
+            ], query
+            if value:
+                assert value not in response.text, "the probed value is not echoed"
+                assert "probe-" not in response.text
         assert (await client.get("/v1/cogs?kind=complete")).status_code == 200, "other filters stay open"
+        assert (await client.get("/v1/cogs?limit=0")).json()["error"]["code"] == "validation_error"
+        client.cookies.update(AUTH)
+        signed_in = await client.get(f"/v1/cogs?source_id={long_value}")
+        assert signed_in.status_code == 422, "a signed-in caller still gets ordinary validation"
 
 
 async def test_anonymous_catalog_v1_is_unchanged(tmp_path, monkeypatch):
@@ -846,32 +885,105 @@ async def test_anonymous_catalog_v1_is_unchanged(tmp_path, monkeypatch):
     assert _keys(anonymous) == {"schemaVersion", "repositories", "namespace", "name", "description"}
 
 
-async def test_under_a_public_rule_bad_credentials_get_the_anonymous_view_not_a_401(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"cookies": {"IdToken-test": "not-a-token"}},
+        {"headers": {"Authorization": "Bearer not-a-token"}},
+        {"headers": {"Authorization": "Basic YWxpY2U6c2VjcmV0"}},
+    ],
+    ids=["garbage-cookie", "garbage-bearer", "other-scheme"],
+)
+@pytest.mark.parametrize("path", [*REDACTED_ROUTES, "/v1/cogs/catalog.v1.json"])
+async def test_under_a_public_rule_rejected_credentials_are_a_401_not_anonymous(
+    tmp_path, monkeypatch, credentials, path
+):
     app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
     async with app.router.lifespan_context(app), client:
         seed_catalog(app.state.cog_catalog_store)
         client.cookies.clear()
-        client.cookies.update({"IdToken-test": "not-a-token"})
-        response = await client.get(f"/v1/cogs/{TRANSCRIBER}")
-        assert response.status_code == 200, response.text
-        assert "source_id" not in _keys(response.json())
-        assert (await client.get("/v1/cogs?source_id=mirror")).status_code == 422
+        response = await client.get(path, headers=credentials.get("headers"), cookies=credentials.get("cookies"))
+        assert response.status_code == 401, response.text
+        assert response.json()["error"]["code"] == "unauthorized"
+        assert (await client.get(path)).status_code == 200, "the same request without credentials is anonymous"
 
 
-@pytest.mark.parametrize(
-    ("failure", "expected"),
-    [
-        (NoOrganizationError(), 200),
-        (HTTPException(status_code=503, detail="membership unknown"), 503),
-    ],
-    ids=["unaffiliated-is-anonymous", "other-failures-propagate"],
-)
-async def test_under_a_public_rule_only_a_missing_caller_is_anonymous(tmp_path, monkeypatch, failure, expected):
-    def refuse(_request):
-        raise failure
+@pytest_asyncio.fixture
+async def signed_api(tmp_path, monkeypatch):
+    """A public catalog whose callers present bearer tokens verified against a live JWKS endpoint."""
 
-    monkeypatch.setattr(cogs_router, "get_auth_context", refuse)
+    endpoint = _JWKSEndpoint()
+    monkeypatch.setitem(auth.__dict__, "_jwks_clients", {})
+    monkeypatch.setenv("FRAMES_BEARER_JWKS_URL", endpoint.url)
+    try:
+        app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+        async with app.router.lifespan_context(app), client:
+            seed_catalog(app.state.cog_catalog_store)
+            client.cookies.clear()
+            yield client, endpoint
+    finally:
+        endpoint.close()
+
+
+def _bearer(**claims) -> dict:
+    payload = {"preferred_username": "alice", "org_id": "org-a", "workspace_id": "workspace-a", **claims}
+    token = jwt.encode(payload, KEY_1_PEM, algorithm="RS256", headers={"kid": KEY_1_JWK["kid"]})
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def test_a_verified_bearer_under_a_public_rule_gets_the_full_view(signed_api):
+    client, _ = signed_api
+    response = await client.get(f"/v1/cogs/{TRANSCRIBER}", headers=_bearer())
+    assert response.status_code == 200, response.text
+    assert _count(response.json(), "source_id") == 1 + len(response.json()["versions"])
+
+
+async def test_an_expired_bearer_under_a_public_rule_is_a_401(signed_api):
+    client, _ = signed_api
+    response = await client.get(f"/v1/cogs/{TRANSCRIBER}", headers=_bearer(exp=int(T0.timestamp())))
+    assert response.status_code == 401, response.text
+
+
+async def test_a_jwks_outage_is_a_401_not_an_anonymous_200(signed_api):
+    # The real decoder path: the verifier cannot fetch signing keys, so it
+    # cannot tell a good token from a bad one. That must not read as a visit
+    # without credentials.
+    client, jwks = signed_api
+    jwks.status = 503
+    response = await client.get(f"/v1/cogs/{TRANSCRIBER}", headers=_bearer())
+    assert jwks.fetches >= 1, "the decoder really tried the JWKS endpoint"
+    assert response.status_code == 401, response.text
+    assert "source_id" not in response.text
+
+
+async def test_a_valid_caller_without_an_organization_gets_the_anonymous_view(tmp_path, monkeypatch):
+    def unaffiliated(_request):
+        raise NoOrganizationError()
+
+    monkeypatch.setattr(cogs_router, "get_auth_context", unaffiliated)
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        _seed_with_diagnostics(app.state.cog_catalog_store)
+        assert client.cookies, "the caller presents credentials"
+        detail = await client.get(f"/v1/cogs/{TRANSCRIBER}")
+        listed = await client.get("/v1/cogs")
+        refused = await client.get("/v1/cogs?source_id=mirror")
+
+    assert detail.status_code == listed.status_code == 200
+    assert detail.json()["versions"] and listed.json()["items"]
+    for document in (detail.json(), listed.json()):
+        assert _count(document, "source_id") == 0
+        for card in _cards(document):
+            assert not set(ANONYMOUS_CARD_OMITTED_KEYS) & set(card)
+    assert refused.status_code == 422
+
+
+async def test_under_a_public_rule_other_auth_failures_propagate(tmp_path, monkeypatch):
+    def unavailable(_request):
+        raise HTTPException(status_code=503, detail="membership unknown")
+
+    monkeypatch.setattr(cogs_router, "get_auth_context", unavailable)
     app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
     async with app.router.lifespan_context(app), client:
         response = await client.get("/v1/cogs")
-    assert response.status_code == expected, response.text
+    assert response.status_code == 503, response.text

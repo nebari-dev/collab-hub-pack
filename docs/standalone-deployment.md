@@ -208,9 +208,15 @@ combination, but not restating the list is the better habit.)
   also carries its own auth dependency, so a `public` entry does not make
   frames or tasks anonymous. The one exception is the Cog catalog: a `public`
   rule at or below `/v1/cogs` opens anonymous discovery
-  ([cog-registry.md](cog-registry.md#read-api)). Anonymous answers omit
-  source ids and the cards' reader diagnostics, and refuse the `source_id`
-  filter; signed-in callers still get everything.
+  ([cog-registry.md](cog-registry.md#read-api)). Under that rule a request
+  with no credentials gets the anonymous view. It omits `source_id` and the
+  cards' reader diagnostics (`errors`, `warnings`), and refuses the
+  `source_id` filter with 422 `validation_error`. So does a valid subject
+  with no organization. Credentials the API accepts get the full answer.
+  Credentials it rejects, including a JWKS it cannot reach, get 401 as
+  anywhere else. For every caller, `GET /v1/cogs` list items carry a
+  trimmed card without `body`, `profile_raw` and `frontmatter_raw`, which
+  the per-version routes serve.
 
 ### Why `/web` and `/invite` ship public
 
