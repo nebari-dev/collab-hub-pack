@@ -296,7 +296,8 @@ def test_migration_creates_the_cog_catalog_schema():
     for index in (
         "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx ON collab_cog_artifacts (cog_id)",
         "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_kind_idx ON collab_cog_artifacts (kind)",
-        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_removed_at_idx ON collab_cog_artifacts (removed_at)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_present_idx"
+        " ON collab_cog_artifacts (cog_id, repository) WHERE removed_at IS NULL",
         "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_card_idx"
         " ON collab_cog_artifacts USING GIN (card jsonb_path_ops)",
     ):
@@ -345,7 +346,7 @@ PINNED_CHECKSUMS = {
     4: "89f34af66d0f7e8a06a398ce43aeed2db93432cfd06ab72e236da2da90a07d8c",
     5: "d6bdbe0d90f9206e5104c448d547b5917e68d7af6db5069b4b2b9a44983b770f",
     6: "6150df72bb6ed264e1e40b60768f787e4e044e1bf8b232da19ba5a2eaf139835",
-    7: "fa32481fc1e51fef62614bb5013fdd44517064116daa57e4b2dccdfdbee5e754",
+    7: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
 }
 
 
@@ -662,10 +663,11 @@ def test_live_migration_creates_tables_constraints_and_index(clean_database):
             "collab_cog_artifacts_pkey",
             "collab_cog_artifacts_cog_id_idx",
             "collab_cog_artifacts_kind_idx",
-            "collab_cog_artifacts_removed_at_idx",
+            "collab_cog_artifacts_present_idx",
             "collab_cog_artifacts_card_idx",
         } <= set(catalog_indexes)
         assert "USING gin (card jsonb_path_ops)" in catalog_indexes["collab_cog_artifacts_card_idx"]
+        assert catalog_indexes["collab_cog_artifacts_present_idx"].endswith("WHERE (removed_at IS NULL)")
 
         assert applied_collab_schema_version(clean_database) == LATEST_COLLAB_SCHEMA_VERSION
 

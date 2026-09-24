@@ -531,10 +531,12 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 PRIMARY KEY (source_id, repository, digest)
             )
             """,
-            # "Every version of this Cog" and "the newest row per Cog" both
-            # start from cog_id; "every model Cog" from kind; and every
-            # catalog read excludes removed rows, so a partial index on the
-            # present ones keeps that filter cheap as the removed tail grows.
+            # "Every version of this Cog" (removed ones included) starts from
+            # cog_id, so that index is full; "every model Cog" from kind. The
+            # catalog's other reads -- the newest present row per Cog, the
+            # present rows per repository -- exclude removed rows, so a partial
+            # index on the present rows keeps those cheap as the removed tail
+            # grows, and it is what "WHERE removed_at IS NULL" plans against.
             """
             CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx
             ON collab_cog_artifacts (cog_id)
@@ -544,8 +546,8 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             ON collab_cog_artifacts (kind)
             """,
             """
-            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_removed_at_idx
-            ON collab_cog_artifacts (removed_at)
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_present_idx
+            ON collab_cog_artifacts (cog_id, repository) WHERE removed_at IS NULL
             """,
             # Containment filters over the structured card ("requires
             # capability X", "provides Y", "accepts io Z") are `card @> ...`
