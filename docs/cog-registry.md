@@ -167,20 +167,31 @@ registry-agnostic — the answers are the same whichever adapter indexed a row.
 
 | Route | Answers |
 | --- | --- |
-| `GET /v1/cogs` | Current Cogs, one entry per `cog_id`: its newest present version, with its card. Filtered and paged (below). |
-| `GET /v1/cogs/{cog_id}` | The Cog's current entry plus `versions`: every indexed location of every version (digest, version, tags, `pushed_at`, `indexed_at`, `source_id`, repository, reference, `removed_at`), newest first, removed ones included. |
-| `GET /v1/cogs/{cog_id}/versions/{digest}` | The exact card indexed for that digest — what an install pins. |
+| `GET /v1/cogs` | Current Cogs, one entry per `cog_id`: its newest present version, with a **trimmed** card (below). Filtered and paged (below). |
+| `GET /v1/cogs/{cog_id}` | The Cog's current entry, with its full card, plus `versions`: every indexed location of every version (digest, version, tags, `pushed_at`, `indexed_at`, `source_id`, repository, reference, `removed_at`), newest first, removed ones included. |
+| `GET /v1/cogs/{cog_id}/versions/{digest}` | The exact, full card indexed for that digest — what an install pins. |
 | `GET /v1/cogs/{cog_id}/versions/{digest}/cog.md` | The Markdown body of the version's `COG.md` (after its frontmatter), `text/markdown`, as captured at index time. The frontmatter is on the card (`frontmatter`, `frontmatter_raw`). |
 | `GET /v1/cogs/{cog_id}/versions/{digest}/reference` | The **install reference** `{"reference": "<host>/<repository>@sha256:…", "source_id", "repository", "digest", "present", "locations"}` — ready for `nebi import`. |
 | `GET /v1/cogs/catalog.v1.json` | **Transitional** compatibility view, below. |
 
 Every entry carries the digest, the location (`source_id`, `repository`,
 `reference`), `tags`, `pushed_at`, `indexed_at`, `removed_at` and the `card`
-— the bundle reader's output, served verbatim. The OpenAPI document (`/docs`)
+— the bundle reader's output, served verbatim (trimmed on list items, and
+redacted for anonymous callers; both below). The OpenAPI document (`/docs`)
 lists and describes every top-level key the reader emits but types none of
 them: the card is the Cog's own declarations, not a hub schema, and a
 publisher's odd value (a numeric `id`, say) is served as declared rather than
 failing the response. Clients must tolerate unexpected shapes.
+
+**List items carry a trimmed card.** A `GET /v1/cogs` item's card is the
+stored card without `body`, `profile_raw` and `frontmatter_raw` — the
+verbatim documents, up to three per item — and is a separate OpenAPI schema
+(`CogListEntry` / `CogListCard`) so a client cannot mistake it for a full
+card. Everything else, including keys a newer reader adds, is kept. The full
+card is at `GET /v1/cogs/{cog_id}` and `…/versions/{digest}`, and the body
+also at `…/cog.md`. The omitted set is `LIST_CARD_OMITTED_KEYS` in
+`cogs/models.py`; adding a key back later is compatible, removing one would
+not be.
 
 **Identity is the digest.** `cog_id` (`<publisher>/<name>`, so it contains a
 `/` — send it as is or percent-encoded) and `name` are search keys. "Newest"
@@ -203,12 +214,12 @@ failed reads and cards without an `id` never appear.
 | `requires` | a capability named in the card's `requires` |
 | `accepts` / `produces` | an io type in the card's `io.accepts` / `io.produces` |
 | `q` | a case-insensitive substring of the Cog's `name`, or of its `description` when that is a string (`%` and `_` are literal; case folding is guaranteed for ASCII, locale-dependent beyond it) |
-| `source_id` | only this registry source |
+| `source_id` | only this registry source (refused for anonymous callers, below) |
 
 `source_id` scopes the choice: the newest version is picked among that
 source's rows. Every other filter tests the Cog's **current** version, never
 an older one — a Cog that dropped a capability in its latest release does not
-list under it — so without `source_id` a listed entry is always the card
+list under it — so without `source_id` a listed entry is always the version
 `GET /v1/cogs/{cog_id}` serves. With `source_id` it is the newest version *in
 that source*, which may be older than the one the detail route shows. The card filters are `jsonb` containment over the stored card, which
 the GIN index on `card` serves.
@@ -223,9 +234,10 @@ the `offset` of the next page, or `null` on the last one.
 indexed, but as another Cog's), `cog_catalog_unavailable` (503 — neither
 Postgres nor the development memory backend is configured; an empty catalog
 is never invented), `validation_error` (422 —
-an out-of-range parameter, or a digest that is not `sha256:` followed by 64
-lowercase hex digits; a well-formed digest the catalog does not hold is a
-404), and `unauthorized` (401).
+an out-of-range parameter, a digest that is not `sha256:` followed by 64
+lowercase hex digits — a well-formed digest the catalog does not hold is a
+404 — or a `source_id` filter from an anonymous caller), and `unauthorized`
+(401).
 
 **Auth.** Every route requires an authenticated caller by default, like the
 frames routes, and `/v1/cogs` is an API prefix of the path-protection map, so
@@ -247,6 +259,25 @@ prefix) does not open the catalog, and neither does `defaultAccess: public`
 on its own (the unconfigured default), so nothing becomes anonymous by
 accident. These are the only API routes that honor a `public` entry this
 way; every other `/v1` route requires a caller whatever the map says.
+
+Under such a rule credentials are optional, not ignored: a caller who
+presents valid ones gets the full answer. Missing or invalid credentials,
+or a subject with no organization, get the **anonymous view** rather than a
+401 or 403. That view leaves out what discovery does not need:
+
+- `source_id`, everywhere it appears: on list items, the detail entry and
+  its `versions`, the version entry, and the reference and its `locations`.
+  Source ids name the hub's internal registry configuration.
+- the card's reader diagnostics, `errors` and `warnings`, on list and full
+  cards alike.
+
+The pinned `reference` (`<host>/<repository>@<digest>`) and `repository`
+stay: a client must know where to pull from. An anonymous `source_id` filter
+is refused with 422 `validation_error` rather than answered, since filtering
+by a value the caller cannot see would let it probe for source ids.
+`catalog.v1.json` carries neither and is the same for every caller. The
+OpenAPI schemas mark these fields "omitted for anonymous callers" and do not
+list `source_id` as required.
 
 ### `catalog.v1.json` (transitional)
 

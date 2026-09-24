@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from test_cog_bundle import read_fixture
 
@@ -31,9 +32,11 @@ from collab_hub_api.cogs.catalog import (
     UnavailableCogCatalogStore,
     card_search_fields,
 )
-from collab_hub_api.cogs.models import CARD_SCHEMA
+from collab_hub_api.cogs.models import ANONYMOUS_CARD_OMITTED_KEYS, CARD_SCHEMA, LIST_CARD_OMITTED_KEYS, list_card
 from collab_hub_api.config import Config, recommended_path_rules
 from collab_hub_api.core import make_app
+from collab_hub_api.frames.auth import NoOrganizationError
+from collab_hub_api.routers import cogs as cogs_router
 
 HOST = "registry.example"
 SOURCE = "main"
@@ -177,6 +180,33 @@ async def test_list_is_one_entry_per_cog_collapsed_to_its_newest_present_version
         "accepts": ["media_transcription_request"],
         "produces": ["timestamped_transcript_bundle"],
     }
+
+
+async def test_list_items_carry_a_trimmed_card_and_the_version_routes_the_full_one(api):
+    client, store = api
+    seed_catalog(store)
+    stored = fixture_card("pixi-complete", version="0.2.0", description="Now with speaker turns.")
+    assert all(stored.get(key) for key in LIST_CARD_OMITTED_KEYS), "the fixture card holds every heavy key"
+
+    items = (await client.get("/v1/cogs")).json()["items"]
+    assert items and all(not set(LIST_CARD_OMITTED_KEYS) & set(item["card"]) for item in items)
+    transcriber = items[0]
+    assert transcriber["card"] == json.loads(json.dumps(list_card(stored))), "only those keys are dropped"
+    assert set(stored) - set(transcriber["card"]) == set(LIST_CARD_OMITTED_KEYS)
+
+    detail = (await client.get(f"/v1/cogs/{TRANSCRIBER}")).json()
+    version = (await client.get(f"/v1/cogs/{TRANSCRIBER}/versions/{digest('2')}")).json()
+    for full in (detail["card"], version["card"]):
+        assert full == json.loads(json.dumps(stored))
+    body = await client.get(f"/v1/cogs/{TRANSCRIBER}/versions/{digest('2')}/cog.md")
+    assert body.text == stored["body"]
+
+
+def test_list_card_leaves_the_stored_card_alone():
+    stored = {"id": "x", "body": "b", "profile_raw": "p", "frontmatter_raw": "f", "future_key": 1}
+    assert list_card(stored) == {"id": "x", "future_key": 1}
+    assert set(stored) == {"id", "body", "profile_raw", "frontmatter_raw", "future_key"}
+    assert list_card(None) == {}
 
 
 @pytest.mark.parametrize(
@@ -569,6 +599,31 @@ async def test_openapi_documents_every_route_and_the_card_schema(api):
     )
     assert all("type" not in prop for prop in card_schema["properties"].values()), "documented, not enforced"
 
+    # List items are a different schema, so a client cannot take one for the other.
+    schemas = spec["components"]["schemas"]
+    assert schemas["CogListPage"]["properties"]["items"]["items"] == {"$ref": "#/components/schemas/CogListEntry"}
+    list_card_schema = schemas["CogListEntry"]["properties"]["card"]
+    assert list_card_schema["title"] == "CogListCard" and list_card_schema["additionalProperties"] is True
+    assert set(list_card_schema["properties"]) == set(card_schema["properties"]) - set(LIST_CARD_OMITTED_KEYS)
+    list_description = paths["/v1/cogs"]["get"]["description"]
+    for key in LIST_CARD_OMITTED_KEYS:
+        assert f"`{key}`" in list_card_schema["description"], key
+        assert f"`{key}`" in list_description, key
+        assert key in card_schema["properties"], key
+
+    # What an anonymous caller does not get is not promised to it.
+    for name in ("CogVersion", "CogEntry", "CogListEntry", "CogDetail", "CogLocation", "CogReference"):
+        source_id = schemas[name]["properties"]["source_id"]
+        assert "anonymous" in source_id["description"], name
+        assert "source_id" not in schemas[name].get("required", []), name
+        assert "reference" in schemas[name]["required"], name
+    for schema in (card_schema, list_card_schema):
+        assert "anonymous" in schema["description"]
+        for key in ANONYMOUS_CARD_OMITTED_KEYS:
+            assert "anonymous" in schema["properties"][key]["description"], key
+    source_param = next(param for param in paths["/v1/cogs"]["get"]["parameters"] if param["name"] == "source_id")
+    assert "anonymous" in source_param["description"]
+
 
 def test_the_card_schema_names_exactly_the_keys_the_reader_emits():
     # A reader key added without a schema entry (or the reverse) fails here,
@@ -602,8 +657,8 @@ async def test_a_card_with_values_of_unexpected_types_is_served_verbatim_not_a_5
     assert page.status_code == 200, page.text
     cards = {item["cog_id"]: item["card"] for item in page.json()["items"]}
     assert set(cards) == {"42", NOTES, TRANSCRIBER}, "one odd card never takes the page down"
-    assert cards["42"] == json.loads(json.dumps(numeric))
-    assert cards[NOTES] == json.loads(json.dumps(odd))
+    assert cards["42"] == json.loads(json.dumps(list_card(numeric)))
+    assert cards[NOTES] == json.loads(json.dumps(list_card(odd)))
 
     for path in ("/v1/cogs/42", f"/v1/cogs/42/versions/{digest('1')}", f"/v1/cogs/{NOTES}/versions/{digest('2')}"):
         response = await client.get(path)
@@ -679,3 +734,144 @@ async def test_an_exact_public_rule_opens_only_that_route(tmp_path, monkeypatch)
         client.cookies.clear()
         assert (await client.get("/v1/cogs/catalog.v1.json")).status_code == 200
         assert (await client.get("/v1/cogs")).status_code == 401
+
+
+# --- what an anonymous caller sees ---------------------------------------------
+
+REDACTED_ROUTES = [
+    "/v1/cogs",
+    f"/v1/cogs/{TRANSCRIBER}",
+    f"/v1/cogs/{TRANSCRIBER}/versions/{digest('2')}",
+    f"/v1/cogs/{TRANSCRIBER}/versions/{digest('2')}/reference",
+]
+
+
+def _keys(value) -> set[str]:
+    """Every mapping key anywhere in a JSON document, cards excluded (they are the Cog's own)."""
+
+    if isinstance(value, list):
+        return set().union(*map(_keys, value)) if value else set()
+    if isinstance(value, dict):
+        return set(value).union(*(_keys(child) for key, child in value.items() if key != "card"))
+    return set()
+
+
+def _cards(document: dict) -> list[dict]:
+    return [item["card"] for item in document.get("items", [document]) if "card" in item]
+
+
+def _seed_with_diagnostics(store: InMemoryCogCatalogStore) -> None:
+    seed_catalog(store)
+    # The current transcriber card, with something for the reader to have said.
+    noisy = fixture_card(
+        "pixi-complete",
+        version="0.2.0",
+        errors=["reader error: example"],
+        warnings=["profile kind 'x' disagrees"],
+    )
+    store.upsert(
+        row("2", noisy, repository="cogs/cog-audio-transcriber-1a2b", pushed_at=T0 + timedelta(days=1), tags=("0.2.0",))
+    )
+
+
+@pytest.mark.parametrize("path", REDACTED_ROUTES)
+async def test_anonymous_answers_carry_no_source_id_and_no_reader_diagnostics(tmp_path, monkeypatch, path):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        _seed_with_diagnostics(app.state.cog_catalog_store)
+
+        signed_in = await client.get(path)
+        assert signed_in.status_code == 200, signed_in.text
+        client.cookies.clear()
+        anonymous = await client.get(path)
+        assert anonymous.status_code == 200, anonymous.text
+
+    full, redacted = signed_in.json(), anonymous.json()
+    assert "source_id" in _keys(full), "a signed-in caller sees every source id"
+    assert "source_id" not in _keys(redacted)
+    for card in _cards(full):
+        assert set(ANONYMOUS_CARD_OMITTED_KEYS) <= set(card)
+    for card in _cards(redacted):
+        assert not set(ANONYMOUS_CARD_OMITTED_KEYS) & set(card)
+    # The install reference stays: a client must know where to pull from.
+    assert _keys(redacted) == _keys(full) - {"source_id"}
+    if "reference" in full:
+        assert redacted["reference"] == full["reference"]
+    if "locations" in full:
+        assert [loc["reference"] for loc in redacted["locations"]] == [loc["reference"] for loc in full["locations"]]
+
+
+async def test_anonymous_cards_keep_everything_but_the_diagnostics(tmp_path, monkeypatch):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        _seed_with_diagnostics(app.state.cog_catalog_store)
+        full = (await client.get(f"/v1/cogs/{TRANSCRIBER}")).json()
+        client.cookies.clear()
+        redacted = (await client.get(f"/v1/cogs/{TRANSCRIBER}")).json()
+        listed = (await client.get("/v1/cogs")).json()["items"][0]
+
+    assert full["card"]["errors"] == ["reader error: example"]
+    expected = {key: value for key, value in full["card"].items() if key not in ANONYMOUS_CARD_OMITTED_KEYS}
+    assert redacted["card"] == expected
+    assert listed["card"] == list_card(expected), "trimmed and redacted"
+    assert redacted["card"]["body"], "the full card still carries the heavy keys"
+
+
+async def test_an_anonymous_source_id_filter_is_refused(tmp_path, monkeypatch):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        seed_catalog(app.state.cog_catalog_store)
+        assert [item["cog_id"] for item in (await client.get("/v1/cogs?source_id=mirror")).json()["items"]] == [
+            TRANSCRIBER
+        ]
+        client.cookies.clear()
+        for value in ("mirror", "no-such-source"):
+            response = await client.get(f"/v1/cogs?source_id={value}")
+            assert response.status_code == 422, value
+            error = response.json()["error"]
+            assert error["code"] == "validation_error"
+            assert [detail["loc"] for detail in error["details"]] == [["query", "source_id"]]
+            assert value not in response.text, "the probed value is not echoed"
+        assert (await client.get("/v1/cogs?kind=complete")).status_code == 200, "other filters stay open"
+
+
+async def test_anonymous_catalog_v1_is_unchanged(tmp_path, monkeypatch):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        _seed_with_diagnostics(app.state.cog_catalog_store)
+        signed_in = (await client.get("/v1/cogs/catalog.v1.json")).json()
+        client.cookies.clear()
+        anonymous = (await client.get("/v1/cogs/catalog.v1.json")).json()
+    assert anonymous == signed_in
+    assert _keys(anonymous) == {"schemaVersion", "repositories", "namespace", "name", "description"}
+
+
+async def test_under_a_public_rule_bad_credentials_get_the_anonymous_view_not_a_401(tmp_path, monkeypatch):
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        seed_catalog(app.state.cog_catalog_store)
+        client.cookies.clear()
+        client.cookies.update({"IdToken-test": "not-a-token"})
+        response = await client.get(f"/v1/cogs/{TRANSCRIBER}")
+        assert response.status_code == 200, response.text
+        assert "source_id" not in _keys(response.json())
+        assert (await client.get("/v1/cogs?source_id=mirror")).status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (NoOrganizationError(), 200),
+        (HTTPException(status_code=503, detail="membership unknown"), 503),
+    ],
+    ids=["unaffiliated-is-anonymous", "other-failures-propagate"],
+)
+async def test_under_a_public_rule_only_a_missing_caller_is_anonymous(tmp_path, monkeypatch, failure, expected):
+    def refuse(_request):
+        raise failure
+
+    monkeypatch.setattr(cogs_router, "get_auth_context", refuse)
+    app, client = await _client(tmp_path, monkeypatch, security=_map(PUBLIC_COGS))
+    async with app.router.lifespan_context(app), client:
+        response = await client.get("/v1/cogs")
+    assert response.status_code == expected, response.text

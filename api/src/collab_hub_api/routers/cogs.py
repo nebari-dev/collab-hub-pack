@@ -6,8 +6,9 @@ comes from what was captured at index time, and an install goes client ->
 registry with the pinned reference this API hands out.
 
 - ``GET /v1/cogs`` -- current Cogs, one per ``cog_id`` (its newest present
-  version), filtered and paged with ``limit`` + ``offset``.
-- ``GET /v1/cogs/{cog_id}`` -- the current card plus every indexed version.
+  version), filtered and paged with ``limit`` + ``offset``. Items carry a
+  trimmed card (no ``body``, ``profile_raw``, ``frontmatter_raw``).
+- ``GET /v1/cogs/{cog_id}`` -- the current full card plus every indexed version.
 - ``GET /v1/cogs/{cog_id}/versions/{digest}`` -- the card for one digest.
   Removed artifacts stay reachable here (installs pin digests); they are
   hidden only from the listing.
@@ -31,14 +32,24 @@ no rule matches never counts, whatever ``default_access`` says -- an
 unconfigured server's default is ``public``. This is the only route family
 that honors a ``public`` entry this way; the others require a caller
 regardless.
+
+An anonymous answer is **redacted** (:class:`Redaction`): no ``source_id``
+anywhere and no reader diagnostics on cards -- internal source names and
+failure strings are more than discovery needs. The pinned ``reference``
+stays, since a client must know where to pull from, and the ``source_id``
+filter is refused (422) rather than answered, so its values cannot be
+probed.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, Path, Query, Request, status
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 
 from ..cogs.catalog import (
     STATUS_INDEXED,
@@ -53,6 +64,7 @@ from ..cogs.models import (
     CogDetail,
     CogEntry,
     CogErrorResponse,
+    CogListEntry,
     CogListPage,
     CogLocation,
     CogReference,
@@ -78,14 +90,45 @@ def get_catalog_caller(request: Request) -> AuthContext | None:
 
     Consults the same protection map the middleware enforces
     (``app.state.path_rules``, resolved by :func:`~..path_protection.winning_rule`).
-    Anything else -- no matching rule, an ``authenticated`` rule, a ``public``
-    rule broader than ``/v1/cogs`` -- is exactly :func:`get_auth_context`.
+    Under a ``public`` catalog rule credentials are optional: a caller who
+    presents valid ones is still resolved (and gets the unredacted answer),
+    and credentials that resolve to no caller -- missing, invalid, or a
+    subject with no organization -- give the anonymous view rather than an
+    error, so a stale cookie cannot close a public page. Anything else -- no
+    matching rule, an ``authenticated`` rule, a ``public`` rule broader than
+    ``/v1/cogs`` -- is exactly :func:`get_auth_context`.
     """
 
     rule = winning_rule(request_path(request), getattr(request.app.state, "path_rules", ()))
     if rule is not None and rule.access == "public" and _within_cogs(rule.path):
-        return None
+        try:
+            return get_auth_context(request)
+        except HTTPException as exc:
+            # 401: no usable credential; 403: NoOrganizationError. Anything
+            # else (an unavailable organization store, say) still propagates.
+            if exc.status_code in (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN):
+                return None
+            raise
     return get_auth_context(request)
+
+
+@dataclass(frozen=True)
+class Redaction:
+    """What the caller may see; the one place a response is cut down for it.
+
+    Each response model declares its anonymous cut as ``ANONYMOUS_EXCLUDE``
+    (see :mod:`..cogs.models`); an authenticated caller gets the model whole.
+    """
+
+    anonymous: bool
+
+    @classmethod
+    def for_caller(cls, caller: AuthContext | None) -> Redaction:
+        return cls(anonymous=caller is None)
+
+    def respond(self, model: BaseModel) -> JSONResponse:
+        exclude = type(model).ANONYMOUS_EXCLUDE if self.anonymous else None
+        return JSONResponse(model.model_dump(mode="json", exclude=exclude))
 
 
 AuthDep = Annotated[AuthContext | None, Depends(get_catalog_caller)]
@@ -152,21 +195,42 @@ def list_cogs(
     produces: Annotated[str | None, _filter("An io type in the card's `io.produces`.")] = None,
     q: Annotated[str | None, _filter("Case-insensitive substring of the Cog's name or description.")] = None,
     source_id: Annotated[
-        str | None, _filter("Only this registry source; the newest version is chosen within it.")
+        str | None,
+        _filter(
+            "Only this registry source; the newest version is chosen within it. "
+            "Refused (422) for anonymous callers, who never see source ids."
+        ),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
     offset: Annotated[int, Query(ge=0)] = 0,
-) -> CogListPage:
+) -> JSONResponse:
     """One entry per `cog_id`: its newest present version, ordered by `cog_id`.
+
+    Each item's card is **trimmed**: it omits `body`, `profile_raw` and
+    `frontmatter_raw`, which `GET /v1/cogs/{cog_id}/versions/{digest}` serves
+    (and `.../cog.md` the body).
 
     `source_id` scopes which versions are considered; every other filter
     tests that newest version, so without `source_id` an entry is always the
-    card `GET /v1/cogs/{cog_id}` serves (with it, the newest in that source,
+    version `GET /v1/cogs/{cog_id}` serves (with it, the newest in that source,
     which may be older). `q` matches `name` or a string `description`,
     case-insensitively for ASCII. Removed artifacts, non-Cog artifacts and
     failed reads never appear.
     """
 
+    redaction = Redaction.for_caller(_auth)
+    if redaction.anonymous and source_id is not None:
+        # Filtering by a value the caller may not see would let it probe for
+        # source ids by watching which requests return items.
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "source_id"),
+                    "msg": "source_id is not available to anonymous callers",
+                }
+            ]
+        )
     filters = CatalogFilter(
         kind=kind,
         publisher=publisher,
@@ -180,12 +244,13 @@ def list_cogs(
     # One row past the page says whether another page exists, without a
     # count query and without an empty trailing request.
     rows = store.list_current(filters, limit=limit + 1, offset=offset)
-    return CogListPage(
-        items=[CogEntry.of(row) for row in rows[:limit]],
+    page = CogListPage(
+        items=[CogListEntry.of(row) for row in rows[:limit]],
         limit=limit,
         offset=offset,
         next_offset=offset + limit if len(rows) > limit else None,
     )
+    return redaction.respond(page)
 
 
 @router.get(
@@ -249,7 +314,7 @@ def get_cog_md(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest: Dig
     responses={**NOT_FOUND, **UNAVAILABLE},
     summary="Pinned install reference of one version",
 )
-def get_cog_reference(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest: DigestPath) -> CogReference:
+def get_cog_reference(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest: DigestPath) -> JSONResponse:
     """`<host>/<repository>@<digest>`, ready for `nebi import`.
 
     When the digest was indexed in several sources or repositories, the
@@ -260,7 +325,7 @@ def get_cog_reference(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, dige
     """
 
     preferred, *others = _version_locations(store, cog_id, digest)
-    return CogReference(
+    answer = CogReference(
         reference=preferred.reference,
         source_id=preferred.source_id,
         repository=preferred.repository,
@@ -268,6 +333,7 @@ def get_cog_reference(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, dige
         present=preferred.present,
         locations=[CogLocation.of(row) for row in others],
     )
+    return Redaction.for_caller(_auth).respond(answer)
 
 
 @router.get(
@@ -276,13 +342,14 @@ def get_cog_reference(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, dige
     responses={**NOT_FOUND, **UNAVAILABLE},
     summary="Card of one version",
 )
-def get_cog_version(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest: DigestPath) -> CogEntry:
-    """The exact card indexed for this digest -- what an install pins.
+def get_cog_version(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest: DigestPath) -> JSONResponse:
+    """The exact card indexed for this digest -- what an install pins -- in full.
 
     Removed versions are served too, with `removed_at` set.
     """
 
-    return CogEntry.of(_version_locations(store, cog_id, digest)[0])
+    entry = CogEntry.of(_version_locations(store, cog_id, digest)[0])
+    return Redaction.for_caller(_auth).respond(entry)
 
 
 @router.get(
@@ -291,8 +358,8 @@ def get_cog_version(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath, digest
     responses={**NOT_FOUND, **UNAVAILABLE},
     summary="A Cog and its versions",
 )
-def get_cog(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath) -> CogDetail:
-    """The Cog's current card (its newest present version) and every indexed version, newest first.
+def get_cog(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath) -> JSONResponse:
+    """The Cog's current full card (its newest present version) and every indexed version, newest first.
 
     404 when no version is present, even if removed ones are indexed: those
     stay reachable by digest.
@@ -302,7 +369,8 @@ def get_cog(_auth: AuthDep, store: CatalogDep, cog_id: CogIdPath) -> CogDetail:
     current = next((row for row in versions if row.present), None)
     if current is None:
         raise CogNotFoundError(cog_id)
-    return CogDetail(**CogEntry.of(current).model_dump(), versions=[CogVersion.of(row) for row in versions])
+    detail = CogDetail(**CogEntry.of(current).model_dump(), versions=[CogVersion.of(row) for row in versions])
+    return Redaction.for_caller(_auth).respond(detail)
 
 
 def register_exception_handlers(app: FastAPI) -> None:

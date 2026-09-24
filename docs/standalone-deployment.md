@@ -208,7 +208,9 @@ combination, but not restating the list is the better habit.)
   also carries its own auth dependency, so a `public` entry does not make
   frames or tasks anonymous. The one exception is the Cog catalog: a `public`
   rule at or below `/v1/cogs` opens anonymous discovery
-  ([cog-registry.md](cog-registry.md#read-api)).
+  ([cog-registry.md](cog-registry.md#read-api)). Anonymous answers omit
+  source ids and the cards' reader diagnostics, and refuse the `source_id`
+  filter; signed-in callers still get everything.
 
 ### Why `/web` and `/invite` ship public
 
