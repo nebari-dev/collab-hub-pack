@@ -241,10 +241,8 @@ audience is people with no account on this deployment yet.
 
 Both entries are **inert on an install that does not enable the web surface**.
 No routes are registered under either prefix, so a request there matches
-nothing in the app and falls through to the MCP catch-all mounted at `/`, which
-runs its own `McpAuthMiddleware` and authenticates on the API axis before the
-sub-application sees it. A prefix declared public that serves nothing is not a
-hole. Unhardened installs never see these entries at all: the chart passes
+nothing in the app and answers a plain 404. A prefix declared public that
+serves nothing is not a hole. Unhardened installs never see these entries at all: the chart passes
 `PATHS="[]"` and `DEFAULT_ACCESS="public"` when `security.enforce` resolves
 false.
 
