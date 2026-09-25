@@ -976,6 +976,37 @@ class CogsConfig(BaseModel):
         return self
 
 
+class FeaturesConfig(BaseModel):
+    """Deployment feature flags (#135). Off unless the environment says on.
+
+    Trunk-based development lands unfinished features on ``main``; this is the
+    per-deployment switch that keeps them dark until an operator opts in. A
+    flag needs no code registration: setting
+    ``COLLAB_HUB_API__FEATURES__<NAME>`` to a truthy value ("1", "true",
+    "yes", "on", any case) turns ``<name>`` on for that deployment, and every
+    read goes through :meth:`enabled` — never a bare ``os.environ`` lookup.
+
+    This is for dark-launching work in progress. A shipped capability with an
+    operational off-switch belongs on its own sub-config as an explicit
+    ``bool`` field with a documented default (the ``api_get_enabled`` pattern
+    on :class:`GitHubConnectorConfig`), not here — flags in this block are
+    expected to disappear once the feature ships. See docs/feature-flags.md.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    _TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+    def enabled(self, name: str) -> bool:
+        """Whether the named flag is on for this deployment. Unknown = off."""
+        value = getattr(self, name.strip().lower().replace("-", "_"), None)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in self._TRUTHY
+        return False
+
+
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -987,6 +1018,7 @@ class BaseConfig(BaseSettings):
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     cogs: CogsConfig = Field(default_factory=CogsConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
 
 
 class Config(BaseConfig):
