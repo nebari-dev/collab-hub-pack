@@ -25,7 +25,7 @@ class RunBudget:
       executor rollout is tracked in collab-hub-pack #1.
 
     Configured token/cost limits require corresponding usage from every worker
-    interaction, including a pause. Unknown or invalid usage fails accounting;
+    interaction, including one whose result escalates at its Gate. Unknown or invalid usage fails accounting;
     it is never counted as zero for a configured limit.
     """
 

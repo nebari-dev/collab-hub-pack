@@ -86,7 +86,8 @@ Optional; absent when the Cog cannot report it.
 - **Guards** run on `payload` and read `problems` as input.
 - The **Gate** declared on the Op step consumes `ok`, `problems`, and Guard
   findings and decides ok / ok-with-problems / escalate. A pause for human
-  review is the Gate's outcome, not something the Cog requests.
+  review is the Gate's outcome, not something the Cog requests: by default a
+  problem with severity `error` escalates, and a `warn` is recorded and passes.
 - **Budgets** consume `usage`.
 
 ## Over HTTP

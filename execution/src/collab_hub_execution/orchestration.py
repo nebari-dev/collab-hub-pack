@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
+from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
 from .states import RUN, Run, RunState, Transition, Worker
 from .track import TrackEvent, TrackStore
@@ -54,16 +55,16 @@ def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None
     if raw is not None and not isinstance(raw, Mapping):
         raise UsageUnavailable("usage must be an object")
     usage = dict(raw) if raw is not None else {}
-    for field in ("tokens", "cost"):
-        if field not in usage:
-            if budget is not None and getattr(budget, f"max_{field}") is not None:
-                raise UsageUnavailable(f"missing {field} usage for configured budget")
+    for name in ("tokens", "cost"):
+        if name not in usage:
+            if budget is not None and getattr(budget, f"max_{name}") is not None:
+                raise UsageUnavailable(f"missing {name} usage for configured budget")
             continue
-        value = usage[field]
-        valid = type(value) is int if field == "tokens" else type(value) in (int, float)
+        value = usage[name]
+        valid = type(value) is int if name == "tokens" else type(value) in (int, float)
         if not valid or value < 0 or (type(value) is float and not math.isfinite(value)):
-            raise UsageUnavailable(f"invalid {field} usage")
-        if field == "cost":
+            raise UsageUnavailable(f"invalid {name} usage")
+        if name == "cost":
             try:
                 finite = math.isfinite(value)
             except OverflowError:
@@ -73,15 +74,36 @@ def _validate_usage(raw: Any, budget: RunBudget | None) -> dict[str, Any] | None
     return {key: usage[key] for key in ("tokens", "cost") if key in usage} if raw is not None else None
 
 
+def _escalation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """One escalation as a caller reads it, filled in for a Track written before Gates.
+
+    An escalation recorded before Gates carries only the step and the reason: the
+    Cog asked for the pause, so there is no id, no envelope and no approvers. It
+    still answers to a decision — naming its id, ``None`` — and an approval re-runs
+    the step, since no envelope was recorded to complete it with.
+    """
+    return {
+        "escalation": payload.get("escalation"),
+        "step": payload.get("step"),
+        "reason": payload.get("reason"),
+        "attempt": payload.get("attempt"),
+        "envelope": payload.get("envelope"),
+        "usage": payload.get("usage"),
+        "approvers": payload.get("approvers", list(DEFAULT_APPROVERS)),
+        "gate": payload.get("gate", Gate().escalate),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class OpStep:
-    """One interaction with a Cog entry point."""
+    """One interaction with a Cog entry point, and the Gate that decides on its result."""
 
     name: str
     cog: str
     entry_point: str
     input: Any = None
     digest: str | None = None
+    gate: Gate = field(default_factory=Gate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,21 +112,6 @@ class OpDefinition:
 
     run_id: str
     steps: tuple[OpStep, ...]
-
-
-class PauseRequest(Exception):
-    """A Cog's request for an external signal before continuing.
-
-    Transitional. A pause is a Gate's decision, declared on the Op step, never
-    something a Cog asks for; this leaves the protocol when step-declared Gates
-    land (#99). Until then the reference worker's ``{"pause": true}`` answer is
-    surfaced through it.
-    """
-
-    def __init__(self, reason: str, *, usage: Mapping[str, Any] | None = None) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.usage = usage
 
 
 class CogWorker(Protocol):
@@ -116,13 +123,14 @@ class CogWorker(Protocol):
 
         Return the result envelope (``envelope.py``): ``payload`` is the Cog's
         output and ``usage`` its accounting, never hidden inside the payload.
-        A PauseRequest carries usage for the interaction that paused.
+        A Cog cannot pause a run: its problems go to the step's Gate, which
+        decides whether a person looks at the result.
 
         ``idempotency_key`` is stable per (run, step, attempt): a crash-recovery
         re-drives the same incomplete step with the *same* key, and an explicit
-        retry or resume after a pause uses a *new* key. ``input`` always contains
-        the step's original input; ``signal`` carries external feedback separately
-        and is omitted until supplied, including when its explicit value is None.
+        retry or a send back at a Gate uses a *new* key. ``input`` always contains
+        the step's original input; ``signal`` carries a send back's findings
+        separately and is omitted until a step is sent back.
         A worker that persists results by key can turn the
         replay into a no-op — but that durability is the worker's to provide. The
         reference and Kubernetes workers here do NOT persist keys across pod
@@ -153,8 +161,14 @@ class WorkflowEngine(Protocol):
     def submit(self, op: OpDefinition) -> RunState:
         """Start or recover an Op."""
 
-    def signal(self, run_id: str, value: Any = None) -> RunState:
-        """Resume an Op waiting at a Gate with an external value."""
+    def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
+        """What a run waiting at a Gate waits on, or ``None``: what ``decide`` answers."""
+
+    def decide(
+        self, run_id: str, *, escalation: str | None, actor: str, outcome: str,
+        findings: Sequence[Any] | None = (),
+    ) -> RunState:
+        """Answer the escalation a run waits on: approve, reject or send back."""
 
     def observe(self, run_id: str) -> RunState | None:
         """Return the run's state reconstructed from the Track; ``None`` if never submitted."""
@@ -167,6 +181,10 @@ class InMemoryCogExecutor(CogExecutor):
     with an ``envelope`` key) to report usage or problems. Any other value
     becomes the payload of a successful envelope with unknown usage, which
     cannot satisfy a configured spending limit.
+
+    That last convenience is this fixture's alone: a worker answering over HTTP
+    must send an envelope, and anything else — a ``{"pause": true}`` included —
+    fails the step as ``EnvelopeInvalid``. Neither path lets a Cog pause a run.
     """
 
     def __init__(self, handlers: dict[str, Callable[..., Any]]) -> None:
@@ -203,8 +221,8 @@ class _Worker:
 class DurableWorkflowEngine(WorkflowEngine):
     """An engine whose recovery source is exclusively the Track.
 
-    Experimental: interfaces may change. submit(), signal(), and retry() run
-    synchronously until completion, pause, or failure. After a process restart,
+    Experimental: interfaces may change. submit(), decide(), and retry() run
+    synchronously until the run completes, fails, or waits at a Gate. After a process restart,
     a caller must resubmit the same Op; no background recovery loop is provided.
 
     Single-owner by assumption: it holds no cross-replica lease, so the same run
@@ -230,13 +248,22 @@ class DurableWorkflowEngine(WorkflowEngine):
         self.budget = budget
         self.max_revisions = max_revisions
 
-    def _append(self, run_id: str, event_type: str, **payload: Any) -> None:
-        self.track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=payload))
+    def _append(self, run_id: str, event_type: str, payload: Mapping[str, Any],
+                into: list[TrackEvent] | None = None) -> TrackEvent:
+        """The one write path: store one event, and keep any snapshot it belongs to current."""
+        event = self.track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=dict(payload)))
+        if into is not None:
+            into.append(event)
+        return event
 
-    def _record(self, run_id: str, transition: Transition[Any]) -> Any:
-        """Write what a transition reports, and return the context after it."""
+    def _record(self, run_id: str, transition: Transition[Any], into: list[TrackEvent] | None = None) -> Any:
+        """Write what a transition reports, and return the context after it.
+
+        ``into`` collects the events written, so a caller holding a snapshot of the
+        Track advances on what it read *and* wrote, without reading it again.
+        """
         for record in transition.records:
-            self._append(run_id, record.event_type, **record.payload)
+            self._append(run_id, record.event_type, record.payload, into)
         return transition.after
 
     def observe(self, run_id: str) -> RunState | None:
@@ -287,24 +314,63 @@ class DurableWorkflowEngine(WorkflowEngine):
 
     @staticmethod
     def _signal_for(events: tuple[TrackEvent, ...], step: str) -> Any:
-        """The latest durably-recorded signal value for a step, or ``_NO_SIGNAL``.
+        """The findings of the latest send back of a step, or ``_NO_SIGNAL``.
 
-        Recovery re-reads the decision from the Track, so a crash after a signal
-        was recorded resumes with both the original input and the signal.
+        Recovery re-reads the decision from the Track, so a crash after a send
+        back was recorded re-runs the step with both its input and the findings.
         """
         value: Any = _NO_SIGNAL
         for e in events:
-            if e.event_type == "signal_received" and e.payload.get("step") == step:
+            if (e.event_type == "signal_received" and e.payload.get("step") == step
+                    and e.payload.get("outcome", "send_back") == "send_back"):
                 value = e.payload.get("value")
         return value
+
+    @staticmethod
+    def _approved(events: tuple[TrackEvent, ...], step: str) -> Mapping[str, Any] | None:
+        """The escalation of a step that was approved and is not yet completed, or ``None``.
+
+        An approval completes the step with the envelope the approver saw, so
+        a crash between recording the approval and completing the step completes
+        it on recovery rather than running it again. An escalation recorded before
+        Gates has no envelope to complete from, so its approval re-runs the step.
+        """
+        escalated: Mapping[str, Any] | None = None
+        approved: Mapping[str, Any] | None = None
+        for e in events:
+            if e.payload.get("step") != step:
+                continue
+            if e.event_type == "paused":
+                escalated, approved = e.payload, None
+            elif e.event_type == "signal_received":
+                approved_now = e.payload.get("outcome") == "approve" and escalated is not None
+                approved = escalated if approved_now and escalated.get("envelope") is not None else None
+            elif e.event_type == "step_completed":
+                approved = None
+        return approved
+
+    @staticmethod
+    def _open_escalation(events: tuple[TrackEvent, ...], run: Run | None) -> dict[str, Any] | None:
+        if run is None or run.state is not RunState.WAITING_AT_GATE:
+            return None
+        return _escalation(next(
+            e.payload for e in reversed(events)
+            if e.event_type == "paused" and e.payload.get("escalation") == run.open_escalation
+        ))
+
+    def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
+        """What a run waiting at a Gate waits on — the escalation id, the envelope, who may decide — or ``None``."""
+        events = self.track.replay(run_id)
+        return self._open_escalation(events, Run.replay(events))
 
     def submit(self, op: OpDefinition) -> RunState:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
             raise ValueError(f"Op {op.run_id!r} has duplicate step names: {names}")
         existing = self.track.replay(op.run_id)
+        written: list[TrackEvent] = []
         if not existing:
-            self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)))
+            self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)), into=written)
         else:
             if _canonical_op(self._submitted_definition(op.run_id, existing)) != _canonical_op(op):
                 raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
@@ -315,13 +381,13 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # is a deliberate act — call retry().
                 return run.state
             if run is not None and run.state is RunState.WAITING_AT_GATE:
-                # A run waiting at a Gate resumes only through signal(), which
+                # A run waiting at a Gate resumes only through decide(), which
                 # carries the decision. Re-submitting must not re-invoke the gated
                 # step behind the gate's back with its original input. A decision
                 # already recorded moved the run back to RUNNING, so a crash between
                 # recording it and advancing resumes below, like a mid-step crash.
                 return run.state
-        return self._advance(op)
+        return self._advance(op, (*existing, *written))
 
     def retry(self, run_id: str) -> RunState:
         """Re-drive an unsuccessfully-ended run from its first incomplete step.
@@ -348,30 +414,52 @@ class DurableWorkflowEngine(WorkflowEngine):
             done = "completed" if state is RunState.COMPLETED else f"was {state.value}"
             raise ValueError(f"run {run_id!r} {done}; nothing to retry (start a new run instead)")
         op = self._submitted_definition(run_id, events)
-        self._record(run_id, run.retry())
-        return self._advance(op)
+        written: list[TrackEvent] = []
+        self._record(run_id, run.retry(), into=written)
+        return self._advance(op, (*events, *written))
 
-    def _advance(self, op: OpDefinition) -> RunState:
-        events = self.track.replay(op.run_id)
-        run = Run.replay(events)
+    def _advance(self, op: OpDefinition, events: tuple[TrackEvent, ...] | None = None) -> RunState:
+        # The caller passes the Track it has already read, so one call reads it once.
+        # Every write goes through `append` or `record` into `history`, so a step reads
+        # what the ones before it wrote without reading the Track again.
+        history = list(self.track.replay(op.run_id) if events is None else events)
+
+        def append(event_type: str, payload: Mapping[str, Any]) -> None:
+            self._append(op.run_id, event_type, payload, history)
+
+        def record(transition: Transition[Any]) -> Any:
+            return self._record(op.run_id, transition, history)
+
+        run = Run.replay(history)
         if run.state is RunState.SUBMITTED:
-            run = self._record(op.run_id, run.pickup())
-        completed = self._completed_steps(events)
-        retries = self._retry_count(events)
+            run = record(run.pickup())
+        completed = self._completed_steps(history)
+        retries = self._retry_count(history)
+        spent_on: str | None = None
         try:
-            tracker = self._budget_tracker(events)
+            tracker = self._budget_tracker(history)
         except UsageUnavailable as exc:
-            run = self._record(op.run_id, run.fail(error="UsageUnavailable", reason=str(exc)))
+            run = record(run.fail(error="UsageUnavailable", reason=str(exc)))
             return run.state
         for step in op.steps:
             if step.name in completed:
+                continue
+            # The last step this call reaches names the budget stop, if one lands at the end.
+            spent_on = step.name
+            approved = self._approved(history, step.name)
+            if approved is not None:
+                # The approver saw this envelope, so it is the step's result; the step does not run again.
+                envelope = ResultEnvelope.parse(approved["envelope"])
+                append("step_completed", {"step": step.name, "output": envelope.payload,
+                                          "usage": approved.get("usage"), "escalation": approved["escalation"],
+                                          **_recorded(envelope)})
                 continue
             if tracker is not None:
                 try:
                     tracker.check()
                 except BudgetExceeded as exc:
                     return self._stop_for_budget(run, step.name, exc)
-            # attempt = prior pauses (revisions) + explicit retries, NOT the
+            # attempt = prior escalations (revisions) + explicit retries, NOT the
             # step_started count: a crash before the outcome is recorded re-runs
             # with the SAME instance/key (a durable worker can dedupe the replay),
             # while an explicit retry() bumps the attempt so it re-runs under a fresh
@@ -381,7 +469,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             attempt = run.escalations.get(step.name, 0) + retries
             instance = f"{_key_component(step.name)}:{attempt}"
             key = f"{_key_component(op.run_id)}:{instance}"
-            self._append(op.run_id, "step_started", step=step.name, cog=step.cog, digest=step.digest, attempt=attempt)
+            append("step_started", {"step": step.name, "cog": step.cog, "digest": step.digest, "attempt": attempt})
             worker = None
             cog_worker: Worker | None = None
             answered = False
@@ -395,41 +483,35 @@ class DurableWorkflowEngine(WorkflowEngine):
             # non-terminal run); teardown is best-effort in `finally`.
             try:
                 worker = self.executor.materialize(step.cog, op.run_id, instance)
-                cog_worker = self._record(op.run_id, Worker.materialize(step.cog, step=step.name, digest=step.digest))
-                cog_worker = self._record(op.run_id, cog_worker.ready())
-                cog_worker = self._record(op.run_id, cog_worker.invoke(entry_point=step.entry_point, step=step.name))
-                signal_value = self._signal_for(events, step.name)
+                cog_worker = record(Worker.materialize(step.cog, step=step.name, digest=step.digest))
+                cog_worker = record(cog_worker.ready())
+                cog_worker = record(cog_worker.invoke(entry_point=step.entry_point, step=step.name))
+                signal_value = self._signal_for(history, step.name)
                 feedback = {} if signal_value is _NO_SIGNAL else {"signal": signal_value}
-                try:
-                    invoked = True
-                    result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
-                    if not isinstance(result, ResultEnvelope):
-                        raise EnvelopeInvalid("interact() must return a ResultEnvelope")
-                    answered = True
-                    # ok with problems is not a failure: the step completes and a
-                    # Gate decides what the problems mean. ok: false is one.
-                    outcome = ("ok", result) if result.ok else ("error", result)
-                    raw_usage = result.usage
-                except PauseRequest as pause:
-                    answered = True
-                    outcome = ("pause", pause.reason)
-                    raw_usage = pause.usage
-                usage = _validate_usage(raw_usage, self.budget)
-                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=usage)
+                invoked = True
+                result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
+                if not isinstance(result, ResultEnvelope):
+                    raise EnvelopeInvalid("interact() must return a ResultEnvelope")
+                answered = True
+                # ok with problems is not a failure: the step's Gate decides what
+                # the problems mean. ok: false is one.
+                outcome = ("ok", result) if result.ok else ("error", result)
+                usage = _validate_usage(result.usage, self.budget)
+                append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": usage})
             except UsageUnavailable as exc:
                 # Persist unknown accounting so recovery/retry cannot forget it.
-                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
+                append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 failure_reason = str(exc)
                 outcome = ("broken", "UsageUnavailable")
             except EnvelopeInvalid as exc:
                 # Not the seam's envelope, so whatever the worker spent is unknown too.
-                self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
+                append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 failure_reason = str(exc)
                 outcome = ("broken", "EnvelopeInvalid")
             except Exception as exc:  # noqa: BLE001 - any materialize/interact failure is durable-failed
                 if invoked:
                     # A failed request may have spent resources before failing.
-                    self._append(op.run_id, "interaction_usage", step=step.name, attempt=attempt, usage=None)
+                    append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 outcome = ("broken", type(exc).__name__)
             finally:
                 if worker is not None:
@@ -442,19 +524,19 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # A failed worker's own error is kept beside it, since its teardown is not a worker move.
                 details = None if answered else {"worker_error": str(outcome[1])}
                 failed = run.fail(step=step.name, error="TeardownFailed", reason=teardown_error, details=details)
-                run = self._record(op.run_id, failed)
+                run = record(failed)
                 return run.state
 
             kind, detail = outcome
             if kind == "broken":
-                run = self._record(op.run_id, run.fail(step=step.name, error=detail, reason=failure_reason))
+                run = record(run.fail(step=step.name, error=detail, reason=failure_reason))
                 return run.state
             if kind == "error":
                 # The worker answered, and said no. The code is what a client acts
                 # on, so it is the event's error, verbatim; the detail is the reason.
                 failed = run.fail(step=step.name, error=detail.error.code, reason=detail.error.detail,
                                   details=_recorded(detail))
-                run = self._record(op.run_id, failed)
+                run = record(failed)
                 return run.state
             budget_stop = None
             if tracker is not None:
@@ -462,21 +544,34 @@ class DurableWorkflowEngine(WorkflowEngine):
                     tracker.consume(tokens=(usage or {}).get("tokens", 0), cost=(usage or {}).get("cost", 0.0))
                 except BudgetExceeded as exc:
                     budget_stop = exc
-            if kind == "pause":
-                if budget_stop is not None:
-                    return self._stop_for_budget(run, step.name, budget_stop)
-                escalation = run.escalate(step=step.name, reason=detail, revise_limit=self.max_revisions)
-                run = self._record(op.run_id, escalation)
+            envelope = detail
+            verdict, why = step.gate.evaluate(envelope)
+            if verdict is GateOutcome.ESCALATE:
+                # A budget stop never discards a result that was paid for: the escalation
+                # is recorded, and the stop lands at the next boundary — the end of the
+                # run included — by when no further work has been spent.
+                details = {
+                    "attempt": attempt, "envelope": envelope.to_dict(), "usage": usage,
+                    "approvers": list(step.gate.deciders), "gate": step.gate.escalate,
+                }
+                eid = escalation_id(op.run_id, step.name, attempt, envelope)
+                run = record(run.escalate(step=step.name, reason=why, escalation=eid, details=details))
                 return run.state
 
-            envelope = detail
             # `output` keeps the Track's current key; the versioned event schema
             # that renames it and stores large payloads by reference is #5.
-            self._append(op.run_id, "step_completed", step=step.name, output=envelope.payload, usage=usage,
-                         **_recorded(envelope))
+            append("step_completed", {"step": step.name, "output": envelope.payload, "usage": usage,
+                                      **_recorded(envelope)})
             if budget_stop is not None:
                 return self._stop_for_budget(run, step.name, budget_stop)
-        run = self._record(op.run_id, run.complete())
+        if tracker is not None and spent_on is not None:
+            # The end of a run is a boundary too: one that overspent on its last step
+            # stops here instead of completing over its budget.
+            try:
+                tracker.check()
+            except BudgetExceeded as exc:
+                return self._stop_for_budget(run, spent_on, exc)
+        run = record(run.complete())
         return run.state
 
     def _tear_down(
@@ -484,7 +579,7 @@ class DurableWorkflowEngine(WorkflowEngine):
     ) -> str | None:
         """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
 
-        A worker that answered — an envelope, ok or not, or a pause — goes IDLE and
+        A worker that answered — with an envelope, ok or not — goes IDLE and
         is torn down as a one-shot, and a teardown that fails is its machine's
         `teardown_failed`. One that did not answer has failed: the executor reclaims
         what is left of it, and if that fails the run's `failed` record says so.
@@ -509,21 +604,46 @@ class DurableWorkflowEngine(WorkflowEngine):
         run = self._record(run.run_id, run.exhaust_budget(dimension=exc.dimension, step=step, reason=str(exc)))
         return run.state
 
-    def signal(self, run_id: str, value: Any = None) -> RunState:
+    def decide(
+        self, run_id: str, *, escalation: str | None, actor: str, outcome: str,
+        findings: Sequence[Any] | None = (),
+    ) -> RunState:
+        """Answer the escalation a run waits on: ``approve``, ``reject`` or ``send_back``.
+
+        The decision names the escalation it answers; one naming an escalation
+        that is no longer open raises ``StaleEscalation`` and changes nothing.
+        Approve completes the step with the envelope the approver saw, reject
+        ends the run ``REJECTED``, and send back re-runs the step with the
+        findings as its signal, up to ``max_revisions`` revisions. The decision is
+        recorded before the run advances, so a crash after it resumes from it.
+        Who may decide is the run API's to check (#103); the engine records who did.
+        """
+        if not actor:
+            raise ValueError("a decision names its actor")
+        if findings is not None and (isinstance(findings, (str, bytes)) or not isinstance(findings, Sequence)):
+            # One string, a mapping or a set is not a sequence of findings: listing it would
+            # record its characters, its keys, or an arbitrary order.
+            raise ValueError("findings are a sequence of findings, not one string, mapping or set")
         events = self.track.replay(run_id)
         run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
-            raise ValueError(f"run {run_id!r} is not paused")
+            raise ValueError(f"run {run_id!r} is not waiting at a Gate")
+        waiting_on = self._open_escalation(events, run)
+        if outcome == "approve" and waiting_on is not None and waiting_on["envelope"] is None:
+            # An escalation recorded before Gates holds no result, so there is nothing to
+            # accept as it is; a send back asks for the work again, a reject ends the run.
+            raise ValueError(f"run {run_id!r} escalated before Gates and has no recorded result to approve; "
+                             f"send it back or reject it")
         op = self._submitted_definition(run_id, events)
-        # Persist the decision before advancing so a crash mid-resume recovers the
-        # signal from the Track alongside the original input. The value may
-        # legitimately be None — see _NO_SIGNAL. #35's signal re-runs the paused
-        # step with its value, which is a send back; it answers whichever
-        # escalation is open, since escalation ids arrive with step Gates (#99).
-        # It cannot say whether it approves, so the revise limit is not applied
-        # here but when the step escalates again (_advance), as #35 applied it.
-        self._record(run_id, run.decide(outcome="send_back", escalation=run.open_escalation, findings=value))
-        return self._advance(op)
+        decided_on = None if waiting_on is None or waiting_on["envelope"] is None \
+            else envelope_digest(waiting_on["envelope"])
+        decision = run.decide(outcome=outcome, escalation=escalation, findings=list(findings or ()), actor=actor,
+                              revise_limit=self.max_revisions, envelope_digest=decided_on)
+        written: list[TrackEvent] = []
+        run = self._record(run_id, decision, into=written)
+        if run.state is not RunState.RUNNING:
+            return run.state
+        return self._advance(op, (*events, *written))
 
 
 def _canonical_op(op: OpDefinition) -> str:
@@ -541,6 +661,7 @@ def _serialize_op(op: OpDefinition) -> dict[str, Any]:
                 "entry_point": step.entry_point,
                 "input": step.input,
                 "digest": step.digest,
+                "gate": step.gate.to_dict(),
             }
             for step in op.steps
         ],
@@ -557,6 +678,7 @@ def _deserialize_op(value: dict[str, Any]) -> OpDefinition:
                 entry_point=step["entry_point"],
                 input=step.get("input"),
                 digest=step.get("digest"),
+                gate=Gate.from_dict(step.get("gate")),
             )
             for step in value["steps"]
         ),

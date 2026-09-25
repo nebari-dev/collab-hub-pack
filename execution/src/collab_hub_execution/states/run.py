@@ -98,18 +98,13 @@ class Submitted(RunState):
 class Running(RunState):
     name = "RUNNING"
 
-    @accepts("WAITING_AT_GATE", "FAILED")
+    @accepts("WAITING_AT_GATE")
     def escalate(
         self, run: Run, *, step: str, reason: str | None = None, escalation: str | None = None,
-        revise_limit: int | None = None, **_: Any,
+        details: Mapping[str, Any] | None = None, **_: Any,
     ) -> Transition[Run]:
-        if revise_limit is not None and run.escalations.get(step, 0) >= revise_limit:
-            # The step has been revised `revise_limit` times and asks for another revision.
-            # #35's signal cannot say whether it approves or sends back, so until a decision
-            # carries its outcome (#99) this is where the limit is applied, as #35 applied it.
-            stop = _failed(step, "revise_limit_exceeded", None, {"revise_limit": revise_limit})
-            return move(run, RunState.FAILED, stop)
-        payload: dict[str, Any] = {"step": step, "reason": reason}
+        # `details` is what the Gate escalated on: the attempt, the envelope, who may decide.
+        payload: dict[str, Any] = {"step": step, "reason": reason, **(details or {})}
         if escalation is not None:
             payload["escalation"] = escalation
         counts = dict(run.escalations)
@@ -156,7 +151,8 @@ class WaitingAtGate(RunState):
     @accepts("RUNNING", "REJECTED", "FAILED")
     def decide(
         self, run: Run, *, outcome: str, escalation: str | None = None, findings: Any = None,
-        revise_limit: int | None = None, **_: Any,
+        revise_limit: int | None = None, actor: str | None = None, envelope_digest: str | None = None,
+        **_: Any,
     ) -> Transition[Run]:
         if outcome not in DECISIONS:
             self.refuse("decide", f"unknown outcome {outcome!r}")
@@ -166,8 +162,15 @@ class WaitingAtGate(RunState):
             )
         step = run.open_step
         closed = {"open_step": None, "open_escalation": None}
-        # Every decision record names the escalation it answered, so replay answers the same one.
+        # Every decision record names the escalation it answered, so replay answers the same one,
+        # and who decided it.
+        # A decision names the escalation it answered, who decided, and the result
+        # they decided on, so a reader of decisions needs no join to identify it.
         answered = {} if escalation is None else {"escalation": escalation}
+        if actor is not None:
+            answered["actor"] = actor
+        if envelope_digest is not None:
+            answered["envelope_digest"] = envelope_digest
         if outcome == "reject":
             record = Record("rejected", {"step": step, "value": findings, **answered})
             return move(run, RunState.REJECTED, record, **closed)
@@ -262,15 +265,18 @@ class Run(Context):
         return self.dispatch("pickup")
 
     def escalate(
-        self, *, step: str, reason: str | None = None, escalation: str | None = None, revise_limit: int | None = None
+        self, *, step: str, reason: str | None = None, escalation: str | None = None,
+        details: Mapping[str, Any] | None = None,
     ) -> Transition[Run]:
-        return self.dispatch("escalate", step=step, reason=reason, escalation=escalation, revise_limit=revise_limit)
+        return self.dispatch("escalate", step=step, reason=reason, escalation=escalation, details=details)
 
     def decide(
-        self, *, outcome: str, escalation: str | None = None, findings: Any = None, revise_limit: int | None = None
+        self, *, outcome: str, escalation: str | None = None, findings: Any = None, revise_limit: int | None = None,
+        actor: str | None = None, envelope_digest: str | None = None,
     ) -> Transition[Run]:
         return self.dispatch(
-            "decide", outcome=outcome, escalation=escalation, findings=findings, revise_limit=revise_limit
+            "decide", outcome=outcome, escalation=escalation, findings=findings, revise_limit=revise_limit,
+            actor=actor, envelope_digest=envelope_digest,
         )
 
     def complete(self) -> Transition[Run]:
@@ -352,7 +358,8 @@ def _replay_failed(run: Run, payload: Mapping[str, Any]) -> Transition[Run]:
     if run.state is RunState.WAITING_AT_GATE and payload.get("error") == "revise_limit_exceeded":
         return run.decide(
             outcome="send_back", escalation=payload.get("escalation"), findings=payload.get("value"),
-            revise_limit=payload.get("revise_limit"),
+            revise_limit=payload.get("revise_limit"), actor=payload.get("actor"),
+            envelope_digest=payload.get("envelope_digest"),
         )
     return run.fail(error=payload.get("error", ""), step=payload.get("step"), reason=payload.get("reason"))
 
@@ -364,6 +371,8 @@ def _replay_decision(outcome: str | None) -> Callable[[Run, Mapping[str, Any]], 
             outcome=outcome or payload.get("outcome", "send_back"),
             escalation=payload.get("escalation"),
             findings=payload.get("value"),
+            actor=payload.get("actor"),
+            envelope_digest=payload.get("envelope_digest"),
         )
 
     return replay

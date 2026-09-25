@@ -116,7 +116,7 @@ stateDiagram-v2
 | `OUTCOME_UNKNOWN` | a step attempt | The key was reserved and never committed: the worker was lost between the side effect and its result. Nothing acts again, an ordinary retry is refused, and a person — or an entry point the Cog declares idempotent — reconciles it. | #102, #103 |
 | `SUBMITTED` | a run | The submission is recorded; no controller has picked the run up. | #121 |
 | `RUNNING` | a run | A controller owns it and is advancing its steps. The worker's own states are not the run's: a run between steps, or with a worker idling, is `RUNNING`. | #121 |
-| `WAITING_AT_GATE` | a run | A step escalated, and the run waits for a decision naming the open escalation. A send back re-runs the step, bounded by the revise limit: a limit of N allows N revisions, and past it the run ends `FAILED` with error `revise_limit_exceeded`. Until step-declared Gates (#99), it is a Cog's pause that escalates. | #99, #103 |
+| `WAITING_AT_GATE` | a run | A step escalated, and the run waits for a decision naming the open escalation. A send back re-runs the step, bounded by the revise limit: a limit of N allows N revisions, and past it the run ends `FAILED` with error `revise_limit_exceeded`. It is the step's Gate that escalates, never the Cog. | #99, #103 |
 | `COMPLETED` | a run | Every step completed, and every Gate passed or was approved. Final. | #2 |
 | `FAILED` | a run | A step's envelope came back `ok: false`, its worker failed, a step attempt ended `OUTCOME_UNKNOWN`, or a send back went past the revise limit — each recorded with its reason. Retry runs a recorded failure as a new attempt under a new key. | #101 |
 | `REJECTED` | a run | A reviewer rejected at a Gate. Final. | #99 |
@@ -172,8 +172,8 @@ record (#106).
 | Event | From → to | Records |
 |---|---|---|
 | `pickup()` | `SUBMITTED` → `RUNNING` | `run_picked_up` |
-| `escalate(step, reason, escalation, revise_limit)` | `RUNNING` → `WAITING_AT_GATE`; → `FAILED` when the step has already been revised `revise_limit` times | `paused`; `failed` |
-| `decide(outcome, escalation, findings, revise_limit)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
+| `escalate(step, reason, escalation, details)` | `RUNNING` → `WAITING_AT_GATE` | `paused`, with what the Gate escalated on: the attempt, the envelope, the approvers |
+| `decide(outcome, escalation, findings, revise_limit, actor, envelope_digest)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
 | `complete()` | `RUNNING` → `COMPLETED` | `completed` |
 | `fail(error, step, reason, details)` | `RUNNING` → `FAILED` | `failed` |
 | `exhaust_budget(dimension, step, reason)` | `RUNNING` → `BUDGET_EXCEEDED` | `timed_out` for `duration`; `budget_exceeded` otherwise |
@@ -210,11 +210,8 @@ durability backend moves the same machines.
 **Guards live in the state that owns them.** A decision must name the open
 escalation (`StaleEscalation` otherwise). A revise limit of N allows N
 revisions: a send back that would produce revision N+1 ends the run `FAILED`
-instead. The engine does not apply the limit at the decision yet — #35's
-`signal()` cannot say whether it approves or sends back, so charging every
-signal would fail runs an approval completes — but when the step escalates
-again after N revisions, as #35 did; step-declared Gates (#99) move it to the
-decision. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
+instead, and a decision records the actor who made it and the digest of the
+result it decided on. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
 opens a new one, from `BUDGET_EXCEEDED` a new budget epoch. `host_stopped` is
 refused under a backend that resumes. A cancellation and a reconciliation name
 who made them, and a worker is torn down only for a reason its state allows.

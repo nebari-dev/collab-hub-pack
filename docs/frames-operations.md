@@ -1722,7 +1722,7 @@ matter for Frames:
 
 - `scripts/smoke_frames_http.py` validates REST, MCP, metrics, and optional active state.
 - `scripts/smoke_frames_observability.sh` checks metrics plus structured request/audit logs.
-- `scripts/smoke_frames_minio_s3.sh` installs MinIO and validates S3-backed Frame content.
+- `scripts/smoke_frames_s3.sh` installs an S3 store (SeaweedFS) and validates S3-backed Frame content.
 - `scripts/smoke_frames_postgres_active_state.sh` installs Postgres and validates stored active-frame state.
 
 ## Identity Inventory Dry Run (Read-Only)

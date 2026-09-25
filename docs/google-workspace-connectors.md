@@ -198,12 +198,12 @@ scripts/smoke_local_collab_hub_features_kind.sh
 That script deploys the fake providers, installs the chart, and runs the Drive,
 Gmail, Calendar, and Slack smoke clients through real HTTP service boundaries.
 
-Exercise the production storage drivers through real Postgres and MinIO/S3
+Exercise the production storage drivers through real Postgres and S3
 services in the same kind cluster:
 
 ```bash
 scripts/smoke_frames_postgres_active_state.sh
-scripts/smoke_frames_minio_s3.sh
+scripts/smoke_frames_s3.sh
 ```
 
 ## Change checklist

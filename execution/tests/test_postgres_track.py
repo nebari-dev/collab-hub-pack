@@ -15,8 +15,8 @@ from collab_hub_execution import (
     InMemoryCogExecutor,
     OpDefinition,
     OpStep,
-    PauseRequest,
     PostgresTrackStore,
+    Problem,
     ResultEnvelope,
     RunBudget,
     RunState,
@@ -86,11 +86,10 @@ def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
     assert len(calls) == 1
 
 
-def test_pause_accounting_survives_postgres_recovery(store):
+def test_escalation_accounting_survives_postgres_recovery(store):
     def handler(entry, value, *, signal=_NO_SIGNAL):
-        if signal is _NO_SIGNAL:
-            raise PauseRequest("feedback", usage={"tokens": 6})
-        return ResultEnvelope.success(value, usage={"tokens": 6})
+        problems = [Problem("review", "needs another look")] if signal is _NO_SIGNAL else []
+        return ResultEnvelope.success(value, usage={"tokens": 6}, problems=problems)
 
     def engine():
         return DurableWorkflowEngine(
@@ -99,5 +98,11 @@ def test_pause_accounting_survives_postgres_recovery(store):
 
     op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
-    assert engine().signal(op.run_id, "go") is RunState.BUDGET_EXCEEDED
+    escalation = engine().open_escalation(op.run_id)["escalation"]
+    # The second step's result crosses the budget and needs review: it is not discarded.
+    assert engine().decide(op.run_id, escalation=escalation, actor="alice", outcome="send_back",
+                           findings=["go"]) is RunState.WAITING_AT_GATE
+    second = engine().open_escalation(op.run_id)["escalation"]
+    assert engine().decide(op.run_id, escalation=second, actor="alice",
+                           outcome="approve") is RunState.BUDGET_EXCEEDED
     assert engine()._budget_tracker(store.replay(op.run_id)).tokens == 18

@@ -35,11 +35,12 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 
 **Landed**
 
-- **#94** — the local development environment in `dev/`: four levels (`make api` with no containers; `make api-pg` with Postgres and MinIO; `make api-oidc` with Keycloak, plus `api-fakes`, `api-full`, `api-membership`; `make kind-up` for the chart), fake Google, Slack and GitHub providers, a `nebari` realm, `seed-org` for owner and operator grants, and a single-port front door so Collab signs in at `http://localhost:9080` (`make api-desktop`). `dev-env.yaml` runs level 1 on Linux and macOS, levels 2–3 on Linux, and level 4 rendered only.
+- **#94** — the local development environment in `dev/`: four levels (`make api` with no containers; `make api-pg` with Postgres and an S3 store; `make api-oidc` with Keycloak, plus `api-fakes`, `api-full`, `api-membership`; `make kind-up` for the chart), fake Google, Slack and GitHub providers, a `nebari` realm, `seed-org` for owner and operator grants, and a single-port front door so Collab signs in at `http://localhost:9080` (`make api-desktop`). `dev-env.yaml` runs level 1 on Linux and macOS, levels 2–3 on Linux, and level 4 rendered only.
 - **#35** — the standalone `execution/` distribution `collab-hub-execution` (Python ≥ 3.11, depends only on `httpx`): `WorkflowEngine` and the reference `DurableWorkflowEngine`, which recovers from the Track when a caller resubmits; `CogExecutor` with in-memory and Kubernetes implementations (a per-run Deployment + Service + ingress-only NetworkPolicy, no ServiceAccount token on workers); `TrackStore` with in-memory and Postgres adapters; `CogLifecycle`, `RunBudget`; `DeclaredCapabilityResolver`; a kind E2E running a gated two-step Op (`test-execution.yaml`, `test-execution-e2e.yaml`).
 - **#111** and **#112** — Phases 0 and 1: the API runs on Python 3.13 with a CI job proving it, and ADR-0002 records the decisions the phases below depend on. **#115** moved the dev MinIO images to quay.io on the way.
 - **#120** — Phase 2: `CogWorker.interact` returns the result envelope, which the engine reads everywhere it read `{output, usage}`. `ok: false` with an `error.code` fails the step and keeps the code; `ok: true` with `problems` completes it and records them for a Gate. The envelope's invariants hold on construction as on parsing, and the worker client maps the document's HTTP statuses. `InteractionResult` is gone.
 - **#133** — Phase 3: the four state machines on the state pattern, in `collab_hub_execution.states` — a Cog's install, a worker, a step attempt and a run. The engine moves the run and worker machines and writes the records they return; a run's status is its Track replayed through the run machine, and a Track the machine could not have written is refused. `CogLifecycle` and `RunStatus` are gone: a paused run reports `WAITING_AT_GATE`, a duration stop `BUDGET_EXCEEDED`, and a revise limit of N allows N revisions. [`docs/cog-execution/states.md`](docs/cog-execution/states.md) is the reference, held to the code by a test, and ADR-0002 gains D11.
+- **#134** — Phase 4: every Op step has a Gate, evaluated over the step's envelope, and a Cog can no longer pause a run — `PauseRequest` and `signal()` are gone. An escalation is recorded with its attempt, envelope and approvers under an id minted over both; `decide()` answers it as an actor, approve completing the step with the envelope its approver saw, reject ending the run `REJECTED`, send back re-running the step with the findings, and a decision on a closed escalation refused. The dev S3 frame store moved off MinIO on the way, whose images left quay.io as they had left Docker Hub (#114, #115), to SeaweedFS with the AWS CLI creating its bucket.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -233,7 +234,7 @@ Location and backend are independent: either location runs under any backend, an
 | Level | Already there (#94) | What this plan adds | First phase |
 |---|---|---|---|
 | **1** — no containers | `make api`: dev auth, frames on local disk | a SQLite Track in `dev/.local/` shared by the API and the controller; fake Cogs under `dev/cogs/`, each with a `pixi.toml`; `make op` to submit a fake Op and print its Track; `make controller LOCATION=local` running the lifecycle runner on `none`, so workers are real child processes — the Hermes Cog from `cogs/hermes` among them, against `make fake-model`; `make cli`, the `collab-hub` CLI against dev auth | 5, 7, 8, 10, 13, 14 |
-| **2** — Postgres, MinIO | `make api-pg`, `make psql` | the Track, claims and run pickup on Postgres; `make controller BACKEND=dbos` — DBOS is a library over the same Postgres, so no new image; a `fake-cog` HTTP worker and the `fake-model` endpoint in the `fakes` profile; optional `registry` and `temporal` profiles | 9, 21, 23, 29 |
+| **2** — Postgres, S3 | `make api-pg`, `make psql` | the Track, claims and run pickup on Postgres; `make controller BACKEND=dbos` — DBOS is a library over the same Postgres, so no new image; a `fake-cog` HTTP worker and the `fake-model` endpoint in the `fakes` profile; optional `registry` and `temporal` profiles | 9, 21, 23, 29 |
 | **3** — Keycloak | `make api-oidc`, `api-fakes`, `seed-org`, `token` | Gate approvers from `seed-org`'s owner and operator; grants backed by the `dev` user's offline token; the connector proxy against the existing fakes; `collab-hub login` against the realm, which is where the CLI's device flow is real | 11, 14, 26 |
 | **4** — kind | `make kind-up` with `values/kind.yaml`, `kind-smoke` | the run controller Deployment and its Role from the chart, with `location: remote`; install from the local registry; `KIND_CNI=calico`, because kind's default CNI does not enforce NetworkPolicy | 18, 19, 25 |
 | **Collab** | `make api-desktop`, `api-desktop-fakes`, the front door on `:9080` | runs launched, watched and decided from Collab, and grants made there — the front door already forwards everything that is not Keycloak to the API, so `/v1/runs` needs no proxy change | 16, 17, 27 |
@@ -289,7 +290,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 1 | #97 | Run the API on Python 3.13 as well as 3.14 | `feat/api-python-3.13` | — | S | merged, #111 |
 | 2 | #98 | Return the result envelope from Cog workers | `feat/cog-result-envelope` | 0 | M | merged, #120 |
 | 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | merged, #133 |
-| 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | not started |
+| 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | not started |
 | 6 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
 | 7 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 6 | L | not started |
@@ -403,25 +404,25 @@ One machine per level of §11's state diagram, built before anything moves throu
 - [x] No module outside `collab_hub_execution.states` compares or assigns a state by string.
 
 #### Phase 4 — Gates declared on the step; human decisions as signals
-**Issue** #99 · **Branch** `feat/cog-step-gates` · **Depends on** Phases 2, 3 · **Size** M
+**Issue** #99 · **Branch** `feat/cog-step-gates` · **Depends on** Phases 2, 3 · **Size** M · **Status** merged as #134
 
 Move approval out of the Cog and onto the Op step, where the glossary puts it.
 
 *In scope*
-- `OpStep.gate`: a declared policy over the envelope (and, from Phase 24, Guard findings) with three outcomes — `pass`, `pass_with_problems`, `escalate`. Default: any `problem` with severity `error` escalates.
+- `OpStep.gate`: a declared policy over the envelope (and, from Phase 24, Guard findings) with three outcomes — `pass`, `pass_with_problems`, `escalate`. Every step has one, and a step that declares none gets the default: any `problem` with severity `error` escalates. The policy is a threshold — `never`, `error`, `warn` (any problem) or `always`, a sign-off on every result — and it is part of the Op recorded at submission.
 - Each escalation gets an **escalation id**, minted over the step attempt and the envelope that escalated, and recorded with it. It is what a decision answers, so a decision is bound to the revision its reviewer actually saw; a send back closes it and the next escalation on that step gets a new one.
-- A decision signal `{escalation, actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit. A decision naming a closed escalation is refused as stale rather than applied to whatever is open now.
+- A decision signal `{escalation, actor, outcome, findings[]}` with outcome `approve | reject | send_back`: approve completes the step with the envelope its approver saw — the step does not run again — and advances; reject ends the run `rejected`; send back re-runs the step with the findings as its signal, bounded by #35's existing revise limit. The engine's `decide(run, escalation, actor, outcome, findings)` replaces `signal()`, and `open_escalation(run)` says what a run waits on; both are on the engine contract, so a client needs no engine of its own to find what a decision must name. A budget stop never discards a result that was paid for: the escalation is recorded, and the stop lands at the next boundary, the end of a run included. A decision naming a closed escalation is refused as stale rather than applied to whatever is open now.
 - Every move above is an event on Phase 3's run machine — `escalate`, `decide` — so `WAITING_AT_GATE` and the stale-escalation refusal are the machine's, not code in this phase.
 - A Gate declares `approvers` (roles); one that declares none is decided by organization owners and platform operators (decision 1). The engine records the decision; Phase 5 versions it and Phase 11 authorizes it.
-- `PauseRequest` and the worker `{"pause": true}` leave the protocol; the E2E fixture becomes a step-declared Gate.
+- `PauseRequest` and the worker `{"pause": true}` leave the protocol — an answer asking to pause is not an envelope, and fails the step; the E2E fixture becomes a step-declared sign-off Gate that the driver sends back once and approves.
 
 *Dev and CI* — the fake Cog set Phase 7 introduces includes `needs-review`, whose output carries an `error` problem, so the default Gate policy escalates without the Cog asking to pause. *Docs* — `execution/README.md` loses `PauseRequest`; the glossary's Gate entry gains the outcomes and decisions; `op-cog-seam.md` states that a Cog cannot pause a run.
 
 *Acceptance*
-- [ ] A Cog cannot pause a run; only a step's Gate can.
-- [ ] approve, reject and send back each drive the run as stated; send back past the revise limit ends the run `FAILED` with reason `revise_limit_exceeded`.
-- [ ] Each decision is recorded with its escalation id, actor, outcome, findings, and the envelope it decided on.
-- [ ] A decision naming an escalation that a send back has closed is refused, and the run is unchanged.
+- [x] A Cog cannot pause a run; only a step's Gate can.
+- [x] approve, reject and send back each drive the run as stated; send back past the revise limit ends the run `FAILED` with reason `revise_limit_exceeded`.
+- [x] Each decision is recorded with its escalation id, actor, outcome, findings, and a stable digest of the envelope it decided on — the envelope itself is on the escalation the decision names.
+- [x] A decision naming an escalation that a send back has closed is refused, and the run is unchanged.
 
 #### Phase 5 — The Track as the accountability record
 **Issue** #5 · **Branch** `feat/cog-track-record-5` · **Depends on** Phases 2, 3, 4 · **Size** M

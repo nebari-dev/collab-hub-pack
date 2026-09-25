@@ -1,8 +1,8 @@
 """In-cluster E2E driver: run a gated multi-step Op via the KubernetesCogExecutor.
 
 Runs as a Job with the cog-executor ServiceAccount. It materializes real Cog
-worker pods, runs a 2-step Op where step 2 is gated, approves the gate, and
-asserts the Track. Exits 0 on success, 1 on failure — so it doubles as the
+worker pods, runs a 2-step Op whose second step declares a sign-off Gate, sends
+that step back once with findings, approves the revision, and asserts the Track. Exits 0 on success, 1 on failure — so it doubles as the
 repo's reproduction base.
 """
 
@@ -13,6 +13,7 @@ import sys
 
 from collab_hub_execution import (
     DurableWorkflowEngine,
+    Gate,
     InMemoryTrackStore,
     KubernetesCogExecutor,
     OpDefinition,
@@ -37,13 +38,15 @@ def main() -> int:
         poll_interval=2,
     )
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=25))
+    # Three interactions of 10 tokens: research, the review, and its revision.
+    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=35))
 
     op = OpDefinition(
         "e2e-run",
         (
             OpStep("research", "openteams/research", "run", {"topic": "kind e2e"}, digest="sha256:research"),
-            OpStep("review", "openteams/gated-reviewer", "review", {"draft": "v1"}, digest="sha256:reviewer"),
+            OpStep("review", "openteams/reviewer", "review", {"draft": "v1"}, digest="sha256:reviewer",
+                   gate=Gate(escalate="always")),
         ),
     )
 
@@ -57,13 +60,20 @@ def main() -> int:
     dump("after submit", status)
     assert status is RunState.WAITING_AT_GATE, f"expected WAITING_AT_GATE, got {status}"
 
-    status = engine.signal("e2e-run", {"approved": True})
+    first = engine.open_escalation("e2e-run")["escalation"]
+    status = engine.decide("e2e-run", escalation=first, actor="e2e", outcome="send_back", findings=["cite a source"])
+    dump("after send back", status)
+    assert status is RunState.WAITING_AT_GATE, f"expected the revision at the Gate, got {status}"
+
+    revision = engine.open_escalation("e2e-run")["escalation"]
+    assert revision != first, "a revision is a new escalation"
+    status = engine.decide("e2e-run", escalation=revision, actor="e2e", outcome="approve")
     dump("after approval", status)
     assert status is RunState.COMPLETED, f"expected COMPLETED after approval, got {status}"
 
     events = [e.event_type for e in track.replay("e2e-run")]
     print("track events:", events, flush=True)
-    for required in ("op_submitted", "materialized", "paused", "step_completed", "completed"):
+    for required in ("op_submitted", "materialized", "paused", "signal_received", "step_completed", "completed"):
         assert required in events, f"missing {required!r} in Track"
 
     # both Cogs were materialized as real pods and step outputs recorded with digests
@@ -75,14 +85,16 @@ def main() -> int:
         e.payload["output"] for e in track.replay("e2e-run")
         if e.event_type == "step_completed" and e.payload["step"] == "review"
     )
+    # The approved revision is the one that ran with the findings, delivered to the pod as its signal.
     assert review["echo"] == {"draft": "v1"}
-    assert review["signal"] == {"approved": True}
+    assert review["signal"] == ["cite a source"]
     assert sum(
         e.payload["usage"]["tokens"] for e in track.replay("e2e-run")
         if e.event_type == "interaction_usage"
-    ) == 20
+    ) == 30  # research, the review, and its revision
 
-    print("E2E OK: real Cog worker pods materialized, gated Op ran and completed, Track asserted", flush=True)
+    print("E2E OK: real Cog worker pods materialized, a Gate sent a step back and approved it, Track asserted",
+          flush=True)
     return 0
 
 

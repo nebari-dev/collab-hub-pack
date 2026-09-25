@@ -11,11 +11,12 @@ import pytest
 
 from collab_hub_execution import (
     DurableWorkflowEngine,
+    Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
     OpDefinition,
     OpStep,
-    PauseRequest,
+    Problem,
     ResultEnvelope,
     RunBudget,
     RunState,
@@ -24,38 +25,42 @@ from collab_hub_execution import (
 )
 from collab_hub_execution.orchestration import _NO_SIGNAL, _serialize_op
 
+SIGN_OFF = Gate(escalate="always")
+
+
+def _review(value=None, *, tokens=None):
+    """An answer whose error problem makes the step's default Gate escalate it."""
+    usage = None if tokens is None else {"tokens": tokens}
+    return ResultEnvelope.success(value, usage=usage, problems=[Problem("review", "needs another look")])
+
+
+def _decide(engine, run_id, outcome, *findings):
+    escalation = engine.open_escalation(run_id)["escalation"]
+    return engine.decide(run_id, escalation=escalation, actor="alice", outcome=outcome, findings=list(findings))
+
 
 def test_token_budget_survives_restart_and_stops_the_run():
     """Budget is reconstructed from the Track, so it holds across an engine restart."""
     def always_usage(entry, value):
         return ResultEnvelope.success({"result": value}, usage={"tokens": 60})
 
-    state = {"paused": True}
-
-    def gate_then_usage(entry, value, *, signal=None):
-        if state["paused"]:
-            raise PauseRequest("approve step 2", usage={"tokens": 0})
+    def review_then_usage(entry, value, *, signal=_NO_SIGNAL):
+        if signal is _NO_SIGNAL:
+            return _review({"result": value}, tokens=0)
         return ResultEnvelope.success({"result": value}, usage={"tokens": 60})
 
     track = InMemoryTrackStore()
     budget = RunBudget(max_tokens=100)
     op = OpDefinition("run-budget", (OpStep("s1", "a", "run", "x"), OpStep("s2", "b", "run", "y")))
 
-    e1 = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"a": always_usage, "b": gate_then_usage}),
-        track=track,
-        budget=budget,
-    )
-    assert e1.submit(op) is RunState.WAITING_AT_GATE  # s1 consumes 60 (<100); s2 pauses
+    def engine():
+        return DurableWorkflowEngine(
+            executor=InMemoryCogExecutor({"a": always_usage, "b": review_then_usage}), track=track, budget=budget,
+        )
 
-    state["paused"] = False
-    e2 = DurableWorkflowEngine(
-        executor=InMemoryCogExecutor({"a": always_usage, "b": gate_then_usage}),
-        track=track,
-        budget=budget,
-    )
-    # fresh engine: reconstructed tracker already holds s1's 60; s2's 60 -> 120 > 100
-    assert e2.signal("run-budget", "approved") is RunState.BUDGET_EXCEEDED
+    assert engine().submit(op) is RunState.WAITING_AT_GATE  # s1 consumes 60 (<100); s2 escalates
+    # fresh engine: reconstructed tracker already holds s1's 60; s2 sent back spends 60 -> 120 > 100
+    assert _decide(engine(), "run-budget", "send_back", "tighten it") is RunState.BUDGET_EXCEEDED
     assert any(e.event_type == "budget_exceeded" for e in track.replay("run-budget"))
 
 
@@ -75,51 +80,50 @@ def test_duration_budget_stops_run_before_any_step_as_timed_out():
 def test_bounded_revise_loop_fails_after_max_revisions():
     runs = []
 
-    def always_pause(entry, value, *, signal=None):
+    def always_needs_review(entry, value, *, signal=None):
         runs.append(signal)
-        raise PauseRequest("needs another revision")
+        return _review(value)
 
     track = InMemoryTrackStore()
     op = OpDefinition("run-revise", (OpStep("draft", "writer", "revise", "v0"),))
 
     def engine():
         return DurableWorkflowEngine(
-            executor=InMemoryCogExecutor({"writer": always_pause}),
-            track=track,
-            max_revisions=2,
+            executor=InMemoryCogExecutor({"writer": always_needs_review}), track=track, max_revisions=2,
         )
 
-    assert engine().submit(op) is RunState.WAITING_AT_GATE             # pause 1
-    assert engine().signal("run-revise", "fix a") is RunState.WAITING_AT_GATE   # pause 2
-    assert engine().signal("run-revise", "fix b") is RunState.FAILED   # exceeds max_revisions
+    assert engine().submit(op) is RunState.WAITING_AT_GATE                          # escalation 1
+    assert _decide(engine(), "run-revise", "send_back", "fix a") is RunState.WAITING_AT_GATE  # revision 1
+    assert _decide(engine(), "run-revise", "send_back", "fix b") is RunState.WAITING_AT_GATE  # revision 2
+    assert _decide(engine(), "run-revise", "send_back", "fix c") is RunState.FAILED  # would be revision 3
     assert any(
         e.event_type == "failed" and e.payload.get("error") == "revise_limit_exceeded"
         for e in track.replay("run-revise")
     )
-    # max_revisions=2 is two revisions: the step runs three times, and fails when it asks for a third.
-    assert len(runs) == 3
+    # max_revisions=2 is two revisions: the step runs three times, and the third send back fails the run.
+    assert runs == [None, ["fix a"], ["fix b"]]
 
 
 @pytest.mark.parametrize("max_revisions", [1, 2])
-def test_an_approving_signal_is_never_charged_as_a_revision(max_revisions):
+def test_an_approval_is_never_charged_as_a_revision(max_revisions):
     signals = []
 
     def reviewer(entry, value, *, signal=None):
         signals.append(signal)
-        if signal is None or signal == "fix":
-            raise PauseRequest("review")
-        return ResultEnvelope.success({"approved": True})
+        return _review({"draft": len(signals)})
 
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track,
                                    max_revisions=max_revisions)
     op = OpDefinition("run-approve", (OpStep("s", "c", "review", "draft"),))
     assert engine.submit(op) is RunState.WAITING_AT_GATE
-    for _ in range(max_revisions - 1):
-        assert engine.signal("run-approve", "fix") is RunState.WAITING_AT_GATE
-    # The last revision the limit allows is approved, and the run completes.
-    assert engine.signal("run-approve", {"approved": True}) is RunState.COMPLETED
-    assert signals[-1] == {"approved": True}
+    for _ in range(max_revisions):
+        assert _decide(engine, "run-approve", "send_back", "fix") is RunState.WAITING_AT_GATE
+    # The last revision the limit allows is approved, and the run completes with it, as the approver saw it.
+    assert _decide(engine, "run-approve", "approve") is RunState.COMPLETED
+    assert len(signals) == max_revisions + 1
+    [completed] = [e for e in track.replay("run-approve") if e.event_type == "step_completed"]
+    assert completed.payload["output"] == {"draft": max_revisions + 1}
 
 
 @pytest.mark.parametrize("ending,state", [("rejected", "rejected"), ("cancelled", "cancelled")])
@@ -135,42 +139,50 @@ def test_a_rejected_or_cancelled_run_is_refused_a_retry_before_anything_is_read_
     assert track.replay("r") == before
 
 
-def test_a_submission_reads_the_track_once_to_check_it_and_once_to_advance():
-    class CountingTrack(InMemoryTrackStore):
-        reads = 0
+class CountingTrack(InMemoryTrackStore):
+    """Counts how often a call reads the run's Track."""
 
-        def replay(self, run_id, *, after_sequence=0):
-            CountingTrack.reads += 1
-            return super().replay(run_id, after_sequence=after_sequence)
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
 
+    def replay(self, run_id, *, after_sequence=0):
+        self.reads += 1
+        return super().replay(run_id, after_sequence=after_sequence)
+
+
+def test_a_call_reads_the_track_once_and_advances_on_what_it_read_and_wrote():
     track = CountingTrack()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
-    op = OpDefinition("run-reads", tuple(OpStep(f"s{i}", "c", "run") for i in range(3)))
-    assert engine.submit(op) is RunState.COMPLETED
-    assert CountingTrack.reads == 2
+
+    def reviewer(entry, value, *, signal=None):
+        return ResultEnvelope.success(value) if signal else _review(value)
+
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track)
+    op = OpDefinition("run-reads", (OpStep("s0", "c", "run"), OpStep("s1", "c", "run", gate=Gate(escalate="never"))))
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    assert track.reads == 1
+    track.reads = 0
+    assert _decide(engine, "run-reads", "send_back", "again") is RunState.COMPLETED
+    assert track.reads == 2  # open_escalation, then the decision, which advances on what it wrote
 
 
 def test_step_digest_is_recorded_and_survives_restart():
-    state = {"paused": True}
-
-    def handler(entry, value, *, signal=None):
-        if state["paused"]:
-            raise PauseRequest("approve")
-        return value
-
     track = InMemoryTrackStore()
-    op = OpDefinition("run-digest", (OpStep("s", "cog", "run", "x", digest="sha256:abc"),))
-    DurableWorkflowEngine(executor=InMemoryCogExecutor({"cog": handler}), track=track).submit(op)
+    op = OpDefinition("run-digest", (OpStep("s", "cog", "run", "x", digest="sha256:abc", gate=SIGN_OFF),))
 
+    def engine():
+        # A handler that is sent back receives the findings as a keyword `signal`.
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"cog": lambda e, v, signal=None: v}), track=track)
+
+    engine().submit(op)
     started = [e for e in track.replay("run-digest") if e.event_type == "step_started"]
     assert started and started[0].payload.get("digest") == "sha256:abc"
 
     # restart: the op is reconstructed from the Track alone; the digest must round-trip
-    state["paused"] = False
-    restarted = DurableWorkflowEngine(executor=InMemoryCogExecutor({"cog": handler}), track=track)
-    assert restarted.signal("run-digest", "ok") is RunState.COMPLETED
+    assert _decide(engine(), "run-digest", "send_back", "again") is RunState.WAITING_AT_GATE
+    assert _decide(engine(), "run-digest", "approve") is RunState.COMPLETED
     materialized = [e for e in track.replay("run-digest") if e.event_type == "materialized"]
-    assert materialized and all(e.payload.get("digest") == "sha256:abc" for e in materialized)
+    assert len(materialized) == 2 and all(e.payload.get("digest") == "sha256:abc" for e in materialized)
 
 
 # --- failure handling (#5), idempotency key (#3), duplicate step names (#7) ---
@@ -341,13 +353,11 @@ def test_retry_re_drives_a_failed_run_under_a_fresh_key():
 
 
 def test_retry_rejects_a_non_terminal_run():
-    def gate(entry, value, *, signal=None):
-        raise PauseRequest("hold")
-
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": gate}), track=InMemoryTrackStore())
-    assert engine.submit(OpDefinition("run-paused", (OpStep("s", "c", "run"),))) is RunState.WAITING_AT_GATE
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore())
+    assert engine.submit(OpDefinition("run-waiting", (OpStep("s", "c", "run", gate=SIGN_OFF),))) \
+        is RunState.WAITING_AT_GATE
     with pytest.raises(ValueError):
-        engine.retry("run-paused")
+        engine.retry("run-waiting")
 
 
 def test_retry_rejects_a_completed_run():
@@ -362,30 +372,27 @@ def test_retry_rejects_a_completed_run():
 # --- a paused run resumes only through signal(), never a re-submit ---
 
 
-def test_re_submitting_a_paused_run_does_not_resume_it_behind_the_gate():
+def test_re_submitting_a_run_waiting_at_a_gate_does_not_resume_it_behind_the_gate():
     calls = {"n": 0}
-    state = {"approved": False}
 
-    def gate(entry, value, *, signal=None):
+    def cog(entry, value):
         calls["n"] += 1
-        if not state["approved"]:
-            raise PauseRequest("approve")
         return value
 
     track = InMemoryTrackStore()
 
     def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": gate}), track=track)
+        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": cog}), track=track)
 
-    op = OpDefinition("run-gate", (OpStep("s", "c", "run", "x"),))
+    op = OpDefinition("run-gate", (OpStep("s", "c", "run", "x", gate=SIGN_OFF),))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     assert calls["n"] == 1
     # a re-submit must NOT re-invoke the gated step (that would bypass the gate)
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     assert calls["n"] == 1
-    # the gate opens only through signal(), which carries the decision value
-    state["approved"] = True
-    assert engine().signal("run-gate", "go") is RunState.COMPLETED
+    # the gate opens only through a decision; an approval takes the result as it is
+    assert _decide(engine(), "run-gate", "approve") is RunState.COMPLETED
+    assert calls["n"] == 1
 
 
 # --- duration budget must survive a crash immediately after submission ---
@@ -417,18 +424,17 @@ def test_duration_budget_survives_a_crash_after_submission():
 # --- signal values are durable and recovered from the Track ---
 
 
-def test_signal_value_is_durable_across_a_crash_mid_resume():
-    approval = {"approved": True}
+def test_send_back_findings_are_durable_across_a_crash_mid_revision():
     seen = []
     crash = {"once": True}
 
     def handler(entry, value, *, signal=_NO_SIGNAL):
         if signal is _NO_SIGNAL:
-            raise PauseRequest("approve")
+            return _review(value)
         seen.append((value, signal))
         if crash["once"]:
             crash["once"] = False
-            raise SystemExit("crash after signal consumed, before completion")
+            raise SystemExit("crash while revising, before completion")
         return ResultEnvelope.success({"ok": True})
 
     track = InMemoryTrackStore()
@@ -438,31 +444,28 @@ def test_signal_value_is_durable_across_a_crash_mid_resume():
 
     op = OpDefinition("run-sig", (OpStep("s", "c", "review", "draft-v1"),))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
-    with pytest.raises(SystemExit):  # crash while resuming with the approval
-        engine().signal("run-sig", approval)
-    # Recovery must preserve both input and approval from the Track.
+    with pytest.raises(SystemExit):  # crash while re-running with the findings
+        _decide(engine(), "run-sig", "send_back", "cite the source")
+    # Recovery must preserve both input and findings from the Track.
     assert engine().submit(op) is RunState.COMPLETED
-    assert seen == [("draft-v1", approval), ("draft-v1", approval)]
+    assert seen == [("draft-v1", ["cite the source"]), ("draft-v1", ["cite the source"])]
 
 
-def test_signal_can_resume_a_step_with_an_explicit_none():
+def test_a_send_back_with_no_findings_still_re_runs_the_step_with_a_signal():
     seen = []
 
     def handler(entry, value, *, signal=_NO_SIGNAL):
-        if signal is _NO_SIGNAL:  # an explicit None is still a signal
-            raise PauseRequest("approve")
+        if signal is _NO_SIGNAL:
+            return _review(value)
         seen.append((value, signal))
         return ResultEnvelope.success({"ok": True})
 
     track = InMemoryTrackStore()
-
-    def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
-
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
     op = OpDefinition("run-none", (OpStep("s", "c", "run", "GATE"),))
-    assert engine().submit(op) is RunState.WAITING_AT_GATE
-    assert engine().signal("run-none", None) is RunState.COMPLETED
-    assert seen == [("GATE", None)]
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    assert _decide(engine, "run-none", "send_back") is RunState.COMPLETED
+    assert seen == [("GATE", [])]
 
 
 # --- idempotency keys are injective even when ids contain the delimiter ---
@@ -516,6 +519,26 @@ def test_between_steps_status_is_running_not_tearing_down():
 
 
 # --- budget limits are inclusive: reaching exactly the max stops the run ---
+
+
+def test_a_budget_stop_keeps_an_escalated_result_rather_than_discarding_it():
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v, signal=None: _review({"draft": v}, tokens=60)}),
+        track=track,
+        budget=RunBudget(max_tokens=50),
+    )
+    op = OpDefinition("run-paid", (OpStep("s", "c", "run", "x"),))
+    # The interaction crossed the budget and its result needs review: the escalation is
+    # recorded, so the work that was paid for is on the Track.
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    escalation = engine.open_escalation("run-paid")
+    assert ResultEnvelope.parse(escalation["envelope"]).payload == {"draft": "x"}
+    # Approving spends nothing and keeps it; the run then stops on its budget.
+    assert engine.decide("run-paid", escalation=escalation["escalation"], actor="alice",
+                         outcome="approve") is RunState.BUDGET_EXCEEDED
+    kinds = [e.event_type for e in track.replay("run-paid")]
+    assert kinds.index("step_completed") < kinds.index("budget_exceeded")
 
 
 def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():

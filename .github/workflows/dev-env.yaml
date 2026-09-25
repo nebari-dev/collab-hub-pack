@@ -10,7 +10,7 @@ name: Dev Environment
 # levels themselves are meant to be used:
 #
 #   level 1  both macOS and Linux, no containers at all      ~1 min
-#   level 2  Linux, Postgres + MinIO                         ~2 min
+#   level 2  Linux, Postgres + the S3 frame store            ~2 min
 #   level 3  Linux, + Keycloak (the one heavy image)         ~3 min
 #   level 4  rendered only -- no cluster, no node image      ~1 min
 #

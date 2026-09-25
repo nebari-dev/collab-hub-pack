@@ -30,7 +30,7 @@ frames:
   # s3:                       # any S3-compatible store — set endpointUrl for non-AWS
   #   bucket: collab-hub-frames
   #   prefix: frames
-  #   endpointUrl: ""         # e.g. https://minio.example.com (blank = AWS)
+  #   endpointUrl: ""         # e.g. https://s3.example.com (blank = AWS)
   #   region: us-west-2
 
   # State/history/tasks default to in-memory. For persistence, point at ANY
