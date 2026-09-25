@@ -759,6 +759,32 @@ async def test_signout_with_the_rendered_csrf_token_ends_the_session(tmp_path, i
         assert (await client.get("/web")).status_code == 303
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_href"),
+    [
+        ("?next=/admin/", "/web/signin?next=%2Fadmin%2F"),
+        ("", "/web/signin"),
+        ("?next=https://evil.example/", "/web/signin"),
+        ("?next=//evil.example/", "/web/signin"),
+        ("?next=/web/signin", "/web/signin"),
+    ],
+)
+async def test_signing_in_again_returns_to_where_the_person_signed_out_from(
+    tmp_path, idp, query, expected_href
+):
+    """The signed-out page passes a safe ``next`` on to sign-in, so leaving the
+    admin panel and signing in again lands back on the panel. Anything the
+    sign-in redirect would refuse is dropped here too."""
+
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        page = await client.get(f"/web/signed-out{query}")
+
+    assert page.status_code == 200
+    links = re.findall(r'<a href="([^"]+)">Sign in again</a>', page.text)
+    assert [html.unescape(link) for link in links] == [expected_href]
+
+
 async def test_the_csrf_token_is_accepted_as_a_header_too(tmp_path, idp):
     # Future POST endpoints of this surface may be called with fetch; the
     # header form must be equivalent to the form field.

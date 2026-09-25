@@ -19,6 +19,12 @@ describe("signOut", () => {
     expect(next).toBe(SIGNED_OUT_URL);
   });
 
+  it("asks the signed-out page to send sign-in back to the panel", () => {
+    // App-relative, as the sign-in redirect expects; the page resolves it
+    // against the deployment's root path.
+    expect(new URL(SIGNED_OUT_URL, "https://hub.example/admin/").searchParams.get("next")).toBe("/admin/");
+  });
+
   // The signed-out page is static: it cannot tell anyone their session
   // survived. So a sign-out the server did not accept must not end there.
   it("reports a failure when the server did not confirm the sign-out", async () => {
