@@ -26,13 +26,15 @@ Three things keep a sweep from doing damage:
   against one database. The loser logs and waits for the next interval. The
   lock hands the winner a connection-bound *view* of the store; every read
   and write of the sweep goes through it and so rides the lock's own session
-  (issue #128), which is what makes cancellation simple: a cancelled sweep
-  releases the lock -- on the Postgres store the release queues behind
-  whatever statement is still in flight on that session -- or, when the pod
-  goes, dies with the session, and the server drops the lock and any
-  in-flight write together. No draining, no deadlines, nothing handed to a
-  thread: what a cancellation leaves running is bounded by the store's
-  statement timeout or ended by the process.
+  (issue #128), which is what makes cancellation simple. Every store call
+  of a sweep -- the acquisition, the view's reads and writes, the release --
+  runs on one thread of the sweep's own, in submission order, so a
+  cancelled sweep queues its release behind whatever call is still in
+  flight and moves on without waiting: the release runs the moment that
+  call returns, or, when the pod goes first, the session dies and the
+  server drops the lock and the in-flight write together. No draining, no
+  deadlines, nothing handed to a second thread: what a cancellation leaves
+  behind is one running call, its queued release, and nothing else.
 - **Removal needs a complete picture.** Rows are only marked removed for a
   source whose enumeration fully succeeded this sweep. A registry that
   answers ``list_repositories`` with an error, one repository's listing that
@@ -83,6 +85,7 @@ import random
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
@@ -119,12 +122,12 @@ logger = logging.getLogger("frames_server.cogs.indexer")
 DEFAULT_INTERVAL_SECONDS = 300
 
 STORE_WORKER_THREADS = 4
-"""Size of the indexer's own store-call thread pool.
+"""Size of the thread pool the targeted entry points' store calls run on.
 
-Its own, rather than asyncio's default executor, so that the
-``concurrent.futures.Future`` a submit returns is this module's to keep: a
-cancellation that lands while the lock acquisition is still running chains
-the matching release onto that future (see :meth:`CogIndexer.sweep`).
+The sweep does not use it: a sweep's calls run on a single thread of their
+own (see :meth:`CogIndexer.__init__`), so a webhook write never queues
+behind a sweep statement and a sweep's release never queues behind a
+webhook write.
 """
 
 INDEXER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -251,6 +254,15 @@ class CogIndexer:
         self._clock = clock
         self.last_summary: SweepSummary | None = None
         self._executor = ThreadPoolExecutor(max_workers=STORE_WORKER_THREADS, thread_name_prefix="cog-index-store")
+        # The sweep's own, single thread. Every store call of a sweep -- the
+        # lock acquisition, the view's reads and writes, the release -- is
+        # submitted here and runs in submission order, which is the whole
+        # cancellation story: a release queued behind a call that a
+        # cancellation abandoned mid-flight cannot overtake it (whether the
+        # call is inside psycopg or still building its statement), cannot
+        # run on the event loop, and is not dropped by the cancellation --
+        # the sweep only ever stops waiting for it.
+        self._sweep_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cog-index-sweep")
         # Per-source fairness state for the fetch budget (see _schedule): the
         # interleave phase advances every sweep, and the retry order is a
         # rotating list of (repository, digest) -- identities, not positions,
@@ -266,46 +278,45 @@ class CogIndexer:
     def close(self) -> None:
         """Stop accepting store calls. Does not interrupt calls already running.
 
-        ``cancel_futures`` drops work that never started; a submitted call that
-        is already on a thread runs to completion.
+        The targeted pool drops work that never started. The sweep thread
+        does **not**: the only call that can be queued on it is a lock
+        release behind an abandoned call, and that release must still run.
         """
 
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._sweep_thread.shutdown(wait=False)
 
     # -- threading discipline ---------------------------------------------------
 
     async def _on_thread(self, func, /, *args, **kwargs):
-        """Run a blocking store call on a worker thread.
-
-        Cancellation returns at once: a worker thread cannot be interrupted,
-        and the sweep does not wait for it (the drain issue #148 removed).
-        The call finishes on its thread and its result is dropped. That is
-        safe because the sweep's calls go through the lock's connection-bound
-        view: on the Postgres store the release a cancelled sweep goes on to
-        submit runs on the *same* connection as the in-flight statement and
-        queues behind it (psycopg serializes one connection's operations), so
-        an unlock cannot overtake a write; and if the process ends first, the
-        session takes the lock and the write with it. A call that had not
-        started yet is dropped unrun (``wrap_future`` cancels it).
-        """
+        """Run a targeted entry point's store call on the shared worker pool."""
 
         return await asyncio.wrap_future(self._executor.submit(func, *args, **kwargs))
 
-    async def _release(self, lock) -> None:
-        """Release the sweep lock, tolerating errors; runs in ``finally`` blocks.
+    async def _on_sweep_thread(self, func, /, *args, **kwargs):
+        """Run one of the sweep's store calls on the sweep thread, in order with the rest.
 
-        Raising here would mask whatever ended the sweep, so an exit failure
-        is logged by class name only. Cancellation during the release returns
-        at once like any other store call: the thread completes the exit on
-        its own, and nothing exits the lock twice.
+        Cancellation returns at once: a thread cannot be interrupted, and the
+        sweep does not wait for it (the drain issue #148 removed). The call
+        finishes on the sweep thread and its result is dropped; the release
+        the cancelled sweep queues next runs after it. A call that had not
+        started is dropped unrun (``wrap_future`` cancels it) -- which for
+        the sweep can only be the acquisition, and the release then finds
+        nothing entered.
         """
 
-        try:
-            await self._on_thread(lock.__exit__, None, None, None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__})
+        return await asyncio.wrap_future(self._sweep_thread.submit(func, *args, **kwargs))
+
+    def _queue_release(self, lock, entering: Future) -> Future:
+        """Queue the lock's exit on the sweep thread, behind whatever call is still running there.
+
+        Never dropped once queued: the sweep may stop waiting for it (a
+        cancellation), the executor may be closed (``close`` does not cancel
+        queued work), but the exit runs. :func:`_exit_entered` exits nothing
+        if the acquisition never ran or raised.
+        """
+
+        return self._sweep_thread.submit(_exit_entered, lock, entering)
 
     # -- the sweep ------------------------------------------------------------
 
@@ -324,20 +335,20 @@ class CogIndexer:
         # the whole sweep, carrying the sweep's reads and writes through the
         # view it yields so they die with the lock session (issue #128).
         lock = self._store.sweep_lock()
-        entering: Future = self._executor.submit(lock.__enter__)
+        entering: Future = self._sweep_thread.submit(lock.__enter__)
         try:
             try:
                 view: SweepView | None = await asyncio.wrap_future(entering)
             except asyncio.CancelledError:
-                # Cancelled while the acquisition may still be running on its
-                # thread. Not waited for (there is no drain), but whatever it
-                # entered still gets its matching exit: chained onto the
-                # acquisition's own future, so it runs on that thread the
-                # moment __enter__ returns -- or right here if it already
-                # has. An acquisition that never started is cancelled unrun,
-                # and one that raised entered nothing; both exit nothing.
-                entering.add_done_callback(lambda done: _exit_entered(lock, done))
+                # Cancelled while the acquisition may still be running. Not
+                # waited for, but whatever it enters gets its matching exit:
+                # queued behind it on the sweep thread, so it runs the moment
+                # __enter__ returns. An acquisition that never started is
+                # cancelled unrun, one that raised entered nothing; both
+                # exit nothing.
+                self._queue_release(lock, entering)
                 raise
+            cancelled = False
             try:
                 if view is None:
                     summary.locked_out = True
@@ -347,11 +358,19 @@ class CogIndexer:
                 for source in self._sources:
                     await self._sweep_source(source, summary, view)
                 COG_INDEX_SWEEPS.labels(result="completed").inc()
-            except BaseException:
+            except BaseException as exc:
                 COG_INDEX_SWEEPS.labels(result="failed").inc()
+                cancelled = isinstance(exc, asyncio.CancelledError)
                 raise
             finally:
-                await self._release(lock)
+                # The release goes behind whatever the sweep thread is still
+                # running (a view call a cancellation abandoned, for one). A
+                # cancelled sweep does not wait for it; every other outcome
+                # does -- and a cancellation that lands during that wait
+                # leaves the queued release exactly where it is.
+                release = self._queue_release(lock, entering)
+                if not cancelled:
+                    await _await_without_cancelling(release)
         finally:
             summary.duration_seconds = self._clock() - started
             COG_INDEX_SWEEP_DURATION.observe(summary.duration_seconds)
@@ -371,7 +390,7 @@ class CogIndexer:
             # declared gone.
             return
 
-        known = {(row.repository, row.digest): row for row in await self._on_thread(view.known, source.id)}
+        known = {(row.repository, row.digest): row for row in await self._on_sweep_thread(view.known, source.id)}
         # Three classes, mirroring _reconcile's decision: bookkeeping (known,
         # not failed) costs no budget; a fetch happens for digests the catalog
         # has never seen and for retries of failed rows. Which fetches get
@@ -407,7 +426,7 @@ class CogIndexer:
         # reconciled. Deferred fetches do NOT skip removal: those artifacts
         # were enumerated and stand in the present set.
         present = {repo: [artifact.digest for artifact in artifacts] for repo, artifacts in enumeration.present.items()}
-        removed = await self._on_thread(
+        removed = await self._on_sweep_thread(
             view.mark_removed, source.id, present, excluding=enumeration.failed_repositories
         )
         summary.removed += removed
@@ -536,19 +555,19 @@ class CogIndexer:
             # Tag change, or a digest that is back after being marked removed:
             # the card is the digest's and cannot have changed. Write the tags
             # (which also clears removed_at) and move on without a fetch.
-            await self._on_thread(
+            await self._on_sweep_thread(
                 view.update_tags, source.id, repository, artifact.digest, tags, pushed_at=artifact.pushed_at
             )
             return OUTCOME_RETAGGED
         row = await self._read_artifact(source, repository, artifact)
-        row = await self._store_row(row, view)
+        row = await self._store_row(row, view, self._on_sweep_thread)
         if row.status == STATUS_INDEXED:
             return OUTCOME_INDEXED
         if row.status == STATUS_NON_COG:
             return OUTCOME_NON_COG
         return OUTCOME_FAILED
 
-    async def _store_row(self, row: CogArtifact, view: SweepView) -> CogArtifact:
+    async def _store_row(self, row: CogArtifact, view: SweepView, run: Callable) -> CogArtifact:
         """Upsert the row; a card the database refuses becomes a ``failed`` row, not a poisoned sweep.
 
         The card is pre-validated (:func:`_card_unstorable`), so this catch is
@@ -557,17 +576,19 @@ class CogIndexer:
         is caught -- an outage raises through, because retrying every artifact
         against a dead database is not resilience.
 
-        ``view`` is the sweep's connection-bound view under the lock, or the
-        store itself for the lock-less :meth:`reindex` path, whose write then
-        takes a pooled connection of its own (issue #148).
+        ``view`` is the sweep's connection-bound view under the lock and
+        ``run`` the sweep thread, or -- for the lock-less :meth:`reindex`
+        path -- the store itself and the targeted pool, so the write takes a
+        pooled connection of its own (issue #148). Passed explicitly rather
+        than inferred: the in-memory store is its own view.
         """
 
         try:
-            await self._on_thread(view.upsert, row)
+            await run(view.upsert, row)
             return row
         except CogCatalogDataError as exc:
             fallback = _with(row, status=STATUS_FAILED, card=None, read_errors=_errors(f"store: {type(exc).__name__}"))
-            await self._on_thread(view.upsert, fallback)
+            await run(view.upsert, fallback)
             return fallback
 
     # -- targeted entry points (webhook receiver, #86) --------------------------
@@ -591,7 +612,7 @@ class CogIndexer:
         source = self._source(source_id)
         ref = ArtifactRef(digest=digest, tags=tuple(sorted(set(tags))), pushed_at=pushed_at)
         row = await self._read_artifact(source, repository, ref)
-        return await self._store_row(row, self._store)
+        return await self._store_row(row, self._store, self._on_thread)
 
     async def mark_removed(self, source_id: str, repository: str, digest: str) -> bool:
         """Mark one artifact removed (a delete event). Returns whether a present row was marked."""
@@ -740,11 +761,14 @@ class CogIndexer:
 
 
 def _exit_entered(lock, entering: Future) -> None:
-    """Exit ``lock`` once its cancelled-under acquisition has finished, if it entered anything.
+    """Exit ``lock`` if its acquisition entered anything; the sweep thread's release step.
 
-    Runs as the acquisition future's done-callback: on the worker thread that
-    ran ``__enter__``, right after it returned, or inline if it had already
-    finished. A cancelled future never ran; a failed one entered nothing.
+    Runs on the sweep thread after the acquisition (same thread, submission
+    order), so ``entering`` is done: a cancelled future never ran, a failed
+    one entered nothing, and either way there is nothing to exit -- calling
+    ``__exit__`` on a context that was never entered would *run* the
+    acquisition. An exit failure is logged by class name; raising would only
+    reach a sweep that may no longer be waiting.
     """
 
     if entering.cancelled() or entering.exception() is not None:
@@ -753,8 +777,35 @@ def _exit_entered(lock, entering: Future) -> None:
         lock.__exit__(None, None, None)
     except Exception as exc:
         logger.error("cog_index_lock_release_failed", extra={"error": type(exc).__name__})
-        return
-    logger.info("cog_index_lock_released_after_cancel")
+
+
+async def _await_without_cancelling(worker: Future):
+    """Await a concurrent future without cancelling it when the awaiter is cancelled.
+
+    ``asyncio.wrap_future`` cancels a not-yet-started future when the
+    awaiting task is cancelled -- right for a view call, wrong for a queued
+    lock release, which must run whether or not anybody still waits for it.
+    """
+
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future = loop.create_future()
+
+    def settle() -> None:
+        if done.cancelled():
+            return
+        if worker.cancelled():
+            done.set_exception(RuntimeError("the release was cancelled before it ran"))
+        elif (exc := worker.exception()) is not None:
+            done.set_exception(exc)
+        else:
+            done.set_result(worker.result())
+
+    def deliver(_: Future) -> None:
+        with suppress(RuntimeError):  # the loop is closed: nobody is waiting
+            loop.call_soon_threadsafe(settle)
+
+    worker.add_done_callback(deliver)
+    return await done
 
 
 def _count(summary: SweepSummary, outcome: str) -> None:

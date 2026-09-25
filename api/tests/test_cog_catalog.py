@@ -1053,6 +1053,15 @@ def test_upsert_translates_a_psycopg_data_error():
     assert "unsupported" not in str(info.value)
 
 
+def test_update_tags_refuses_a_naive_pushed_at_before_touching_the_database():
+    from datetime import datetime
+
+    store, conn = _fake_store()
+    with pytest.raises(ValueError, match="pushed_at"):
+        store.update_tags(SOURCE, "cogs/a", DIGEST_A, ["v1"], pushed_at=datetime(2026, 9, 1))
+    assert conn.calls == []
+
+
 def test_update_tags_reports_whether_a_row_existed():
     store, conn = _fake_store([[{"digest": DIGEST_A}]])
     assert store.update_tags(SOURCE, "cogs/a", DIGEST_A, ["b", "a", "b"], pushed_at=T0) is True

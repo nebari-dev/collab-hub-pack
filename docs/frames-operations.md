@@ -1256,13 +1256,16 @@ as present, so removal stays correct. Safety rules operators should know:
   lands concurrently with a sweep and nothing but the view can ride, or die
   with, the lock session (issue #148).
 - **A cancelled sweep releases the lock or dies with its session.** Nothing
-  drains: a store call in flight on a worker thread is not waited for. The
-  release is issued on the same connection the call is running on, and
-  psycopg serializes one connection's operations, so the unlock queues behind
-  the write and cannot overtake it; if the pod exits first, the session ends
-  and the server drops the lock and the write together — which, for a
-  one-replica workload that is recreated rather than rolled, is the designed
-  outcome. The app lifespan waits at most 5 s for the cancelled indexer task
+  drains: a store call in flight is not waited for. Every store call of a
+  sweep — the acquisition, the view's reads and writes, the release — runs
+  on one thread of the sweep's own, in submission order, so a cancelled
+  sweep queues its release behind the call it abandoned and moves on; the
+  unlock runs the moment that call returns and can neither overtake it nor
+  be dropped by a later cancellation or by shutdown. If the pod exits first,
+  the session ends and the server drops the lock and the write together —
+  which, for a one-replica workload that is recreated rather than rolled, is
+  the designed outcome. The app lifespan waits at most 5 s for the cancelled
+  indexer task (in practice it returns at once, since it waits for nothing)
   and otherwise leaves it pending with `cog_indexer_shutdown_abandoned`.
   Sweep-path statements carry a 20 s server-side `statement_timeout` and
   every pooled connection sets TCP keepalives, which covers the ordinary

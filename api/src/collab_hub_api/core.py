@@ -433,11 +433,22 @@ def make_app(config: BaseConfig) -> FastAPI:
                             "cog_indexer_shutdown_abandoned",
                             extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
                         )
-                    elif cog_indexing is not None:
-                        # The task is done, so no further store calls are
-                        # coming: stop accepting them. Work already on a
-                        # thread still finishes.
-                        cog_indexing.indexer.close()
+                    else:
+                        if not cog_index_task.cancelled() and cog_index_task.exception() is not None:
+                            # run() swallows ordinary sweep failures, so this
+                            # is a bug in the loop itself; retrieving it here
+                            # keeps asyncio from reporting it at collection
+                            # with a text this module never logs.
+                            logger.error(
+                                "cog_indexer_task_failed",
+                                extra={"error": type(cog_index_task.exception()).__name__},
+                            )
+                        if cog_indexing is not None:
+                            # The task is done, so no further store calls are
+                            # coming: stop accepting them. Work already on a
+                            # thread -- a queued release included -- still
+                            # finishes.
+                            cog_indexing.indexer.close()
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):

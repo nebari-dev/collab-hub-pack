@@ -84,13 +84,12 @@ SWEEP_STATEMENT_TIMEOUT_SECONDS = 20.0
 """Server-side bound on every statement the sweep runs (lock included).
 
 The pool timeout bounds *checkout*; nothing else bounds execution. A
-cancelled sweep releases its lock on the same connection its last statement
-is running on, and that release queues behind the statement -- so this is
-what bounds how long a cancelled sweep can keep its lock while the transport
-still works (a dead transport is the process's to end: the session dies with
-it). Session-set on the lock connection (which runs in autocommit) and reset
-before it returns to the pool; transaction-local on the store's own
-sweep-path methods, so their connections go back unaltered.
+cancelled sweep's release is queued behind the statement it abandoned, so
+this is what bounds how long a cancelled sweep can keep its lock while the
+transport still works (a dead transport is the process's to end: the session
+dies with it). Session-set on the lock connection (which runs in autocommit)
+and reset before it returns to the pool; transaction-local on the store's
+own sweep-path methods, so their connections go back unaltered.
 """
 
 
@@ -772,6 +771,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
             _upsert_row(conn, artifact)
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
+        require_aware(pushed_at, "pushed_at")  # before a connection is checked out
         with self._own_connection() as conn:
             return _update_tags_row(conn, source_id, repository, digest, tags, pushed_at=pushed_at)
 
@@ -1101,9 +1101,10 @@ def _postgres_sweep_lock(db):
     is bound to this connection (issue #128). The view is the block's alone:
     a losing acquisition gets ``None`` and touches no session but its own.
 
-    A release that runs while a statement is still in flight on the view --
-    a cancelled sweep, issue #148 -- queues behind it: psycopg serializes
-    the operations of one connection, so the unlock cannot overtake a write.
+    A cancelled sweep's release is queued on the indexer's sweep thread
+    behind the view call it abandoned (issue #148), so the unlock runs after
+    that call has returned -- never while its statement is in flight, and
+    never before a call that had started but not yet reached the server.
     """
 
     with db.connection() as conn:
@@ -1123,8 +1124,8 @@ def _postgres_sweep_lock(db):
             conn.autocommit = True
             # Session-set (autocommit makes a transaction-local set a no-op)
             # and RESET below before the connection returns. It bounds every
-            # statement the view runs on this session, and the release a
-            # cancelled sweep issues queues behind whichever of them is in
+            # statement the view runs on this session, and a cancelled
+            # sweep's release is queued behind whichever of them is in
             # flight -- so this is what bounds how long a cancelled sweep can
             # keep its lock while the server still answers.
             conn.execute(f"SET statement_timeout = '{int(SWEEP_STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
