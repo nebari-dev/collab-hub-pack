@@ -42,8 +42,8 @@ The engine returns and `observe()` reports a `RunState` — `RunState.RUNNING`,
 `RunState.WAITING_AT_GATE` and so on — sent on the wire as its name in lower
 case. `observe()` is the run machine folded over the Track (`Run.replay`, or
 `derive_run_status` over a Track), and `None` for a run never submitted. A
-duration stop is `RunState.BUDGET_EXCEEDED`; the Track still records it as
-`timed_out`, with `dimension: duration`. The worker's own states are not the
+duration stop is `RunState.BUDGET_EXCEEDED`, recorded as `budget_exceeded`
+with `dimension: duration`. The worker's own states are not the
 run's: between steps, or while a worker idles, the run is `RUNNING`.
 
 Each call reads the Track once to act on it.
@@ -102,6 +102,31 @@ back N times; the next send back ends the run `FAILED` with error
 `revise_limit_exceeded`. Who may decide is the run API's to check (#103); the
 engine records who did.
 
+## The Track
+
+Every write to the Track is an event of schema v1
+([`docs/cog-execution/track.md`](../docs/cog-execution/track.md)). Three kinds
+share it: run events, which are the run machine's records (`gate_escalated`,
+`gate_decided`, `failed`, `budget_exceeded` and the rest); step facts, which say
+what one attempt did and produced; and worker facts. `step_completed` alone
+names what produced a result — the Cog, its digest, the binding, the problems,
+the usage, the Frames — with the result inline or, above
+`payload_inline_max_bytes` (64 KiB by default), kept by reference and named by
+`payload_ref`; `TrackStore.get_payload` returns it. `step_failed` records a
+step's failure with its idempotency key, the Cog, the error code or exception
+class and a message bounded to 1024 characters, before the run's own `failed`.
+
+A Track written before v1 is never rewritten: `track.upgrade` reads its events
+in the v1 shape, and everything that reads a Track goes through it.
+
+Three stores implement `TrackStore` and pass the same conformance suite:
+`InMemoryTrackStore`, `SqliteTrackStore` (one file in WAL mode, for the
+processes of one host; `SqliteTrackStore.ensure_schema(path)` creates it) and
+`PostgresTrackStore`. On the hub the Postgres tables come from the API's
+migration registry, never from the store's `ensure_schema`. Every store assigns
+sequences, refuses a duplicate event id, and refuses a second `op_submitted`
+for a run with `OneSubmissionPerRun`.
+
 ## The result envelope
 
 Every `CogWorker.interact()` returns a `ResultEnvelope`, the version-1 envelope
@@ -121,8 +146,9 @@ envelope with unknown usage.
 
 `ok: false` needs `error: {code, detail}`, with the code one of the five the
 envelope document lists — any other code is an invalid envelope, not a new
-kind of failure. The step fails, and the Track's `failed` event keeps the code
-as its `error` and the detail as its `reason`. These rules hold on construction
+kind of failure. The step fails: `step_failed` records the code, the detail,
+the key and the worker, and the run's `failed` event keeps the code as its
+`error` and the detail as its `reason`. These rules hold on construction
 as well as on parsing, so an envelope a worker builds in process cannot
 sidestep them.
 `ok: true` with a non-empty `problems` list is **not** a failure: the step

@@ -7,12 +7,17 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from uuid import uuid4
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
 from .states import RUN, Run, RunState, Transition, Worker
-from .track import TrackEvent, TrackStore
+from .track import PAYLOAD_INLINE_MAX_BYTES, TrackEvent, TrackStore, upgrade
+
+# A failure's message on the Track is bounded, so a stack trace or a model's
+# answer cannot turn the accountability record into a log.
+MESSAGE_MAX_CHARS = 1024
 
 # Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
 # value is genuinely None (a human resuming a Gate with an empty decision). None
@@ -242,11 +247,13 @@ class DurableWorkflowEngine(WorkflowEngine):
         track: TrackStore,
         budget: RunBudget | None = None,
         max_revisions: int | None = None,
+        payload_inline_max_bytes: int = PAYLOAD_INLINE_MAX_BYTES,
     ) -> None:
         self.executor = executor
         self.track = track
         self.budget = budget
         self.max_revisions = max_revisions
+        self.payload_inline_max_bytes = payload_inline_max_bytes
 
     def _append(self, run_id: str, event_type: str, payload: Mapping[str, Any],
                 into: list[TrackEvent] | None = None) -> TrackEvent:
@@ -255,6 +262,35 @@ class DurableWorkflowEngine(WorkflowEngine):
         if into is not None:
             into.append(event)
         return event
+
+    def _step_completed(self, run_id: str, step: OpStep, attempt: int, envelope: ResultEnvelope,
+                        usage: Mapping[str, Any] | None, escalation: str | None = None) -> dict[str, Any]:
+        """A ``step_completed`` payload: what produced the result, and the result inline or by reference."""
+        record: dict[str, Any] = {
+            "step": step.name, "attempt": attempt, "cog": step.cog, "digest": step.digest, "usage": usage,
+            "frames": [], **_recorded(envelope),
+        }
+        if escalation is not None:
+            record["escalation"] = escalation
+        rendered = json.dumps(envelope.payload, default=str)
+        if len(rendered.encode()) > self.payload_inline_max_bytes:
+            ref = f"{run_id}/{step.name}/{attempt}/{uuid4().hex}"
+            self.track.put_payload(ref, envelope.payload)
+            record["payload_ref"] = ref
+        else:
+            record["payload"] = envelope.payload
+        return record
+
+    def _step_failed(self, step: OpStep, attempt: int, key: str, error: str, message: str | None,
+                     envelope: ResultEnvelope | None = None) -> dict[str, Any]:
+        """A ``step_failed`` payload: the attempt, its key, the worker, the code and a bounded message."""
+        record: dict[str, Any] = {
+            "step": step.name, "attempt": attempt, "key": key, "cog": step.cog, "digest": step.digest,
+            "error": error, "message": (message or "")[:MESSAGE_MAX_CHARS],
+        }
+        if envelope is not None:
+            record.update(_recorded(envelope))
+        return record
 
     def _record(self, run_id: str, transition: Transition[Any], into: list[TrackEvent] | None = None) -> Any:
         """Write what a transition reports, and return the context after it.
@@ -266,8 +302,12 @@ class DurableWorkflowEngine(WorkflowEngine):
             self._append(run_id, record.event_type, record.payload, into)
         return transition.after
 
+    def _read(self, run_id: str) -> tuple[TrackEvent, ...]:
+        """The run's Track, read once and in schema v1 whatever version it was written in."""
+        return tuple(upgrade(event) for event in self.track.replay(run_id))
+
     def observe(self, run_id: str) -> RunState | None:
-        run = Run.replay(self.track.replay(run_id))
+        run = Run.replay(self._read(run_id))
         return None if run is None else run.state
 
     # The helpers below read one snapshot of the Track, taken once per call, so a
@@ -321,7 +361,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         """
         value: Any = _NO_SIGNAL
         for e in events:
-            if (e.event_type == "signal_received" and e.payload.get("step") == step
+            if (e.event_type == "gate_decided" and e.payload.get("step") == step
                     and e.payload.get("outcome", "send_back") == "send_back"):
                 value = e.payload.get("value")
         return value
@@ -340,9 +380,9 @@ class DurableWorkflowEngine(WorkflowEngine):
         for e in events:
             if e.payload.get("step") != step:
                 continue
-            if e.event_type == "paused":
+            if e.event_type == "gate_escalated":
                 escalated, approved = e.payload, None
-            elif e.event_type == "signal_received":
+            elif e.event_type == "gate_decided":
                 approved_now = e.payload.get("outcome") == "approve" and escalated is not None
                 approved = escalated if approved_now and escalated.get("envelope") is not None else None
             elif e.event_type == "step_completed":
@@ -355,19 +395,19 @@ class DurableWorkflowEngine(WorkflowEngine):
             return None
         return _escalation(next(
             e.payload for e in reversed(events)
-            if e.event_type == "paused" and e.payload.get("escalation") == run.open_escalation
+            if e.event_type == "gate_escalated" and e.payload.get("escalation") == run.open_escalation
         ))
 
     def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
         """What a run waiting at a Gate waits on — the escalation id, the envelope, who may decide — or ``None``."""
-        events = self.track.replay(run_id)
+        events = self._read(run_id)
         return self._open_escalation(events, Run.replay(events))
 
     def submit(self, op: OpDefinition) -> RunState:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
             raise ValueError(f"Op {op.run_id!r} has duplicate step names: {names}")
-        existing = self.track.replay(op.run_id)
+        existing = self._read(op.run_id)
         written: list[TrackEvent] = []
         if not existing:
             self._record(op.run_id, Run.submit(op.run_id, _serialize_op(op)), into=written)
@@ -402,7 +442,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         marker that advances the per-step attempt, so each step gets a fresh key —
         the caller is asking for the work to run again.
         """
-        events = self.track.replay(run_id)
+        events = self._read(run_id)
         run = Run.replay(events)
         state = None if run is None else run.state
         if run is None or not run.state.ended:
@@ -422,7 +462,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         # The caller passes the Track it has already read, so one call reads it once.
         # Every write goes through `append` or `record` into `history`, so a step reads
         # what the ones before it wrote without reading the Track again.
-        history = list(self.track.replay(op.run_id) if events is None else events)
+        history = list(self._read(op.run_id) if events is None else events)
 
         def append(event_type: str, payload: Mapping[str, Any]) -> None:
             self._append(op.run_id, event_type, payload, history)
@@ -450,9 +490,8 @@ class DurableWorkflowEngine(WorkflowEngine):
             if approved is not None:
                 # The approver saw this envelope, so it is the step's result; the step does not run again.
                 envelope = ResultEnvelope.parse(approved["envelope"])
-                append("step_completed", {"step": step.name, "output": envelope.payload,
-                                          "usage": approved.get("usage"), "escalation": approved["escalation"],
-                                          **_recorded(envelope)})
+                append("step_completed", self._step_completed(op.run_id, step, approved.get("attempt", 0),
+                                                              envelope, approved.get("usage"), approved["escalation"]))
                 continue
             if tracker is not None:
                 try:
@@ -512,6 +551,8 @@ class DurableWorkflowEngine(WorkflowEngine):
                 if invoked:
                     # A failed request may have spent resources before failing.
                     append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
+                # The class names the failure; its message, bounded, says what happened.
+                failure_reason = str(exc)[:MESSAGE_MAX_CHARS] or None
                 outcome = ("broken", type(exc).__name__)
             finally:
                 if worker is not None:
@@ -522,6 +563,8 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # a leak, not success. Fail the run so it is visible; durable
                 # cleanup-retry lands with the crash-safe engine backing (#1).
                 # A failed worker's own error is kept beside it, since its teardown is not a worker move.
+                append("step_failed", self._step_failed(step, attempt, key, "TeardownFailed",
+                                                        f"{teardown_error}: the worker could not be torn down"))
                 details = None if answered else {"worker_error": str(outcome[1])}
                 failed = run.fail(step=step.name, error="TeardownFailed", reason=teardown_error, details=details)
                 run = record(failed)
@@ -529,11 +572,14 @@ class DurableWorkflowEngine(WorkflowEngine):
 
             kind, detail = outcome
             if kind == "broken":
+                append("step_failed", self._step_failed(step, attempt, key, detail, failure_reason))
                 run = record(run.fail(step=step.name, error=detail, reason=failure_reason))
                 return run.state
             if kind == "error":
                 # The worker answered, and said no. The code is what a client acts
                 # on, so it is the event's error, verbatim; the detail is the reason.
+                append("step_failed", self._step_failed(step, attempt, key, detail.error.code, detail.error.detail,
+                                                        detail))
                 failed = run.fail(step=step.name, error=detail.error.code, reason=detail.error.detail,
                                   details=_recorded(detail))
                 run = record(failed)
@@ -558,10 +604,7 @@ class DurableWorkflowEngine(WorkflowEngine):
                 run = record(run.escalate(step=step.name, reason=why, escalation=eid, details=details))
                 return run.state
 
-            # `output` keeps the Track's current key; the versioned event schema
-            # that renames it and stores large payloads by reference is #5.
-            append("step_completed", {"step": step.name, "output": envelope.payload, "usage": usage,
-                                      **_recorded(envelope)})
+            append("step_completed", self._step_completed(op.run_id, step, attempt, envelope, usage))
             if budget_stop is not None:
                 return self._stop_for_budget(run, step.name, budget_stop)
         if tracker is not None and spent_on is not None:
@@ -624,7 +667,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             # One string, a mapping or a set is not a sequence of findings: listing it would
             # record its characters, its keys, or an arbitrary order.
             raise ValueError("findings are a sequence of findings, not one string, mapping or set")
-        events = self.track.replay(run_id)
+        events = self._read(run_id)
         run = Run.replay(events)
         if run is None or run.state is not RunState.WAITING_AT_GATE:
             raise ValueError(f"run {run_id!r} is not waiting at a Gate")

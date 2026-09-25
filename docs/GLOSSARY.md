@@ -63,7 +63,11 @@ which bindings, which Guards and Gates fired, who approved, what came out
 (whitepaper §5.3). Status is derived from the Track, never held only in
 memory. The Track is the accountability record — a Gate signature is only
 meaningful because the Track can say *which* model, *which* weights,
-*which* evidence produced the thing that was signed.
+*which* evidence produced the thing that was signed. Its events follow a
+versioned schema ([track](cog-execution/track.md)): `step_completed` names
+the Cog, its digest, the binding, the problems, the usage and the Frames
+behind a result, `gate_decided` names the escalation, the actor and the
+result decided on, and `step_failed` carries more than a class name.
 
 ## Hub execution vocabulary (defined by ADR-0001, ADR-0002 and the cog-execution docs)
 

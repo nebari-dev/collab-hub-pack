@@ -3,9 +3,10 @@
 A run's status is this machine folded over its Track (:meth:`Run.replay`), so
 the API, the controller and a local run host derive it the same way.
 
-The records keep the Track's current event names — ``paused`` for an
-escalation, ``signal_received`` for a decision, ``timed_out`` for a duration
-stop. Track event schema v1 (#5) renames them; the states do not change.
+The records are Track event schema v1 (``docs/cog-execution/track.md``):
+``gate_escalated`` for an escalation, ``gate_decided`` for a decision,
+``budget_exceeded`` with a dimension for a budget stop. A Track written before
+v1 is read through ``track.upgrade`` before it is replayed here.
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ class Running(RunState):
         counts = dict(run.escalations)
         counts[step] = counts.get(step, 0) + 1
         return move(
-            run, RunState.WAITING_AT_GATE, Record("paused", payload),
+            run, RunState.WAITING_AT_GATE, Record("gate_escalated", payload),
             open_step=step, open_escalation=escalation, escalations=counts,
         )
 
@@ -133,8 +134,7 @@ class Running(RunState):
             self.refuse("exhaust_budget", f"unknown budget dimension {dimension!r}")
         payload: dict[str, Any] = {} if step is None else {"step": step}
         payload.update(reason=reason, dimension=dimension)
-        event_type = "timed_out" if dimension == "duration" else "budget_exceeded"
-        return move(run, RunState.BUDGET_EXCEEDED, Record(event_type, payload))
+        return move(run, RunState.BUDGET_EXCEEDED, Record("budget_exceeded", payload))
 
     @accepts("CANCELLED")
     def cancel(self, run: Run, *, actor: str | None = None, **_: Any) -> Transition[Run]:
@@ -172,14 +172,14 @@ class WaitingAtGate(RunState):
         if envelope_digest is not None:
             answered["envelope_digest"] = envelope_digest
         if outcome == "reject":
-            record = Record("rejected", {"step": step, "value": findings, **answered})
+            record = Record("gate_decided", {"step": step, "outcome": outcome, "value": findings, **answered})
             return move(run, RunState.REJECTED, record, **closed)
         if outcome == "send_back" and revise_limit is not None and run.escalations.get(step, 0) > revise_limit:
             # The step has escalated `escalations` times, so a send back now would produce
             # revision number `escalations`: past the limit, the run fails instead.
             details = {"revise_limit": revise_limit, "value": findings, **answered}
             return move(run, RunState.FAILED, _failed(step, "revise_limit_exceeded", None, details), **closed)
-        record = Record("signal_received", {"step": step, "outcome": outcome, "value": findings, **answered})
+        record = Record("gate_decided", {"step": step, "outcome": outcome, "value": findings, **answered})
         return move(run, RunState.RUNNING, record, **closed)
 
     @accepts("CANCELLED")
@@ -331,7 +331,9 @@ class Run(Context):
     def replay(cls, facts: Iterable[TrackFact]) -> Run | None:
         """Fold a run's Track through the machine; ``None`` for a run never submitted.
 
-        A Track the machine could not have written fails with
+        The facts are read in schema v1: a Track written before it goes through
+        ``track.upgrade`` first, which ``derive_run_status`` does. A Track the
+        machine could not have written fails with
         :class:`InvalidTransition` instead of becoming a status. A Track with no
         ``run_picked_up`` at all was written before pickups were recorded: its first
         step start, or its first run event, is read as the pickup.
@@ -366,7 +368,7 @@ def _replay_failed(run: Run, payload: Mapping[str, Any]) -> Transition[Run]:
 
 def _replay_decision(outcome: str | None) -> Callable[[Run, Mapping[str, Any]], Transition[Run]]:
     def replay(run: Run, payload: Mapping[str, Any]) -> Transition[Run]:
-        # #35's signal re-ran the paused step with its value: a send back.
+        # A decision recorded before Gates was a send back: it re-ran the step with its value.
         return run.decide(
             outcome=outcome or payload.get("outcome", "send_back"),
             escalation=payload.get("escalation"),
@@ -384,7 +386,7 @@ _SUBMISSIONS = frozenset({"op_submitted", "submitted"})
 # Track events about a step or its worker: facts beside the run, not moves of it.
 _FACTS = frozenset({
     "step_started", "materialized", "ready", "interaction_started", "interaction_usage",
-    "idle", "teardown_started", "teardown_failed", "step_completed",
+    "idle", "teardown_started", "teardown_failed", "step_completed", "step_failed",
 })
 
 # The payload fields that decide where a replayed event leads; a record and its replay must agree on them.
@@ -392,22 +394,18 @@ _DECIDING = ("outcome", "attempt", "from_status", "error", "dimension")
 
 # In a Track written before pickups were recorded, what showed the run had been picked up.
 _PICKED_UP_BY = frozenset({
-    "step_started", "paused", "signal_received", "rejected", "completed", "failed",
-    "timed_out", "budget_exceeded", "interrupted", "retry_requested",
+    "step_started", "gate_escalated", "gate_decided", "completed", "failed",
+    "budget_exceeded", "interrupted", "retry_requested",
 })
 
 _REPLAY: dict[str, Callable[[Run, Mapping[str, Any]], Transition[Run]]] = {
     "run_picked_up": lambda run, payload: run.pickup(),
-    "paused": lambda run, payload: run.escalate(
+    "gate_escalated": lambda run, payload: run.escalate(
         step=payload.get("step", ""), reason=payload.get("reason"), escalation=payload.get("escalation")
     ),
-    "signal_received": _replay_decision(None),
-    "rejected": _replay_decision("reject"),
+    "gate_decided": _replay_decision(None),
     "completed": lambda run, payload: run.complete(),
     "failed": _replay_failed,
-    "timed_out": lambda run, payload: run.exhaust_budget(
-        dimension="duration", step=payload.get("step"), reason=payload.get("reason")
-    ),
     "budget_exceeded": lambda run, payload: run.exhaust_budget(
         # Older records did not say which spending limit stopped the run; the state is the same.
         dimension=payload.get("dimension", "tokens"), step=payload.get("step"), reason=payload.get("reason")

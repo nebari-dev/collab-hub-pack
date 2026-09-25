@@ -172,18 +172,18 @@ record (#106).
 | Event | From → to | Records |
 |---|---|---|
 | `pickup()` | `SUBMITTED` → `RUNNING` | `run_picked_up` |
-| `escalate(step, reason, escalation, details)` | `RUNNING` → `WAITING_AT_GATE` | `paused`, with what the Gate escalated on: the attempt, the envelope, the approvers |
-| `decide(outcome, escalation, findings, revise_limit, actor, envelope_digest)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
+| `escalate(step, reason, escalation, details)` | `RUNNING` → `WAITING_AT_GATE` | `gate_escalated`, with what the Gate escalated on: the attempt, the envelope, the approvers |
+| `decide(outcome, escalation, findings, revise_limit, actor, envelope_digest)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `gate_decided` with its `outcome`; `failed` past the limit |
 | `complete()` | `RUNNING` → `COMPLETED` | `completed` |
 | `fail(error, step, reason, details)` | `RUNNING` → `FAILED` | `failed` |
-| `exhaust_budget(dimension, step, reason)` | `RUNNING` → `BUDGET_EXCEEDED` | `timed_out` for `duration`; `budget_exceeded` otherwise |
+| `exhaust_budget(dimension, step, reason)` | `RUNNING` → `BUDGET_EXCEEDED` | `budget_exceeded`, with its `dimension` |
 | `cancel(actor)` | `SUBMITTED`, `RUNNING`, `WAITING_AT_GATE` → `CANCELLED` | `cancelled` |
 | `host_stopped(backend)` | `RUNNING`, `WAITING_AT_GATE` → `INTERRUPTED`, under `none` only | `interrupted` |
 | `retry()` | `FAILED` → `RUNNING` (new attempt); `INTERRUPTED` → `RUNNING` (same attempt); `BUDGET_EXCEEDED` → `RUNNING` (new budget epoch) | `retry_requested` |
 
-The run's records keep the Track's current event names — `paused` for an
-escalation, `signal_received` for a decision, `timed_out` for a duration stop.
-Track event schema v1 (#5) renames them; the states do not change.
+The run's records are Track event schema v1 ([track](track.md)). A Track
+written before it — `paused`, `signal_received`, `rejected`, `timed_out` — is
+read through `track.upgrade` before replay; the states are the same.
 
 ## How the code holds them
 
@@ -223,12 +223,13 @@ arguments the Track recorded, and must record what was recorded: the same
 event, with the same outcome, attempt, error and dimension. A step's and a
 worker's facts — `step_started`, `materialized`, `ready`,
 `interaction_started`, `interaction_usage`, `idle`, `teardown_started`,
-`teardown_failed`, `step_completed` — leave the run where it is. Anything else
-raises `InvalidTransition` instead of becoming a status: an event no run
-records, a second submission, a `signal_received` that rejects, a revise-limit
-stop its recorded limit does not produce. The older `submitted` is read as
-`op_submitted`, and a Track with no `run_picked_up` at all, written before
-pickups were recorded, reads its first step start or run event as the pickup.
+`teardown_failed`, `step_completed`, `step_failed` — leave the run where it is.
+Anything else raises `InvalidTransition` instead of becoming a status: an event
+no run records, a second submission, a decision with no escalation open, a
+revise-limit stop its recorded limit does not produce. A Track written before
+schema v1 is lifted by `track.upgrade` first, and one with no `run_picked_up`
+at all, written before pickups were recorded, reads its first step start or run
+event as the pickup.
 
 **A worker that cannot be reclaimed.** A worker that answered and then fails to
 tear down records `teardown_failed` through its machine. One that did not answer

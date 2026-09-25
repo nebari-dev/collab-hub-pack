@@ -105,7 +105,7 @@ def test_a_cog_asking_to_pause_never_pauses_a_run_at_either_boundary():
     engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: {"pause": True}}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.COMPLETED
     [completed] = [e for e in track.replay("r") if e.event_type == "step_completed"]
-    assert completed.payload["output"] == {"pause": True}  # the payload, not a pause
+    assert completed.payload["payload"] == {"pause": True}  # the payload, not a pause
 
     # Over HTTP, where a real worker answers, the same body is not an envelope at all.
     worker = _KubernetesWorker("openteams/gated", "w", "http://worker",
@@ -166,7 +166,7 @@ def test_approve_completes_the_step_with_the_envelope_the_approver_saw_and_advan
     assert op.engine().decide("r", escalation=escalation, actor="alice", outcome="approve") is RunState.COMPLETED
     assert op.calls == [("draft", None), ("publish", None)]  # the approved step did not run again
     draft = next(e for e in op.events("step_completed") if e.payload["step"] == "draft")
-    assert draft.payload["output"] == {"version": 1} and draft.payload["escalation"] == escalation
+    assert draft.payload["payload"] == {"version": 1} and draft.payload["escalation"] == escalation
 
 
 def test_reject_ends_the_run_rejected_and_nothing_after_it_runs():
@@ -176,7 +176,8 @@ def test_reject_ends_the_run_rejected_and_nothing_after_it_runs():
     assert state is RunState.REJECTED
     assert op.engine().observe("r") is RunState.REJECTED
     assert op.calls == [("draft", None)]
-    [rejected] = op.events("rejected")
+    [rejected] = op.events("gate_decided")
+    assert rejected.payload["outcome"] == "reject"
     assert rejected.payload["actor"] == "alice" and rejected.payload["value"] == ["off topic"]
 
 
@@ -195,8 +196,8 @@ def test_each_decision_is_recorded_with_its_escalation_actor_outcome_findings_an
     op.engine().submit(op.op)
     escalation = op.open()
     op.engine().decide("r", escalation=escalation, actor="alice", outcome="send_back", findings=["add a source"])
-    [escalated] = [e for e in op.events("paused") if e.payload["escalation"] == escalation]
-    [decision] = op.events("signal_received")
+    [escalated] = [e for e in op.events("gate_escalated") if e.payload["escalation"] == escalation]
+    [decision] = op.events("gate_decided")
     assert decision.payload == {"step": "draft", "outcome": "send_back", "value": ["add a source"],
                                 "escalation": escalation, "actor": "alice",
                                 "envelope_digest": envelope_digest(escalated.payload["envelope"])}
@@ -310,7 +311,7 @@ def _paused_before_gates():
                                       "digest": None}]}
     for kind, payload in (("op_submitted", {"op": op}), ("run_picked_up", {}),
                           ("step_started", {"step": "s", "attempt": 0}),
-                          ("paused", {"step": "s", "reason": "cog requested a pause"})):
+                          ("gate_escalated", {"step": "s", "reason": "cog requested a pause"})):
         track.append(TrackEvent(run_id="old", event_type=kind, payload=payload))
     return track
 
