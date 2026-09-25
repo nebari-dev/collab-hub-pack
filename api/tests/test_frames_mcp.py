@@ -318,6 +318,59 @@ async def test_bad_method_on_api_path_answers_the_envelope_and_keeps_allow(clien
     assert response.json() == {"error": {"code": "http_error", "message": "Method Not Allowed"}}
 
 
+async def test_unsupported_head_and_options_on_api_paths_answer_405_with_allow(client):
+    # Not a CORS preflight (no Origin / Access-Control-Request-Method), so the
+    # request is routed and the GET-only route refuses it.
+    for method in ("HEAD", "OPTIONS"):
+        response = await client.request(method, "/v1/frames")
+        assert response.status_code == 405, method
+        assert "GET" in response.headers["allow"], method
+
+
+async def test_body_parse_errors_on_api_paths_answer_the_envelope(client):
+    # FastAPI raises Starlette's HTTPException(400) for an unparseable body, so
+    # registering the handler on the base class brings it into the envelope.
+    response = await client.post(
+        "/v1/frames",
+        content=b"{\"name\": \"\xff\"}",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "http_error"
+
+
+@pytest.mark.parametrize("request_prefix", ["/nexus", ""])
+async def test_routing_errors_keep_the_envelope_under_a_root_path(tmp_path, monkeypatch, request_prefix):
+    # A proxy that keeps the `server.root_path` prefix ("/nexus") and one that
+    # strips it (""): either way the app-relative path is an API path.
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
+    config = Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "server": {"root_path": "/nexus"},
+            "frames": {
+                "active_state": {"backend": "memory"},
+                "history": {"backend": "memory"},
+                "usage": {"backend": "memory"},
+                "mcp_session_manager_enabled": False,
+            },
+            "tasks": {"backend": "memory"},
+        }
+    )
+    app = make_app(config)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, root_path="/nexus")
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            unmatched = await client.get(f"{request_prefix}/v1/frames/a/b/c")
+            bad_method = await client.delete(f"{request_prefix}/v1/frames")
+    assert unmatched.status_code == 404
+    assert unmatched.json() == {"error": {"code": "not_found", "message": "Not Found"}}
+    assert bad_method.status_code == 405
+    assert "GET" in bad_method.headers["allow"]
+    assert bad_method.json() == {"error": {"code": "http_error", "message": "Method Not Allowed"}}
+
+
 async def test_mcp_mount_removal_leaves_other_response_shapes_alone(client):
     # `/v1/connectors/*` stays out of core._api_path, so it keeps FastAPI's
     # default error body. Converging error shapes app-wide is a contract

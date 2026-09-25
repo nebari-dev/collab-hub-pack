@@ -632,7 +632,10 @@ def make_app(config: BaseConfig) -> FastAPI:
     # every unmatched path, so they never reached a handler at all (#67).
     @app.exception_handler(StarletteHTTPException)
     async def frames_http_exception_handler(request: Request, exc: StarletteHTTPException):
-        if not _api_path(request.url.path):
+        # App-relative, like the path-protection middleware's refusals: behind
+        # a proxy that keeps the `server.root_path` prefix, the raw URL path
+        # would never look like an API path.
+        if not _api_path(request_path(request)):
             return await http_exception_handler(request, exc)
         code = {
             status.HTTP_401_UNAUTHORIZED: error_codes.UNAUTHORIZED,
