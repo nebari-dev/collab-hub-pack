@@ -96,7 +96,7 @@ idempotent — already-running containers are left alone. You never run
 all**. The API is a plain process on your machine at every level except 4;
 Docker only ever supplies the things around it.
 
-| Command | Postgres | MinIO | Keycloak | Fake providers | Front door |
+| Command | Postgres | S3 | Keycloak | Fake providers | Front door |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `make api` | – | – | – | – | – |
 | `make api-watch` | – | – | – | – | – |
@@ -108,8 +108,8 @@ Docker only ever supplies the things around it.
 | `make api-desktop` | ✅ | ✅ | ✅ | – | ✅ |
 | `make api-desktop-fakes` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-(MinIO tags along with Postgres because both come from `make services`; only
-`make api-full` actually stores frames in it.)
+(The S3 store tags along with Postgres because both come from `make services`;
+only `make api-full` actually stores frames in it.)
 
 Containers left running from a previous level are **not** wired in by a lower
 one: `make api-pg` then Ctrl-C then `make api` leaves Postgres up but running
@@ -190,7 +190,7 @@ flowchart LR
     proxy["<b>front door</b> :9080<br/><i>make hub-proxy</i><br/>routes by Host"]
     kc["<b>Keycloak</b> :8080<br/>realm 'nebari'"]
     pg[("<b>Postgres</b> :5432<br/>orgs · history · tasks")]
-    minio[("<b>MinIO</b> :9000<br/>S3 frame store")]
+    s3[("<b>SeaweedFS</b> :9000<br/>S3 frame store")]
     fg["fake Google :8081"]
     fs["fake Slack :8082"]
     fg2["fake GitHub :8083"]
@@ -201,7 +201,7 @@ flowchart LR
   api -->|"exchange bearer for<br/>the user's provider token"| kc
   api --> pg
   api --> frames
-  api -.->|"frames.storage.backend=s3"| minio
+  api -.->|"frames.storage.backend=s3"| s3
   api -->|"provider API calls"| fg
   api --> fs
   api --> fg2
@@ -256,11 +256,20 @@ tables at startup; the dev targets set it.
 make psql          # a psql shell on the dev database
 ```
 
-### MinIO — the S3 frame store
+### SeaweedFS — the S3 frame store
 
-Frame **bodies** default to the local filesystem (`dev/.local/frames`). MinIO
-is only needed to exercise the S3 code path, which `make api-full` does. The
-console is at <http://localhost:9001> (`minioadmin` / `minioadmin123`).
+Frame **bodies** default to the local filesystem (`dev/.local/frames`). The S3
+store is only needed to exercise the S3 code path, which `make api-full` does.
+Its keys are `devaccesskey` / `devsecretkey` (`dev/s3/s3.json`), the API is on
+<http://localhost:9000>, and the server's status page is at
+<http://localhost:9333>. `make services` creates the `frames` bucket with the
+AWS CLI, which speaks to any S3.
+
+This was MinIO until its images left Docker Hub (#114, #115) and then quay.io,
+which no account can pull; SeaweedFS is maintained, Apache-2.0, and serves the
+part of S3 the frame store uses, conditional writes included. Nothing outside
+`dev/` and `scripts/smoke_frames_s3.sh` knew which server it was: the API
+speaks S3 through boto3 either way.
 
 ### Keycloak
 
@@ -321,7 +330,7 @@ Level 4 builds `api/Dockerfile`, loads it into a kind cluster, and installs
 | | `make down` | `make destroy` | `make clean` |
 |---|:--:|:--:|:--:|
 | Postgres rows — frames, orgs, roles, audit | kept | **erased** | kept |
-| MinIO objects | kept | **erased** | kept |
+| S3 objects | kept | **erased** | kept |
 | Keycloak realm, identity providers, account links | kept | **erased** | kept |
 | Frame bodies on disk (`dev/.local/frames`) | kept | kept | **erased** |
 | The kind cluster | kept | kept | kept |
@@ -387,7 +396,7 @@ true` — on a routed host they are an authentication bypass. See
 ## Level 2 — with Postgres
 
 ```sh
-make api-pg      # starts Postgres + MinIO, then the API
+make api-pg      # starts Postgres + the S3 store, then the API
 ```
 
 Starts the two containers first (skipping any already up), waits for them to be
@@ -417,7 +426,7 @@ curl -s localhost:8000/v1/frame-groups
 ## Level 3 — with Keycloak
 
 ```sh
-make api-oidc    # starts Postgres, MinIO and Keycloak, then the API
+make api-oidc    # starts Postgres, the S3 store and Keycloak, then the API
 ```
 
 Three containers, started for you and waited on before the API launches. The
@@ -1181,7 +1190,7 @@ works as a set:
 | `KC_USER` / `KC_PASS` | `dev` / `dev` | Whose token `make token` prints |
 | `PG_URL` | `postgresql://collab:collab@127.0.0.1:5432/collab` | Dev database |
 | `KC_ADMIN` / `KC_ADMIN_PW` | `admin` / `admin` | Admin console **and** `kcadm`; only seeded against an empty database |
-| `S3_ENDPOINT` | `http://127.0.0.1:9000` | MinIO, for the S3 frame store |
+| `S3_ENDPOINT` | `http://127.0.0.1:9000` | The S3 frame store |
 | `CLUSTER_NAME` | `collab-hub-dev` | kind cluster name |
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
 | `IMAGE` | `collab-hub-api:dev` | Image `make kind-image` builds and loads, and `make kind-up` deploys |
@@ -1193,7 +1202,8 @@ works as a set:
 | Path | What it is |
 |---|---|
 | `Makefile` | Every target described above |
-| `compose.yaml` | Postgres, MinIO, Keycloak, the two fake providers, and the desktop front door |
+| `compose.yaml` | Postgres, the S3 store, Keycloak, the two fake providers, and the desktop front door |
+| `s3/s3.json` | The dev credentials the S3 store reads |
 | `keycloak/realm-nebari.json` | The `nebari` realm: clients, mappers, users |
 | `sql/bootstrap.sql` | Org + owner membership + operator grant, in one transaction |
 | `proxy/Caddyfile` | Host-routing front door for the desktop client |

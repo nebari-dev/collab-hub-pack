@@ -159,8 +159,8 @@ S3_ENV := \
   COLLAB_HUB_API__FRAMES__S3__BUCKET=frames \
   COLLAB_HUB_API__FRAMES__S3__ENDPOINT_URL=$(S3_ENDPOINT) \
   COLLAB_HUB_API__FRAMES__S3__REGION=us-east-1 \
-  AWS_ACCESS_KEY_ID=minioadmin \
-  AWS_SECRET_ACCESS_KEY=minioadmin123
+  AWS_ACCESS_KEY_ID=devaccesskey \
+  AWS_SECRET_ACCESS_KEY=devsecretkey
 
 # The server-rendered /web and /admin pages.
 WEB_ENV := \
@@ -233,7 +233,7 @@ api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on ever
 ## Level 2 — API with real datastores
 # ---------------------------------------------------------------------------
 
-api-pg: services | $(LOCAL)/frames ## Starts Postgres+MinIO, then the API: history, groups, orgs, tasks
+api-pg: services | $(LOCAL)/frames ## Starts Postgres+S3, then the API: history, groups, orgs, tasks
 	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(PG_ENV) uv run python -m collab_hub_api
 
 # ---------------------------------------------------------------------------
@@ -337,9 +337,9 @@ hub-proxy-down: ## Stop the front door (Keycloak stays up on localhost:8080)
 ## Supporting services (docker compose)
 # ---------------------------------------------------------------------------
 
-services: ## Start Postgres + MinIO
-	$(COMPOSE) up -d --wait postgres minio
-	$(COMPOSE) up minio-init
+services: ## Start Postgres + the S3 frame store
+	$(COMPOSE) up -d --wait postgres s3
+	$(COMPOSE) up s3-init
 
 keycloak: ## Start Keycloak and import the `nebari` realm
 	$(COMPOSE) --profile auth up -d --wait keycloak
