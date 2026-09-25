@@ -632,10 +632,12 @@ def make_app(config: BaseConfig) -> FastAPI:
     # every unmatched path, so they never reached a handler at all (#67).
     @app.exception_handler(StarletteHTTPException)
     async def frames_http_exception_handler(request: Request, exc: StarletteHTTPException):
-        # App-relative, and by the same segment-aware rule the router matched
-        # on: behind a proxy that keeps the `server.root_path` prefix, the raw
-        # URL path would never look like an API path.
-        if not _api_path(get_route_path(request.scope)):
+        # The raw URL path (main's rule, kept so nothing it enveloped loses the
+        # envelope) or the app-relative path the router matched on, by the
+        # router's own segment-aware rule: behind a proxy that keeps the
+        # `server.root_path` prefix, the raw path alone never looks like an
+        # API path.
+        if not (_api_path(request.url.path) or _api_path(get_route_path(request.scope))):
             return await http_exception_handler(request, exc)
         code = {
             status.HTTP_401_UNAUTHORIZED: error_codes.UNAUTHORIZED,

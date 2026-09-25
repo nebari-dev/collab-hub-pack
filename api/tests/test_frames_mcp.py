@@ -382,6 +382,28 @@ async def test_routing_errors_keep_the_envelope_under_a_root_path(
     assert bad_method.json() == {"error": {"code": "http_error", "message": "Method Not Allowed"}}
 
 
+async def test_a_root_path_that_is_itself_an_api_prefix_keeps_the_envelope(tmp_path, monkeypatch):
+    # With root_path="/frames", "/frames/v1/connectors" is enveloped by its raw
+    # path even though the app-relative path is a connector path. Classifying
+    # by the app-relative path must add to that rule, not replace it.
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
+    config = Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "server": {"root_path": "/frames"},
+            "frames": {"active_state": {"backend": "memory"}, "mcp_session_manager_enabled": False},
+        }
+    )
+    app = make_app(config)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, root_path="/frames")
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/frames/v1/connectors")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
 async def test_mcp_mount_removal_leaves_other_response_shapes_alone(client):
     # `/v1/connectors/*` stays out of core._api_path, so it keeps FastAPI's
     # default error body. Converging error shapes app-wide is a contract
