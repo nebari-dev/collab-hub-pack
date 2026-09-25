@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1191,13 +1192,24 @@ async def test_an_acquisition_that_completes_before_the_cancel_is_handled_exits_
     # finishing, so the handler cannot run until the future is done.
     indexer, store, _ = evented_indexer()
     store.release_enter.clear()
+    submitted: list = []
+    submit = indexer._sweep_thread.submit
+
+    def recording_submit(fn, /, *args, **kwargs):
+        future = submit(fn, *args, **kwargs)
+        submitted.append(future)
+        return future
+
+    indexer._sweep_thread.submit = recording_submit  # type: ignore[method-assign]
 
     task = asyncio.create_task(indexer.sweep())
     await asyncio.to_thread(store.enter_started.wait, 10)
     task.cancel()
     store.release_enter.set()
-    assert store.entered.wait(timeout=10)  # blocking on purpose: the loop does not run
-    time.sleep(0.05)  # and the acquisition future has settled by the time the handler sees it
+    # Blocking on purpose: the loop does not run, so the cancellation is not
+    # handled until the acquisition's own future has settled (codex round-3
+    # finding: an event set inside __enter__ plus a sleep was not that).
+    assert submitted[0].result(timeout=10) is not None
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
 
@@ -1212,9 +1224,12 @@ async def test_a_release_the_sweep_is_waiting_for_survives_a_cancel_while_it_is_
     # Codex round-1 finding: the normal path awaited its release through
     # wrap_future, which cancels a future that has not started -- so a
     # cancellation arriving while the release sat behind another call on
-    # the sweep thread dropped the release outright. Deterministic: a
-    # blocker is put on the sweep thread just before the release is queued,
-    # so the sweep is waiting on a release that is queued, not running.
+    # the sweep thread dropped the release outright. This pins HEAD's
+    # mechanism end to end (the bridge itself is pinned by
+    # test_awaiting_without_cancelling_leaves_the_worker_alone below):
+    # a blocker is put on the sweep thread just before the release is
+    # queued, so the sweep is waiting on a release that is queued, not
+    # running, when the cancel lands.
     indexer, store, _ = evented_indexer()
     blocker = threading.Event()
     queue_release = indexer._queue_release
@@ -1238,6 +1253,46 @@ async def test_a_release_the_sweep_is_waiting_for_survives_a_cancel_while_it_is_
     await _until(lambda: store.events == ["entered", "write_done", "write_done", "unlocked"])
     with store.sweep_lock() as held:
         assert held is not None, "the queued release ran once the thread freed; nothing dropped it"
+
+
+async def test_awaiting_without_cancelling_leaves_the_worker_alone():
+    # The bridge the normal path awaits its release through. wrap_future
+    # would cancel a queued worker when the awaiter is cancelled; this must
+    # not -- the worker runs once the thread frees, and its result and
+    # exception still reach an awaiter that is there to receive them.
+    from collab_hub_api.cogs.indexer import _await_without_cancelling
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        blocker = threading.Event()
+        ran = threading.Event()
+        pool.submit(blocker.wait, 10)
+        queued = pool.submit(ran.set)
+
+        waiter = asyncio.create_task(_await_without_cancelling(queued))
+        await asyncio.sleep(0.02)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not queued.cancelled() and not queued.done(), "the awaiter's cancellation did not reach the worker"
+        blocker.set()
+        assert await asyncio.to_thread(ran.wait, 5), "the queued worker still ran"
+
+        # Results and exceptions travel; a worker the executor cancelled is an error, not a hang.
+        assert await _await_without_cancelling(pool.submit(lambda: 42)) == 42
+        with pytest.raises(ValueError, match="boom"):
+            await _await_without_cancelling(pool.submit(_raise, ValueError("boom")))
+    stopped = ThreadPoolExecutor(max_workers=1)
+    hold = threading.Event()
+    stopped.submit(hold.wait, 10)
+    never = stopped.submit(lambda: None)
+    stopped.shutdown(wait=False, cancel_futures=True)
+    hold.set()
+    with pytest.raises(RuntimeError, match="cancelled before it ran"):
+        await _await_without_cancelling(never)
+
+
+def _raise(exc: BaseException) -> None:
+    raise exc
 
 
 async def test_a_cancelled_sweeps_queued_release_survives_a_second_cancel_and_close():

@@ -1204,7 +1204,9 @@ as present, so removal stays correct. Safety rules operators should know:
   Service — so a rolling update of the API never starts a sweep, and a
   rollout of the indexer never overlaps two. The API replicas render
   `cogs.index.enabled=false` whatever the values say, and keep serving the
-  read API and the lock-less targeted entry points. Under that shape a sweep
+  read API (the lock-less targeted entry points a webhook receiver will
+  call are built only where indexing is enabled today; wiring them onto the
+  API replicas without a sweep loop is issue #86's). Under that shape a sweep
   still takes the session-level advisory lock
   `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its
   whole duration (outside any transaction, so a minutes-long sweep pins no

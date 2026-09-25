@@ -644,9 +644,8 @@ include with nindent.
 
   Which process sweeps is decided here, not by the operator (issue
   #148): the API replicas always render `enabled=false` and serve the
-  catalog read API and the lock-less targeted entry points; the one
-  indexer replica (indexer-deployment.yaml) renders `enabled=true`
-  with the tuning. Single flight is therefore a property of the
+  catalog read API; the one indexer replica (indexer-deployment.yaml)
+  renders `enabled=true` with the tuning. Single flight is therefore a property of the
   deployment shape, and the store's advisory lock is the belt under it.
 */}}
 - name: COLLAB_HUB_API__COGS__INDEX__ENABLED
