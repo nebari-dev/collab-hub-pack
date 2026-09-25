@@ -321,8 +321,8 @@ class SlackDmsResponse(UntrustedConnectorResponse):
     next_cursor: str = ""
 
 
+# No channel_id here: the read response already has it once at the top.
 class SlackMessage(BaseModel):
-    channel_id: str
     ts: str
     user_id: str = ""
     text: str = ""
@@ -344,6 +344,8 @@ class SlackSearchHit(BaseModel):
     user_id: str = ""
     author_name: str = ""
     text: str = ""
+    # True when the text was shortened. Read the message by its ts to get the full text.
+    truncated: bool = False
 
 
 class SlackSearchRequest(BaseModel):
@@ -373,6 +375,8 @@ class SlackReadRequest(BaseModel):
     until_date: date | None = None
     # Pass ``next_cursor`` from a prior page to continue a long history.
     cursor: str = Field(default="", max_length=256)
+    # Stop adding messages once their text would go over this many characters.
+    max_chars: int = Field(default=12_000, ge=1, le=50_000)
 
     @model_validator(mode="after")
     def _derive_oldest_latest(self) -> SlackReadRequest:
@@ -426,6 +430,8 @@ class SlackThreadReadRequest(BaseModel):
     limit: int = Field(default=50, ge=1, le=200)
     # Pass ``next_cursor`` from a prior page to continue a long thread.
     cursor: str = Field(default="", max_length=256)
+    # Stop adding messages once their text would go over this many characters.
+    max_chars: int = Field(default=12_000, ge=1, le=50_000)
 
 
 class SlackThreadReadResponse(UntrustedConnectorResponse):
