@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.routing import Route
+from starlette.routing import Route, get_route_path
 
 from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
 from .config import (
@@ -632,10 +632,10 @@ def make_app(config: BaseConfig) -> FastAPI:
     # every unmatched path, so they never reached a handler at all (#67).
     @app.exception_handler(StarletteHTTPException)
     async def frames_http_exception_handler(request: Request, exc: StarletteHTTPException):
-        # App-relative, like the path-protection middleware's refusals: behind
-        # a proxy that keeps the `server.root_path` prefix, the raw URL path
-        # would never look like an API path.
-        if not _api_path(request_path(request)):
+        # App-relative, and by the same segment-aware rule the router matched
+        # on: behind a proxy that keeps the `server.root_path` prefix, the raw
+        # URL path would never look like an API path.
+        if not _api_path(get_route_path(request.scope)):
             return await http_exception_handler(request, exc)
         code = {
             status.HTTP_401_UNAUTHORIZED: error_codes.UNAUTHORIZED,

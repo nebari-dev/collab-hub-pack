@@ -339,16 +339,23 @@ async def test_body_parse_errors_on_api_paths_answer_the_envelope(client):
     assert response.json()["error"]["code"] == "http_error"
 
 
-@pytest.mark.parametrize("request_prefix", ["/nexus", ""])
-async def test_routing_errors_keep_the_envelope_under_a_root_path(tmp_path, monkeypatch, request_prefix):
-    # A proxy that keeps the `server.root_path` prefix ("/nexus") and one that
-    # strips it (""): either way the app-relative path is an API path.
+@pytest.mark.parametrize(
+    ("root_path", "request_prefix"),
+    [("/nexus", "/nexus"), ("/nexus", ""), ("/", ""), ("/v", "")],
+)
+async def test_routing_errors_keep_the_envelope_under_a_root_path(
+    tmp_path, monkeypatch, root_path, request_prefix
+):
+    # A proxy that keeps the `server.root_path` prefix ("/nexus" requested as
+    # "/nexus/..."), one that strips it, and root paths that are a textual but
+    # not a segment prefix of the API path ("/", "/v"): in every case the path
+    # the router matched on is an API path, and the answer is the envelope.
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
     config = Config.parse(
         {
             "storage": {"frames_path": str(tmp_path / "frames")},
-            "server": {"root_path": "/nexus"},
+            "server": {"root_path": root_path},
             "frames": {
                 "active_state": {"backend": "memory"},
                 "history": {"backend": "memory"},
@@ -360,10 +367,14 @@ async def test_routing_errors_keep_the_envelope_under_a_root_path(tmp_path, monk
     )
     app = make_app(config)
     async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, root_path="/nexus")
+        transport = httpx.ASGITransport(app=app, root_path=root_path)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             unmatched = await client.get(f"{request_prefix}/v1/frames/a/b/c")
             bad_method = await client.delete(f"{request_prefix}/v1/frames")
+            # A route-raised 401 goes through the same handler.
+            anonymous = await client.get(f"{request_prefix}/v1/frames")
+    assert anonymous.status_code == 401
+    assert anonymous.json()["error"]["code"] == "unauthorized"
     assert unmatched.status_code == 404
     assert unmatched.json() == {"error": {"code": "not_found", "message": "Not Found"}}
     assert bad_method.status_code == 405
