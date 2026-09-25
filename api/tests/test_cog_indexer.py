@@ -981,7 +981,7 @@ async def test_app_shutdown_is_bounded_when_the_indexer_task_does_not_unwind(tmp
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
                 if let_go.is_set():
-                    raise
+                    raise RuntimeError("late failure: postgresql://user:secret@db.internal/collab") from None
 
     monkeypatch.setattr(CogIndexer, "run", run_that_swallows_cancellation)
     store = InMemoryCogCatalogStore()
@@ -1001,13 +1001,19 @@ async def test_app_shutdown_is_bounded_when_the_indexer_task_does_not_unwind(tmp
     assert not task.done(), "the task that would not unwind is left pending, not waited out"
     assert "cog_indexer_shutdown_abandoned" in [r.message for r in caplog.records]
 
-    # The executors are closed once the task does finish, whenever that is.
+    # The executors are closed once the task does finish, whenever that is
+    # -- and a task that then fails is observed, by class name, rather than
+    # left for asyncio to report at collection (codex round-2 finding).
     executor = app.state.cog_indexer._executor
     executor.submit(lambda: None).result(timeout=5)
     let_go.set()
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=5)
+    with caplog.at_level(logging.ERROR, logger="frames_server.core"):
+        with pytest.raises(RuntimeError, match="late failure"):
+            await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0.05)
+    failed = [r for r in caplog.records if r.message == "cog_indexer_task_failed"]
+    assert failed and failed[0].error == "RuntimeError"
     for closed in (executor, app.state.cog_indexer._sweep_thread):
         with pytest.raises(RuntimeError, match="shutdown"):
             closed.submit(lambda: None)
@@ -1087,6 +1093,7 @@ class _EventedStore(InMemoryCogCatalogStore):
         self.fail_write: BaseException | None = None
         self.enter_thread: threading.Thread | None = None
         self.exit_thread: threading.Thread | None = None
+        self.entered = threading.Event()
         # Default: nothing blocks unless a test arms it.
         self.release_enter.set()
         self.release_write.set()
@@ -1098,6 +1105,7 @@ class _EventedStore(InMemoryCogCatalogStore):
         assert self.release_enter.wait(timeout=10)
         self.enter_thread = threading.current_thread()
         self.events.append("entered")
+        self.entered.set()
         try:
             with super().sweep_lock() as held:
                 yield held
@@ -1172,6 +1180,64 @@ async def test_cancellation_during_a_write_queues_the_release_behind_it_without_
     assert store.events == ["entered", "write_done", "unlocked"]
     with store.sweep_lock() as held:
         assert held is not None
+
+
+async def test_an_acquisition_that_completes_before_the_cancel_is_handled_exits_on_the_sweep_thread():
+    # Codex round-1 finding: with the exit chained as a done-callback, an
+    # acquisition that had already completed by the time the cancellation
+    # handler ran got its exit *inline*, on the event loop. The release is
+    # now queued on the sweep thread whatever the timing. Deterministic: the
+    # loop is held (no await) between task.cancel() and the acquisition
+    # finishing, so the handler cannot run until the future is done.
+    indexer, store, _ = evented_indexer()
+    store.release_enter.clear()
+
+    task = asyncio.create_task(indexer.sweep())
+    await asyncio.to_thread(store.enter_started.wait, 10)
+    task.cancel()
+    store.release_enter.set()
+    assert store.entered.wait(timeout=10)  # blocking on purpose: the loop does not run
+    time.sleep(0.05)  # and the acquisition future has settled by the time the handler sees it
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    await _until(lambda: store.events == ["entered", "unlocked"])
+    assert store.exit_thread is not threading.main_thread(), "the exit must not run on the event loop"
+    assert store.exit_thread is store.enter_thread, "it ran on the sweep thread, behind the acquisition"
+    with store.sweep_lock() as held:
+        assert held is not None
+
+
+async def test_a_release_the_sweep_is_waiting_for_survives_a_cancel_while_it_is_still_queued():
+    # Codex round-1 finding: the normal path awaited its release through
+    # wrap_future, which cancels a future that has not started -- so a
+    # cancellation arriving while the release sat behind another call on
+    # the sweep thread dropped the release outright. Deterministic: a
+    # blocker is put on the sweep thread just before the release is queued,
+    # so the sweep is waiting on a release that is queued, not running.
+    indexer, store, _ = evented_indexer()
+    blocker = threading.Event()
+    queue_release = indexer._queue_release
+
+    def queue_behind_a_blocker(lock, entering):
+        indexer._sweep_thread.submit(blocker.wait, 10)
+        return queue_release(lock, entering)
+
+    indexer._queue_release = queue_behind_a_blocker  # type: ignore[method-assign]
+    task = asyncio.create_task(indexer.sweep())
+    # The sweep has written both Cogs and is now waiting on its release,
+    # which sits in the queue behind the running blocker.
+    await _until(lambda: store.events == ["entered", "write_done", "write_done"])
+    await _until(lambda: indexer._sweep_thread._work_queue.qsize() == 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert store.events == ["entered", "write_done", "write_done"], "the release is still queued behind the blocker"
+
+    blocker.set()
+    await _until(lambda: store.events == ["entered", "write_done", "write_done", "unlocked"])
+    with store.sweep_lock() as held:
+        assert held is not None, "the queued release ran once the thread freed; nothing dropped it"
 
 
 async def test_a_cancelled_sweeps_queued_release_survives_a_second_cancel_and_close():

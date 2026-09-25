@@ -372,6 +372,26 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.cog_registry_sources = cog_indexing.indexer.sources if cog_indexing is not None else []
             cog_index_task: asyncio.Task | None = None
             if cog_indexing is not None:
+                indexer = cog_indexing.indexer
+
+                def _settle_cog_index_task(task: asyncio.Task) -> None:
+                    """The one place a finished indexer task is observed and its executors closed.
+
+                    Whether it finished inside the shutdown wait or long
+                    after (as a done-callback), the same thing happens:
+                    run() swallows ordinary sweep failures, so an exception
+                    here is a bug in the loop itself -- retrieved and logged
+                    by class name, which also keeps asyncio from reporting
+                    it at collection with a text this module never logs --
+                    and then the executors stop accepting calls. Work
+                    already on a thread, a queued lock release included,
+                    still finishes.
+                    """
+
+                    if not task.cancelled() and task.exception() is not None:
+                        logger.error("cog_indexer_task_failed", extra={"error": type(task.exception()).__name__})
+                    indexer.close()
+
                 # After the migration (which ran in make_app) and after the
                 # pools opened: the first sweep may be immediate. Single
                 # flight is the chart's doing (one indexer replica, recreated
@@ -420,35 +440,21 @@ def make_app(config: BaseConfig) -> FastAPI:
                     cog_index_task.cancel()
                     _, still_pending = await asyncio.wait({cog_index_task}, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
                     if still_pending:
-                        # Not closing the indexer's executor here: the task
-                        # may yet come back and submit its lock release, and
-                        # a shut-down executor would turn that into an
-                        # exception. Close it when the task does finish, so a
-                        # process that outlives this lifespan (a reload, a
-                        # test holding the app) does not keep idle workers.
-                        if cog_indexing is not None:
-                            indexer = cog_indexing.indexer
-                            cog_index_task.add_done_callback(lambda _task: indexer.close())
+                        # The executors are not closed here: the task may yet
+                        # come back and submit its lock release, and a
+                        # shut-down executor would turn that into an
+                        # exception. The one settlement below runs when the
+                        # task does finish, whenever that is, so a process
+                        # that outlives this lifespan (a reload, a test
+                        # holding the app) does not keep idle workers and a
+                        # late failure is still observed.
+                        cog_index_task.add_done_callback(_settle_cog_index_task)
                         logger.error(
                             "cog_indexer_shutdown_abandoned",
                             extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
                         )
                     else:
-                        if not cog_index_task.cancelled() and cog_index_task.exception() is not None:
-                            # run() swallows ordinary sweep failures, so this
-                            # is a bug in the loop itself; retrieving it here
-                            # keeps asyncio from reporting it at collection
-                            # with a text this module never logs.
-                            logger.error(
-                                "cog_indexer_task_failed",
-                                extra={"error": type(cog_index_task.exception()).__name__},
-                            )
-                        if cog_indexing is not None:
-                            # The task is done, so no further store calls are
-                            # coming: stop accepting them. Work already on a
-                            # thread -- a queued release included -- still
-                            # finishes.
-                            cog_indexing.indexer.close()
+                        _settle_cog_index_task(cog_index_task)
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):
