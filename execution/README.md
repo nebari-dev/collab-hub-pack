@@ -68,14 +68,32 @@ step again, since no envelope was recorded to complete it with. `decide(run_id, 
 actor=, outcome=, findings=)` answers it:
 
 - `approve` completes the step with the envelope the approver saw — the step
-  does not run again — and the run goes on;
+  does not run again — and the run goes on. An escalation recorded before Gates
+  holds no result, so approving one is refused: send it back, which asks for the
+  work again, or reject it;
 - `reject` ends the run `REJECTED`;
 - `send_back` re-runs the step with the findings as its `signal`, under a new
   attempt key, and its next result goes through the Gate again, with a new
   escalation id.
 
-`findings` is a sequence of findings, and one string is refused rather than
-sent back as its characters; `None` is no findings at all.
+`findings` is a sequence of findings. One string, a mapping or a set is refused
+rather than sent back as its characters, its keys, or an arbitrary order;
+`None` is no findings at all.
+
+Each decision is recorded with its escalation, the actor, the outcome, the
+findings and `envelope_digest`, a stable id for the result it decided on, so a
+reader of decisions identifies that result without joining to the escalation.
+
+A budget stop never discards a result that was paid for. When an interaction
+crosses a spending limit and its result needs review, the escalation is
+recorded, and the stop lands at the next boundary — the end of the run
+included — by when no further work has been spent. So an approval, which spends
+nothing, keeps the work, and the run then stops on its budget.
+
+A Gate recorded on the Track is read, never refused, so a run stays decidable
+even after a rollback: a policy this engine does not know reads as `always`,
+the strictest, and approvers that are not role names read as none declared. A
+Gate a caller *declares* is still refused.
 
 A decision naming an escalation that is no longer open raises
 `StaleEscalation` and changes nothing, so a late approval never approves a

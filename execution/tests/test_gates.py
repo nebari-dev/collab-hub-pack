@@ -1,10 +1,14 @@
 """Gates on Op steps: the policy, and how approve, reject and send back drive a run."""
 
+import inspect
+
+import httpx
 import pytest
 
 from collab_hub_execution import (
     DEFAULT_APPROVERS,
     DurableWorkflowEngine,
+    EnvelopeInvalid,
     Gate,
     GateOutcome,
     InMemoryCogExecutor,
@@ -17,8 +21,10 @@ from collab_hub_execution import (
     StaleEscalation,
     TrackEvent,
     WorkflowEngine,
+    envelope_digest,
     escalation_id,
 )
+from collab_hub_execution.kubernetes import _KubernetesWorker
 from collab_hub_execution.orchestration import _NO_SIGNAL
 
 ERROR = Problem("grounding", "quote not verbatim", "error")
@@ -52,12 +58,32 @@ def test_a_gate_is_refused_when_its_policy_or_approvers_are_not_ones_it_knows(ar
         Gate(**arguments)
 
 
-def test_approvers_given_once_are_kept_and_a_string_is_refused_however_it_arrives():
+def test_approvers_given_once_are_kept_and_a_declared_string_is_refused():
     # A sequence read twice would validate and then be empty, widening who may decide.
     assert Gate(approvers=(role for role in ["editor"])).deciders == ("editor",)
     assert Gate.from_dict({"approvers": ["editor"]}).approvers == ("editor",)
-    with pytest.raises(ValueError, match="not one string"):
-        Gate.from_dict({"approvers": "owner"})
+
+
+def test_a_recorded_gate_is_read_rather_than_refused_so_a_run_stays_decidable():
+    # A Track written by an engine this one does not know must not make a run undrivable.
+    assert Gate.from_dict({"escalate": "sometimes"}).escalate == "always"  # the strictest: a person decides
+    assert Gate.from_dict({"approvers": "owner"}).deciders == DEFAULT_APPROVERS  # not five one-character roles
+    assert Gate.from_dict({"approvers": ["editor", "", 3]}).approvers == ("editor",)
+
+
+def test_a_run_whose_recorded_gate_is_unknown_can_still_be_decided():
+    track = InMemoryTrackStore()
+    op = {"run_id": "future", "steps": [{"name": "s", "cog": "c", "entry_point": "run", "input": "draft",
+                                         "digest": None, "gate": {"escalate": "sometimes", "approvers": 7}}]}
+    track.append(TrackEvent(run_id="future", event_type="op_submitted", payload={"op": op}))
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
+    # The unknown policy reads as `always`, so the step escalates and can be approved.
+    assert engine.submit(OpDefinition("future", (OpStep("s", "c", "run", "draft",
+                                                        gate=Gate(escalate="always")),))) is RunState.WAITING_AT_GATE
+    escalation = engine.open_escalation("future")
+    assert escalation["approvers"] == list(DEFAULT_APPROVERS)
+    assert engine.decide("future", escalation=escalation["escalation"], actor="alice",
+                         outcome="approve") is RunState.COMPLETED
 
 
 def test_an_escalation_id_is_minted_over_the_attempt_and_the_envelope():
@@ -71,10 +97,22 @@ def test_an_escalation_id_is_minted_over_the_attempt_and_the_envelope():
 # --- a Cog cannot pause a run; only a step's Gate can ---------------------------------
 
 
-def test_a_cog_asking_to_pause_is_only_answering_with_data():
+def test_a_cog_asking_to_pause_never_pauses_a_run_at_either_boundary():
+    # In process: an in-memory handler's value that is not an envelope is a test
+    # payload by that executor's contract, so `{"pause": true}` is just data, and the
+    # run completes rather than waiting. A Cog cannot reach WAITING_AT_GATE.
     track = InMemoryTrackStore()
     engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: {"pause": True}}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.COMPLETED
+    [completed] = [e for e in track.replay("r") if e.event_type == "step_completed"]
+    assert completed.payload["output"] == {"pause": True}  # the payload, not a pause
+
+    # Over HTTP, where a real worker answers, the same body is not an envelope at all.
+    worker = _KubernetesWorker("openteams/gated", "w", "http://worker",
+                               httpx.Client(transport=httpx.MockTransport(
+                                   lambda _: httpx.Response(200, json={"pause": True, "reason": "review"}))))
+    with pytest.raises(EnvelopeInvalid):
+        worker.interact("run", "x")
 
 
 def test_an_error_problem_escalates_through_the_default_gate_without_the_cog_asking():
@@ -157,11 +195,12 @@ def test_each_decision_is_recorded_with_its_escalation_actor_outcome_findings_an
     op.engine().submit(op.op)
     escalation = op.open()
     op.engine().decide("r", escalation=escalation, actor="alice", outcome="send_back", findings=["add a source"])
+    [escalated] = [e for e in op.events("paused") if e.payload["escalation"] == escalation]
     [decision] = op.events("signal_received")
     assert decision.payload == {"step": "draft", "outcome": "send_back", "value": ["add a source"],
-                                "escalation": escalation, "actor": "alice"}
-    # The escalation it names holds the envelope the decision was made on.
-    [escalated] = [e for e in op.events("paused") if e.payload["escalation"] == escalation]
+                                "escalation": escalation, "actor": "alice",
+                                "envelope_digest": envelope_digest(escalated.payload["envelope"])}
+    # The digest names the result decided on; the escalation it answers holds that result.
     assert ResultEnvelope.parse(escalated.payload["envelope"]).payload == {"version": 1}
     assert escalated.payload["attempt"] == 0
 
@@ -228,20 +267,37 @@ def test_a_resubmission_with_a_different_gate_is_refused():
         op.engine().submit(changed)
 
 
-def test_findings_are_a_sequence_of_findings_never_one_string():
+@pytest.mark.parametrize("findings", ["cite the source", {"note": "cite the source"}, {"cite", "source"}],
+                         ids=["string", "mapping", "set"])
+def test_findings_are_a_sequence_of_findings_never_something_that_only_iterates(findings):
     op = _Engine()
     op.engine().submit(op.op)
-    with pytest.raises(ValueError, match="not one string"):
-        op.engine().decide("r", escalation=op.open(), actor="alice", outcome="send_back", findings="cite the source")
-    # None is no findings at all.
+    with pytest.raises(ValueError, match="sequence of findings"):
+        op.engine().decide("r", escalation=op.open(), actor="alice", outcome="send_back", findings=findings)
+
+
+def test_a_sequence_of_findings_reaches_the_step_whole():
+    op = _Engine()
+    op.engine().submit(op.op)
+    op.engine().decide("r", escalation=op.open(), actor="alice", outcome="send_back",
+                       findings=("cite the source", "shorten it"))
+    assert op.calls[-1] == ("draft", ["cite the source", "shorten it"])
+
+
+def test_findings_may_be_absent():
+    op = _Engine()
+    op.engine().submit(op.op)
     assert op.engine().decide("r", escalation=op.open(), actor="alice", outcome="send_back",
                               findings=None) is RunState.WAITING_AT_GATE
     assert op.calls[-1] == ("draft", [])
 
 
-def test_the_engine_contract_offers_what_a_decision_must_name():
-    # A caller coded against WorkflowEngine can find the escalation `decide` requires.
-    assert hasattr(WorkflowEngine, "open_escalation") and hasattr(WorkflowEngine, "decide")
+@pytest.mark.parametrize("method", ["submit", "observe", "open_escalation", "decide"])
+def test_the_engine_implements_the_contract_a_caller_codes_against(method):
+    # A caller coded against WorkflowEngine — the #103 run API — needs the engine's
+    # methods to take and return what the contract says, `decide`'s escalation included.
+    assert inspect.signature(getattr(DurableWorkflowEngine, method)) == \
+        inspect.signature(getattr(WorkflowEngine, method))
 
 
 # --- a Track written before Gates -------------------------------------------------------
@@ -267,17 +323,22 @@ def test_an_escalation_recorded_before_gates_reads_with_the_shape_callers_expect
     assert escalation["approvers"] == list(DEFAULT_APPROVERS) and escalation["gate"] == "error"
 
 
-def test_approving_an_escalation_recorded_before_gates_runs_the_step_rather_than_wedging_the_run():
+def test_an_escalation_recorded_before_gates_has_no_result_to_approve_but_can_be_sent_back():
     track = _paused_before_gates()
     calls = []
     engine = DurableWorkflowEngine(
         executor=InMemoryCogExecutor({"c": lambda e, v, signal=None: calls.append(v) or ResultEnvelope.success(v)}),
         track=track,
     )
-    # No envelope was recorded to complete the step with, so the approval runs it.
-    assert engine.decide("old", escalation=None, actor="alice", outcome="approve") is RunState.COMPLETED
+    before = track.replay("old")
+    # "Approve" means "accept the result I saw", and no result was recorded: say so
+    # rather than silently running the step and its side effects again.
+    with pytest.raises(ValueError, match="no recorded result to approve"):
+        engine.decide("old", escalation=None, actor="alice", outcome="approve")
+    assert track.replay("old") == before and calls == []
+    # A send back asks for the work again, which is what the old engine's signal did.
+    assert engine.decide("old", escalation=None, actor="alice", outcome="send_back") is RunState.COMPLETED
     assert calls == ["draft"]
-    assert engine.observe("old") is RunState.COMPLETED
 
 
 def test_a_step_recorded_before_gates_has_the_default_gate():

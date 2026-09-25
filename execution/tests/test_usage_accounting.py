@@ -163,11 +163,19 @@ def test_escalated_usage_and_completed_usage_survive_restart_without_double_coun
 
     assert engine().submit(op(count=2)) is RunState.WAITING_AT_GATE
     escalation = engine().open_escalation("accounting")["escalation"]
-    # 6 (escalated) + 6 (sent back) + 6 (next step, which would escalate) exceeds 15.
+    # 6 (escalated) + 6 (sent back) + 6 (the next step, which escalates too) exceeds 15,
+    # and that result is not discarded: its escalation is recorded and waits.
     assert engine().decide("accounting", escalation=escalation, actor="alice", outcome="send_back",
-                           findings=["go"]) is RunState.BUDGET_EXCEEDED
+                           findings=["go"]) is RunState.WAITING_AT_GATE
     assert engine()._budget_tracker(track.replay("accounting")).tokens == 18
     assert len(executor.materialized) == 3
+    # Approving that result spends nothing, keeps the work, and the run stops on its budget.
+    second = engine().open_escalation("accounting")["escalation"]
+    assert engine().decide("accounting", escalation=second, actor="alice",
+                           outcome="approve") is RunState.BUDGET_EXCEEDED
+    completed = [e for e in track.replay("accounting") if e.event_type == "step_completed"]
+    assert [e.payload["step"] for e in completed] == ["0", "1"]
+    assert len(executor.materialized) == 3  # no further work was spent
 
 
 def test_a_result_that_would_escalate_without_usage_fails_when_spending_is_bounded():

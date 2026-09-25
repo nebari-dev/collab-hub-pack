@@ -173,7 +173,7 @@ record (#106).
 |---|---|---|
 | `pickup()` | `SUBMITTED` → `RUNNING` | `run_picked_up` |
 | `escalate(step, reason, escalation, details)` | `RUNNING` → `WAITING_AT_GATE` | `paused`, with what the Gate escalated on: the attempt, the envelope, the approvers |
-| `decide(outcome, escalation, findings, revise_limit, actor)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
+| `decide(outcome, escalation, findings, revise_limit, actor, envelope_digest)` | `WAITING_AT_GATE` → `RUNNING` (approve; send back), `REJECTED` (reject), `FAILED` (send back past the revise limit) | `signal_received`; `rejected`; `failed` |
 | `complete()` | `RUNNING` → `COMPLETED` | `completed` |
 | `fail(error, step, reason, details)` | `RUNNING` → `FAILED` | `failed` |
 | `exhaust_budget(dimension, step, reason)` | `RUNNING` → `BUDGET_EXCEEDED` | `timed_out` for `duration`; `budget_exceeded` otherwise |
@@ -210,7 +210,8 @@ durability backend moves the same machines.
 **Guards live in the state that owns them.** A decision must name the open
 escalation (`StaleEscalation` otherwise). A revise limit of N allows N
 revisions: a send back that would produce revision N+1 ends the run `FAILED`
-instead, and a decision records the actor who made it. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
+instead, and a decision records the actor who made it and the digest of the
+result it decided on. Retry from `INTERRUPTED` keeps the attempt, from `FAILED`
 opens a new one, from `BUDGET_EXCEEDED` a new budget epoch. `host_stopped` is
 refused under a backend that resumes. A cancellation and a reconciliation name
 who made them, and a worker is torn down only for a reason its state allows.

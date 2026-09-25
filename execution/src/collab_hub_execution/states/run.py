@@ -151,7 +151,8 @@ class WaitingAtGate(RunState):
     @accepts("RUNNING", "REJECTED", "FAILED")
     def decide(
         self, run: Run, *, outcome: str, escalation: str | None = None, findings: Any = None,
-        revise_limit: int | None = None, actor: str | None = None, **_: Any,
+        revise_limit: int | None = None, actor: str | None = None, envelope_digest: str | None = None,
+        **_: Any,
     ) -> Transition[Run]:
         if outcome not in DECISIONS:
             self.refuse("decide", f"unknown outcome {outcome!r}")
@@ -163,9 +164,13 @@ class WaitingAtGate(RunState):
         closed = {"open_step": None, "open_escalation": None}
         # Every decision record names the escalation it answered, so replay answers the same one,
         # and who decided it.
+        # A decision names the escalation it answered, who decided, and the result
+        # they decided on, so a reader of decisions needs no join to identify it.
         answered = {} if escalation is None else {"escalation": escalation}
         if actor is not None:
             answered["actor"] = actor
+        if envelope_digest is not None:
+            answered["envelope_digest"] = envelope_digest
         if outcome == "reject":
             record = Record("rejected", {"step": step, "value": findings, **answered})
             return move(run, RunState.REJECTED, record, **closed)
@@ -267,11 +272,11 @@ class Run(Context):
 
     def decide(
         self, *, outcome: str, escalation: str | None = None, findings: Any = None, revise_limit: int | None = None,
-        actor: str | None = None,
+        actor: str | None = None, envelope_digest: str | None = None,
     ) -> Transition[Run]:
         return self.dispatch(
             "decide", outcome=outcome, escalation=escalation, findings=findings, revise_limit=revise_limit,
-            actor=actor,
+            actor=actor, envelope_digest=envelope_digest,
         )
 
     def complete(self) -> Transition[Run]:
@@ -354,6 +359,7 @@ def _replay_failed(run: Run, payload: Mapping[str, Any]) -> Transition[Run]:
         return run.decide(
             outcome="send_back", escalation=payload.get("escalation"), findings=payload.get("value"),
             revise_limit=payload.get("revise_limit"), actor=payload.get("actor"),
+            envelope_digest=payload.get("envelope_digest"),
         )
     return run.fail(error=payload.get("error", ""), step=payload.get("step"), reason=payload.get("reason"))
 
@@ -366,6 +372,7 @@ def _replay_decision(outcome: str | None) -> Callable[[Run, Mapping[str, Any]], 
             escalation=payload.get("escalation"),
             findings=payload.get("value"),
             actor=payload.get("actor"),
+            envelope_digest=payload.get("envelope_digest"),
         )
 
     return replay

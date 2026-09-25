@@ -42,7 +42,7 @@ from .envelope import (
     Problem,
     ResultEnvelope,
 )
-from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, escalation_id
+from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .kubernetes import KubernetesCogExecutor, cog_slug, label_value, resource_name
 from .lifecycle import (
     BudgetExceeded,
@@ -116,6 +116,7 @@ __all__ = [
     "DEFAULT_APPROVERS",
     "Gate",
     "GateOutcome",
+    "envelope_digest",
     "escalation_id",
     "WorkflowEngine",
     "KubernetesCogExecutor",

@@ -521,6 +521,26 @@ def test_between_steps_status_is_running_not_tearing_down():
 # --- budget limits are inclusive: reaching exactly the max stops the run ---
 
 
+def test_a_budget_stop_keeps_an_escalated_result_rather_than_discarding_it():
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(
+        executor=InMemoryCogExecutor({"c": lambda e, v, signal=None: _review({"draft": v}, tokens=60)}),
+        track=track,
+        budget=RunBudget(max_tokens=50),
+    )
+    op = OpDefinition("run-paid", (OpStep("s", "c", "run", "x"),))
+    # The interaction crossed the budget and its result needs review: the escalation is
+    # recorded, so the work that was paid for is on the Track.
+    assert engine.submit(op) is RunState.WAITING_AT_GATE
+    escalation = engine.open_escalation("run-paid")
+    assert ResultEnvelope.parse(escalation["envelope"]).payload == {"draft": "x"}
+    # Approving spends nothing and keeps it; the run then stops on its budget.
+    assert engine.decide("run-paid", escalation=escalation["escalation"], actor="alice",
+                         outcome="approve") is RunState.BUDGET_EXCEEDED
+    kinds = [e.event_type for e in track.replay("run-paid")]
+    assert kinds.index("step_completed") < kinds.index("budget_exceeded")
+
+
 def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
     engine = DurableWorkflowEngine(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage={"tokens": 60})}),

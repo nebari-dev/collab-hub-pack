@@ -99,6 +99,10 @@ def test_escalation_accounting_survives_postgres_recovery(store):
     op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     escalation = engine().open_escalation(op.run_id)["escalation"]
+    # The second step's result crosses the budget and needs review: it is not discarded.
     assert engine().decide(op.run_id, escalation=escalation, actor="alice", outcome="send_back",
-                           findings=["go"]) is RunState.BUDGET_EXCEEDED
+                           findings=["go"]) is RunState.WAITING_AT_GATE
+    second = engine().open_escalation(op.run_id)["escalation"]
+    assert engine().decide(op.run_id, escalation=second, actor="alice",
+                           outcome="approve") is RunState.BUDGET_EXCEEDED
     assert engine()._budget_tracker(store.replay(op.run_id)).tokens == 18

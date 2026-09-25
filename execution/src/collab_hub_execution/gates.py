@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -72,11 +72,31 @@ class Gate:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any] | None) -> Gate:
-        """The Gate a step was submitted with; a step recorded before Gates has the default one."""
+        """The Gate a step was submitted with; a step recorded before Gates has the default one.
+
+        A recorded Gate is read, never refused: a run must stay decidable even when
+        its Track was written by an engine this one does not know — after a
+        rollback, say. A policy this engine does not know reads as ``always``, the
+        strictest, so a person decides every result rather than the run becoming
+        undrivable; approvers that are not role names read as none declared, so the
+        Gate's escalations fall to the default approvers instead of to roles nobody
+        holds. A Gate a caller *declares* is still refused (``__post_init__``).
+        """
         if value is None:
             return cls()
-        # The recorded value goes through the same validation as a declared one.
-        return cls(escalate=value.get("escalate", "error"), approvers=value.get("approvers", ()))
+        policy = value.get("escalate", "error")
+        recorded = value.get("approvers", ())
+        if isinstance(recorded, (str, bytes)) or not isinstance(recorded, Iterable):
+            recorded = ()
+        approvers = tuple(role for role in recorded if isinstance(role, str) and role)
+        return cls(escalate=policy if policy in POLICIES else "always", approvers=approvers)
+
+
+def envelope_digest(envelope: ResultEnvelope | Mapping[str, Any]) -> str:
+    """A stable id for one result: what a decision names as the envelope it decided on."""
+    shape = envelope.to_dict() if isinstance(envelope, ResultEnvelope) else dict(envelope)
+    digest = hashlib.sha256(json.dumps(shape, sort_keys=True, default=str).encode()).hexdigest()
+    return f"env-{digest[:16]}"
 
 
 def escalation_id(run_id: str, step: str, attempt: int, envelope: ResultEnvelope) -> str:
