@@ -685,29 +685,57 @@ async def test_mark_removed_marks_one_row():
         await indexer.mark_removed("no-such-source", "cogs/notes", "sha256:" + "b" * 64)
 
 
-async def test_reindex_upserts_are_targeted_and_sweep_upserts_are_not():
-    # Issue #128: the Postgres store gives a targeted upsert its own pooled
-    # connection instead of a concurrent sweep's lock session, so the
-    # lock-less reindex must mark every write it makes -- the fallback row
-    # for an unstorable card included -- while the sweep marks none.
-    flags: list[bool] = []
+async def test_the_sweep_writes_through_the_locks_view_and_reindex_through_the_store():
+    # Issues #128 and #148: the sweep's reads and writes go through the view
+    # its lock returned (on Postgres, the lock's own session) and never
+    # through the store; the lock-less reindex writes through the store --
+    # the fallback row for an unstorable card included -- and never through
+    # a view, because it holds none. The store below hands out a view that
+    # is a distinct object, so the two routes are told apart by identity.
+    routes: list[str] = []
 
     class RecordingStore(InMemoryCogCatalogStore):
-        def upsert(self, artifact, *, targeted=False):
-            flags.append(targeted)
+        def upsert(self, artifact, route="store"):
+            routes.append(route)
             if artifact.card is not None and artifact.repository == "cogs/transcriber":
                 raise CogCatalogDataError("DataError")
-            super().upsert(artifact, targeted=targeted)
+            super().upsert(artifact)
+
+        @contextmanager
+        def sweep_lock(self):
+            with super().sweep_lock() as held:
+                yield _RecordingView(self) if held is not None else None
+
+    class _RecordingView:
+        def __init__(self, store):
+            self._store = store
+
+        def known(self, source_id):
+            routes.append("view:known")
+            return self._store.known(source_id)
+
+        def upsert(self, artifact):
+            self._store.upsert(artifact, route="view")
+
+        def update_tags(self, *args, **kwargs):
+            routes.append("view:update_tags")
+            return self._store.update_tags(*args, **kwargs)
+
+        def mark_removed(self, *args, **kwargs):
+            routes.append("view:mark_removed")
+            return self._store.mark_removed(*args, **kwargs)
 
     base, _, _ = make()
     indexer = CogIndexer(RecordingStore(), base.sources)
 
     await indexer.reindex(SOURCE_ID, "cogs/transcriber", "sha256:" + "a" * 64)
-    assert flags == [True, True], "the reindex upsert and its failed-row fallback are both targeted"
+    assert routes == ["store", "store"], "the reindex upsert and its failed-row fallback both go through the store"
 
-    flags.clear()
-    await indexer.sweep()
-    assert flags and all(flag is False for flag in flags), "sweep-path upserts ride the lock session"
+    routes.clear()
+    summary = await indexer.sweep()
+    assert summary.indexed + summary.failed == 2
+    assert routes and all(route.startswith("view") for route in routes), routes
+    assert {"view:known", "view", "view:mark_removed"} <= set(routes), "every sweep-path call went through the view"
 
 
 # ---------------------------------------------------------------------------
@@ -865,18 +893,8 @@ async def test_app_exposes_the_store_and_no_indexer_when_indexing_is_off(config,
         assert app.state.cog_indexer is None and app.state.cog_registry_sources == []
 
 
-async def test_app_shutdown_is_bounded_when_the_sweep_is_stuck(tmp_path, monkeypatch, caplog):
-    # Round-3 codex finding: wait_for re-cancels and then AWAITS the task on
-    # timeout, and the indexer defers cancellation while draining -- so the
-    # "outer wall" waited the whole drain out. The lifespan now uses
-    # asyncio.wait and leaves a still-pending task behind, loudly.
-    from collab_hub_api import config as config_module
-    from collab_hub_api import core
-    from collab_hub_api.core import make_app
-
-    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
-    monkeypatch.setattr(core, "INDEXER_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
-    config = Config.parse(
+def _app_config(tmp_path) -> Config:
+    return Config.parse(
         {
             "storage": {"frames_path": str(tmp_path / "frames")},
             "frames": {
@@ -889,36 +907,105 @@ async def test_app_shutdown_is_bounded_when_the_sweep_is_stuck(tmp_path, monkeyp
             "cogs": cogs_block(STATIC_SOURCE, interval_seconds=3600, run_on_startup=True),
         }
     )
+
+
+async def test_app_shutdown_does_not_wait_for_a_stuck_store_call(tmp_path, monkeypatch, caplog):
+    # Issue #148: a store call that never returns (a dead transport) is not
+    # drained. The cancelled sweep unwinds at once, the lifespan exits at
+    # once, and the exit chained onto the stuck acquisition still releases
+    # the lock on that thread when -- if -- the acquisition returns. In the
+    # pod, the process exits first and the session takes the lock with it.
+    from collab_hub_api import config as config_module
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     store = _EventedStore()
     store.release_enter.clear()  # the sweep's lock acquisition never returns
     monkeypatch.setattr(config_module, "build_cog_catalog_store", lambda *_: store)
     monkeypatch.setattr("collab_hub_api.core.build_cog_catalog_store", lambda *_: store)
 
-    app = make_app(config)
+    app = make_app(_app_config(tmp_path))
     loop = asyncio.get_running_loop()
     async with app.router.lifespan_context(app):
         await asyncio.to_thread(store.enter_started.wait, 10)
         task = {t.get_name(): t for t in asyncio.all_tasks()}["cog-index"]
-        # A drain deadline well past the shutdown wall: the wall must win.
-        app.state.cog_indexer._drain_deadline = 30.0
+        started = loop.time()
+        with caplog.at_level(logging.ERROR, logger="frames_server.core"):
+            pass
+    elapsed = loop.time() - started
+    assert elapsed < 1, f"lifespan exit took {elapsed:.1f}s: the cancelled sweep waited for its worker"
+    assert task.cancelled(), "the task unwound without waiting for the blocked acquisition"
+    assert "cog_indexer_shutdown_abandoned" not in [r.message for r in caplog.records]
+    assert store.events == [], "nothing was released under -- or before -- the still-running acquisition"
+    # The task is done, so the lifespan closed the executor at once...
+    executor = app.state.cog_indexer._executor
+    with pytest.raises(RuntimeError, match="shutdown"):
+        executor.submit(lambda: None)
+    # ...and the exit chained onto the acquisition does not need it: it runs
+    # on the acquisition's own thread the moment __enter__ returns.
+    store.release_enter.set()
+    await _until(lambda: store.events == ["entered", "unlocked"])
+    with store.sweep_lock() as held:
+        assert held is not None
+
+
+async def test_app_shutdown_is_bounded_when_the_indexer_task_does_not_unwind(tmp_path, monkeypatch, caplog):
+    # The lifespan's wait is bounded regardless of what the task does with
+    # its cancellation, so a database that stopped answering -- or a future
+    # sweep that defers cancellation -- cannot hang app shutdown: past the
+    # deadline the task is left pending, loudly, and dies with the process.
+    from collab_hub_api import config as config_module
+    from collab_hub_api import core
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setattr(core, "INDEXER_SHUTDOWN_TIMEOUT_SECONDS", 0.3)
+    let_go = asyncio.Event()
+
+    async def run_that_swallows_cancellation(self, **_kwargs):
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                if let_go.is_set():
+                    raise
+
+    monkeypatch.setattr(CogIndexer, "run", run_that_swallows_cancellation)
+    store = InMemoryCogCatalogStore()
+    monkeypatch.setattr(config_module, "build_cog_catalog_store", lambda *_: store)
+    monkeypatch.setattr("collab_hub_api.core.build_cog_catalog_store", lambda *_: store)
+
+    app = make_app(_app_config(tmp_path))
+    loop = asyncio.get_running_loop()
+    async with app.router.lifespan_context(app):
+        task = {t.get_name(): t for t in asyncio.all_tasks()}["cog-index"]
+        await asyncio.sleep(0)  # let the task reach its first await; a task cancelled before it starts just ends
         started = loop.time()
         with caplog.at_level(logging.ERROR, logger="frames_server.core"):
             pass
     elapsed = loop.time() - started
     assert elapsed < 3, f"lifespan exit took {elapsed:.1f}s: shutdown is not bounded"
-    assert not task.done(), "the stuck task is left pending, not waited out"
+    assert not task.done(), "the task that would not unwind is left pending, not waited out"
     assert "cog_indexer_shutdown_abandoned" in [r.message for r in caplog.records]
 
-    # Let the worker finish so the task unwinds and the interpreter can exit.
-    store.release_enter.set()
+    # The executor is closed once the task does finish, whenever that is.
+    executor = app.state.cog_indexer._executor
+    executor.submit(lambda: None).result(timeout=5)
+    let_go.set()
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
-    assert store.events == ["entered", "unlocked"]
-    # The lifespan could not close the executor while the task might still
-    # submit its unlock; it must do so once the task has finished.
-    executor = app.state.cog_indexer._executor
     with pytest.raises(RuntimeError, match="shutdown"):
         executor.submit(lambda: None)
+
+
+async def _until(condition, *, timeout: float = 5.0) -> None:
+    """Poll ``condition`` (a plain callable) until true; the worker threads under test are not awaitable."""
+
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        await asyncio.sleep(0.02)
 
 
 async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdown(tmp_path, monkeypatch):
@@ -958,17 +1045,20 @@ async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdo
 
 
 # ---------------------------------------------------------------------------
-# Cancellation never outlives lock ownership (codex-gate HIGH finding)
+# Cancellation: a cancelled sweep releases its lock or dies with its session
+# (issue #148 -- the drain, its deadline and the thread hand-off are gone)
 # ---------------------------------------------------------------------------
 
 
 class _EventedStore(InMemoryCogCatalogStore):
     """An in-memory store whose lock and writes can be held open from the test.
 
-    ``events`` records the order of the operations that matter: a correct
-    cancellation always shows the blocked operation *completing* before
-    ``unlocked``, because worker threads cannot be interrupted and the sweep
-    must drain them before releasing.
+    ``events`` records the operations that matter. Worker threads cannot be
+    interrupted and the sweep no longer waits for them, so a cancellation
+    landing inside a blocked operation returns at once; what the tests assert
+    is that the lock is still released exactly once -- by the exit chained
+    onto a blocked acquisition, or by the release submitted past a blocked
+    write -- and never twice.
     """
 
     def __init__(self):
@@ -999,12 +1089,12 @@ class _EventedStore(InMemoryCogCatalogStore):
             assert self.release_exit.wait(timeout=10)
             self.events.append("unlocked")
 
-    def upsert(self, artifact, *, targeted=False):
+    def upsert(self, artifact):
         self.write_started.set()
         assert self.release_write.wait(timeout=10)
         if self.fail_write is not None:
             raise self.fail_write
-        super().upsert(artifact, targeted=targeted)
+        super().upsert(artifact)
         self.events.append("write_done")
 
 
@@ -1014,295 +1104,72 @@ def evented_indexer(**kwargs):
     return CogIndexer(store, base.sources, **kwargs), store, client
 
 
-async def test_cancellation_during_lock_acquisition_still_releases():
+async def test_cancellation_during_lock_acquisition_still_releases(caplog):
+    # Nothing waits for the blocked acquisition, but whatever it enters gets
+    # its matching exit: chained onto the acquisition's future, run on the
+    # worker thread the moment __enter__ returns.
     indexer, store, _ = evented_indexer()
     store.release_enter.clear()
 
     task = asyncio.create_task(indexer.sweep())
     await asyncio.to_thread(store.enter_started.wait, 10)
     task.cancel()
-    await asyncio.sleep(0.05)  # cancellation lands while __enter__ is blocked
-    store.release_enter.set()
-
     with pytest.raises(asyncio.CancelledError):
-        await task
-    # The acquisition that completed after the cancel got its matching exit:
-    # nothing holds the lock, and no source was swept.
-    assert store.events == ["entered", "unlocked"]
+        await asyncio.wait_for(task, timeout=5)
+    assert store.events == [], "the cancelled sweep neither waited for the acquisition nor exited under it"
+
+    with caplog.at_level(logging.INFO, logger="frames_server.cogs.indexer"):
+        store.release_enter.set()
+        await _until(lambda: store.events == ["entered", "unlocked"])
+    assert "cog_index_lock_released_after_cancel" in [r.message for r in caplog.records]
     with store.sweep_lock() as held:
-        assert held
+        assert held is not None
 
 
-async def test_cancellation_during_a_write_drains_it_before_unlocking():
+async def test_cancellation_during_a_write_releases_the_lock_without_waiting_for_it():
+    # The post-#148 contract: a cancelled sweep releases its lock (or dies
+    # with its session); it does not drain the write. On the in-memory store
+    # the release lands while the write thread is still blocked -- which is
+    # what keeps shutdown from hanging on a dead transport. On the Postgres
+    # store the same release is issued on the connection the write is running
+    # on, and psycopg queues it behind the write (see catalog._postgres_sweep_lock).
     indexer, store, _ = evented_indexer()
     store.release_write.clear()
 
     task = asyncio.create_task(indexer.sweep())
     await asyncio.to_thread(store.write_started.wait, 10)
     task.cancel()
-    await asyncio.sleep(0.05)  # cancellation lands mid-upsert
-    store.release_write.set()
-
     with pytest.raises(asyncio.CancelledError):
-        await task
-    # The invariant single-flight exists for: the lock is never released
-    # while a write is still mutating rows.
-    assert store.events == ["entered", "write_done", "unlocked"]
+        await asyncio.wait_for(task, timeout=5)
+
+    await _until(lambda: "unlocked" in store.events)
+    assert store.events == ["entered", "unlocked"], "released while the write was still blocked"
+    with InMemoryCogCatalogStore.sweep_lock(store) as held:  # the base class, so the probe is not an event
+        assert held is not None, "the lock is free: nobody waits on the abandoned write"
+
+    store.release_write.set()
+    await _until(lambda: "write_done" in store.events)
+    assert store.events == ["entered", "unlocked", "write_done"]
 
 
-async def test_cancellation_during_unlock_completes_the_unlock():
+async def test_cancellation_during_unlock_completes_the_unlock_exactly_once(caplog):
     indexer, store, _ = evented_indexer()
     store.release_exit.clear()
 
     task = asyncio.create_task(CogIndexer(store, []).sweep())
     await asyncio.to_thread(store.exit_started.wait, 10)
     task.cancel()
-    await asyncio.sleep(0.05)  # cancellation lands during __exit__
-    store.release_exit.set()
-
     with pytest.raises(asyncio.CancelledError):
-        await task
-    assert store.events == ["entered", "unlocked"]
-    with store.sweep_lock() as held:
-        assert held
+        await asyncio.wait_for(task, timeout=5)
+    assert store.events == ["entered"], "the cancelled release did not wait for the blocked unlock"
 
-
-async def test_double_cancellation_during_a_write_still_drains_before_unlocking():
-    # Round-2 codex repro: the first drain awaited the worker unshielded, so a
-    # SECOND cancel interrupted the drain and the finally released the lock
-    # while the thread was still writing (entered -> unlocked -> write_done).
-    # The drain now shields and defers repeated cancels until the worker is
-    # done, so the order is write_done before unlocked, however many cancels.
-    indexer, store, _ = evented_indexer()
-    store.release_write.clear()
-
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.write_started.wait, 10)
-    task.cancel()
-    await asyncio.sleep(0.05)
-    task.cancel()  # lands inside the drain
-    await asyncio.sleep(0.05)
-    task.cancel()  # and again
-    await asyncio.sleep(0.05)
-    store.release_write.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert store.events == ["entered", "write_done", "unlocked"]
-
-
-async def test_double_cancellation_during_acquisition_still_releases():
-    indexer, store, _ = evented_indexer()
-    store.release_enter.clear()
-
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.enter_started.wait, 10)
-    task.cancel()
-    await asyncio.sleep(0.05)
-    task.cancel()  # a second cancel must not exit the context before entry finishes
-    await asyncio.sleep(0.05)
-    store.release_enter.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert store.events == ["entered", "unlocked"]
-    with store.sweep_lock() as held:
-        assert held
-
-
-async def test_double_cancellation_during_unlock_completes_the_unlock():
-    indexer, store, _ = evented_indexer()
-    store.release_exit.clear()
-
-    task = asyncio.create_task(CogIndexer(store, []).sweep())
-    await asyncio.to_thread(store.exit_started.wait, 10)
-    task.cancel()
-    await asyncio.sleep(0.05)
-    task.cancel()
-    await asyncio.sleep(0.05)
-    store.release_exit.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert store.events == ["entered", "unlocked"]
-
-
-async def test_drain_deadline_hands_the_lock_off_instead_of_releasing_under_a_live_write(caplog):
-    # The one hang no timeout upstream can break: a thread stuck on a call
-    # that never returns (a dead transport). The cancelled sweep must come
-    # back after its drain deadline -- so app shutdown is bounded -- but it
-    # must NOT release the lock: the write is still running, and a release
-    # now would let another sweep acquire and a late write land under its
-    # lock (round-3 codex repro: entered -> unlocked -> write_done). The
-    # release is handed to a background task that waits for the worker.
-    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.3)
-    store.release_write.clear()
-
-    loop = asyncio.get_running_loop()
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.write_started.wait, 10)
-    task.cancel()
-    started = loop.time()
     with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)
-    assert loop.time() - started < 3, "the cancelled sweep did not come back within a small multiple of the deadline"
-    messages = [record.message for record in caplog.records]
-    assert "cog_index_worker_drain_expired" in messages and "cog_index_lock_release_deferred" in messages
-
-    # The sweep is gone but the lock is still held: nobody else may sweep.
-    # (Probe through the base class so the probe itself is not recorded.)
-    assert store.events == ["entered"]
-    assert indexer.pending_late_releases == 1
-    with InMemoryCogCatalogStore.sweep_lock(store) as held:
-        assert held is False, "the lock must not be handed out while the abandoned write runs"
-
-    # The worker finally finishes; only then is the lock released.
-    store.release_write.set()
-    for _ in range(100):
-        if indexer.pending_late_releases == 0:
-            break
-        await asyncio.sleep(0.02)
-    assert store.events == ["entered", "write_done", "unlocked"]
-    assert indexer.pending_late_releases == 0
-    with InMemoryCogCatalogStore.sweep_lock(store) as held:
-        assert held is True
-
-
-async def test_drain_deadline_during_acquisition_exits_the_lock_only_after_entry_finishes():
-    # Same hand-off when the stuck call is the acquisition itself: __exit__
-    # must not run while __enter__ is still executing (round-3 codex repro:
-    # a release error followed by "entered" with nobody left to unlock).
-    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.3)
-    store.release_enter.clear()
-
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.enter_started.wait, 10)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=5)
-    assert store.events == [] and indexer.pending_late_releases == 1
-
-    store.release_enter.set()
-    for _ in range(100):
-        if indexer.pending_late_releases == 0:
-            break
-        await asyncio.sleep(0.02)
-    assert store.events == ["entered", "unlocked"], "entry completed, then its matching exit -- in that order"
+        store.release_exit.set()
+        await _until(lambda: store.events == ["entered", "unlocked"])
+        await asyncio.sleep(0.05)
+    assert "cog_index_lock_release_failed" not in [r.message for r in caplog.records], "no second release"
     with store.sweep_lock() as held:
-        assert held is True
-
-
-async def test_the_hand_off_is_owned_by_a_thread_and_survives_collection():
-    # Round-4 codex repro: the hand-off used to be an asyncio task. At loop
-    # shutdown every task is cancelled, the task stopped mid-wait, the last
-    # reference to the lock context went with it, and finalizing the context
-    # manager ran its unlock -- while the write was still in flight
-    # (entered -> unlocked -> second sweeper acquired -> write_done).
-    #
-    # This asserts the structural half: the owner is a thread, and collecting
-    # the sweep's own objects does not unlock. The loop actually going away is
-    # covered by test_the_hand_off_outlives_a_closed_event_loop.
-    import gc
-
-    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
-    store.release_write.clear()
-
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.write_started.wait, 10)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=5)
-    assert indexer.pending_late_releases == 1
-
-    # The structural guarantee: the owner is a thread, so there is no task for
-    # a loop shutdown to cancel in the first place.
-    assert all(isinstance(owner, threading.Thread) for owner in indexer._late_releases)
-    assert not [t for t in asyncio.all_tasks() if t.get_name() == "cog-index-late-release"]
-
-    # And the sweep's own task is gone, so the only thing keeping the lock
-    # context alive is the hand-off. Collecting must not run its __exit__.
-    del task
-    gc.collect()
-    await asyncio.sleep(0.05)
-
-    assert store.events == ["entered"], "no unlock while the write is in flight"
-    with InMemoryCogCatalogStore.sweep_lock(store) as held:
-        assert held is False
-
-    store.release_write.set()
-    for _ in range(100):
-        if indexer.pending_late_releases == 0:
-            break
-        await asyncio.sleep(0.02)
-    assert store.events == ["entered", "write_done", "unlocked"]
-
-
-def test_the_hand_off_outlives_a_closed_event_loop():
-    # The scenario the hand-off exists for, with the loop really gone: run a
-    # sweep on its own event loop, cancel it, let the drain expire, then CLOSE
-    # that loop while the store worker is still blocked. Nothing asyncio owns
-    # survives that. The unlock must still happen -- once -- and only after
-    # the write completes.
-    import gc
-
-    store = _EventedStore()
-    store.release_write.clear()
-    base, _, _ = make()
-    indexer = CogIndexer(store, base.sources, drain_deadline_seconds=0.2)
-
-    loop = asyncio.new_event_loop()
-    try:
-        task = loop.create_task(indexer.sweep())
-        loop.run_until_complete(asyncio.to_thread(store.write_started.wait, 10))
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            loop.run_until_complete(asyncio.wait_for(task, timeout=5))
-        assert indexer.pending_late_releases == 1
-        del task
-    finally:
-        loop.close()
-    gc.collect()
-
-    assert store.events == ["entered"], "a closed loop must not have unlocked anything"
-
-    store.release_write.set()
-    for _ in range(200):
-        if indexer.pending_late_releases == 0:
-            break
-        time.sleep(0.02)
-    assert store.events == ["entered", "write_done", "unlocked"], "exactly one unlock, after the write"
-    with InMemoryCogCatalogStore.sweep_lock(store) as held:
-        assert held is True
-    indexer.close()
-
-
-def test_closing_the_indexer_does_not_strand_a_hand_off_in_flight():
-    # close() shuts the executor down; the hand-off calls lock.__exit__
-    # directly rather than through it, so an unlock already handed over still
-    # happens.
-    store = _EventedStore()
-    store.release_write.clear()
-    base, _, _ = make()
-    indexer = CogIndexer(store, base.sources, drain_deadline_seconds=0.2)
-
-    loop = asyncio.new_event_loop()
-    try:
-        task = loop.create_task(indexer.sweep())
-        loop.run_until_complete(asyncio.to_thread(store.write_started.wait, 10))
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            loop.run_until_complete(asyncio.wait_for(task, timeout=5))
-    finally:
-        loop.close()
-
-    indexer.close()  # while the hand-off is still waiting
-    store.release_write.set()
-    for _ in range(200):
-        if indexer.pending_late_releases == 0:
-            break
-        time.sleep(0.02)
-    assert store.events == ["entered", "write_done", "unlocked"]
+        assert held is not None
 
 
 def test_retry_rotation_is_keyed_by_identity_not_position():
@@ -1351,48 +1218,6 @@ async def test_an_interrupted_sweep_does_not_rotate_past_an_unattempted_retry():
     # The first candidate's attempt began (it is rotated to the back); the
     # second was never reached and is still at the front.
     assert indexer._retry_order[SOURCE_ID] == [before[1], before[0]]
-
-
-async def test_an_abandoned_workers_failure_is_consumed_and_logged_by_class(caplog):
-    # Round-4 codex finding: nobody observed an abandoned worker, so a failure
-    # inside it surfaced through asyncio's default handler with the raw
-    # exception -- which for a store call can carry a URL this module never
-    # logs. The abandoning side now attaches a consumer.
-    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
-    handled: list[dict] = []
-    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handled.append(context))
-    store.release_write.clear()
-    store.fail_write = ValueError("postgresql://user:secret@db.internal/collab refused the write")
-
-    task = asyncio.create_task(indexer.sweep())
-    await asyncio.to_thread(store.write_started.wait, 10)
-    task.cancel()
-    with caplog.at_level(logging.ERROR, logger="frames_server.cogs.indexer"):
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5)
-        store.release_write.set()
-        for _ in range(100):
-            if indexer.pending_late_releases == 0:
-                break
-            await asyncio.sleep(0.02)
-        await asyncio.sleep(0.05)
-
-    records = [r for r in caplog.records if r.message == "cog_index_abandoned_worker_failed"]
-    assert records and records[0].error == "ValueError", "the failure is logged, by class name"
-    assert not any("secret" in str(record.__dict__) for record in caplog.records), "never the message itself"
-    assert handled == [], "and nothing reached asyncio's default exception handler"
-
-
-async def test_a_targeted_reindex_left_behind_does_not_defer_the_next_sweeps_release():
-    # reindex() takes no lock; a worker it abandoned is not the next sweep's
-    # to wait for, or every later release would be needlessly deferred.
-    from concurrent.futures import Future
-
-    indexer, store, _ = evented_indexer(drain_deadline_seconds=0.2)
-    indexer._abandoned.append(Future())  # a never-finishing leftover
-    await indexer.sweep()
-    assert store.events == ["entered", "write_done", "write_done", "unlocked"]
-    assert indexer.pending_late_releases == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1531,10 +1356,10 @@ async def test_store_data_error_falls_back_to_a_failed_row():
     # representability rule the store enforces that the validation did not
     # anticipate becomes a failed row, while outages still propagate.
     class PickyStore(InMemoryCogCatalogStore):
-        def upsert(self, artifact, *, targeted=False):
+        def upsert(self, artifact):
             if artifact.card is not None:
                 raise CogCatalogDataError("UntranslatableCharacter")
-            super().upsert(artifact, targeted=targeted)
+            super().upsert(artifact)
 
     base, _, _ = make()
     store = PickyStore()

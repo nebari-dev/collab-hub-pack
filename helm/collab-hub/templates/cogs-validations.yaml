@@ -8,6 +8,16 @@ reported to whoever ran helm instead of by a crash-looping pod. */}}
 {{- if and .Values.cogs.caBundle.configMap (not .Values.cogs.caBundle.key) }}
 {{- fail "cogs.caBundle.key must name the ConfigMap key holding the PEM bundle when cogs.caBundle.configMap is set." }}
 {{- end }}
+{{- /* Issue #148: the indexer is single-flight by deployment shape -- one
+replica, Recreate -- and the store's advisory lock is only a belt under
+that. A second replica would be a second sweeper on every interval, kept
+apart only by the belt, so the count is refused rather than tolerated;
+refused whether or not indexing is on, since a latent value would bite at
+the moment it was enabled. Pause indexing with cogs.index.enabled=false,
+not with a replica count. */}}
+{{- if ne (int .Values.cogs.indexer.replicas) 1 }}
+{{- fail (printf "cogs.indexer.replicas must be 1 (configured: %v): the Cog indexer runs as a single-replica workload so that only one process ever sweeps; to stop sweeping set cogs.index.enabled=false." .Values.cogs.indexer.replicas) }}
+{{- end }}
 {{- $ids := list }}
 {{- $envIds := list }}
 {{- range $index, $source := .Values.cogs.registry.sources }}
