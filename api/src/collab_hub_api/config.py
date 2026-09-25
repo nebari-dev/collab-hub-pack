@@ -1176,9 +1176,12 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
         # A sweep occupies one pooled connection for its whole duration: the
         # session-level advisory lock is held on it, and the sweep's reads and
         # writes ride it too (issue #128). With max_size=1 that is the pool's
-        # only connection gone for minutes at a time -- every API read and
-        # every webhook write would wait on the sweep and time out, silently,
-        # at runtime. Refuse the rollout instead.
+        # only connection gone for minutes at a time -- every catalog read
+        # and every webhook write this process serves would wait on the sweep
+        # and time out, silently, at runtime. Refuse the rollout instead. A
+        # check on the sweeping process only: the chart enables indexing on
+        # its dedicated indexer workload and never on the API replicas
+        # (issue #148), so this never constrains an API pod.
         raise RuntimeError(
             "cogs.index.enabled requires frames.postgres.pool.max_size >= 2 "
             f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "

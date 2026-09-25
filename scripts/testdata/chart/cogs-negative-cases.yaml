@@ -75,6 +75,25 @@ cases:
       index: {enabled: true}
     app_error: 'cogs.index.enabled is true but cogs.registry_sources is empty'
 
+  - name: indexer replicas other than one
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        index: {enabled: true}
+        indexer: {replicas: 2}
+    chart_error: 'cogs.indexer.replicas must be 1'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      index: {enabled: true}
+    why_chart_only: >-
+      The replica count is the chart's: single flight is a property of the
+      deployment shape (one indexer replica, Recreate), and the API only sees
+      the index switch the chart derives for each workload.
+
   - name: duplicate source id
     layers: [template]
     values:
