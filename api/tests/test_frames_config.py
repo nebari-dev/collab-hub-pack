@@ -3,9 +3,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from collab_hub_api.cogs.catalog import InMemoryCogCatalogStore, PostgresCogCatalogStore, UnavailableCogCatalogStore
 from collab_hub_api.config import (
     Config,
     build_active_frame_store,
+    build_cog_catalog_store,
+    build_cog_indexing,
     build_group_store,
     build_history_store,
     build_postgres_pools,
@@ -110,6 +113,56 @@ def test_build_group_store_uses_shared_postgres():
     store = _build(build_group_store, Config.parse({"frames": {"postgres": {"url": "postgresql://shared/db"}}}))
 
     assert isinstance(store, PostgresFrameGroupStore)
+
+
+# --- Cog catalog: memory dev override, else shared frames.postgres, else refuses
+
+
+def test_build_cog_catalog_store_unavailable_without_db():
+    store = _build(build_cog_catalog_store, Config.parse())
+
+    assert isinstance(store, UnavailableCogCatalogStore)
+
+
+def test_build_cog_catalog_store_uses_shared_postgres():
+    config = Config.parse({"frames": {"postgres": {"url": "postgresql://shared/db"}}})
+    pools = build_postgres_pools(config)
+
+    store = build_cog_catalog_store(config, pools)
+
+    assert isinstance(store, PostgresCogCatalogStore)
+    # Same pool as every other store on the shared URL; no second registry.
+    assert store._db is pools.database("postgresql://shared/db")
+
+
+def test_build_cog_catalog_store_memory_override_wins_over_postgres():
+    config = Config.parse(
+        {"frames": {"postgres": {"url": "postgresql://shared/db"}}, "cogs": {"catalog": {"backend": "memory"}}}
+    )
+
+    assert isinstance(build_cog_catalog_store(config, build_postgres_pools(config)), InMemoryCogCatalogStore)
+
+
+def test_an_in_memory_catalog_can_be_indexed_into_at_level_1():
+    config = Config.parse(
+        {
+            "cogs": {
+                "catalog": {"backend": "memory"},
+                "index": {"enabled": True},
+                "registry_sources": [
+                    {"id": "dev", "kind": "static", "url": "https://registry.example", "repositories": ["cogs/a"]}
+                ],
+            }
+        }
+    )
+    store = build_cog_catalog_store(config, build_postgres_pools(config))
+
+    assert build_cog_indexing(config, store) is not None
+
+
+def test_cog_catalog_backend_refuses_an_unknown_value():
+    with pytest.raises(ValidationError):
+        Config.parse({"cogs": {"catalog": {"backend": "postgres-ish"}}})
 
 
 def test_build_task_store_supports_memory_backend():

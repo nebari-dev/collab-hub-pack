@@ -1,7 +1,8 @@
 import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -13,15 +14,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
 from .config import (
     BaseConfig,
     build_active_frame_store,
+    build_audit_log,
+    build_cog_catalog_store,
+    build_cog_indexing,
+    build_connector_store,
     build_frames_store,
     build_group_store,
     build_history_store,
     build_invitation_email_delivery,
     build_invitation_service,
+    build_model_access,
+    build_model_catalog,
     build_org_store,
+    build_platform_role_admin,
+    build_platform_role_sync,
     build_postgres_pools,
     build_service_access_granter,
     build_task_store,
@@ -57,6 +67,9 @@ from .frames.store import ConcurrentFrameUpdateError
 from .path_protection import PathProtectionMiddleware, api_path, request_path
 from .routers import (
     admin,
+    admin_api,
+    admin_ui,
+    cogs,
     connectors,
     frame_groups,
     frames,
@@ -246,11 +259,25 @@ def make_app(config: BaseConfig) -> FastAPI:
     usage_store = build_usage_store(config, postgres_pools)
     task_store = build_task_store(config, postgres_pools)
     org_store = build_org_store(config, postgres_pools)
+    # After the store, because the reconcile writes through whichever one
+    # this deployment actually has.
+    platform_role_sync = build_platform_role_sync(config, postgres_pools, org_store)
+    audit_log = build_audit_log(config, postgres_pools)
+    platform_role_admin = build_platform_role_admin(config, postgres_pools)
+    connector_store = build_connector_store(config, postgres_pools)
+    model_catalog = build_model_catalog(config)
+    model_access = build_model_access(config, postgres_pools)
     # The collab_ tenancy tables' store carries no DDL of its own, so their
     # migration is invoked here rather than falling out of a store's
     # construction the way the frames_server_ tables' DDL does. Same trigger
     # (frames.postgres.url + auto_migrate), same startup failure semantics.
     migrate_collab_schema(config, postgres_pools)
+    # The Cog catalog (issue #84) rides the same collab_ migration (version
+    # 7) and is always built so the catalog read API is up whether or not
+    # this replica sweeps registries. The indexer -- and the registry
+    # sources it owns -- exist only when cogs.index.enabled (issue #87).
+    cog_catalog_store = build_cog_catalog_store(config, postgres_pools)
+    cog_indexing = build_cog_indexing(config, cog_catalog_store)
     if org_source_resolves_membership():
         # Third membership precondition (the env-only ones are checked above):
         # the organization store must have a real backend. Membership is an
@@ -307,6 +334,13 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.group_store = group_store
             app.state.invitation_email_delivery = invitation_email_delivery
             app.state.invitation_service = invitation_service
+            app.state.platform_role_sync = platform_role_sync
+            app.state.audit_log = audit_log
+            app.state.platform_role_admin = platform_role_admin
+            app.state.connector_store = connector_store
+            app.state.model_catalog = model_catalog
+            app.state.model_access = model_access
+            app.state.model_groups = dict(config.frames.model_access.model_groups)
             app.state.service_access_granter = service_access_granter
             app.state.granted_service_groups = granted_service_groups
             app.state.user_directory_client = user_directory_client
@@ -328,6 +362,25 @@ def make_app(config: BaseConfig) -> FastAPI:
             # mutating it. Logged in the throttle event so a deferred queue-length
             # cap (max_waiting) stays a monitored deferral, not a blind one.
             app.state.github_api_get_waiters = 0
+            # For the catalog API (#85) and the webhook receiver (#86):
+            # the store is always there; the indexer and its sources only
+            # on a sweeping replica.
+            app.state.cog_catalog_store = cog_catalog_store
+            app.state.cog_indexer = cog_indexing.indexer if cog_indexing is not None else None
+            app.state.cog_registry_sources = cog_indexing.indexer.sources if cog_indexing is not None else []
+            cog_index_task: asyncio.Task | None = None
+            if cog_indexing is not None:
+                # After the migration (which ran in make_app) and after the
+                # pools opened: the first sweep may be immediate. The loop
+                # jitters its interval so replicas drift apart, and the
+                # store's advisory lock keeps them from sweeping at once.
+                cog_index_task = asyncio.create_task(
+                    cog_indexing.indexer.run(
+                        interval_seconds=cog_indexing.interval_seconds,
+                        run_on_startup=cog_indexing.run_on_startup,
+                    ),
+                    name="cog-index",
+                )
             if config.web.enabled:
                 # Again at boot, and this is the **last** time either check
                 # runs. make_app verifies what *it* registered; this sees
@@ -345,6 +398,57 @@ def make_app(config: BaseConfig) -> FastAPI:
             try:
                 yield
             finally:
+                # First, before the pools close: a sweep in flight may hold
+                # the lock connection and be mid-write. Cancel, wait for it
+                # to unwind (its finally releases the lock), then close the
+                # registry clients it was talking to.
+                if cog_index_task is not None:
+                    # Bounded: the indexer's drain already has a deadline, and
+                    # this is the outer wall -- a database that stopped
+                    # answering must not be able to hang app shutdown.
+                    # asyncio.wait, not wait_for: wait_for cancels the task
+                    # again on timeout and then AWAITS it, and the indexer
+                    # defers repeated cancellations until its worker finishes
+                    # -- which is the wait this deadline exists to bound.
+                    # Past the deadline the task stays pending and dies with
+                    # the process; any lock it still holds is the server's to
+                    # release with the connection. A reference is kept below
+                    # for as long as this frame lives so it is not finalized
+                    # while pending.
+                    cog_index_task.cancel()
+                    _, still_pending = await asyncio.wait({cog_index_task}, timeout=INDEXER_SHUTDOWN_TIMEOUT_SECONDS)
+                    if still_pending:
+                        # Deliberately NOT closing the indexer's executor here:
+                        # the abandoned task may yet come back and need to
+                        # submit its lock release, and a shut-down executor
+                        # would turn that into an exception -- losing the
+                        # unlock this whole path exists to protect. Close it
+                        # when the task does finish, whenever that is, so a
+                        # process that outlives this lifespan (a reload, a
+                        # test holding the app) does not keep idle workers.
+                        if cog_indexing is not None:
+                            indexer = cog_indexing.indexer
+                            cog_index_task.add_done_callback(lambda _task: indexer.close())
+                        logger.error(
+                            "cog_indexer_shutdown_abandoned",
+                            extra={"timeout_seconds": INDEXER_SHUTDOWN_TIMEOUT_SECONDS},
+                        )
+                    else:
+                        if cog_indexing is not None and cog_indexing.indexer.pending_late_releases:
+                            logger.warning(
+                                "cog_indexer_shutdown_with_late_release_pending",
+                                extra={"pending": cog_indexing.indexer.pending_late_releases},
+                            )
+                        if cog_indexing is not None:
+                            # The task is done, so no further store calls are
+                            # coming: stop accepting them. Work already on a
+                            # thread -- including a hand-off waiting to
+                            # release the lock -- still finishes.
+                            cog_indexing.indexer.close()
+                if cog_indexing is not None:
+                    for source in cog_indexing.indexer.sources:
+                        with suppress(Exception):
+                            await source.aclose()
                 user_directory_client.close()
                 # Same reason as the line above: this granter owns an
                 # `httpx.Client`, so its connection pool outlives the app
@@ -408,6 +512,9 @@ def make_app(config: BaseConfig) -> FastAPI:
             return get_caller_identity(request)
         return get_auth_context(request)
 
+    # The same map, readable by a route that honors a `public` entry itself
+    # (the Cog catalog's anonymous discovery, issue #85).
+    app.state.path_rules = tuple(config.security.paths)
     app.add_middleware(
         PathProtectionMiddleware,
         rules=config.security.paths,
@@ -608,6 +715,7 @@ def make_app(config: BaseConfig) -> FastAPI:
     user_directory.register_exception_handlers(app)
     usage.register_exception_handlers(app)
     invitations.register_exception_handlers(app)
+    cogs.register_exception_handlers(app)
     app.include_router(frames.router, prefix="/v1")
     app.include_router(user_directory.router, prefix="/v1")
     app.include_router(frames.router, include_in_schema=False)
@@ -621,6 +729,9 @@ def make_app(config: BaseConfig) -> FastAPI:
     app.include_router(tasks.devices_router, prefix="/v1")
     app.include_router(tasks.notifications_router, prefix="/v1")
     app.include_router(tasks.runs_router, prefix="/v1")
+    # The Cog catalog read API (#85). /v1 only: it post-dates the unprefixed
+    # legacy mounts, so there is no old client to keep answering.
+    app.include_router(cogs.router, prefix="/v1")
 
     if config.web.enabled:
         # The browser surface (issue #88): session sign-in and the page
@@ -660,6 +771,18 @@ def make_app(config: BaseConfig) -> FastAPI:
                 # declared organization — how a single-org hub grants `owner`
                 # — go through the owner page and API as usual.
                 page_routers.append(admin.make_router())
+            # The panel's JSON. Mounted on the outer condition rather than
+            # beside the invitation page: everything it manages — models,
+            # roles, connectors, usage, the audit log — is just as meaningful
+            # on a single-organization hub. Only the org-creating invitation
+            # page is particular to the multi-organization source.
+            page_routers.append(admin_api.make_router())
+            # The built panel, when this deployment ships one. Checked here
+            # rather than inside the router so that a deployment without a
+            # build mounts nothing at all.
+            admin_ui_dist = _built_admin_ui(config)
+            if admin_ui_dist is not None:
+                page_routers.append(admin_ui.make_router(admin_ui_dist))
             # The owner invitation page (issue #142), same mounting rule and
             # for the same reason: on a claims-sourced deployment the org-role
             # axis is structurally None, so every owner would be refused, and
@@ -771,3 +894,22 @@ def make_app(config: BaseConfig) -> FastAPI:
         enforce_web_surface_map_access(app.routes, config)
 
     return app
+
+
+def _built_admin_ui(config) -> Path | None:
+    """The panel's built directory, or ``None`` if this build has no panel.
+
+    A configured path whose ``index.html`` is missing counts as no panel. That
+    is the failure a broken Docker stage produces, and answering it with the
+    pre-panel behaviour is both truthful and harmless; a startup refusal would
+    take down sign-in and the invitation pages over a front-end build.
+    """
+
+    configured = config.web.admin_ui_dist
+    if not configured:
+        return None
+    dist = Path(configured)
+    if not (dist / "index.html").is_file():
+        logger.warning("admin_ui_dist_missing_index", extra={"path": str(dist)})
+        return None
+    return dist

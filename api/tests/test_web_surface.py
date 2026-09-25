@@ -76,6 +76,7 @@ from collab_hub_api.web.surface import (
     PRIVACY_PATH,
     PUBLIC_WEB_PATHS,
     TERMS_PATH,
+    WEB_LOGO_PATH,
     WEB_SURFACE_PREFIXES,
     WebSurface,
     blocked_web_route_paths,
@@ -3608,3 +3609,44 @@ def test_the_admin_entries_will_cover_the_routes_when_they_arrive(tmp_path, idp)
     assert stale_csrf_exemptions(app.routes) == []
     verify_web_route_protection(app.routes)
 
+
+
+# ---------------------------------------------------------------------------
+# The wordmark on the server-rendered pages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_pages_carry_the_wordmark_and_are_allowed_to_show_it(tmp_path, idp):
+    """A logo needs both an asset to fetch and a policy that permits fetching it.
+
+    The surface shipped `img-src 'none'`, which is the right default for pages
+    that had no images. Putting the product wordmark on them means widening
+    that by exactly one source -- this origin -- and it is worth asserting both
+    halves together: a page referencing an image its own policy forbids renders
+    a broken mark and looks like a deploy fault.
+    """
+
+    app = make_web_app(tmp_path, idp)
+
+    async with app.router.lifespan_context(app), web_client(app) as client:
+        # A page that renders rather than redirecting into the OIDC flow.
+        page = await client.get("/web/data-statement")
+        logo = await client.get(WEB_LOGO_PATH)
+
+    assert logo.status_code == 200
+    assert logo.headers["content-type"].startswith("image/")
+    assert WEB_LOGO_PATH in page.text
+
+    csp = page.headers["content-security-policy"]
+    assert "img-src 'self'" in csp
+    assert "default-src 'none'" in csp
+    assert "script-src" not in csp
+
+
+def test_the_surface_stylesheet_shouts_at_nobody():
+    """Nothing in this product is capitalised for emphasis."""
+
+    from collab_hub_api.web.pages import STYLESHEET
+
+    assert "text-transform: uppercase" not in STYLESHEET

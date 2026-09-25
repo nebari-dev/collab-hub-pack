@@ -68,6 +68,8 @@ than dead-ending a signed-in operator.
 | `COLLAB_HUB_API__WEB__SESSION_LIFETIME_SECONDS` | Absolute session lifetime. Default **and hard ceiling** 8 hours; may be lowered, never raised (the stateless-session risk argument rests on this number). Enforced on `WebSurface` (which is slotted, so the accessor cannot be shadowed on an instance) and clamped at mint time through a module-level function on the validated field, not only in config validation. No sliding renewal. |
 | `COLLAB_HUB_API__WEB__SCOPE` | Default `openid email profile`; must include `openid`. |
 | `COLLAB_HUB_API__WEB__PUBLIC_BASE_URL` | External origin the surface builds its absolute URLs from, the OIDC redirect URI among them. **Required** when the surface is enabled on a membership-resolving deployment — startup refuses without it, because those origins must never be derived from a forgeable request `Host` (see below). Also what makes the redirect URI correct behind a proxy whose forwarded headers are not trusted. Same https/loopback rule as the issuer. |
+| `COLLAB_HUB_API__WEB__ADMIN_UI_DIST` | Directory holding the built admin panel. The image sets it to `/var/collab-hub-api/admin-ui-dist`. Empty, or a directory with no `index.html`, mounts no panel routes (the second case logs `admin_ui_dist_missing_index`). The panel and its `/admin/api/*` endpoints mount only on a membership-resolving deployment (`orgSource` `membership` or `single`). |
+| `COLLAB_HUB_API__WEB__ADMIN_GROUP` | Identity-provider group whose members hold the operator role, reconciled at each sign-in from the ID token's `groups` claim. Matches with or without a leading slash. Empty (default) turns sync off. Needs a groups mapper on the client so the ID token carries the claim; see [frames-operations.md](frames-operations.md#where-operator-rows-come-from-source-and-sign-in-sync). |
 
 The realm's JWKS endpoint is derived from the issuer URL — there is no
 separate JWKS setting to point somewhere else.
@@ -193,8 +195,14 @@ elsewhere" shape as `web_platform_role_source_missing`.
   `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a CSP with
   `default-src 'none'`, `frame-ancestors 'none'`, `form-action 'self'`, and
-  **no script source** — the surface serves no JavaScript, with the single
-  path-scoped exception described under [Invitation acceptance](#invitation-acceptance-inviteaccept).
+  **no script source**. The server-rendered pages serve no JavaScript. Two
+  path-scoped exceptions carry their own policy: the acceptance page, described
+  under [Invitation acceptance](#invitation-acceptance-inviteaccept), and the
+  admin panel at `/admin`, `/admin/` and `/admin/assets/*`, which serves a built
+  single-page bundle under `ADMIN_PANEL_CONTENT_SECURITY_POLICY`
+  (`web/pages.py`):
+  `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
+  `web.surface.on_admin_panel()` decides which paths get it.
   They are applied by middleware keyed on the path rather than by each handler,
   so responses no handler of this surface produced — redirects, a 405, an
   unmatched `/web/*` path answered by the mounted MCP catch-all ([#86]), and an
@@ -264,7 +272,7 @@ That refusal is made in two places, because one of them cannot see enough:
 
 | Check | When | Covers |
 |---|---|---|
-| `enforce_web_surface_preconditions` | config parse, before any store opens | the six `/web` flow paths, named literally |
+| `enforce_web_surface_preconditions` | config parse, before any store opens | the seven `/web` flow paths and the two `/invite/accept` paths, named literally |
 | `enforce_web_surface_map_access` | `make_app` after every router is mounted, and again at boot | **every registered route** under any prefix in `WEB_SURFACE_PREFIXES` |
 
 The first is a floor: it fails early and clearly for the paths whose absence
@@ -310,6 +318,7 @@ a protection the middleware does not itself enforce.
 | `POST /web/signout` | CSRF-protected; clears the session cookie. |
 | `GET /web/signed-out` | Confirmation page. |
 | `GET /web/app.css` | The shared stylesheet (documents keep `style-src 'self'`). |
+| `GET /web/collab-logo.png` | The product wordmark the server-rendered pages show (documents allow `img-src 'self'`). **Anonymous**, like the stylesheet: the sign-in and acceptance pages show it before anybody has a session. |
 | `GET /web/data-statement` | The data statement ([#146]): what is stored, who can see it, and the address deletion requests go to. **Anonymous** — see below. The copy lives in `web/data_statement.py` and the acceptance page renders the same constant above its accept control. Links to the two documents below. |
 | `GET /web/terms` | The canonical Terms of Service ([#95]). **Anonymous** — see below. The copy lives in `web/terms_of_service.py` as one constant; placeholder until counsel replaces it. |
 | `GET /web/privacy` | The canonical Privacy Statement ([#95]). **Anonymous** — see below. The copy lives in `web/privacy_statement.py`, same shape. |
@@ -318,6 +327,10 @@ a protection the middleware does not itself enforce.
 | `GET /admin/invitations` | The operator invitation page ([#91]). Session + `operator`. |
 | `POST /admin/invitations` | Issues one invitation and renders its link. Session + `operator` + CSRF. |
 | `POST /admin/invitations/revoke` | Revokes one invitation. Session + `operator` + CSRF. |
+| `GET /admin` | Redirects (308) to `/admin/`. The trailing slash matters: the panel's asset and API URLs are relative to the document. Session + `operator`. |
+| `GET /admin/` | The admin panel's document (`routers/admin_ui.py`), served from `web.admin_ui_dist`. Session + `operator`. Mounted only when that directory holds an `index.html`. |
+| `GET /admin/assets/*` | The panel's hashed bundle files. File names are checked against a strict pattern and must resolve inside the assets directory; anything else is 404. Session + `operator`. |
+| `/admin/api/*` | The panel's JSON API (`routers/admin_api.py`): session, models, model access, users and roles, connectors, usage, invitations and the audit log. Session + `operator`; every `POST` also needs the `X-CSRF-Token` header, whose value `GET /admin/api/session` returns. Refusals are JSON. |
 | `GET /web/org/invitations` | The owner invitation page ([#142]). Session + org `owner`. |
 | `POST /web/org/invitations` | Issues one invitation into the caller's org and emails it. Refused (409) while the organization still carries the placeholder name ([#44]). Session + org `owner` + CSRF. |
 | `POST /web/org/invitations/revoke` | Revokes one of the caller's org's invitations. Session + org `owner` + CSRF. |
@@ -333,9 +346,10 @@ per request.
 ### Authenticated by default
 
 Every path under a guarded prefix requires a session unless it appears in
-`web.surface.PUBLIC_WEB_PATHS`, which names exactly eight: sign-in, the
-callback, the signed-out confirmation, the stylesheet, the acceptance page,
-the data statement, and the Terms of Service and Privacy Statement.
+`web.surface.PUBLIC_WEB_PATHS`, which names exactly nine: sign-in, the
+callback, the signed-out confirmation, the stylesheet, the product wordmark,
+the acceptance page, the data statement, and the Terms of Service and Privacy
+Statement.
 
 The last two ([#95]) are linked from the deployment's Keycloak
 terms-acceptance step, which runs *before* Keycloak issues a token — and this
@@ -612,7 +626,7 @@ CSP:
 
 ```
 default-src 'none'; style-src 'self'; script-src 'sha256-…';
-connect-src 'self'; img-src 'none'; base-uri 'none';
+connect-src 'self'; img-src 'self'; base-uri 'none';
 form-action 'self'; frame-ancestors 'none'
 ```
 
@@ -1055,7 +1069,10 @@ naming:
 - No RP-initiated (Keycloak) logout: sign-out ends the app session only; the
   Keycloak SSO session is the IdP's own, and ending it belongs to the page
   that needs that semantics.
-- No JavaScript anywhere except the acceptance page: plain documents and
-  forms, so the CSP forbids script outright on every other path — the operator
-  page included, and it once rendered a live secret, so that is checked rather
-  than assumed.
+- No JavaScript on the server-rendered pages except the acceptance page:
+  plain documents and forms, so the CSP forbids script outright on every other
+  server-rendered path. That includes the operator page, which once rendered a
+  live secret, so it is checked explicitly. The admin panel at
+  `/admin` is a separate single-page app: it serves its own bundle from this
+  origin under its own CSP (`script-src 'self'`, no inline script, no other
+  origin), quoted in full in the headers list above.

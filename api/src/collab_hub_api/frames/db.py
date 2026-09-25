@@ -39,6 +39,32 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 # 0 means "unbounded" (psycopg_pool's own default) and is discouraged.
 DEFAULT_MAX_WAITING = 50
 
+TCP_KEEPALIVE_PARAMS = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 6,
+}
+"""libpq TCP keepalive settings for every pooled connection.
+
+Without them a connection whose peer silently vanished (a node lost, a NAT
+entry expired, a network partition) blocks its caller in ``recv`` until the
+OS keepalive fires -- two hours by default. A worker thread blocked like that
+cannot be interrupted from Python, and ``statement_timeout`` cannot help
+because the server never sees the statement. With these values a dead peer is
+detected in about ninety seconds (30 s idle + 6 probes 10 s apart), which
+turns the common partition case from "blocked until the process dies" into
+"blocked for a minute and a half".
+
+What this is **not** is a guarantee that every blocked call ends: a peer whose
+kernel still answers TCP probes while the database process is stopped defeats
+both keepalives and ``statement_timeout``, and the settings do not apply to
+Unix-socket connections at all. Nothing in this codebase may promise bounded
+*worker termination* on the strength of these values -- only a bounded wait by
+whoever is waiting. Set through the pool's connection kwargs, so they take
+precedence over any keepalive parameters in the connection string.
+"""
+
 # Sanity bounds, mirrored by the app config validators and the helm schema.
 POOL_SIZE_LIMIT = 500
 TIMEOUT_SECONDS_LIMIT = 60.0
@@ -215,7 +241,7 @@ class PostgresDatabase:
             max_size=max_size,
             timeout=timeout_seconds,
             max_waiting=max_waiting,
-            kwargs={"row_factory": dict_row},
+            kwargs={"row_factory": dict_row, **TCP_KEEPALIVE_PARAMS},
         )
 
     def connection(self, timeout: float | None = None):

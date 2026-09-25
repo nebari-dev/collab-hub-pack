@@ -46,6 +46,8 @@ from collab_hub_api.frames.collab_schema import (  # noqa: E402
 )
 
 COLLAB_TABLES = (
+    "collab_connector_state",
+    "collab_cog_artifacts",
     "collab_service_access_grants",
     "collab_provisioned_accounts",
     "collab_invitations",
@@ -261,6 +263,54 @@ def test_no_workspaces_table_is_created_and_invitations_arrived_only_in_v3():
     assert "collab_invitations" in created
 
 
+def test_migration_creates_the_cog_catalog_schema():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    (catalog,) = server.ddl_for("collab_cog_artifacts")
+    # Identity is the digest, per location: the same bytes in two
+    # repositories (or two sources) are two rows; the repository path is
+    # not identity and carries no uniqueness of its own.
+    assert "PRIMARY KEY (source_id, repository, digest)" in catalog
+    assert "UNIQUE" not in catalog
+    # The card is the reader's output as structured JSON, nullable because
+    # non-Cog and failed rows have none; status is a closed vocabulary.
+    assert "card jsonb," in catalog
+    assert "status text NOT NULL CHECK (status IN ('indexed', 'non_cog', 'failed'))" in catalog
+    assert "read_errors jsonb NOT NULL DEFAULT '[]'::jsonb" in catalog
+    assert "tags text[] NOT NULL DEFAULT '{}'" in catalog
+    # Never hard-deleted: removal is a timestamp.
+    assert "removed_at timestamptz," in catalog
+    for column in (
+        "cog_id text,",
+        "name text,",
+        "version text,",
+        "kind text,",
+        "publisher text,",
+        "manifest_schema text,",
+    ):
+        assert column in catalog, column
+    assert "host text NOT NULL" in catalog and "pushed_at timestamptz," in catalog
+
+    created = " ".join(server.statements)
+    for index in (
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx ON collab_cog_artifacts (cog_id)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_kind_idx ON collab_cog_artifacts (kind)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_present_idx"
+        " ON collab_cog_artifacts (cog_id, repository) WHERE removed_at IS NULL",
+        "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_card_idx"
+        " ON collab_cog_artifacts USING GIN (card jsonb_path_ops)",
+    ):
+        assert index in created, index
+    # Appended as version 11; nothing earlier mentions the table.
+    earlier = " ".join(
+        statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 11 for statement in statements
+    )
+    assert "collab_cog_artifacts" not in earlier
+    assert LATEST_COLLAB_SCHEMA_VERSION == 11
+
+
 def test_rerunning_the_migration_applies_nothing():
     server = FakeServer()
     database = FakeDatabase(server)
@@ -297,6 +347,11 @@ PINNED_CHECKSUMS = {
     4: "89f34af66d0f7e8a06a398ce43aeed2db93432cfd06ab72e236da2da90a07d8c",
     5: "d6bdbe0d90f9206e5104c448d547b5917e68d7af6db5069b4b2b9a44983b770f",
     6: "6150df72bb6ed264e1e40b60768f787e4e044e1bf8b232da19ba5a2eaf139835",
+    7: "0d38607a5e2c1311bed7d364133d8c39a6fa76491aa52c5b0b9105f440998a32",
+    8: "3af64e0721b01f88d34f3005d479e3a50af94bac08284b3215414e23d72d49a7",
+    9: "f3b9d518f4f6c116bcc5df4afeee9bd65d4f6e6bee2e03736ad0844d905af678",
+    10: "cad0ef7844a3458f9aa0528f4edf5d418300cdd40b22a65fd4ecd1e6e0a29e6b",
+    11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
 }
 
 
@@ -603,6 +658,22 @@ def test_live_migration_creates_tables_constraints_and_index(clean_database):
         indexes = {row["indexname"] for row in index_rows}
         assert "collab_org_members_org" in indexes
 
+        catalog_indexes = {
+            row["indexname"]: row["indexdef"]
+            for row in conn.execute(
+                "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'collab_cog_artifacts'"
+            ).fetchall()
+        }
+        assert {
+            "collab_cog_artifacts_pkey",
+            "collab_cog_artifacts_cog_id_idx",
+            "collab_cog_artifacts_kind_idx",
+            "collab_cog_artifacts_present_idx",
+            "collab_cog_artifacts_card_idx",
+        } <= set(catalog_indexes)
+        assert "USING gin (card jsonb_path_ops)" in catalog_indexes["collab_cog_artifacts_card_idx"]
+        assert catalog_indexes["collab_cog_artifacts_present_idx"].endswith("WHERE (removed_at IS NULL)")
+
         assert applied_collab_schema_version(clean_database) == LATEST_COLLAB_SCHEMA_VERSION
 
 
@@ -853,3 +924,37 @@ def test_live_legacy_registry_gains_the_column_and_a_backfill(clean_database):
         # Backfill only — nothing was re-applied, existing data survives.
         assert conn.execute("SELECT count(*) AS n FROM collab_orgs").fetchone()["n"] == 1
     assert recorded == EXPECTED_CHECKSUMS
+
+
+@live_postgres
+def test_live_upgrade_from_version_six_keeps_existing_rows_and_widens_the_vocabulary(clean_database, monkeypatch):
+    """The path every running deployment takes: a database already at v6, with
+    rows in it, migrated to the latest version. A fresh create never exercises
+    the backfill or the constraint swaps."""
+
+    released = tuple((version, statements) for version, statements in COLLAB_SCHEMA_MIGRATIONS if version <= 6)
+    monkeypatch.setattr(collab_schema, "COLLAB_SCHEMA_MIGRATIONS", released)
+    run_collab_schema_migrations(clean_database)
+    with clean_database.connection() as conn:
+        conn.execute(
+            "INSERT INTO collab_platform_roles (user_id, role, status) VALUES ('sub-bootstrap', 'operator', 'active')"
+        )
+        conn.execute("INSERT INTO collab_audit_events (actor, action) VALUES ('sub-bootstrap', 'operator.manual')")
+    assert applied_collab_schema_version(clean_database) == 6
+
+    monkeypatch.undo()
+    run_collab_schema_migrations(clean_database)
+
+    assert applied_collab_schema_version(clean_database) == LATEST_COLLAB_SCHEMA_VERSION
+    with clean_database.connection() as conn:
+        # The hand-inserted bootstrap operator is backfilled as manual, which is
+        # what keeps sign-in sync from ever revoking it.
+        row = conn.execute(
+            "SELECT status, source FROM collab_platform_roles WHERE user_id = 'sub-bootstrap'"
+        ).fetchone()
+        assert (row["status"], row["source"]) == ("active", "manual")
+        # The old audit row survives the constraint swaps, and the new actions
+        # are accepted.
+        assert conn.execute("SELECT count(*) AS n FROM collab_audit_events").fetchone()["n"] == 1
+        for action in ("platform_role.grant", "platform_role.revoke", "service_access.revoke", "connector.disable"):
+            conn.execute("INSERT INTO collab_audit_events (actor, action) VALUES ('sub-op', %s)", (action,))

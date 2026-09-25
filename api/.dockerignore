@@ -1,0 +1,12 @@
+# Host build output and caches. Without this, `COPY admin-ui/ ./` lays the
+# host's node_modules (built for the host's platform) over the ones `npm ci`
+# just installed in the image.
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo
+.venv/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml

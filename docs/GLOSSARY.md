@@ -176,6 +176,13 @@ environment, run its checks, resolve its requirements, record the binding,
 derive its catalog card. Distinct from materialize — installing does not
 start a worker. (Cog-execution README, "Materialize / worker".)
 
+**Install reference.** The pinned `<host>/<repository>@<digest>` of one
+indexed Cog version — what a client hands to `nebi import`, and what the
+catalog read API answers at `…/versions/{digest}/reference`. It names one
+location of the artifact; identity is the digest, so the same digest may have
+several install references across sources and repositories.
+([cog-registry.md](cog-registry.md#read-api).)
+
 **Interrupted.** The terminal status of a run that a host was advancing
 when it stopped, under a backend that cannot resume it (`none`). Recorded
 on the Track when the host next starts. The run is never resumed; retrying

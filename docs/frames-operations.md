@@ -476,6 +476,9 @@ operator authority and the record of its use:
   bootstrap operator issues the first invitation on a fresh deployment, before
   any organization exists). Such a caller can use operator surfaces only —
   every org-scoped page and endpoint answers `no_organization` for them.
+  Migration version 7 adds a `source` column (`manual` or `idp`, default
+  `manual`) that records who administers the row; see
+  [Where operator rows come from](#where-operator-rows-come-from-source-and-sign-in-sync).
 - `collab_audit_events` — every privileged action's durable record, written
   **in the same database transaction** as the mutation it describes (the
   `audited()` primitive in `frames/audit.py` is the only writer). `actor` is
@@ -492,11 +495,81 @@ no application code path updates or deletes audit rows. Enforcing it for real
 needs a separate migration/owner role and a non-owning runtime role; out of
 scope for the beta, recorded here so it is not re-derived.
 
+#### Where operator rows come from (`source` and sign-in sync)
+
+Every row in `collab_platform_roles` has a `source` (migration version 7):
+
+- `manual`: administered by a person, either a hand-run `psql` insert or a
+  grant from the admin panel. Every row that existed before version 7 ran was
+  inserted by hand, so the column defaults to `manual` and those rows keep
+  their authority.
+- `idp`: created by sign-in sync from the identity provider's groups.
+
+Sign-in sync (`frames/platform_role_sync.py`) is off unless `web.admin_group`
+(`COLLAB_HUB_API__WEB__ADMIN_GROUP`) names a group. When it is set, each
+browser sign-in reads the verified ID token's `groups` claim and reconciles
+that person's operator row:
+
+- In the admin group, with no active row (or a revoked `idp` row): an active
+  `idp` row is written, and a `platform_role.grant` audit row with
+  `detail = {"origin": "oidc", "group": "<admin_group>"}`.
+- Not in the admin group, with an active `idp` row: that row is revoked, and a
+  `platform_role.revoke` audit row is written with the same `detail`.
+- A `manual` row is never granted or revoked by sync, in either direction. So
+  the bootstrap operator stays an operator whatever groups they are in, and a
+  deliberate revocation by hand is not undone by group membership.
+- Sync never revokes the last active operator. It keeps the row, logs
+  `platform_role_sync_kept_last_operator`, and the person stays an operator.
+  A renamed admin group or a changed groups mapper would otherwise remove
+  every synced operator at their next sign-in.
+- The group name matches with or without a leading slash, so `/collab-admins`
+  in the setting matches `collab-admins` in the claim and the reverse.
+- A missing `groups` claim, or one that is not a list, changes nothing. The
+  sign-in continues and `platform_role_sync_no_groups_claim` is logged. The
+  realm client needs a groups mapper (or the `groups` client scope) so the ID
+  token carries the claim at all.
+- A reconcile that fails is logged as `platform_role_sync_failed` and the
+  sign-in continues on the row as it already stood.
+
+The audit row's `actor` is the person who signed in, since their sign-in
+caused the change. On the browser session a sync revocation takes effect at
+the holder's next sign-in.
+
+#### Granting and revoking from the admin panel
+
+`POST /admin/api/users/{user_id}/role` with a JSON body
+`{"action": "grant" | "revoke", "user_label": "<optional>"}` changes the
+operator role (`frames/platform_role_admin.py`). It needs an operator session
+and the `X-CSRF-Token` header, like every write under `/admin/api`, and the
+shared `frames.postgres` URL; without a database it answers 503
+`role_management_unavailable`. The Users section of the panel calls it.
+
+- **A grant writes a `manual` row.** It is an upsert, so re-granting a revoked
+  person reuses their row, and it sets `source = 'manual'` even on a row that
+  was `idp`. Sync then leaves it alone, so a panel grant stays in place after
+  the person leaves the admin group.
+- **A revoke reaches any row**, `manual` or `idp`. A revoked `idp` row stays
+  `idp`, so if that person is still in the admin group their next sign-in
+  grants the role again.
+- **Some revokes are refused with HTTP 409** and a body of
+  `{"error": "<reason>"}`:
+  - `self_revoke`: the operator is revoking themselves.
+  - `last_operator`: the person is the only active operator.
+  - `not_operator`: the person holds no active operator role, so there is
+    nothing to revoke.
+
+Each change writes a `platform_role.grant` or `platform_role.revoke` audit row
+in the same transaction, with `actor` set to the operator who clicked and
+`detail = {"origin": "admin_panel"}`. A refused revoke writes no audit row.
+Both revoke paths (panel and sync) lock the active operator rows before they
+write, so two revokes at the same moment cannot together remove the last
+operator.
+
 #### Bootstrapping the first operator
 
-There are no grant/revoke endpoints (built the second time they are needed).
-The first operator is one `psql` insert, recorded as an `operator.manual`
-event in the same transaction:
+The panel can grant the role, but only an operator can open the panel. So the
+first operator is either a member of `web.admin_group` (see above) or one
+`psql` insert, recorded as an `operator.manual` event in the same transaction:
 
 ```sql
 BEGIN;
@@ -534,7 +607,16 @@ of creating a row no query ever finds.
 
 #### Reading the log
 
-There is no viewer; the log is read with `psql`:
+The admin panel's Audit log section shows it, newest first, through
+`GET /admin/api/audit` (operator session required). The endpoint takes
+optional `actor` and `action` filters and a page size `limit` (1 to 200,
+default 50). Paging is by cursor: each page returns `next_before_id`, and
+passing that back as `before_id` returns the entries older than it, so rows
+written while someone is reading do not shift the pages. `next_before_id` is
+`null` on the last page. Without a database the endpoint answers 503
+`audit_log_unavailable`.
+
+The same log read with `psql`:
 
 ```sql
 SELECT at, actor, actor_label, action, target_type, target_id, target_label, org_id, detail
@@ -546,11 +628,29 @@ Filter with `WHERE org_id = '<org>'`, `WHERE actor = '<sub>'`, or
 `WHERE action = 'invitation.send'` as needed; the action vocabulary is the
 closed set in `frames/audit.py` (`AUDIT_ACTIONS`). Rows are permanent — there
 is no retention or rotation policy in the beta, and the table holds email
-snapshots, so it is in scope for any future deletion request handling. The
-table also has no index beyond the primary key, so the queries above scan.
-All three — indexes, retention, and erasure-request handling — are tracked
-for resolution before GA in
-[#113](https://github.com/nebari-dev/collab-hub-pack/issues/113).
+snapshots, so it is in scope for any future deletion request handling.
+Migration version 8 adds `collab_audit_events_actor_idx` on `(actor, id DESC)`
+and `collab_audit_events_action_idx` on `(action, id DESC)`, which serve the
+actor and action filters; the unfiltered listing uses the primary key.
+Retention and erasure-request handling are tracked for resolution before GA
+in [#113](https://github.com/nebari-dev/collab-hub-pack/issues/113).
+
+#### Actions the admin panel and sign-in sync record
+
+Migrations 7, 9 and 10 widen the `action` CHECK constraint, and migration 10
+adds `connector` to the `target_type` constraint:
+
+| Action | Migration | Written by | `target_type` / `target_id` | `detail` |
+| --- | --- | --- | --- | --- |
+| `platform_role.grant` | 7 | panel role change, or sign-in sync | `user` / the person's `sub` | `{"origin": "admin_panel"}` or `{"origin": "oidc", "group": ...}` |
+| `platform_role.revoke` | 7 | panel role change, or sign-in sync | `user` / the person's `sub` | same as grant |
+| `service_access.revoke` | 9 | panel model access change | `user` / the person's `sub` | `{"group_path": ...}` |
+| `connector.enable` | 10 | panel connector switch | `connector` / `google`, `slack` or `github` | `{"enabled": true}` |
+| `connector.disable` | 10 | panel connector switch | `connector` / `google`, `slack` or `github` | `{"enabled": false}` |
+
+All of them are hub-scoped (`org_id` is `NULL`). The panel also writes
+`service_access.grant` rows, whose shape differs from the acceptance path's;
+see [below](#the-audit-trail-for-a-grant-service_accessgrant).
 
 #### Finding grants that are still owed
 
@@ -647,10 +747,75 @@ ORDER BY at, id;
 `actor` and `target_id` are both the accepter — they are the actor of their own
 grant — and `actor_label` is their address as `audited()` snapshotted it.
 
+**Rows written by the admin panel look different.** When an operator adds
+someone to a model group from the panel (`POST /admin/api/model-access`,
+`frames/model_access.py`), the `service_access.grant` row has:
+
+- `actor` and `actor_label`: the operator who made the change.
+- `target_id`: the person added, and `target_label`: the address the panel
+  sent with the request.
+- `org_id`: `NULL`, because model access belongs to the hub.
+- `detail`: `{"group_path": "<group>"}` only, with no `outcome` and no
+  `invitation_id`.
+
+The Keycloak call runs inside the audited transaction, so a refusal from
+Keycloak rolls the audit row back: a panel row exists only for a change that
+Keycloak accepted. Removing someone writes the same shape under
+`service_access.revoke`. The panel path writes no
+`collab_service_access_grants` row, so the reconciliation query above does not
+show it. If Keycloak accepts the change and the database commit then fails,
+the membership change stands with no audit row.
+
+To tell the two apart, filter on `detail`:
+
+```sql
+SELECT at, actor_label, action, target_id, target_label, detail
+FROM collab_audit_events
+WHERE action IN ('service_access.grant', 'service_access.revoke')
+  AND NOT detail ? 'invitation_id'
+ORDER BY at, id;
+```
+
 **Membership rides in the token.** A grant does not reach a session that is
 already signed in; the group appears on the accepter's next token. If
 somebody reports no model access immediately after accepting, a fresh sign-in
 is the first thing to try, before this query.
+
+### Connector switches (`collab_connector_state`)
+
+Migration version 10 adds `collab_connector_state`, one row per connector an
+operator has switched from the admin panel's Connectors section:
+
+| Column | Meaning |
+| --- | --- |
+| `connector` | Primary key: `google`, `slack` or `github` (`CONNECTOR_KEYS` in `frames/connector_state.py`). |
+| `enabled` | `false` switches the connector off. |
+| `updated_at` | When it was last switched. |
+| `updated_by` | The operator's `sub`. |
+
+A connector with no row is enabled, so a deployment that never opens the
+panel behaves as it did before the table existed. The table holds no
+credentials: deployment configuration decides whether a connector can work at
+all, and this row decides whether it is currently offered. Switching on a
+connector that has no credentials leaves it unusable.
+
+`POST /admin/api/connectors/{connector}` with `{"enabled": true | false}`
+writes the row and a `connector.enable` or `connector.disable` audit row in
+the same transaction. The connector routes read the table on every request,
+with no cache, and blank the credential fields of a switched-off connector, so
+it answers exactly as an unconfigured one does from the next request. Without
+a database the endpoint answers 503 `connector_switch_unavailable`, and a
+database that has not yet applied version 10 reads as nothing switched off.
+If the table cannot be read on a request, that request treats every connector
+as switched on and logs `connector_state_unavailable`.
+
+To see what is switched off:
+
+```sql
+SELECT connector, enabled, updated_at, updated_by
+FROM collab_connector_state
+ORDER BY connector;
+```
 
 ### Invitations
 
@@ -989,6 +1154,145 @@ expired everywhere the API presents it, and no sweeper process exists or is
 needed. `token_hash` is the only trace of the secret; there is no column, and
 no query, that can recover a link.
 
+### The Cog catalog (`collab_cog_artifacts`)
+
+Migration version 11 adds the Cog catalog: one row per artifact the indexer has
+seen in a configured registry source, keyed by `(source_id, repository,
+digest)`. It rides the same shared `frames.postgres.url` and the same
+`autoMigrate` switch as every other `collab_` table.
+
+- **Identity is the digest.** `cog_id`/`name`/`version`/`kind`/`publisher` are
+  search keys read from the Cog's own declarations; the repository path is not
+  identity (published names carry an id suffix, and one Cog may be published to
+  several repositories, each of which is its own row). The pinned install
+  reference `<host>/<repository>@<digest>` is rebuilt from the row.
+- **`card` is the bundle reader's output, verbatim, as `jsonb`** — the whole
+  profile as structured data. A GIN index (`jsonb_path_ops`) on it serves the
+  containment filters (`card @> …`) the catalog read API
+  ([cog-registry.md](cog-registry.md#read-api)) uses for
+  requires/provides/io; plain indexes cover `cog_id`, `kind` and `removed_at`.
+  With no `frames.postgres.url` the read API answers `503
+  cog_catalog_unavailable` rather than an empty catalog, unless the
+  development override `cogs.catalog.backend=memory` is set (level 1 of
+  `dev/`; no chart value).
+- **`status`** is `indexed` (the reader produced a card — a draft or a Cog with
+  a broken profile is still a Cog and lists with what it declared, its errors
+  mirrored into `read_errors`), `non_cog` (the manifest carries no `COG.md` and
+  no Prog `pixi.toml`; recorded with a reason so a repository full of images is
+  not re-read every sweep) or `failed` (the fetch or read failed; retried on
+  the next sweep).
+- **Rows are never deleted.** An artifact that disappears from its registry is
+  marked `removed_at = now()` and stays readable by digest — installs and runs
+  may reference it long after its publisher removed it. A digest that comes
+  back is restored (and retagged) without a refetch.
+
+The indexer is a reconciliation loop: enumerate each source, skip digests
+already indexed with the same tag set, fetch and read only new digests
+(`COG.md` first, then the profile file it names — never the lockfile, by
+title **or** media type), then mark this source's rows whose digest is no
+longer present as removed. A card the database cannot store (a NUL character
+anywhere in its JSON, or an oversized card) becomes a `failed` row with a
+reason instead of a sweep-aborting error. Fetching is budgeted per sweep
+(already-known digests cost nothing), so a large registry's tail is reached
+across successive sweeps rather than starved; deferred artifacts still count
+as present, so removal stays correct. Safety rules operators should know:
+
+- **Single flight.** A sweep takes the session-level advisory lock
+  `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its whole
+  duration (outside any transaction, so a minutes-long sweep pins no
+  snapshot). Replicas starting together do not double-index: the loser logs
+  `cog_index_sweep_skipped` and waits for its next interval. That connection
+  is one slot of the shared pool while a sweep runs, and it carries the
+  sweep's reads and writes (see the fencing bullet below).
+- **Removal needs a complete picture — per repository.** Rows are marked
+  removed only in repositories whose listing fully succeeded this sweep. If the
+  source's *repository list* cannot be obtained, nothing is reconciled and
+  nothing is declared gone. If one repository fails to list, or is refused for
+  exceeding the per-repository artifact bound, only **that repository's** rows
+  are shielded from removal (the summary says `removal skipped for it` and
+  counts the source in `sources_failed`); every other repository — and every
+  repository that has vanished from the source's list — still reconciles,
+  removal included. A transient registry outage therefore never marks a
+  catalog gone, and one permanently oversized repository does not freeze
+  removal for its neighbours. The adapters uphold their half by **raising past
+  their own limits instead of truncating** (a repository over the static
+  adapter's tag bound, a Harbor listing over its page bound), and the indexer's
+  own artifact bound is a refusal, never a prefix: a truncated list presented
+  as complete would turn a bound into false removals, and a prefix cut at the
+  same sorted position every sweep would permanently starve what lies behind
+  it.
+- **The fetch budget is dealt fairly.** Fetch slots go to never-seen artifacts
+  and to retries of `failed` rows in a fixed interleave (every fourth slot is a
+  retry slot; a class that has run out yields its slot). The interleave's phase
+  advances each sweep, and retries are served from a rotating order of
+  `(repository, digest)` identities — identities rather than positions, because
+  the failed set changes between sweeps and a positional cursor would step over
+  a candidate each time it did. A candidate moves to the back of the rotation as
+  its attempt *begins*, so a sweep that dies partway does not rotate past work it
+  never tried. The effect: even a budget of one reaches a retry within four
+  sweeps under a constant stream of new artifacts, and a stable prefix of
+  permanent failures cannot occupy the retry slots while a recoverable failure
+  behind it waits. Never-seen artifacts keep enumeration order; once indexed
+  they cost nothing, so the tail of a large registry is reached across sweeps
+  without rotation.
+- **The lock is never released under a live write.** A cancelled sweep waits for
+  its in-flight worker thread up to a drain deadline (30 s), however many times
+  it is cancelled. Past that deadline the sweep stops waiting — but it does
+  **not** release the lock: it logs `cog_index_worker_drain_expired` and
+  `cog_index_lock_release_deferred`, and hands the lock to a daemon thread
+  (`cog-index-late-release`) that releases it only once the worker has actually
+  finished (`cog_index_lock_released_late`). A thread rather than a task because
+  it must outlive the event loop: at shutdown every task is cancelled and the
+  loop closes, and an asyncio owner would stop mid-wait and leave the lock
+  context to be finalized by the garbage collector — unlocking while the write
+  was still in flight. Until the hand-off completes, other replicas keep seeing
+  `cog_index_sweep_skipped`, which is correct: a write may still be running.
+- **Shutdown bounds the wait, not the workers.** The app lifespan waits at most
+  45 s for the cancelled indexer task and otherwise leaves it pending with
+  `cog_indexer_shutdown_abandoned`. Sweep-path statements carry a server-side
+  `statement_timeout` and every pooled connection sets TCP keepalives (a dead
+  peer is noticed in about 90 s), which covers the ordinary partition; neither
+  ends a call to a peer whose kernel still answers probes while the database
+  process is stopped. The hand-off thread is a daemon, but the blocked call
+  itself runs on a pool worker, and those are joined at interpreter exit — so a
+  permanently blocked store call means the pod needs its `SIGKILL` (the
+  `terminationGracePeriodSeconds` deadline) rather than exiting on its own.
+- **Sweep writes ride the lock's session.** The sweep's reads and writes run
+  on the very connection the sweep lock is held on, so a sweeper that dies
+  mid-write loses the write and the lock together: the server drops both with
+  the one session, and no write of a dead sweep can land after another replica
+  has acquired the lock (issue #128). The targeted webhook writes (`reindex`
+  and `mark_removed_one`) deliberately do **not** share that session — they
+  check out their own pooled connections, so a push or delete event lands
+  concurrently with a running sweep.
+- **A doubtful lock connection is discarded, not returned.** If any step of
+  taking or giving back the lock fails (setting autocommit, the acquire, the
+  unlock, `RESET statement_timeout`, restoring autocommit), the connection is
+  **closed** (`cog_index_lock_connection_discarded`) so the pool opens a fresh
+  one instead of handing a session with an altered timeout — or one still
+  holding the lock — to the next borrower.
+- **Indexing needs two pooled connections.** The sweep occupies one connection
+  of the shared `frames.postgres` pool for its whole duration (the lock is
+  held on it and the sweep's reads and writes ride it), so the API refuses to
+  start with `cogs.index.enabled` and `frames.postgres.pool.max_size < 2`:
+  everything else — API reads, the webhook's targeted writes — needs a
+  connection while a sweep runs.
+
+Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
+non_cog / failed / removed / sources_failed / duration) and exports the same
+counts as `frames_server_cog_index_artifacts_total{outcome}`,
+`frames_server_cog_index_sweeps_total{result}` and
+`frames_server_cog_index_sweep_duration_seconds`. Per-artifact failures are
+stored in the row's `read_errors` and never abort the sweep.
+
+On content and secrecy, precisely: the `card` is the published bundle's own
+declarations, stored verbatim — whatever a publisher writes in `COG.md` or the
+profile is what the catalog holds. The guarantee is narrower and absolute:
+*configured registry credentials* never reach cards, `read_errors`, or logs;
+`read_errors` and log lines carry exception class names (plus the message only
+for the OCI client's own errors, whose contract is that messages name neither
+URLs nor headers), never raw URLs or exception chains.
+
 ### Connection pooling
 
 All Postgres-backed stores draw connections from a shared `psycopg_pool`
@@ -1247,6 +1551,79 @@ on: [Finding grants that are still owed](#finding-grants-that-are-still-owed).
 
 Group membership rides in the token, so the grant reaches the accepter on their
 next token rather than the session they accepted in.
+
+## Model Access from the Admin Panel
+
+The admin panel's Models and access section lists the models the serving
+layer offers, shows who is in the group that gates each one, and adds or
+removes people from those groups. The serving gateway reads Keycloak group
+membership, so the change lands in Keycloak and the hub records that it made
+it (`frames/model_access.py`, `frames/group_membership.py`). Disabled by
+default.
+
+The chart has no `frames.modelAccess` values, so the settings arrive as
+environment variables through `api.deployment.extraEnv`; see
+[Configuring the admin panel](standalone-deployment.md#configuring-the-admin-panel)
+for a worked example. The settings are `frames.model_access.*` in the API's
+config, under `COLLAB_HUB_API__FRAMES__MODEL_ACCESS__`:
+
+| Setting | Env | Meaning |
+| --- | --- | --- |
+| `catalog_base_url` | `…__CATALOG_BASE_URL` | The serving layer's origin. The panel reads `<catalog_base_url>/v1/models`. Empty shows no models, with `catalog_error: not_configured`, and leaves the rest of the panel working. |
+| `keycloak.token_url` | `…__KEYCLOAK__TOKEN_URL` | The realm's token endpoint. Required: unlike the other two credentials, there is no issuer fallback. |
+| `keycloak.admin_api_base_url` | `…__KEYCLOAK__ADMIN_API_BASE_URL` | `https://keycloak.example.com/admin/realms/<realm>`. |
+| `keycloak.client_id` | `…__KEYCLOAK__CLIENT_ID` | The confidential client whose service account holds the scopes below. |
+| `keycloak.client_secret` | `…__KEYCLOAK__CLIENT_SECRET` | Its secret. Supply it from a Secret with `valueFrom`. |
+| `group_ids` | `…__GROUP_IDS` | A JSON object from group path to Keycloak group id, for example `{"/models/example-model": "<group id>"}`. It is also the boundary: a group path missing from it is refused before any request is made. |
+| `model_groups` | `…__MODEL_GROUPS` | A JSON object from model id to the group path that gates it. A model with no entry is shown as ungated. |
+
+Membership changes are available only when `token_url`,
+`admin_api_base_url`, `client_id` and `group_ids` are all set and the shared
+`frames.postgres` URL is set, because every change writes an audit row.
+Otherwise the endpoints answer 503 `model_access_unavailable` and the panel
+shows model access as unavailable. A Keycloak refusal answers 502
+`group_unavailable`.
+
+### Why this is a third credential
+
+The service-access credential above can add a new account to a group and
+nothing else: it cannot read, so it cannot list members, and it cannot remove
+anyone. The panel needs both. Widening that credential would grow the
+invitation path's authority because an admin screen needed it, so the panel
+uses its own client. Use a different client from `userDirectory.keycloak` and
+from `frames.serviceAccess.keycloak`.
+
+Group ids are configuration for the same reason as at acceptance: resolving a
+path would need group-read authority, and startup should not depend on the
+identity provider being reachable.
+
+### The authority to change membership, and the scope never to grant
+
+Grant the client's service account exactly these three scopes:
+
+- `Groups/view-members`, to list who is in a group;
+- `Groups/manage-membership`, and
+- `Users/manage-group-membership`, together to add and remove members.
+
+**Never grant it `Groups/manage-members`.** Over a member of a group that
+scope also permits password reset, email change and deletion. A credential
+that can put somebody into a model group and also rewrite their password can
+take over any account it chooses: the two halves are safe apart and are
+account takeover together.
+
+The code keeps to that boundary by construction. The client issues only a
+member listing and a membership `PUT` or `DELETE`, has no method that touches
+an account, and acts only on the groups in `group_ids`. The realm scoping is
+the backstop.
+
+### What each change records
+
+Each add or remove writes a `service_access.grant` or `service_access.revoke`
+audit row whose `actor` is the operator; see
+[The audit trail for a grant](#the-audit-trail-for-a-grant-service_accessgrant)
+for the row shape and how it differs from acceptance-time grants. Membership
+rides in the token, so a person added from the panel sees the model on their
+next token.
 
 ## Invitation Email Provider
 

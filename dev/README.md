@@ -384,6 +384,8 @@ Every request is then treated as `dev-user`, with no token:
 ```sh
 curl -s localhost:8000/v1/frames
 curl -s localhost:8000/health
+curl -s localhost:8000/v1/cogs                    # the Cog catalog, empty here
+curl -s localhost:8000/v1/cogs/catalog.v1.json    # {"schemaVersion":1,"repositories":[]}
 ```
 
 These switches are a local-development affordance and nothing else. The Helm
@@ -1083,6 +1085,27 @@ TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
 `cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
 runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 
+### The Cog catalog read API
+
+The read API (`/v1/cogs`, [docs/cog-registry.md](../docs/cog-registry.md#read-api))
+runs at **level 1**: `make api` keeps the catalog in process memory
+(`COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory`), so every route answers,
+over an empty catalog that resets when the process stops. From level 2 up the
+catalog is the `collab_cog_artifacts` table in Postgres and survives restarts
+(`make destroy` clears it). Nothing indexes into it unless a registry source
+and `cogs.index.enabled` are configured — see
+[docs/cog-registry.md](../docs/cog-registry.md#bare-process).
+
+```sh
+make api
+curl -s localhost:8000/v1/cogs                    # {"items":[],"limit":50,"offset":0,"next_offset":null}
+curl -s 'localhost:8000/v1/cogs?kind=model&q=small'
+curl -s localhost:8000/v1/cogs/catalog.v1.json
+```
+
+CI asserts both empty answers at level 1, and at level 2 runs the filtered
+list against Postgres.
+
 ---
 
 ## Troubleshooting
@@ -1093,6 +1116,7 @@ runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 | 401 with a token that looks fine | Issuer mismatch, or the token has no `sub` claim | Check `iss` matches `FRAMES_BEARER_ISSUER` exactly; check the client kept the `basic` client scope |
 | `403 no_organization` | Membership mode with no row for that subject | `make seed-org SUB=$(make -s sub)` |
 | `503` from history / groups / invitations | No Postgres — `make api` starts none | Use `make api-pg` or above |
+| `503 cog_catalog_unavailable` from `/v1/cogs` | The API was started by hand with neither Postgres nor the level-1 memory override | Use `make api`, or set `COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory` |
 | `/web/signin` returns 404 | The web surface is not mounted without a Keycloak client id | Use `make api-full` |
 | `/health/db` says 200 but nothing persists | It answers 200 either way; the body says `not_configured` | Read the body, and use level 2 or above |
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
@@ -1142,8 +1166,8 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token |
-| 2 | Linux | `/health/db` reports a real database, and `/v1/frame-groups` answers 200 instead of 503 |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`) |
+| 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
 

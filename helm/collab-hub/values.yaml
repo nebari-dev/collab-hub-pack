@@ -274,13 +274,15 @@ security:
   # checks in-route, and the app refuses to start if this map does not leave
   # the routes it actually serves public.
   #
-  # They are inert on an install that does not enable the web surface, and
-  # /admin is inert today on every install: no routes are registered under a
-  # prefix until its page ships, so a request there matches nothing in the app
-  # and falls through to the MCP catch-all mounted at "/", which runs its own
-  # McpAuthMiddleware and authenticates on the API axis before the
+  # They are inert on an install that does not enable the web surface: no
+  # routes are registered under them, so a request there matches nothing in
+  # the app and falls through to the MCP catch-all mounted at "/", which runs
+  # its own McpAuthMiddleware and authenticates on the API axis before the
   # sub-application sees it. A prefix declared public that serves nothing is
-  # not a hole.
+  # not a hole. Where the web surface is enabled and organizations come from
+  # membership, /admin now serves the admin panel (/admin/, /admin/assets/*
+  # and its JSON API under /admin/api/*). The panel authenticates itself with
+  # the web session, the CSRF token on every write, and the operator check.
   #
   # /admin is listed ahead of its routes (nebari-dev/collab-hub-pack#91) on
   # purpose. The alternative — each page shipping its own entry — leaves
