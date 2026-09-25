@@ -1558,9 +1558,9 @@ def _post_body_over_socket(
 def _read_one_response(sock: socket.socket, buffered: bytes) -> tuple[bytes, bytes] | None:
     """One ``Content-Length``-framed response off ``sock``, or None at EOF.
 
-    Returns ``(response, leftover)``. None means the server closed (or reset)
-    the connection before a complete response arrived — the observation the
-    keep-alive controls exist to make.
+    Returns ``(response, leftover)``. None means no complete response arrived
+    on this socket — end-of-file, a reset, or the socket timeout — which is
+    what the keep-alive controls must fail on, whichever of those it was.
     """
 
     data = buffered
@@ -1597,7 +1597,8 @@ def _requests_over_one_socket(base_url: str, requests: list[bytes]) -> list[byte
     """Send ``requests`` one after another on **one** raw socket.
 
     Returns the responses that were served, in order; a list shorter than
-    ``requests`` means the server let the connection go after the last one.
+    ``requests`` means the connection did not serve the next one (closed,
+    reset, or timed out).
     A raw socket rather than an HTTP client because a client library quietly
     opens a fresh connection when the server closes one, so "the second
     request was served" proves nothing about reuse there. Here there is only
@@ -1624,8 +1625,8 @@ def _requests_over_one_socket(base_url: str, requests: list[bytes]) -> list[byte
 def _raw_post(base_url: str, path: str, *, headers: dict[str, str], body: bytes) -> bytes:
     """A ``Content-Length``-framed HTTP/1.1 POST, as bytes, with no ``Connection`` header.
 
-    HTTP/1.1's default is persistent, so leaving the header out is what asks
-    for keep-alive; saying so explicitly would test the header, not the server.
+    HTTP/1.1's default is persistent, so leaving the header out asks for
+    keep-alive the way an ordinary client does.
     """
 
     parts = urlsplit(base_url)

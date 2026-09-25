@@ -756,8 +756,9 @@ async def test_the_form_type_is_matched_as_a_media_type(tmp_path, idp, content_t
         "multipart/form-data; boundary=x",
         "text/plain",
         "",
+        None,
     ],
-    ids=["suffix_extended", "suffix_extended_with_param", "multipart", "text", "absent"],
+    ids=["suffix_extended", "suffix_extended_with_param", "multipart", "text", "empty", "absent"],
 )
 async def test_anything_but_the_form_type_is_refused_unread(tmp_path, idp, path, content_type):
     """A type that merely *begins* with the form type is not the form type (#71).
@@ -774,9 +775,10 @@ async def test_anything_but_the_form_type_is_refused_unread(tmp_path, idp, path,
         await signed_in(client, idp)
         page = await client.get(ADMIN_INVITATIONS_PATH)
         body = {"csrf_token": csrf_from(page.text), EMAIL_FIELD: INVITEE, INVITATION_ID_FIELD: "inv-9"}
-        response = await client.post(
-            path, content=urlencode(body), headers={"Content-Type": content_type}
-        )
+        # None sends no Content-Type at all; httpx adds none for raw content.
+        headers = {} if content_type is None else {"Content-Type": content_type}
+        response = await client.post(path, content=urlencode(body), headers=headers)
+        assert (content_type is None) == ("content-type" not in response.request.headers)
     assert response.status_code == admin_router.UNSUPPORTED_MEDIA_TYPE, response.text
     assert response.headers.get("connection") == "close"
     assert service.issue_calls == [] and service.revoke_calls == []

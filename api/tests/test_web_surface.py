@@ -961,9 +961,11 @@ async def test_the_fallback_reads_the_form_type_however_it_is_spelled(tmp_path, 
 )
 async def test_a_type_that_only_begins_like_a_form_is_not_read_as_one(tmp_path, idp, content_type):
     """A type that merely *begins* with a form type does not claim a form
-    (#71). It used to pass the fallback's prefix match and have its body read
-    and parsed; it is now what any other non-form type is — a missing token,
-    the plain 403, and none of its body pulled."""
+    (#71). Both used to pass the fallback's prefix match: the urlencoded one
+    then had its body read and parsed (and its token honoured), the multipart
+    one was refused 415 by ``form_fields``. Each is now what any other
+    non-form type is — a missing token, the plain 403, none of its body
+    pulled."""
 
     pulled = 0
 
