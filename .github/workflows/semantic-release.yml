@@ -1,22 +1,36 @@
 name: Semantic Release
 
-# Cuts the release from the squash commits on main: computes the next version
-# from conventional commits, writes CHANGELOG.md, pins the version into
-# Chart.yaml and api/pyproject.toml (scripts/release/bump-version.py), commits
-# that back to main, and creates the v<version> tag and GitHub Release.
+# Every merge to main that carries a releasable conventional commit becomes a
+# chart release, without a release PR and without writing to main:
 #
-# The bump commit deliberately does NOT carry [skip ci]: its push is what
-# triggers release.yaml (pack-release packages the chart, pins the image sha,
-# and syncs to helm-repository) and build-images.yaml (builds the sha image
-# that pinned chart references). semantic-release's own re-run on that push
-# finds no releasable commits and exits without releasing.
+# 1. semantic-release names the version from the squash commits since the last
+#    v<version> tag and tags the merged commit on main as v<version>. That tag
+#    is the version lineage; nothing else is pushed to main.
+# 2. A release commit is made on top of that commit, pinning the version into
+#    helm/collab-hub/Chart.yaml and api/pyproject.toml
+#    (scripts/release/bump-version.py). It is pushed only as the tag
+#    collab-hub-<version>, the name pack-release gives the release, and never
+#    to a branch.
+# 3. build-images.yaml and release.yaml are dispatched from that tag. The
+#    shared pack-release reads the version from the tag's Chart.yaml and pins
+#    the chart to the sha-<short> image that build-images builds from the same
+#    ref, then packages, releases, and syncs to nebari-dev/helm-repository as
+#    it does for every pack.
+#
+# Chart.yaml on main keeps a placeholder version; the released version lives
+# in the tags and the GitHub Release. GITHUB_TOKEN is enough throughout: tags
+# are not branch-protected, and workflow_dispatch is the one event it may start.
+#
+# The repo has no root package.json for this; semantic-release and its plugins
+# are resolved by npx per run and pinned here.
 on:
   push:
     branches:
       - main
 
 permissions:
-  contents: write
+  contents: write # push the two tags
+  actions: write # dispatch build-images.yaml and release.yaml
 
 concurrency:
   group: semantic-release
@@ -24,35 +38,61 @@ concurrency:
 
 jobs:
   release:
-    name: semantic-release
+    name: Tag and dispatch the chart release
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          # The default GITHUB_TOKEN cannot trigger the downstream workflows
-          # on the commit/tag it pushes; without a PAT/app token the
-          # pack-release and image build for the bump commit never start.
-          token: ${{ secrets.RELEASE_TOKEN || github.token }}
-          persist-credentials: true
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
-      - name: Release
+      - name: Name the version and tag it on main
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          GIT_AUTHOR_NAME: openteams-release-bot
-          GIT_AUTHOR_EMAIL: releases@openteams.com
-          GIT_COMMITTER_NAME: openteams-release-bot
-          GIT_COMMITTER_EMAIL: releases@openteams.com
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           npx --yes \
             -p semantic-release@24.2.9 \
-            -p @semantic-release/changelog@6.0.3 \
-            -p @semantic-release/exec@7.1.0 \
-            -p @semantic-release/git@10.0.1 \
+            -p @semantic-release/exec@6.0.3 \
             semantic-release
+
+      - id: release
+        name: Tag the release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -s .next-release ]]; then
+            echo "No releasable commits since the last release; nothing to release."
+            exit 0
+          fi
+          version="$(cat .next-release)"
+          tag="collab-hub-${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "::warning::${tag} already exists; not re-tagging."
+            exit 0
+          fi
+          git config user.name "OpenTeams Release Bot"
+          git config user.email "releases@openteams.com"
+          # Detached, so the release commit exists only under its tag and no
+          # branch ref, local or remote, ever moves to it.
+          git checkout -q --detach
+          python3 scripts/release/bump-version.py "${version}"
+          git commit -q -am "chore(release): ${version}"
+          git tag -a "${tag}" -m "collab-hub ${version}"
+          git push origin "refs/tags/${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the image build and the chart release
+        if: steps.release.outputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Both from the tag, so the image is built from the release commit
+          # and pack-release pins the chart to that same commit's sha.
+          gh workflow run build-images.yaml --ref "${TAG}"
+          gh workflow run release.yaml --ref "${TAG}"

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Pin the release version into the files that carry it.
 
-Called by semantic-release's prepare step with the computed version. Updates
-helm/collab-hub/Chart.yaml (version + appVersion) and api/pyproject.toml
-(project version). The commit of these bumps is what triggers release.yaml
-(pack-release) and build-images.yaml, so the chart, image, and tag all
-describe the same commit.
+Called by .github/workflows/semantic-release.yml with the computed version.
+Updates helm/collab-hub/Chart.yaml (version + appVersion) and
+api/pyproject.toml (project version) for the release commit, which is pushed
+only as the collab-hub-<version> tag. build-images.yaml and release.yaml run
+from that tag, so the chart, image, and tag all describe the same commit.
 """
 
 import re
