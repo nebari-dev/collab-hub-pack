@@ -132,7 +132,7 @@ def test_usage_inside_the_payload_is_output_not_accounting():
     )
     assert engine.submit(op(count=2)) is RunState.COMPLETED
     completed = [e for e in track.replay("accounting") if e.event_type == "step_completed"]
-    assert all(e.payload["output"] == payload for e in completed)
+    assert all(e.payload["payload"] == payload for e in completed)
     assert all(e.payload["usage"] == {"tokens": 1} for e in completed)
 
 

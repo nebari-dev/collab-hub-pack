@@ -71,10 +71,10 @@ def test_duration_budget_stops_run_before_any_step_as_timed_out():
         track=track,
         budget=RunBudget(max_duration=timedelta(0)),
     )
-    # a duration overrun is a timeout, distinct from token/cost overspend
+    # a duration overrun is a budget stop whose dimension says so, distinct from token/cost overspend
     assert engine.submit(OpDefinition("run-dur", (OpStep("s", "a", "run"),))) is RunState.BUDGET_EXCEEDED
-    assert any(e.event_type == "timed_out" for e in track.replay("run-dur"))
-    assert not any(e.event_type == "budget_exceeded" for e in track.replay("run-dur"))
+    [stop] = [e for e in track.replay("run-dur") if e.event_type == "budget_exceeded"]
+    assert stop.payload["dimension"] == "duration"
 
 
 def test_bounded_revise_loop_fails_after_max_revisions():
@@ -123,14 +123,17 @@ def test_an_approval_is_never_charged_as_a_revision(max_revisions):
     assert _decide(engine, "run-approve", "approve") is RunState.COMPLETED
     assert len(signals) == max_revisions + 1
     [completed] = [e for e in track.replay("run-approve") if e.event_type == "step_completed"]
-    assert completed.payload["output"] == {"draft": max_revisions + 1}
+    assert completed.payload["payload"] == {"draft": max_revisions + 1}
 
 
-@pytest.mark.parametrize("ending,state", [("rejected", "rejected"), ("cancelled", "cancelled")])
+@pytest.mark.parametrize("ending,state", [
+    (("gate_decided", {"step": "s", "outcome": "reject", "actor": "alice"}), "rejected"),
+    (("cancelled", {"actor": "alice"}), "cancelled"),
+], ids=["rejected", "cancelled"])
 def test_a_rejected_or_cancelled_run_is_refused_a_retry_before_anything_is_read_or_written(ending, state):
     track = InMemoryTrackStore()
     for kind, payload in (("op_submitted", {"op": {"run_id": "r", "steps": []}}), ("run_picked_up", {}),
-                          ("paused", {"step": "s"}), (ending, {"step": "s", "actor": "alice"})):
+                          ("gate_escalated", {"step": "s"}), ending):
         track.append(TrackEvent(run_id="r", event_type=kind, payload=payload))
     before = track.replay("r")
     engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({}), track=track)

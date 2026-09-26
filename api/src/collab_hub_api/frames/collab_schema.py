@@ -696,6 +696,55 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        12,
+        (
+            # The Track (issue #5): the append-only record of every run, which is
+            # the only source of a run's status (ADR-0002 D3). The execution
+            # package's `PostgresTrackStore` reads and writes these tables; on the
+            # hub they are created here and never by that store's `ensure_schema`,
+            # which serves the standalone package and local use. That store's
+            # `_SCHEMA` is this registry's Track statements in order, and
+            # execution/tests/test_track_ddl.py holds the two equal. Like every
+            # released version this one is frozen by its checksum: a change to the
+            # Track tables is a new migration, with the same statements appended
+            # to `_SCHEMA`, never an edit here.
+            #
+            # `sequence` is global, so events written by several replicas replay
+            # in one stable order. `schema` is the version of the event's shape
+            # (docs/cog-execution/track.md); rows written before events carried
+            # one read as version 0, which the default records.
+            "CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence",
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_events (
+                sequence    bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence'),
+                event_id    text NOT NULL UNIQUE,
+                run_id      text NOT NULL,
+                event_type  text NOT NULL,
+                payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
+                occurred_at timestamptz NOT NULL,
+                schema      integer NOT NULL DEFAULT 0
+            )
+            """,
+            "ALTER TABLE collab_track_events ADD COLUMN IF NOT EXISTS schema integer NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
+            # At most one submission per run: two API replicas cannot both start
+            # the same run; the losing insert fails on this index.
+            "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission "
+            "ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
+            # A step's payload above the inline threshold, kept beside the Track
+            # and named by the `payload_ref` of its `step_completed` event.
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_payloads (
+                ref        text PRIMARY KEY,
+                run_id     text NOT NULL,
+                payload    jsonb NOT NULL,
+                stored_at  timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS collab_track_payloads_run ON collab_track_payloads (run_id)",
+        ),
+    ),
 )
 
 

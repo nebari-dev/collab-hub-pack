@@ -143,7 +143,7 @@ def test_ok_with_warnings_completes_the_step_and_records_them():
     track = InMemoryTrackStore()
     assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.COMPLETED
     (completed,) = events(track, "env", "step_completed")
-    assert completed.payload["output"] == {"answer": "draft"}
+    assert completed.payload["payload"] == {"answer": "draft"}
     assert completed.payload["problems"] == [
         {"check": "grounding", "detail": "quote not verbatim", "severity": "warn"},
     ]
@@ -211,8 +211,8 @@ def test_in_memory_handler_may_return_an_envelope_shaped_mapping_or_a_raw_value(
     definition = OpDefinition("mix", (OpStep("a", "c", "run", "x"), OpStep("b", "raw", "run", "y")))
     assert DurableWorkflowEngine(executor=executor, track=track).submit(definition) is RunState.COMPLETED
     first, second = events(track, "mix", "step_completed")
-    assert first.payload["output"] == "x" and first.payload["problems"][0]["check"] == "schema"
-    assert second.payload["output"] == {"answer": "y"} and "problems" not in second.payload
+    assert first.payload["payload"] == "x" and first.payload["problems"][0]["check"] == "schema"
+    assert second.payload["payload"] == {"answer": "y"} and "problems" not in second.payload
 
 
 def test_a_worker_returning_something_else_fails_durably_as_envelope_invalid():

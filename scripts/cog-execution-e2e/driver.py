@@ -73,7 +73,8 @@ def main() -> int:
 
     events = [e.event_type for e in track.replay("e2e-run")]
     print("track events:", events, flush=True)
-    for required in ("op_submitted", "materialized", "paused", "signal_received", "step_completed", "completed"):
+    for required in ("op_submitted", "materialized", "gate_escalated", "gate_decided", "step_completed",
+                     "completed"):
         assert required in events, f"missing {required!r} in Track"
 
     # both Cogs were materialized as real pods and step outputs recorded with digests
@@ -82,7 +83,7 @@ def main() -> int:
     assert any(e.payload.get("digest") == "sha256:reviewer" for e in materialized)
 
     review = next(
-        e.payload["output"] for e in track.replay("e2e-run")
+        e.payload["payload"] for e in track.replay("e2e-run")
         if e.event_type == "step_completed" and e.payload["step"] == "review"
     )
     # The approved revision is the one that ran with the findings, delivered to the pod as its signal.

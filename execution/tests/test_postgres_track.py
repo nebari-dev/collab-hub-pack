@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to ru
 def store():
     from psycopg_pool import ConnectionPool
 
-    pool = ConnectionPool(TEST_PG, min_size=1, open=True)
+    pool = ConnectionPool(TEST_PG, min_size=1, max_size=4, open=True)
     with pool.connection() as conn:
         conn.execute("DROP INDEX IF EXISTS collab_track_one_submission")
         conn.execute("DROP TABLE IF EXISTS collab_track_events")
@@ -106,3 +106,47 @@ def test_escalation_accounting_survives_postgres_recovery(store):
     assert engine().decide(op.run_id, escalation=second, actor="alice",
                            outcome="approve") is RunState.BUDGET_EXCEEDED
     assert engine()._budget_tracker(store.replay(op.run_id)).tokens == 18
+
+
+def test_a_live_stream_never_skips_an_event_that_commits_after_a_later_one(store):
+    """Sequences are drawn at insert, rows appear at commit: appends to a run are serialized.
+
+    Without that, a second append could draw sequence N+1 and commit while the
+    first still holds N uncommitted; a reader would see N+1, move its cursor past
+    N, and never see N once it committed.
+    """
+    import threading
+
+    import psycopg
+
+    from collab_hub_execution.track import _run_lock
+
+    first = store.append(TrackEvent(run_id="r", event_type="op_submitted"))
+    # An append in flight: its lock taken and its row inserted with a sequence, not yet committed.
+    held = psycopg.connect(TEST_PG)
+    held.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_run_lock("r"),))
+    held.execute(
+        "INSERT INTO collab_track_events (event_id, run_id, event_type, payload, occurred_at, schema) "
+        "VALUES ('in-flight', 'r', 'run_picked_up', '{}'::jsonb, now(), 1)"
+    )
+    later, done = [], threading.Event()
+
+    def append_later():
+        later.append(store.append(TrackEvent(run_id="r", event_type="completed")))
+        done.set()
+
+    thread = threading.Thread(target=append_later)
+    thread.start()
+    try:
+        # The later append waits rather than drawing a sequence and committing first ...
+        assert not done.wait(0.5)
+        assert store.replay("r", after_sequence=first.sequence) == ()
+        # ... while another run's append does not wait at all.
+        store.append(TrackEvent(run_id="other", event_type="op_submitted"))
+    finally:
+        held.commit()
+        held.close()
+        thread.join(5)
+    seen = store.replay("r", after_sequence=first.sequence)
+    assert [e.event_type for e in seen] == ["run_picked_up", "completed"]
+    assert seen[0].sequence < seen[1].sequence == later[0].sequence
