@@ -6,8 +6,12 @@ before schema version 1 — the same assertions against the in-memory, SQLite an
 Postgres stores. Postgres needs ``TEST_POSTGRES_URL``, as the adapter tests do.
 """
 
+import gc
+import json
 import os
+import sqlite3
 import threading
+import warnings
 from datetime import UTC, datetime
 
 import pytest
@@ -27,8 +31,12 @@ from collab_hub_execution import (
 TEST_PG = os.environ.get("TEST_POSTGRES_URL")
 
 
-@pytest.fixture(params=["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.skipif(
-    not TEST_PG, reason="set TEST_POSTGRES_URL to run the suite against Postgres"))])
+_NEEDS_PG = pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to run the suite against Postgres")
+
+
+@pytest.fixture(params=["memory", "sqlite", pytest.param("postgres", marks=_NEEDS_PG),
+                        # The hub's shared pool returns mappings, not tuples (frames/db.py).
+                        pytest.param("postgres-dict-rows", marks=_NEEDS_PG)])
 def store(request, tmp_path):
     if request.param == "memory":
         yield InMemoryTrackStore()
@@ -37,9 +45,11 @@ def store(request, tmp_path):
         SqliteTrackStore.ensure_schema(path)
         yield SqliteTrackStore(path)
     else:
+        from psycopg.rows import dict_row
         from psycopg_pool import ConnectionPool
 
-        pool = ConnectionPool(TEST_PG, min_size=1, open=True)
+        kwargs = {"row_factory": dict_row} if request.param == "postgres-dict-rows" else {}
+        pool = ConnectionPool(TEST_PG, min_size=1, max_size=4, open=True, kwargs=kwargs)
         with pool.connection() as conn:
             for statement in ("DROP TABLE IF EXISTS collab_track_payloads", "DROP TABLE IF EXISTS collab_track_events",
                               "DROP SEQUENCE IF EXISTS collab_track_event_sequence"):
@@ -50,7 +60,7 @@ def store(request, tmp_path):
 
 
 def _event(kind, run_id="r", **payload):
-    return TrackEvent(run_id=run_id, event_type=kind, payload=payload)
+    return TrackEvent(run_id=run_id, event_type=kind, payload=payload, schema=SCHEMA_VERSION)
 
 
 # --- append, replay, stream --------------------------------------------------------------
@@ -70,7 +80,7 @@ def test_append_assigns_increasing_sequences_and_replay_keeps_them(store):
 def test_a_replayed_event_is_the_event_that_was_appended(store):
     when = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
     stored = store.append(TrackEvent(run_id="r", event_type="op_submitted", payload={"op": {"n": 1, "t": [1, 2]}},
-                                     occurred_at=when, event_id="evt-1"))
+                                     occurred_at=when, event_id="evt-1", schema=SCHEMA_VERSION))
     [read] = store.replay("r")
     assert read == stored
     assert read.payload == {"op": {"n": 1, "t": [1, 2]}} and read.occurred_at == when and read.schema == SCHEMA_VERSION
@@ -137,12 +147,13 @@ def test_status_is_the_track_replayed_through_the_run_machine(store):
 
 def test_a_payload_kept_by_reference_comes_back_as_it_was(store):
     payload = {"answer": "x" * 100, "items": [1, 2, {"deep": None}]}
-    store.put_payload("r/s/0/abc", payload)
-    assert store.get_payload("r/s/0/abc") == payload
-    store.put_payload("r/s/0/abc", {"answer": "y"})  # the same reference can be rewritten
-    assert store.get_payload("r/s/0/abc") == {"answer": "y"}
+    store.put_payload("org/team-42", "org%2Fteam-42:s:0", json.dumps(payload))
+    assert store.get_payload("org%2Fteam-42:s:0") == payload
+    # The same reference is rewritten, not added: recovering an attempt leaves one row.
+    store.put_payload("org/team-42", "org%2Fteam-42:s:0", json.dumps({"answer": "y"}))
+    assert store.get_payload("org%2Fteam-42:s:0") == {"answer": "y"}
     with pytest.raises(KeyError):
-        store.get_payload("r/s/0/missing")
+        store.get_payload("org%2Fteam-42:s:1")
 
 
 # --- a Track written before schema version 1 ----------------------------------------------
@@ -217,3 +228,42 @@ def test_a_pre_v1_duration_stop_and_rejection_read_as_v1(store):
 def test_a_v1_event_passes_through_the_reader_unchanged():
     event = _event("gate_decided", step="s", outcome="approve")
     assert upgrade(event) is event
+
+
+def test_an_event_built_without_a_version_is_read_as_written_before_v1():
+    # A pre-v1 event rebuilt from an export without its version must still be lifted, not taken for v1.
+    rebuilt = TrackEvent(run_id="r", event_type="paused", payload={"step": "s"})
+    assert rebuilt.schema == 0
+    assert upgrade(rebuilt).event_type == "gate_escalated"
+    track = [TrackEvent(run_id="r", event_type="submitted"), TrackEvent(run_id="r", event_type="paused",
+                                                                         payload={"step": "s"})]
+    assert derive_run_status(track) is RunState.WAITING_AT_GATE
+
+
+# --- SQLite specifics ---------------------------------------------------------------------
+
+
+def test_sqlite_keeps_the_whole_run_id_on_a_payload(tmp_path):
+    path = tmp_path / "track.sqlite"
+    SqliteTrackStore.ensure_schema(path)
+    SqliteTrackStore(path).put_payload("org/team-42", "org%2Fteam-42:s:0", json.dumps({"a": 1}))
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT run_id FROM collab_track_payloads").fetchall() == [("org/team-42",)]
+    finally:
+        connection.close()
+
+
+def test_sqlite_closes_every_connection_it_opens(tmp_path):
+    path = tmp_path / "track.sqlite"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        SqliteTrackStore.ensure_schema(path)
+        store = SqliteTrackStore(path)
+        store.append(_event("op_submitted"))
+        store.put_payload("r", "r:s:0", "{}")
+        store.get_payload("r:s:0")
+        list(store.stream("r", timeout_seconds=0.2))  # a few polls
+        gc.collect()
+    unclosed = [w for w in caught if issubclass(w.category, ResourceWarning) and "sqlite3" in str(w.message)]
+    assert unclosed == []

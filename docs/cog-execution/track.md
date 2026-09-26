@@ -13,7 +13,10 @@ The code is `collab_hub_execution.track` and the engine that writes it,
 An event is `{run_id, event_type, payload, occurred_at, event_id, sequence, schema}`.
 The store assigns `sequence`, a global order that replay follows; `event_id`
 is unique, so an event appended twice is refused; `schema` is the version of
-the event's shape, `1` for everything this page describes. Every event of a
+the event's shape, `1` for everything this page describes and everything the
+engine writes. An event built without a version is `0` — read as written before
+v1 — so one rebuilt from an export without it is still lifted rather than taken
+for a v1 event it is not. Every event of a
 run carries `run_id`; those about one step carry `step`, and those about one
 attempt of it carry `attempt`.
 
@@ -33,7 +36,7 @@ Three kinds of event share the Track:
 | `gate_escalated` | `step`, `attempt`, `reason`, `escalation` (its id), `envelope` (the result the Gate escalated), `usage`, `approvers` (roles that may decide), `gate` (the policy) | a step's Gate escalates its result |
 | `gate_decided` | `step`, `outcome` (`approve`, `send_back`, `reject`), `escalation` (the id answered), `actor`, `value` (the findings), `envelope_digest` (a stable id of the result decided on) | a person decides an escalation |
 | `completed` | — | every step completed |
-| `failed` | `step`, `error`, `reason`, and what the failure carried (`problems`, `binding`, `worker_error`, `revise_limit`) | the run fails; `step_failed` precedes it for a step's failure |
+| `failed` | `step`, `error`, `reason` (bounded to 1024 characters), and what the failure carried (`problems`, `binding`, `worker_error`, `revise_limit`) | the run fails; `step_failed` precedes it for a step's failure |
 | `budget_exceeded` | `step`, `dimension` (`duration`, `tokens`, `cost`), `reason` | a budget stops the run |
 | `cancelled` | `actor` | a client cancels |
 | `interrupted` | `backend` | the host stopped under `none` and the run cannot resume |
@@ -46,7 +49,7 @@ Three kinds of event share the Track:
 | `step_started` | `step`, `cog`, `digest`, `attempt` |
 | `interaction_usage` | `step`, `attempt`, `usage` — what one interaction spent, `null` when unknown |
 | `step_completed` | `step`, `attempt`, `cog`, `digest`, `binding`, `problems`, `usage`, `frames`, `escalation` (when an approval completed it), and the result: `payload` inline, or `payload_ref` naming where it is kept |
-| `step_failed` | `step`, `attempt`, `key` (the idempotency key), `cog`, `digest`, `error` (the envelope's code, or the exception's class), `message` (bounded to 1024 characters), and `problems` and `binding` when the failure carried them |
+| `step_failed` | `step`, `attempt`, `key` (the idempotency key), `cog`, `digest`, `error` (the envelope's code, or the exception's class), `message` (bounded to 1024 characters), `problems` and `binding` when the failure carried them, and `teardown_error` when the worker could not be torn down either — the step's own failure is kept, not replaced |
 
 `step_completed` alone answers "what produced this": the Cog and its digest,
 the binding, the problems the Cog reported, the usage it spent, and the Frames
@@ -54,11 +57,18 @@ it was given (`frames` is empty until Frames are delivered to steps). `label`
 is reserved on step events for sensitivity labels (#13) and is not written yet.
 
 **Payloads by reference.** A result whose JSON is larger than the engine's
-`payload_inline_max_bytes` (64 KiB by default) is kept beside the Track under
-a reference `run_id/step/attempt/<id>`, and the event carries `payload_ref`
-instead of `payload`. `TrackStore.get_payload(ref)` returns it. Everything
-else about the step stays on the event, so a reader that never fetches
-payloads still knows what produced them.
+`payload_inline_max_bytes` (64 KiB by default) is kept beside the Track, and
+the event carries `payload_ref` instead of `payload`;
+`TrackStore.get_payload(ref)` returns it. The reference is the attempt's
+idempotency key, so recovering an attempt rewrites the same row instead of
+leaving another one, and at most one is ever kept per attempt. The result is
+rendered as JSON once, and that is what is measured and kept; a payload that
+is not JSON fails the step as `EnvelopeInvalid`. An escalated result follows
+the same rule: `gate_escalated` carries the `payload_ref`, and its `envelope`
+holds `payload: null` and a `payload_digest` of the result, so the digest a
+decision names still identifies it. Approving it completes the step from the
+row already kept. Everything else about the step stays on the event, so a
+reader that never fetches payloads still knows what produced them.
 
 ### Worker facts
 
@@ -103,7 +113,12 @@ suite (`execution/tests/test_track_conformance.py`) runs against all of them:
   `collab_track_payloads`, come from the `collab_` migration registry
   (version 12) that the API runs at startup, never from the store's own
   `ensure_schema`, which exists for the standalone package and local use. The
-  two carry the same DDL, and a change to one is a change to both.
+  store's `_SCHEMA` is the registry's Track statements in order, and
+  `execution/tests/test_track_ddl.py` holds them equal, and the SQLite tables to
+  the same columns. A released migration is frozen by its checksum, so a change
+  to the Track tables is a new migration with the same statements appended to
+  `_SCHEMA`, never an edit to version 12. The store reads rows by position or
+  by name, so it works on the hub's shared pool, which returns mappings.
 
 Every store assigns sequences, refuses a duplicate `event_id`, and refuses a
 second `op_submitted` for a run (`OneSubmissionPerRun`), so two callers can

@@ -5,8 +5,9 @@ the Track; status is a projection of its events, never a separately maintained
 mutable field: the run machine (``states/run.py``) folded over the events.
 
 Every event carries ``schema``, the version of its shape. Version 1 is the
-schema ``docs/cog-execution/track.md`` describes; an event with ``schema`` 0
-was written before it, and :func:`upgrade` reads it in the version-1 shape.
+schema ``docs/cog-execution/track.md`` describes, and the engine writes it; an
+event with ``schema`` 0 was written before it (or built without saying), and
+:func:`upgrade` reads it in the version-1 shape.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import sqlite3
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,7 +43,11 @@ class TrackEvent:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     event_id: str = field(default_factory=lambda: uuid4().hex)
     sequence: int | None = None
-    schema: int = SCHEMA_VERSION
+    # The version of the event's shape. An event built without one is read as
+    # written before v1, so `upgrade` lifts it: a pre-v1 `paused` rebuilt from an
+    # export stays readable instead of being taken for a v1 event it is not. A
+    # v1 event through `upgrade` is unchanged either way. The engine writes v1.
+    schema: int = 0
 
 
 class TrackStore(Protocol):
@@ -62,8 +68,8 @@ class TrackStore(Protocol):
     ) -> Iterator[TrackEvent]:
         """Yield new events, optionally polling until the timeout expires."""
 
-    def put_payload(self, ref: str, payload: Any) -> None:
-        """Keep a step's payload under ``ref``, for a ``step_completed`` that carries ``payload_ref``."""
+    def put_payload(self, run_id: str, ref: str, rendered: str) -> None:
+        """Keep a step's payload, already rendered as JSON, under ``ref``; writing a ``ref`` again replaces it."""
 
     def get_payload(self, ref: str) -> Any:
         """The payload kept under ``ref``; ``KeyError`` when there is none."""
@@ -119,6 +125,11 @@ def derive_run_status(events: Iterable[TrackEvent]) -> RunState | None:
 
     run = Run.replay(upgrade(event) for event in events)
     return None if run is None else run.state
+
+
+def _column(row: Any, index: int, name: str) -> Any:
+    """One column of a row, whether the connection returns tuples or mappings (``dict_row``)."""
+    return row[name] if isinstance(row, Mapping) else row[index]
 
 
 def _run_lock(run_id: str) -> str:
@@ -190,9 +201,9 @@ class InMemoryTrackStore:
     ) -> Iterator[TrackEvent]:
         return _poll(self.replay, run_id, after_sequence, timeout_seconds, 0.05)
 
-    def put_payload(self, ref: str, payload: Any) -> None:
+    def put_payload(self, run_id: str, ref: str, rendered: str) -> None:
         with self._lock:
-            self._payloads[ref] = json.loads(json.dumps(payload))
+            self._payloads[ref] = json.loads(rendered)
 
     def get_payload(self, ref: str) -> Any:
         with self._lock:
@@ -240,15 +251,21 @@ class SqliteTrackStore:
     def ensure_schema(cls, path: str | Path) -> None:
         """Create the Track tables in the file if absent (idempotent), and the file itself."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(path)) as connection:
+        with closing(sqlite3.connect(str(path))) as connection, connection:
             connection.execute("PRAGMA journal_mode=WAL")
             for statement in cls._SCHEMA:
                 connection.execute(statement)
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.execute("PRAGMA busy_timeout=5000")
-        return connection
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """One connection for one call, in one transaction, and closed after it.
+
+        ``with sqlite3.connect(...)`` only commits: the connection, its file
+        handles and the WAL's stay open until collected, so a stream polling every
+        50 ms would pile them up. ``timeout`` is how long a write waits for the lock.
+        """
+        with closing(sqlite3.connect(self.path, timeout=5)) as connection, connection:
+            yield connection
 
     def append(self, event: TrackEvent) -> TrackEvent:
         if event.sequence is not None:
@@ -292,12 +309,11 @@ class SqliteTrackStore:
     ) -> Iterator[TrackEvent]:
         return _poll(self.replay, run_id, after_sequence, timeout_seconds, 0.05)
 
-    def put_payload(self, ref: str, payload: Any) -> None:
-        run_id = ref.split("/", 1)[0]
+    def put_payload(self, run_id: str, ref: str, rendered: str) -> None:
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO collab_track_payloads (ref, run_id, payload, stored_at) VALUES (?, ?, ?, ?)",
-                (ref, run_id, json.dumps(payload), datetime.now(UTC).isoformat()),
+                (ref, run_id, rendered, datetime.now(UTC).isoformat()),
             )
 
     def get_payload(self, ref: str) -> Any:
@@ -327,8 +343,10 @@ class PostgresTrackStore:
 
     On the hub the tables come from the ``collab_`` migration registry
     (``COLLAB_SCHEMA_MIGRATIONS`` in the API), never from :meth:`ensure_schema`,
-    which exists for the standalone package and local use. The two carry the
-    same DDL; a change to one is a change to both.
+    which exists for the standalone package and local use. ``_SCHEMA`` is the
+    registry's Track statements, in order, and a test holds the two equal. A
+    released migration is frozen (its checksum is verified at startup), so a
+    change is a *new* migration, and the same statements appended here.
     """
 
     def __init__(self, pool: Any) -> None:
@@ -404,7 +422,7 @@ class PostgresTrackStore:
                 if "collab_track_one_submission" in str(exc):
                     raise OneSubmissionPerRun(f"run {event.run_id!r} was already submitted") from exc
                 raise
-            return replace(event, sequence=row[0])
+            return replace(event, sequence=_column(row, 0, "sequence"))
 
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         with self.pool.connection() as connection:
@@ -417,10 +435,13 @@ class PostgresTrackStore:
                 """,
                 (run_id, after_sequence),
             ).fetchall()
+        # By name or by position: the hub's shared pool returns mappings (dict_row).
         return tuple(
             TrackEvent(
-                sequence=row[0], event_id=row[1], run_id=row[2], event_type=row[3],
-                payload=row[4], occurred_at=row[5], schema=row[6],
+                sequence=_column(row, 0, "sequence"), event_id=_column(row, 1, "event_id"),
+                run_id=_column(row, 2, "run_id"), event_type=_column(row, 3, "event_type"),
+                payload=_column(row, 4, "payload"), occurred_at=_column(row, 5, "occurred_at"),
+                schema=_column(row, 6, "schema"),
             )
             for row in rows
         )
@@ -434,8 +455,7 @@ class PostgresTrackStore:
     ) -> Iterator[TrackEvent]:
         return _poll(self.replay, run_id, after_sequence, timeout_seconds, 0.1)
 
-    def put_payload(self, ref: str, payload: Any) -> None:
-        run_id = ref.split("/", 1)[0]
+    def put_payload(self, run_id: str, ref: str, rendered: str) -> None:
         with self.pool.connection() as connection:
             connection.execute(
                 """
@@ -443,7 +463,7 @@ class PostgresTrackStore:
                 VALUES (%s, %s, %s::jsonb)
                 ON CONFLICT (ref) DO UPDATE SET payload = EXCLUDED.payload, stored_at = now()
                 """,
-                (ref, run_id, json.dumps(payload)),
+                (ref, run_id, rendered),
             )
 
     def get_payload(self, ref: str) -> Any:
@@ -451,4 +471,4 @@ class PostgresTrackStore:
             row = connection.execute("SELECT payload FROM collab_track_payloads WHERE ref = %s", (ref,)).fetchone()
         if row is None:
             raise KeyError(ref)
-        return row[0]
+        return _column(row, 0, "payload")

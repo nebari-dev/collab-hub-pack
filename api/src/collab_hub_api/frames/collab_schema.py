@@ -703,8 +703,12 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             # the only source of a run's status (ADR-0002 D3). The execution
             # package's `PostgresTrackStore` reads and writes these tables; on the
             # hub they are created here and never by that store's `ensure_schema`,
-            # which serves the standalone package and local use. The DDL is the
-            # same in both places, and a change to one is a change to both.
+            # which serves the standalone package and local use. That store's
+            # `_SCHEMA` is this registry's Track statements in order, and
+            # execution/tests/test_track_ddl.py holds the two equal. Like every
+            # released version this one is frozen by its checksum: a change to the
+            # Track tables is a new migration, with the same statements appended
+            # to `_SCHEMA`, never an edit here.
             #
             # `sequence` is global, so events written by several replicas replay
             # in one stable order. `schema` is the version of the event's shape

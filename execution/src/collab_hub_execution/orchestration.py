@@ -2,22 +2,40 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from uuid import uuid4
 
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
 from .states import RUN, Run, RunState, Transition, Worker
-from .track import PAYLOAD_INLINE_MAX_BYTES, TrackEvent, TrackStore, upgrade
+from .track import PAYLOAD_INLINE_MAX_BYTES, SCHEMA_VERSION, TrackEvent, TrackStore, upgrade
 
 # A failure's message on the Track is bounded, so a stack trace or a model's
 # answer cannot turn the accountability record into a log.
 MESSAGE_MAX_CHARS = 1024
+
+def _bound(text: Any) -> str | None:
+    """A failure's text as the Track keeps it: at most ``MESSAGE_MAX_CHARS`` characters."""
+    return None if text is None else str(text)[:MESSAGE_MAX_CHARS]
+
+
+def _render(payload: Any) -> str:
+    """A step's payload as JSON, once: what the size check measures and a store keeps.
+
+    The envelope contract says a payload is JSON. One that is not fails the step
+    as an invalid envelope, durably, instead of failing later in whichever store
+    happens to serialize it.
+    """
+    try:
+        return json.dumps(payload)
+    except (TypeError, ValueError) as exc:
+        raise EnvelopeInvalid(f"the payload is not JSON: {exc}") from exc
+
 
 # Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
 # value is genuinely None (a human resuming a Gate with an empty decision). None
@@ -93,6 +111,7 @@ def _escalation(payload: Mapping[str, Any]) -> dict[str, Any]:
         "reason": payload.get("reason"),
         "attempt": payload.get("attempt"),
         "envelope": payload.get("envelope"),
+        "payload_ref": payload.get("payload_ref"),
         "usage": payload.get("usage"),
         "approvers": payload.get("approvers", list(DEFAULT_APPROVERS)),
         "gate": payload.get("gate", Gate().escalate),
@@ -258,27 +277,34 @@ class DurableWorkflowEngine(WorkflowEngine):
     def _append(self, run_id: str, event_type: str, payload: Mapping[str, Any],
                 into: list[TrackEvent] | None = None) -> TrackEvent:
         """The one write path: store one event, and keep any snapshot it belongs to current."""
-        event = self.track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=dict(payload)))
+        event = self.track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=dict(payload),
+                                             schema=SCHEMA_VERSION))
         if into is not None:
             into.append(event)
         return event
 
-    def _step_completed(self, run_id: str, step: OpStep, attempt: int, envelope: ResultEnvelope,
-                        usage: Mapping[str, Any] | None, escalation: str | None = None) -> dict[str, Any]:
+    def _result(self, run_id: str, key: str, payload: Any, rendered: str) -> dict[str, Any]:
+        """The result as an event carries it: ``payload`` inline, or ``payload_ref`` above the threshold.
+
+        A large result is kept under the attempt's idempotency key, so recovering
+        an attempt rewrites the same row instead of leaving another one behind, and
+        an escalated result approved later is completed from the row already kept.
+        """
+        if len(rendered.encode()) > self.payload_inline_max_bytes:
+            self.track.put_payload(run_id, key, rendered)
+            return {"payload_ref": key}
+        return {"payload": payload}
+
+    def _step_completed(self, step: OpStep, attempt: int, envelope: ResultEnvelope,
+                        usage: Mapping[str, Any] | None, result: Mapping[str, Any],
+                        escalation: str | None = None) -> dict[str, Any]:
         """A ``step_completed`` payload: what produced the result, and the result inline or by reference."""
         record: dict[str, Any] = {
             "step": step.name, "attempt": attempt, "cog": step.cog, "digest": step.digest, "usage": usage,
-            "frames": [], **_recorded(envelope),
+            "frames": [], **_recorded(envelope), **result,
         }
         if escalation is not None:
             record["escalation"] = escalation
-        rendered = json.dumps(envelope.payload, default=str)
-        if len(rendered.encode()) > self.payload_inline_max_bytes:
-            ref = f"{run_id}/{step.name}/{attempt}/{uuid4().hex}"
-            self.track.put_payload(ref, envelope.payload)
-            record["payload_ref"] = ref
-        else:
-            record["payload"] = envelope.payload
         return record
 
     def _step_failed(self, step: OpStep, attempt: int, key: str, error: str, message: str | None,
@@ -286,7 +312,7 @@ class DurableWorkflowEngine(WorkflowEngine):
         """A ``step_failed`` payload: the attempt, its key, the worker, the code and a bounded message."""
         record: dict[str, Any] = {
             "step": step.name, "attempt": attempt, "key": key, "cog": step.cog, "digest": step.digest,
-            "error": error, "message": (message or "")[:MESSAGE_MAX_CHARS],
+            "error": error, "message": _bound(message) or "",
         }
         if envelope is not None:
             record.update(_recorded(envelope))
@@ -490,8 +516,10 @@ class DurableWorkflowEngine(WorkflowEngine):
             if approved is not None:
                 # The approver saw this envelope, so it is the step's result; the step does not run again.
                 envelope = ResultEnvelope.parse(approved["envelope"])
-                append("step_completed", self._step_completed(op.run_id, step, approved.get("attempt", 0),
-                                                              envelope, approved.get("usage"), approved["escalation"]))
+                kept = approved.get("payload_ref")
+                result = {"payload_ref": kept} if kept else {"payload": envelope.payload}
+                append("step_completed", self._step_completed(step, approved.get("attempt", 0), envelope,
+                                                              approved.get("usage"), result, approved["escalation"]))
                 continue
             if tracker is not None:
                 try:
@@ -516,6 +544,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             teardown_error: str | None = None
             usage = None
             failure_reason = None
+            rendered = ""
             invoked = False
             # Materialize, interact, and teardown are all inside failure handling
             # so any infra error becomes a durable `failed` event (never a
@@ -531,6 +560,8 @@ class DurableWorkflowEngine(WorkflowEngine):
                 result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
                 if not isinstance(result, ResultEnvelope):
                     raise EnvelopeInvalid("interact() must return a ResultEnvelope")
+                if result.ok:
+                    rendered = _render(result.payload)
                 answered = True
                 # ok with problems is not a failure: the step's Gate decides what
                 # the problems mean. ok: false is one.
@@ -540,47 +571,56 @@ class DurableWorkflowEngine(WorkflowEngine):
             except UsageUnavailable as exc:
                 # Persist unknown accounting so recovery/retry cannot forget it.
                 append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
-                failure_reason = str(exc)
+                failure_reason = _bound(exc)
                 outcome = ("broken", "UsageUnavailable")
             except EnvelopeInvalid as exc:
                 # Not the seam's envelope, so whatever the worker spent is unknown too.
                 append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
-                failure_reason = str(exc)
+                failure_reason = _bound(exc)
                 outcome = ("broken", "EnvelopeInvalid")
             except Exception as exc:  # noqa: BLE001 - any materialize/interact failure is durable-failed
                 if invoked:
                     # A failed request may have spent resources before failing.
                     append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 # The class names the failure; its message, bounded, says what happened.
-                failure_reason = str(exc)[:MESSAGE_MAX_CHARS] or None
+                failure_reason = _bound(exc) or None
                 outcome = ("broken", type(exc).__name__)
             finally:
                 if worker is not None:
                     teardown_error = self._tear_down(op.run_id, worker, cog_worker, answered, outcome)
 
+            kind, detail = outcome
             if teardown_error is not None:
                 # A worker we couldn't tear down may keep running/serving — that is
                 # a leak, not success. Fail the run so it is visible; durable
                 # cleanup-retry lands with the crash-safe engine backing (#1).
+                # The step's own failure, when it had one, is what step_failed
+                # records; the teardown that also failed is recorded beside it.
+                if kind == "broken":
+                    own = self._step_failed(step, attempt, key, detail, failure_reason)
+                elif kind == "error":
+                    own = self._step_failed(step, attempt, key, detail.error.code, detail.error.detail, detail)
+                else:
+                    own = self._step_failed(step, attempt, key, "TeardownFailed",
+                                            f"{teardown_error}: the worker could not be torn down")
+                append("step_failed", {**own, "teardown_error": teardown_error})
                 # A failed worker's own error is kept beside it, since its teardown is not a worker move.
-                append("step_failed", self._step_failed(step, attempt, key, "TeardownFailed",
-                                                        f"{teardown_error}: the worker could not be torn down"))
-                details = None if answered else {"worker_error": str(outcome[1])}
-                failed = run.fail(step=step.name, error="TeardownFailed", reason=teardown_error, details=details)
+                details = None if answered else {"worker_error": str(detail)}
+                failed = run.fail(step=step.name, error="TeardownFailed", reason=_bound(teardown_error),
+                                  details=details)
                 run = record(failed)
                 return run.state
 
-            kind, detail = outcome
             if kind == "broken":
                 append("step_failed", self._step_failed(step, attempt, key, detail, failure_reason))
-                run = record(run.fail(step=step.name, error=detail, reason=failure_reason))
+                run = record(run.fail(step=step.name, error=detail, reason=_bound(failure_reason)))
                 return run.state
             if kind == "error":
                 # The worker answered, and said no. The code is what a client acts
                 # on, so it is the event's error, verbatim; the detail is the reason.
                 append("step_failed", self._step_failed(step, attempt, key, detail.error.code, detail.error.detail,
                                                         detail))
-                failed = run.fail(step=step.name, error=detail.error.code, reason=detail.error.detail,
+                failed = run.fail(step=step.name, error=detail.error.code, reason=_bound(detail.error.detail),
                                   details=_recorded(detail))
                 run = record(failed)
                 return run.state
@@ -596,15 +636,24 @@ class DurableWorkflowEngine(WorkflowEngine):
                 # A budget stop never discards a result that was paid for: the escalation
                 # is recorded, and the stop lands at the next boundary — the end of the
                 # run included — by when no further work has been spent.
+                # A large result is kept once, by reference, like a completed one: the
+                # escalation holds the envelope without it, and its digest, so what a
+                # decision names still identifies the result.
+                result = self._result(op.run_id, key, envelope.payload, rendered)
+                shown = envelope.to_dict()
+                if "payload_ref" in result:
+                    shown["payload"] = None
+                    shown["payload_digest"] = hashlib.sha256(rendered.encode()).hexdigest()
                 details = {
-                    "attempt": attempt, "envelope": envelope.to_dict(), "usage": usage,
+                    "attempt": attempt, "envelope": shown, **result, "usage": usage,
                     "approvers": list(step.gate.deciders), "gate": step.gate.escalate,
                 }
                 eid = escalation_id(op.run_id, step.name, attempt, envelope)
                 run = record(run.escalate(step=step.name, reason=why, escalation=eid, details=details))
                 return run.state
 
-            append("step_completed", self._step_completed(op.run_id, step, attempt, envelope, usage))
+            result = self._result(op.run_id, key, envelope.payload, rendered)
+            append("step_completed", self._step_completed(step, attempt, envelope, usage, result))
             if budget_stop is not None:
                 return self._stop_for_budget(run, step.name, budget_stop)
         if tracker is not None and spent_on is not None:
