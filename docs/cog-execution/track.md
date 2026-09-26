@@ -108,3 +108,13 @@ suite (`execution/tests/test_track_conformance.py`) runs against all of them:
 Every store assigns sequences, refuses a duplicate `event_id`, and refuses a
 second `op_submitted` for a run (`OneSubmissionPerRun`), so two callers can
 never both start it.
+
+**A stream never skips an event.** A reader follows a run with a cursor: the
+last sequence it saw. On Postgres a sequence is drawn when a row is inserted
+but the row appears when it commits, and two transactions can commit in the
+other order — a reader that saw the later one would move past the earlier one
+for good. So `PostgresTrackStore` serializes appends to one run: each takes a
+transaction-scoped advisory lock on the run before its insert draws a
+sequence, and holds it until it commits, so within a run sequence order is
+commit order. Appends to different runs do not wait for each other. SQLite and
+the in-memory store already write one event at a time.

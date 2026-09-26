@@ -121,6 +121,11 @@ def derive_run_status(events: Iterable[TrackEvent]) -> RunState | None:
     return None if run is None else run.state
 
 
+def _run_lock(run_id: str) -> str:
+    """The advisory lock that serializes appends to one run's Track."""
+    return f"collab_track:{run_id}"
+
+
 def _copy(event: TrackEvent, sequence: int) -> TrackEvent:
     return TrackEvent(
         run_id=event.run_id,
@@ -311,6 +316,15 @@ class PostgresTrackStore:
     gives each event a stable replay order, including events written by
     multiple API replicas.
 
+    A sequence is drawn when a row is inserted, but rows become visible when
+    they commit, and two transactions can commit in the other order. A reader
+    that had seen the later sequence would move its cursor past the earlier one
+    and never return it. So appends to one run are serialized: each takes a
+    transaction-scoped advisory lock on the run before its insert draws a
+    sequence, and holds it until it commits. Within a run, sequence order is
+    then commit order, and a cursor over one run's events never skips one.
+    Appends to different runs do not wait for each other.
+
     On the hub the tables come from the ``collab_`` migration registry
     (``COLLAB_SCHEMA_MIGRATIONS`` in the API), never from :meth:`ensure_schema`,
     which exists for the standalone package and local use. The two carry the
@@ -372,6 +386,9 @@ class PostgresTrackStore:
         if event.sequence is not None:
             raise ValueError("TrackStore assigns event sequences")
         with self.pool.connection() as connection:
+            # Held until this transaction commits, so no other append to the run
+            # draws a sequence before this row is visible (see the class docstring).
+            connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_run_lock(event.run_id),))
             try:
                 row = connection.execute(
                     """
