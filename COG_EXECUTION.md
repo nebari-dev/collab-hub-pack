@@ -293,7 +293,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | merged, #133 |
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | merged, #158 |
-| 6 | #125 | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | in review |
+| 6 | #125 | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | in review, #159 |
 | 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | not started |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | not started |
@@ -455,7 +455,7 @@ Make the Track answer "what produced this, and who signed it".
 The hub's first client, built first: it needs nothing the phases after it build, and each of them adds its commands to it instead of waiting for a client to exist. Every Cog execution feature is reachable from a terminal over the same REST endpoints Collab uses, which is also how a script, a CI job or an operator drives the hub. It starts with what every other command needs, signing in, and with the one Cog surface the hub already serves, its catalog.
 
 #### Phase 6 — The `collab-hub` CLI: sign in, and list the Cogs the hub offers
-**Issue** #125 · **Branch** `feat/cli-auth` · **Depends on** nothing in this plan · **Size** M · **Status** in review
+**Issue** #125 · **Branch** `feat/cli-auth` · **Depends on** nothing in this plan · **Size** M · **Status** in review, #159
 
 A terminal client for the hub, and the thing every later command needs first: a way to sign in. It is a client, not a second implementation — every command is an HTTP call to the hub's REST API.
 
