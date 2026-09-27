@@ -177,12 +177,16 @@ def recommended_path_rules() -> list[PathRule]:
 
     ``/health`` and ``/health/db`` stay public because kubelet probes and
     uptime checks carry no credentials: a hardened map that drops them stops
-    the pod passing its own probes.
+    the pod passing its own probes. ``/v1/auth/cli`` stays public because a
+    command-line client asks it how to sign in before it holds any credential;
+    it names only what the realm's own discovery document publishes.
     """
 
     return [
         PathRule(path="/health", match="exact", access="public"),
         PathRule(path="/health/db", match="exact", access="public"),
+        # Where the collab-hub CLI learns how to sign in, asked before it holds a token.
+        PathRule(path="/v1/auth/cli", match="exact", access="public"),
         PathRule(path="/", match="exact", access="authenticated"),
         PathRule(path="/metrics", match="exact", access="authenticated"),
     ]

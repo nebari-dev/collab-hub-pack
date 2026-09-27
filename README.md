@@ -113,6 +113,10 @@ result envelope, the sensitivity model — is in
 [`docs/cog-execution/`](docs/cog-execution/); the decisions behind it are
 recorded in [`docs/adr/`](docs/adr/).
 
+The [`collab-hub` CLI](cli/README.md) is a terminal client for the hub's REST
+API: it signs in the way the Collab desktop does, and lists the Cogs the hub
+offers.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under the

@@ -471,6 +471,37 @@ rows you seed by subject match nobody.
 make sub        # the OIDC subject for the same user
 ```
 
+### Signing in from the CLI
+
+The `collab-hub` CLI signs in the way the Collab desktop does: the realm's
+`apollo-desktop` client, the authorization code flow with PKCE, and a redirect
+back to a listener on `127.0.0.1`. `make cli` installs it into `cli/.venv`.
+
+```sh
+make cli
+../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login
+```
+
+`login` opens the realm's sign-in page in your browser. **Sign in as `dev`,
+password `dev`** — or `owner` / `owner`, the realm's second user (see
+[What is in the realm](#2-what-is-in-the-realm)). The page then sends the
+browser back to the CLI's listener, which says you can close the tab, and the
+CLI prints who the hub signed you in as. Leave `login` running until then: the
+listener lives only as long as the command, so a sign-in finished after it
+stopped lands on a closed port.
+
+```sh
+../cli/.venv/bin/collab-hub whoami           # dev, its organization, and when the token expires
+../cli/.venv/bin/collab-hub cog list         # the Cogs in the catalog
+../cli/.venv/bin/collab-hub logout           # ends the realm session and deletes the stored token
+```
+
+With no browser on this machine, take a token from `make token` instead:
+`make -s token | ../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login --with-token`.
+At level 1 there is no realm: `login` says the hub runs dev auth, and `whoami`
+says the session is unauthenticated. [`cli/README.md`](../cli/README.md) has
+the rest.
+
 Other level-3 targets:
 
 | Target | Adds |
@@ -611,6 +642,16 @@ leaving you guessing at a login screen.
 
 `apollo-desktop` carries an **audience mapper** so its access tokens contain
 `"aud": ["apollo-desktop", …]`, which is what `FRAMES_BEARER_AUDIENCE` checks.
+The `collab-hub` CLI signs in with the same client and the same flow as the
+desktop, so it needs no client of its own.
+
+| User | Password | Email | Used for |
+|---|---|---|---|
+| `dev` | `dev` | `dev@example.com` | Every sign-in in this guide: the desktop, `collab-hub login`, `make token` (`KC_USER`/`KC_PASS` default to it) |
+| `owner` | `owner` | `owner@example.com` | A second person, for sharing and membership: `make token KC_USER=owner KC_PASS=owner` |
+
+These are development credentials, imported with the realm and good only on
+this local Keycloak.
 
 Both clients keep the realm-default client scopes, **including `basic`**. That
 scope carries the `sub` mapper in Keycloak 25+; a client whose default scopes

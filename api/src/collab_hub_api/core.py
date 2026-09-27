@@ -73,6 +73,7 @@ from .routers import (
     connectors,
     frame_groups,
     frames,
+    identity,
     invitations,
     invite,
     org_invitations,
@@ -732,6 +733,9 @@ def make_app(config: BaseConfig) -> FastAPI:
     # The Cog catalog read API (#85). /v1 only: it post-dates the unprefixed
     # legacy mounts, so there is no old client to keep answering.
     app.include_router(cogs.router, prefix="/v1")
+    # Who is calling, and how the collab-hub CLI signs in. /auth/cli is public:
+    # the hardened map lists it, since a client asks it before it holds a token.
+    app.include_router(identity.router, prefix="/v1")
 
     if config.web.enabled:
         # The browser surface (issue #88): session sign-in and the page
