@@ -63,11 +63,15 @@ the event carries `payload_ref` instead of `payload`;
 idempotency key, so recovering an attempt rewrites the same row instead of
 leaving another one, and at most one is ever kept per attempt. The result is
 rendered as JSON once, and that is what is measured and kept; a payload that
-is not JSON fails the step as `EnvelopeInvalid`. An escalated result follows
-the same rule: `gate_escalated` carries the `payload_ref`, and its `envelope`
-holds `payload: null` and a `payload_digest` of the result, so the digest a
-decision names still identifies it. Approving it completes the step from the
-row already kept. Everything else about the step stays on the event, so a
+is not JSON fails the step as `EnvelopeInvalid`, and the usage the worker
+reported with it is still recorded on `interaction_usage`, since it was spent.
+An escalated result follows the same rule: `gate_escalated` carries the
+`payload_ref`, and its `envelope` holds `payload: null` and a `payload_digest`
+of the result, so the digest a decision names still identifies it. The digest
+is the sha256 of the payload's canonical JSON (sorted keys, `,` and `:` as
+separators), so it can be recomputed from `get_payload(ref)` on every store,
+Postgres included, whose `jsonb` does not keep key order. Approving it completes
+the step from the row already kept. Everything else about the step stays on the event, so a
 reader that never fetches payloads still knows what produced them.
 
 ### Worker facts

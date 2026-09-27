@@ -37,6 +37,16 @@ def _render(payload: Any) -> str:
         raise EnvelopeInvalid(f"the payload is not JSON: {exc}") from exc
 
 
+def _payload_digest(payload: Any) -> str:
+    """The sha256 of a payload's canonical JSON: sorted keys, compact separators.
+
+    Canonical, not the bytes that were kept, so anyone can recompute it from the
+    stored payload: Postgres keeps it as ``jsonb``, which does not keep key order.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 # Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
 # value is genuinely None (a human resuming a Gate with an empty decision). None
 # alone is overloaded, so a paused step could not be resumed with a real None.
@@ -543,6 +553,7 @@ class DurableWorkflowEngine(WorkflowEngine):
             outcome: tuple[str, Any] = ("broken", "Unknown")
             teardown_error: str | None = None
             usage = None
+            accounted = False
             failure_reason = None
             rendered = ""
             invoked = False
@@ -560,22 +571,33 @@ class DurableWorkflowEngine(WorkflowEngine):
                 result = worker.interact(step.entry_point, step.input, idempotency_key=key, **feedback)
                 if not isinstance(result, ResultEnvelope):
                     raise EnvelopeInvalid("interact() must return a ResultEnvelope")
+                not_json = None
                 if result.ok:
-                    rendered = _render(result.payload)
-                answered = True
+                    try:
+                        rendered = _render(result.payload)
+                    except EnvelopeInvalid as exc:
+                        not_json = exc
+                answered = not_json is None
                 # ok with problems is not a failure: the step's Gate decides what
                 # the problems mean. ok: false is one.
                 outcome = ("ok", result) if result.ok else ("error", result)
                 usage = _validate_usage(result.usage, self.budget)
                 append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": usage})
+                accounted = True
+                if not_json is not None:
+                    # The worker spent what it reported, so that is counted; its
+                    # answer is still not a valid envelope, and fails the step.
+                    raise not_json
             except UsageUnavailable as exc:
                 # Persist unknown accounting so recovery/retry cannot forget it.
                 append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 failure_reason = _bound(exc)
                 outcome = ("broken", "UsageUnavailable")
             except EnvelopeInvalid as exc:
-                # Not the seam's envelope, so whatever the worker spent is unknown too.
-                append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
+                # Not the seam's envelope, so whatever the worker spent is unknown too,
+                # unless it was a valid envelope but for its payload.
+                if not accounted:
+                    append("interaction_usage", {"step": step.name, "attempt": attempt, "usage": None})
                 failure_reason = _bound(exc)
                 outcome = ("broken", "EnvelopeInvalid")
             except Exception as exc:  # noqa: BLE001 - any materialize/interact failure is durable-failed
@@ -643,7 +665,7 @@ class DurableWorkflowEngine(WorkflowEngine):
                 shown = envelope.to_dict()
                 if "payload_ref" in result:
                     shown["payload"] = None
-                    shown["payload_digest"] = hashlib.sha256(rendered.encode()).hexdigest()
+                    shown["payload_digest"] = _payload_digest(envelope.payload)
                 details = {
                     "attempt": attempt, "envelope": shown, **result, "usage": usage,
                     "approvers": list(step.gate.deciders), "gate": step.gate.escalate,

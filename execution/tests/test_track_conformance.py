@@ -156,6 +156,22 @@ def test_a_payload_kept_by_reference_comes_back_as_it_was(store):
         store.get_payload("org%2Fteam-42:s:1")
 
 
+def test_an_escalated_payload_s_digest_can_be_recomputed_from_the_kept_row(store):
+    # Postgres keeps the row as jsonb, which reorders keys: the digest is over canonical JSON.
+    import hashlib
+
+    from collab_hub_execution import DurableWorkflowEngine, Gate, InMemoryCogExecutor, OpDefinition, OpStep
+
+    result = {"zeta": "x" * 200, "alpha": {"b": 1, "a": [2.5, None]}, "mid": "é"}
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=store,
+                                   payload_inline_max_bytes=100)
+    engine.submit(OpDefinition("r", (OpStep("s", "c", "run", result, gate=Gate(escalate="always")),)))
+    [escalated] = [e for e in store.replay("r") if e.event_type == "gate_escalated"]
+    kept = store.get_payload(escalated.payload["payload_ref"])
+    canonical = json.dumps(kept, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(canonical.encode()).hexdigest() == escalated.payload["envelope"]["payload_digest"]
+
+
 # --- a Track written before schema version 1 ----------------------------------------------
 
 

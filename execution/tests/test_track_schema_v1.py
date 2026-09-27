@@ -286,6 +286,19 @@ def test_a_payload_that_is_not_json_fails_the_step_durably():
     assert failed_step.payload["message"].startswith("the payload is not JSON")
 
 
+def test_a_payload_that_is_not_json_still_counts_the_usage_the_worker_reported():
+    from datetime import datetime
+
+    answer = ResultEnvelope.success({"at": datetime(2026, 1, 1)}, usage={"tokens": 7, "cost": 0.5})
+    track = InMemoryTrackStore()
+    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
+    assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
+    [spent] = _events(track, "r", "interaction_usage")  # once, with what was reported
+    assert spent.payload["usage"] == {"tokens": 7, "cost": 0.5}
+    [failed_step] = _events(track, "r", "step_failed")
+    assert failed_step.payload["error"] == "EnvelopeInvalid"
+
+
 def test_a_failed_teardown_keeps_the_step_s_own_failure():
     class Executor:
         class Worker:
