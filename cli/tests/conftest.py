@@ -40,6 +40,8 @@ class Stub:
     authorizations: list[dict] = field(default_factory=list)
     exchanges: list[dict] = field(default_factory=list)
     ended: list[dict] = field(default_factory=list)
+    revoked: list[dict] = field(default_factory=list)
+    publishes_revocation: bool = True
     cogs: list[dict] = field(default_factory=list)
     counter: int = 0
 
@@ -67,7 +69,8 @@ class Stub:
                 "issuer": ISSUER, "authorization_endpoint": f"{ISSUER}/protocol/openid-connect/auth",
                 "token_endpoint": f"{ISSUER}/protocol/openid-connect/token",
                 "end_session_endpoint": f"{ISSUER}/protocol/openid-connect/logout",
-                "revocation_endpoint": f"{ISSUER}/protocol/openid-connect/revoke",
+                **({"revocation_endpoint": f"{ISSUER}/protocol/openid-connect/revoke"}
+                   if self.publishes_revocation else {}),
             })
         if path == f"{realm}/token" and form.get("grant_type") == "authorization_code":
             self.exchanges.append(form)
@@ -86,6 +89,11 @@ class Stub:
             self.ended.append(form)
             self.refreshable.pop(form.get("refresh_token"), None)
             return httpx.Response(204)
+        if path == f"{realm}/revoke":
+            # RFC 7009 §2.2: an invalid or already revoked token is still a 200.
+            self.revoked.append(form)
+            self.refreshable.pop(form.get("token"), None)
+            return httpx.Response(200)
         return httpx.Response(404)
 
     def _hub(self, request: httpx.Request) -> httpx.Response:

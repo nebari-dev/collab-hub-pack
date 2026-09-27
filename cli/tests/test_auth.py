@@ -91,13 +91,34 @@ def test_a_session_the_realm_will_not_renew_exits_5_and_is_forgotten(stub, cli, 
     assert not _session_file(tmp_path).exists()
 
 
-def test_logout_ends_the_realm_session_and_leaves_nothing_on_disk(stub, cli, tmp_path):
+def test_logout_ends_the_realm_session_revokes_the_token_and_leaves_nothing_on_disk(stub, cli, tmp_path):
     assert cli("--hub", HUB, "login").exit_code == 0
-    result = cli("logout")
+    result = cli("logout", "--json")
     assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"hub": HUB, "profile": "default", "was_signed_in": True, "revoked": True,
+                                         "warning": None}
     assert stub.ended == [{"client_id": CLIENT, "refresh_token": "refresh-1"}]
+    # Revocation is what the standard guarantees, so it happens whatever the end-session call did.
+    assert stub.revoked == [{"client_id": CLIENT, "token": "refresh-1", "token_type_hint": "refresh_token"}]
     assert list((tmp_path / "config" / "credentials").iterdir()) == []
     assert cli("whoami").exit_code == 5  # the hub now sees no one
+
+
+def test_a_realm_that_cannot_revoke_leaves_a_warning_and_exit_1(stub, cli, tmp_path):
+    assert cli("--hub", HUB, "login").exit_code == 0
+    stub.publishes_revocation = False
+    result = cli("logout")
+    assert result.exit_code == 1
+    assert "no revocation endpoint" in result.stderr and "may still be open" in result.stderr
+    assert not _session_file(tmp_path).exists()  # forgotten here all the same
+
+
+def test_login_json_reports_who_signed_in(stub, cli):
+    result = cli("--hub", HUB, "login", "--json")
+    assert result.exit_code == 0, result.output
+    reported = json.loads(result.stdout)
+    assert reported["user"] == "alice" and reported["signed_in"] is True and reported["hub"] == HUB
+    assert reported["obtained_by"] == "browser" and reported["token_expires_at"] == "1970-01-12T13:51:40Z"
 
 
 def test_a_session_is_never_sent_to_another_hub(stub, cli):
@@ -135,6 +156,8 @@ def test_against_dev_auth_there_is_nothing_to_sign_in_to_and_whoami_says_so(stub
     stub.dev_auth, stub.issuer = True, None
     login = cli("--hub", HUB, "login")
     assert login.exit_code == 0 and "runs dev auth" in login.stderr
+    assert json.loads(cli("--hub", HUB, "login", "--json").stdout) == {
+        "hub": HUB, "profile": "default", "signed_in": False, "dev_auth": True}
     whoami = cli("whoami")
     assert whoami.exit_code == 0
     assert "unauthenticated dev auth" in whoami.stdout and "dev-user" in whoami.stdout

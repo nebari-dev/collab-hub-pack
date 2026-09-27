@@ -43,8 +43,9 @@ class CliAuthConfig(BaseModel):
     """How a command-line client signs in to this hub."""
 
     issuer: str | None = Field(
-        description="The OpenID issuer to sign in with, whose discovery document names the device "
-        "authorization, token and revocation endpoints. Null when the hub verifies no bearer tokens."
+        description="The OpenID issuer to sign in with, whose discovery document names the authorization, "
+        "token, end-session and revocation endpoints the sign-in and sign-out use. Null when the hub "
+        "verifies no bearer tokens."
     )
     client_id: str = Field(
         description="The public realm client to sign in with: authorization code with PKCE (S256) on a "

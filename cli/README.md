@@ -30,8 +30,10 @@ The session is kept in `credentials/<profile>.json` in the configuration directo
 
 ```sh
 collab-hub whoami            # the user, organization and roles the hub resolved, and the token's expiry
-collab-hub logout            # ends the realm session and deletes the stored token
+collab-hub logout            # ends the realm session, revokes its refresh token, deletes the stored token
 ```
+
+`logout` does what the desktop's sign-out does, ending the realm session at its end-session endpoint, and then revokes the refresh token at the realm's revocation endpoint (RFC 7009), which is what guarantees it never renews again. If the realm cannot revoke it, the stored token is still deleted, and `logout` warns and exits 1. A token given to `--with-token` is only forgotten: the CLI did not obtain it, so it stays valid until it expires.
 
 `whoami` asks the hub (`GET /v1/me`), so it reports what the hub will act on rather than what the token claims. Against a hub running dev auth, as at dev level 1, it says the session is unauthenticated: the hub answers every request as its development user, and there is nothing to sign in to.
 
@@ -60,11 +62,16 @@ collab-hub cog list --kind context -q review
 collab-hub cog show acme/reviewer          # one Cog's card and every indexed version
 ```
 
-`cog list` follows every page of `GET /v1/cogs` and takes its filters: `--kind`, `--publisher`, `--provides`, `--requires` and `--query`.
+`cog list` follows every page of `GET /v1/cogs` and takes every filter the catalog API does: `--kind`, `--publisher`, `--provides`, `--requires`, `--accepts`, `--produces`, `--source-id` and `--query`.
 
 ## Output and exit codes
 
-Tables for people by default; `--json` prints one JSON document for scripts, shaped for `jq`. Results go to stdout, messages to stderr.
+Tables for people by default; `--json`, which every command takes, prints one JSON document for scripts, shaped for `jq`. Results go to stdout, messages to stderr.
+
+- `login --json`: what `whoami --json` prints, plus `obtained_by` (`browser` or `token`) and `dev_auth`; against a hub running dev auth, `{hub, profile, signed_in: false, dev_auth: true}`.
+- `logout --json`: `{hub, profile, was_signed_in, revoked, warning}`.
+- `whoami --json`: the hub's `GET /v1/me` answer plus `hub`, `profile`, `signed_in` and `token_expires_at`.
+- `cog list --json` and `cog show --json`: the catalog API's items and Cog, as the hub returns them.
 
 | Code | Meaning |
 |---|---|

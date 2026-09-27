@@ -493,7 +493,7 @@ stopped lands on a closed port.
 ```sh
 ../cli/.venv/bin/collab-hub whoami           # dev, its organization, and when the token expires
 ../cli/.venv/bin/collab-hub cog list         # the Cogs in the catalog
-../cli/.venv/bin/collab-hub logout           # ends the realm session and deletes the stored token
+../cli/.venv/bin/collab-hub logout           # ends the realm session, revokes the token, deletes it here
 ```
 
 With no browser on this machine, take a token from `make token` instead:

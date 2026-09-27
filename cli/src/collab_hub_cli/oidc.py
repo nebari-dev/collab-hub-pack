@@ -6,8 +6,9 @@ loopback redirect (RFC 8252). A listener on ``127.0.0.1`` and a port the
 system picks receives the redirect at ``/callback``, the code is exchanged
 with the verifier only this process holds, and ``offline_access`` asks the
 realm for a refresh token. Every endpoint comes from the issuer's discovery
-document. Signing out ends the realm session through its
-``end_session_endpoint``, with the refresh token, as the desktop does.
+document. Signing out revokes the refresh token at the realm's
+``revocation_endpoint`` (RFC 7009), and first ends the realm session through
+its ``end_session_endpoint`` with that token, as the desktop does.
 """
 
 from __future__ import annotations
@@ -178,18 +179,29 @@ def refresh(http: httpx.Client, metadata: dict, client_id: str, refresh_token: s
     return Tokens(tokens.access_token, tokens.refresh_token or refresh_token, tokens.expires_at)
 
 
-def end_session(http: httpx.Client, metadata: dict, client_id: str, refresh_token: str) -> None:
-    """End the realm session behind a refresh token, so neither it nor its access tokens renew again."""
+def sign_out(http: httpx.Client, metadata: dict, client_id: str, refresh_token: str) -> None:
+    """Make a refresh token unusable at the realm, and end the realm session behind it.
 
-    endpoint = metadata.get("end_session_endpoint")
-    if endpoint:
-        response = http.post(endpoint, data={"client_id": client_id, "refresh_token": refresh_token})
-    elif metadata.get("revocation_endpoint"):
-        response = http.post(metadata["revocation_endpoint"], data={
-            "client_id": client_id, "token": refresh_token, "token_type_hint": "refresh_token",
-        })
-    else:
-        raise AuthError("the realm publishes neither an end-session nor a revocation endpoint")
-    if response.status_code not in (200, 204):
+    Revocation (RFC 7009) is what guarantees the token never renews again, so
+    it is required. Ending the session first, through the end-session
+    endpoint with the refresh token, is how the desktop signs out of
+    Keycloak; it is done when the realm offers it, and a token it already
+    ended is still accepted by revocation, which answers 200 for a token that
+    is no longer valid.
+    """
+
+    revocation = metadata.get("revocation_endpoint")
+    if not revocation:
+        raise AuthError("the realm publishes no revocation endpoint, so the session cannot be revoked")
+    ended = metadata.get("end_session_endpoint")
+    if ended:
+        response = http.post(ended, data={"client_id": client_id, "refresh_token": refresh_token})
+        if response.status_code not in (200, 204):
+            code, detail = _error(response)
+            raise AuthError(f"the realm did not end the session: {code} {detail}".rstrip())
+    response = http.post(revocation, data={
+        "client_id": client_id, "token": refresh_token, "token_type_hint": "refresh_token",
+    })
+    if response.status_code != 200:
         code, detail = _error(response)
-        raise AuthError(f"the realm did not end the session: {code} {detail}".rstrip())
+        raise AuthError(f"the realm did not revoke the refresh token: {code} {detail}".rstrip())

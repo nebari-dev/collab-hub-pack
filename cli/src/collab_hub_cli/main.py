@@ -125,6 +125,7 @@ def login(
         "--with-token", help="Read a bearer token from stdin instead of signing in through the browser.")] = False,
     no_browser: Annotated[bool, typer.Option(
         "--no-browser", help="Print the sign-in URL without opening a browser.")] = False,
+    as_json: JsonOption = False,
 ) -> None:
     """Sign in to the hub through its realm, the way the Collab desktop does.
 
@@ -152,6 +153,8 @@ def login(
             config.remember(target)
             _err(f"{url} runs dev auth: there is nothing to sign in to, and requests are answered as its "
                  "development user without a token.")
+            if as_json:
+                _print_json({"hub": url, "profile": target.profile, "signed_in": False, "dev_auth": True})
             return
         else:
             metadata = oidc.discover(hub.http, issuer)
@@ -174,33 +177,45 @@ def login(
         config.remember(target)
     organization = f" in {me['org_id']}" if me.get("org_id") else ""
     _err(f"Signed in to {url} as {me['user']}{organization}.")
+    if as_json:
+        _print_json({**me, "hub": url, "profile": target.profile, "signed_in": True, "dev_auth": False,
+                     "obtained_by": session.obtained_by, "token_expires_at": _when(session.expires_at)})
 
 
 @app.command()
 @handled
-def logout() -> None:
-    """Sign out: end the realm session and forget the stored token."""
+def logout(as_json: JsonOption = False) -> None:
+    """Sign out: end the realm session, revoke its refresh token, and forget the stored token."""
 
     target = _target()
     session = credentials.load(target.directory, target.profile)
     if session is None:
         _err(f"Not signed in (profile {target.profile}).")
+        if as_json:
+            _print_json({"hub": target.hub, "profile": target.profile, "was_signed_in": False, "revoked": False,
+                         "warning": None})
         return
     problem = None
+    revoked = False
     if session.refresh_token and session.issuer and session.client_id:
         http = http_client()
         try:
-            oidc.end_session(http, oidc.discover(http, session.issuer), session.client_id, session.refresh_token)
+            oidc.sign_out(http, oidc.discover(http, session.issuer), session.client_id, session.refresh_token)
+            revoked = True
         except AuthError as exc:
-            problem = str(exc)
+            problem = f"{exc}; the stored token is deleted, but the realm session may still be open"
         finally:
             http.close()
+    elif session.obtained_by == "token":
+        problem = "the token was given to `login --with-token`; it is forgotten here and stays valid until it expires"
     credentials.delete(target.directory, target.profile)
     _err(f"Signed out of {session.hub}.")
-    if session.obtained_by == "token":
-        _err("The token was given to `login --with-token`; it stays valid at the realm until it expires.")
     if problem:
-        _err(f"warning: {problem}; the stored token is deleted, but the realm session may still be open")
+        _err(f"warning: {problem}")
+    if as_json:
+        _print_json({"hub": session.hub, "profile": target.profile, "was_signed_in": True, "revoked": revoked,
+                     "warning": problem})
+    if problem and session.obtained_by != "token":
         raise typer.Exit(EXIT_HUB)
 
 
@@ -248,12 +263,17 @@ def cog_list(
     publisher: Annotated[str | None, typer.Option(help="Only this publisher's Cogs.")] = None,
     provides: Annotated[str | None, typer.Option(help="Only Cogs that provide this.")] = None,
     requires: Annotated[str | None, typer.Option(help="Only Cogs that require this capability.")] = None,
+    accepts: Annotated[str | None, typer.Option(help="Only Cogs that accept this io type.")] = None,
+    produces: Annotated[str | None, typer.Option(help="Only Cogs that produce this io type.")] = None,
+    source_id: Annotated[str | None, typer.Option(
+        "--source-id", help="Only this registry source; the newest version is chosen within it.")] = None,
     query: Annotated[str | None, typer.Option("--query", "-q", help="Text in the name or description.")] = None,
     as_json: JsonOption = False,
 ) -> None:
     """List the Cogs in the hub's catalog, each at its newest version, following every page."""
 
-    filters = {"kind": kind, "publisher": publisher, "provides": provides, "requires": requires, "q": query}
+    filters = {"kind": kind, "publisher": publisher, "provides": provides, "requires": requires,
+               "accepts": accepts, "produces": produces, "source_id": source_id, "q": query}
     with Hub(_target()) as hub:
         items = list(hub.pages("/v1/cogs", {key: value for key, value in filters.items() if value is not None}))
     if as_json:

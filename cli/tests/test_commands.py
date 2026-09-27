@@ -41,6 +41,17 @@ def test_cog_list_prints_a_table_and_passes_its_filters(stub, cli):
     assert request.url.params["kind"] == "context"
 
 
+def test_cog_list_passes_every_catalog_filter(stub, cli):
+    stub.dev_auth = True
+    options = {"--kind": "kind", "--publisher": "publisher", "--provides": "provides", "--requires": "requires",
+               "--accepts": "accepts", "--produces": "produces", "--source-id": "source_id", "--query": "q"}
+    args = [part for option in options for part in (option, f"value-of-{option}")]
+    assert cli("--hub", HUB, "cog", "list", *args).exit_code == 0
+    [request] = [r for r in stub.requests if r.url.path == "/v1/cogs"]
+    assert {param: request.url.params[param] for param in options.values()} == \
+        {param: f"value-of-{option}" for option, param in options.items()}
+
+
 def test_an_empty_catalog_says_so(stub, cli):
     stub.dev_auth = True
     result = cli("--hub", HUB, "cog", "list")
