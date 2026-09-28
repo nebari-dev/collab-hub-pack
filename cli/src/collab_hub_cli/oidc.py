@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from .config import is_loopback
+from .config import UsageError, is_loopback
 
 SCOPES = ("openid", "profile", "email", "offline_access")
 LOGIN_TIMEOUT_SECONDS = 300
@@ -183,12 +183,21 @@ def browser_login(
     open_browser: Callable[[str], object],
     show: Callable[[str], None],
     timeout: float = LOGIN_TIMEOUT_SECONDS,
+    port: int = 0,
 ) -> Tokens:
-    """Sign in through the browser: authorization code with PKCE, redirected to a loopback listener."""
+    """Sign in through the browser: authorization code with PKCE, redirected to a loopback listener.
+
+    The listener takes ``port`` on ``127.0.0.1``, or one the system picks when
+    it is 0. A fixed port is what lets an SSH forward (``ssh -L port:127.0.0.1:port``)
+    be set up before the sign-in starts, for a CLI on a remote host.
+    """
 
     verifier, challenge = _pkce()
     callback = _Callback(secrets.token_urlsafe(32))
-    server = HTTPServer(("127.0.0.1", 0), callback.handler())
+    try:
+        server = HTTPServer(("127.0.0.1", port), callback.handler())
+    except OSError as exc:
+        raise UsageError(f"cannot listen on 127.0.0.1:{port} for the sign-in: {exc.strerror or exc}") from exc
     redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/callback"
     url = f"{metadata['authorization_endpoint']}?" + urlencode({
         "response_type": "code",

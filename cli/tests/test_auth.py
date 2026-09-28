@@ -64,6 +64,35 @@ def test_a_redirect_carrying_another_sign_in_s_state_is_refused(stub, monkeypatc
     assert stub.exchanges == []  # the forged code was never exchanged
 
 
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def test_login_port_fixes_the_listener_so_an_ssh_forward_can_be_set_up_first(stub, cli):
+    port = _free_port()
+    result = cli("--hub", HUB, "login", "--port", str(port))
+    assert result.exit_code == 0, result.output
+    [asked] = stub.authorizations
+    assert asked["redirect_uri"] == f"http://127.0.0.1:{port}/callback"
+    [exchange] = stub.exchanges
+    assert exchange["redirect_uri"] == asked["redirect_uri"]
+
+
+def test_a_login_port_already_in_use_is_a_usage_error(stub, cli):
+    import socket
+
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen()
+        result = cli("--hub", HUB, "login", "--port", str(busy.getsockname()[1]))
+    assert result.exit_code == 2 and "cannot listen on 127.0.0.1:" in result.stderr
+    assert stub.authorizations == []
+
+
 def test_a_sign_in_that_never_returns_times_out(stub):
     with httpx.Client(transport=httpx.MockTransport(stub.handle)) as http:
         metadata = oidc.discover(http, ISSUER)

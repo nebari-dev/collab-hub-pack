@@ -23,7 +23,15 @@ collab-hub login --hub https://hub.example.org
 
 The CLI signs in the way the Collab desktop does, against the same Keycloak realm and the same public client (`apollo-desktop`): the authorization code flow with PKCE (S256) and a loopback redirect (RFC 8252). `login` opens the realm's sign-in page in a browser on this machine, which returns to a listener on `127.0.0.1` and a port the system picks. The hub's URL is all you type: the hub names its issuer and client at `GET /v1/auth/cli`.
 
-- `--no-browser` prints the sign-in URL instead of opening it. The browser still has to run on the same machine, since the redirect goes to its loopback address; on a remote host, forward the port with SSH or use `--with-token`.
+- `--no-browser` prints the sign-in URL instead of opening it. The browser has to reach the CLI's listener on `127.0.0.1`, so on the same machine it just works.
+- `--port PORT` fixes the listener's port (by default the system picks one). That is what makes a remote host work: forward the port from your laptop first, then sign in on the remote host and open the printed URL in your laptop's browser. The realm's client accepts any `127.0.0.1` port.
+
+  ```sh
+  ssh -L 8765:127.0.0.1:8765 remote-host          # on your laptop
+  collab-hub login --no-browser --port 8765        # on the remote host
+  ```
+
+  Or use `--with-token`.
 - `--with-token` reads a bearer token from stdin, for CI or a script that already holds one: `make -C dev token | collab-hub login --with-token`. Such a token is used until it expires and never renewed.
 
 The session is kept in `credentials/<profile>.json` in the configuration directory, readable only by you (the directory is `0700`, the file `0600`), and is sent only to the hub it was obtained for. It is renewed with its refresh token before it expires. Only a refresh the realm refuses (`invalid_grant`) ends it; a realm that is down or failing is exit 1, and the session is kept for the next command.

@@ -158,6 +158,10 @@ def login(
         "--with-token", help="Read a bearer token from stdin instead of signing in through the browser.")] = False,
     no_browser: Annotated[bool, typer.Option(
         "--no-browser", help="Print the sign-in URL without opening a browser.")] = False,
+    port: Annotated[int, typer.Option(
+        "--port", min=0, max=65535,
+        help="The 127.0.0.1 port the sign-in returns to; 0 lets the system pick. Fix it to forward it over SSH "
+             "(ssh -L PORT:127.0.0.1:PORT) when the CLI runs on a remote host.")] = 0,
     as_json: JsonOption = False,
 ) -> None:
     """Sign in to the hub through its realm, the way the Collab desktop does.
@@ -200,7 +204,7 @@ def login(
 
             tokens = oidc.browser_login(hub.http, metadata, client_id,
                                         open_browser=(lambda _url: None) if no_browser else webbrowser.open,
-                                        show=show)
+                                        show=show, port=port)
             session = Credentials(hub=url, access_token=tokens.access_token, issuer=issuer, client_id=client_id,
                                   refresh_token=tokens.refresh_token, expires_at=tokens.expires_at)
 
