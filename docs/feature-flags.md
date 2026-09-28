@@ -2,7 +2,21 @@
 
 Work in progress lands on `main`, so a feature can reach a deployment before it is ready to expose. Feature flags keep such a feature dark by default and let an operator turn it on per deployment, with no code change and no long-lived branch.
 
-The mechanism is always on and needs no registration. Every flag is off until a deployment sets it to true.
+The mechanism is always on. Each flag is declared once and is off until a deployment sets it to true.
+
+## Adding a flag
+
+Declare it in `FEATURE_FLAGS` in `api/src/collab_hub_api/config.py`, with one line on what it exposes:
+
+```python
+FEATURE_FLAGS: dict[str, str] = {
+    "cogs_ui": "The Cogs screens in the admin panel.",
+}
+```
+
+Then gate the code path on it. A name that is not declared is refused wherever it appears: set in the environment or the chart, it stops the API at startup, and passed to `enabled()`, it raises. A misspelled flag therefore fails loudly instead of silently reading as off.
+
+Flags are for work in progress: remove the flag, from `FEATURE_FLAGS` and from the code, once the feature ships. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`. Deployments that still set a removed flag fail at startup until their values drop it.
 
 ## Turning a flag on
 
@@ -19,19 +33,25 @@ The chart renders each entry as an environment variable, `COLLAB_HUB_API__FEATUR
 COLLAB_HUB_API__FEATURES__COGS_UI=true
 ```
 
-The variable name follows pydantic-settings' [nested environment variables](https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values), and the value is parsed with pydantic's [boolean rules](https://docs.pydantic.dev/latest/api/standard_library_types/#booleans): `true`, `1`, `yes` and `on` (any case) turn a flag on, and `false`, `0`, `no` and `off` keep it off. Any other value stops the API at startup with an error naming the flag, so a typo never silently leaves a feature off.
+The variable name follows pydantic-settings' [nested environment variables](https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values), and the value is parsed with pydantic's [boolean rules](https://docs.pydantic.dev/latest/api/standard_library_types/#booleans): `true`, `1`, `yes` and `on` (any case) turn a flag on, and `false`, `0`, `no` and `off` keep it off. Any other value stops the API at startup with an error naming the flag. The chart's schema also refuses a non-boolean value at render time.
 
 ## Reading a flag
 
-Code reads flags only through the one accessor on the config, never with a bare `os.environ` lookup:
+In a route, take the features through the `get_features` dependency:
 
 ```python
-if config.features.enabled("cogs_ui"):
-    ...
+from fastapi import Depends
+
+from collab_hub_api.config import FeaturesConfig
+from collab_hub_api.dependencies import get_features
+
+
+@router.get("/example")
+def example(features: FeaturesConfig = Depends(get_features)):
+    if features.enabled("cogs_ui"):
+        ...
 ```
 
-A flag that nobody set reads as off.
+In the app factory and the store builders, read `config.features.enabled("cogs_ui")` directly. Never read the environment variable with `os.environ`.
 
-## Adding a flag
-
-Pick a name, gate the code path on `config.features.enabled("<name>")`, and describe what the flag exposes in the feature's own docs. Flags are expected to disappear once the feature ships. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`.
+The admin panel receives the flags that are on as `features` in its session payload (`GET /admin/api/session`), so an unfinished screen can be hidden until its flag is set.

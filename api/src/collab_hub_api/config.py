@@ -989,6 +989,15 @@ class CogsConfig(BaseModel):
         return self
 
 
+FEATURE_FLAGS: dict[str, str] = {}
+"""Every feature flag this hub knows: name to one line on what it exposes.
+
+Adding a flag starts here. A name that is not listed is refused wherever it
+appears: set in the environment or the chart, it stops startup; passed to
+:meth:`FeaturesConfig.enabled`, it raises. So a misspelled flag fails loudly
+instead of silently reading as off.
+"""
+
 _FLAG_VALUE = TypeAdapter(bool)
 
 
@@ -999,10 +1008,11 @@ def _flag_name(name: str) -> str:
 class FeaturesConfig(BaseModel):
     """Per-deployment switches for features that are on ``main`` but not yet exposed.
 
-    The mechanism is always on and needs no registration. Every flag is off
-    until a deployment sets it to true, either in the chart's ``features``
-    values or as the environment variable ``COLLAB_HUB_API__FEATURES__<NAME>``,
-    following pydantic-settings' nested variables:
+    The mechanism is always on. Each flag is declared once in
+    :data:`FEATURE_FLAGS` and is off until a deployment sets it to true,
+    either in the chart's ``features`` values or as the environment variable
+    ``COLLAB_HUB_API__FEATURES__<NAME>``, following pydantic-settings' nested
+    variables:
     https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values
 
     Values are parsed with pydantic's boolean rules, so ``true``, ``1``,
@@ -1010,9 +1020,11 @@ class FeaturesConfig(BaseModel):
     cannot parse stops startup instead of reading as off:
     https://docs.pydantic.dev/latest/api/standard_library_types/#booleans
 
-    Code reads flags only through :meth:`enabled`. Flags are for work in
-    progress and are removed once the feature ships; a permanent operational
-    switch belongs in its own section as a documented ``bool`` field.
+    Code reads flags only through :meth:`enabled`: routes through the
+    ``get_features`` dependency, the admin UI through the ``features`` list in
+    its session payload. Flags are for work in progress and are removed once
+    the feature ships; a permanent operational switch belongs in its own
+    section as a documented ``bool`` field.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -1024,15 +1036,26 @@ class FeaturesConfig(BaseModel):
             return data
         flags: dict[str, bool] = {}
         for name, value in data.items():
+            flag = _flag_name(str(name))
+            if flag not in FEATURE_FLAGS:
+                known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
+                raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
             try:
-                flags[_flag_name(str(name))] = _FLAG_VALUE.validate_python(value)
+                flags[flag] = _FLAG_VALUE.validate_python(value)
             except ValidationError:
                 raise ValueError(f"feature flag {name!r} must be a boolean, got {value!r}") from None
         return flags
 
     def enabled(self, name: str) -> bool:
-        """Whether the named flag is on for this deployment; a flag nobody set is off."""
-        return bool((self.__pydantic_extra__ or {}).get(_flag_name(name), False))
+        """Whether the named flag is on for this deployment. An unregistered name raises ``KeyError``."""
+        flag = _flag_name(name)
+        if flag not in FEATURE_FLAGS:
+            raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
+        return bool((self.__pydantic_extra__ or {}).get(flag, False))
+
+    def enabled_names(self) -> list[str]:
+        """The flags that are on for this deployment, sorted."""
+        return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)
 
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)

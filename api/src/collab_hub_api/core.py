@@ -350,6 +350,7 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.org_store = org_store
             app.state.mcp_server = mcp
             app.state.connectors_config = config.connectors
+            app.state.features = config.features
             # Process-wide bound on concurrent generic GitHub reads (api_get).
             # Created once here, where the sizing config is in hand and we're
             # already inside the event loop — so the route needs no lazy

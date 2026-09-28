@@ -10,6 +10,7 @@ const OPERATOR = {
   role: "operator",
   csrf_token: "csrf-value",
   version: "0.1.0",
+  features: [],
 };
 
 function answering(status: number, body?: unknown): typeof fetch {

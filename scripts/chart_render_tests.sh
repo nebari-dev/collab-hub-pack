@@ -45,6 +45,14 @@ check "ci fixture: harbor + static, Secrets attached, CA mounted read-only" fixt
 check "sources with the indexer off: JSON renders, tuning vars do not" static-only $STATIC
 check "three sources: each credential attached to its own source" three-sources -f "$TESTDATA/cogs-three-sources.yaml"
 check "middle source removed and order reversed: attachments follow the id" reordered -f "$TESTDATA/cogs-reordered.yaml"
+check "feature flags: each entry renders as its variable, dashes as underscores" features --set features.cogs_ui=true --set features.new-thing=false
+if out="$($HELM template t "$CHART" --set-string features.cogs_ui=maybe 2>&1)"; then
+  fail "feature flags: a non-boolean value is refused" "rendered"
+elif printf '%s' "$out" | grep -q "features.cogs_ui"; then
+  pass "feature flags: a non-boolean value is refused"
+else
+  fail "feature flags: a non-boolean value is refused" "failed for another reason: $(printf '%s' "$out" | head -3)"
+fi
 
 # --- negative: every refused configuration, from one fixture ------------------
 # scripts/testdata/chart/cogs-negative-cases.yaml holds each refusal once, in
