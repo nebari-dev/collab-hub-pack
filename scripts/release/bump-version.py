@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Pin the release version into the files that carry it.
 
+The version is a Semantic Versioning 2.0.0 version, pre-release suffix allowed:
+https://semver.org/spec/v2.0.0.html
+
 Called by .github/workflows/semantic-release.yml with the computed version.
 Updates helm/collab-hub/Chart.yaml (version + appVersion) and
 api/pyproject.toml (project version) for the release commit, which is pushed
