@@ -20,7 +20,9 @@ SEARCH_SNIPPET_CHARS = 500
 DEFAULT_READ_BUDGET_CHARS = 12_000
 
 # Prefix marking a cursor as our own read-budget continuation point (a Slack
-# message ts) rather than Slack's opaque pagination cursor.
+# message ts) rather than Slack's opaque pagination cursor. A channel read that
+# had a lower time bound carries it too, as "ts:<resume ts>:<oldest>", so the
+# next page stays inside the requested window.
 _BUDGET_CURSOR_PREFIX = "ts:"
 
 # ``auth.test`` errors that mean the brokered token is not a usable Slack Web API
@@ -160,16 +162,21 @@ class SlackClient:
             params["oldest"] = oldest
         if latest:
             params["latest"] = latest
-        budget_ts = _decode_budget_cursor(cursor)
-        if budget_ts is not None:
+        budget = _decode_budget_cursor(cursor)
+        if budget is not None:
+            budget_ts, window_oldest = budget
             # A budget cursor picks up where the last page's budget stopped:
             # everything at or before that ts, i.e. the next (older) page.
             params["latest"] = budget_ts
+            # Keep the original lower time bound (from oldest, days_back or
+            # since_date) so later pages don't drift outside the window.
+            if window_oldest and not oldest:
+                params["oldest"] = window_oldest
         elif cursor:
             params["cursor"] = cursor
         payload = await self._get_json("/conversations.history", params=params, operation="conversation read")
         messages, has_more, next_cursor = _messages_page(payload)
-        return _apply_read_budget(messages, has_more, next_cursor, max_chars)
+        return _apply_read_budget(messages, has_more, next_cursor, max_chars, oldest=params.get("oldest", ""))
 
     async def read_thread(
         self,
@@ -187,7 +194,8 @@ class SlackClient:
             "limit": str(limit),
             "inclusive": "true",
         }
-        budget_ts = _decode_budget_cursor(cursor)
+        budget = _decode_budget_cursor(cursor)
+        budget_ts = budget[0] if budget is not None else None
         if budget_ts is not None:
             # Threads are read oldest-first, so the budget cursor drops the
             # already-read older messages and continues from where we stopped.
@@ -333,33 +341,38 @@ def _apply_read_budget(
     has_more: bool,
     next_cursor: str,
     max_chars: int,
+    oldest: str = "",
 ) -> tuple[list[SlackMessage], bool, str]:
     """Stop adding messages once their text would go over ``max_chars``.
 
     Never cuts a message, and always keeps the first one even if it alone is
     over budget. Stopping early takes precedence over Slack's own pagination:
     the cursor points at the first message left out, so the next call picks up
-    exactly there.
+    exactly there. ``oldest`` is the read's lower time bound, if any; it rides
+    along in the cursor so the next page keeps it.
     """
     kept: list[SlackMessage] = []
     total = 0
     for message in messages:
         size = len(message.text)
         if kept and total + size > max_chars:
-            return kept, True, _encode_budget_cursor(message.ts)
+            return kept, True, _encode_budget_cursor(message.ts, oldest)
         kept.append(message)
         total += size
     return kept, has_more, next_cursor
 
 
-def _encode_budget_cursor(ts: str) -> str:
-    return f"{_BUDGET_CURSOR_PREFIX}{ts}"
+def _encode_budget_cursor(ts: str, oldest: str = "") -> str:
+    cursor = f"{_BUDGET_CURSOR_PREFIX}{ts}"
+    return f"{cursor}:{oldest}" if oldest else cursor
 
 
-def _decode_budget_cursor(cursor: str) -> str | None:
-    if cursor.startswith(_BUDGET_CURSOR_PREFIX):
-        return cursor[len(_BUDGET_CURSOR_PREFIX) :]
-    return None
+def _decode_budget_cursor(cursor: str) -> tuple[str, str] | None:
+    """Return (resume ts, lower time bound or "") for a budget cursor, else None."""
+    if not cursor.startswith(_BUDGET_CURSOR_PREFIX):
+        return None
+    ts, _, oldest = cursor[len(_BUDGET_CURSOR_PREFIX) :].partition(":")
+    return ts, oldest
 
 
 def _encode_channel_cursor(phase: str, upstream_cursor: str) -> str:

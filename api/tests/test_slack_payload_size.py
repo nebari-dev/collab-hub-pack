@@ -120,7 +120,7 @@ async def test_read_messages_do_not_repeat_the_channel_id(monkeypatch):
 
 
 def _history_handler(history: list[dict], seen_params: list[dict]):
-    """A fake channel that honors limit, an inclusive latest, and an inclusive oldest."""
+    """A fake channel that honors limit and inclusive latest/oldest bounds."""
 
     def handler(request: httpx.Request) -> Response:
         path = request.url.path
@@ -131,7 +131,12 @@ def _history_handler(history: list[dict], seen_params: list[dict]):
         limit = int(params.get("limit", "50"))
         if path.endswith("/conversations.history"):
             latest = params.get("latest")
-            pool = [m for m in reversed(history) if not latest or float(m["ts"]) <= float(latest)]
+            oldest = params.get("oldest")
+            pool = [
+                m
+                for m in reversed(history)
+                if (not latest or float(m["ts"]) <= float(latest)) and (not oldest or float(m["ts"]) >= float(oldest))
+            ]
         else:
             oldest = params.get("oldest")
             pool = [m for m in history if not oldest or float(m["ts"]) >= float(oldest)]
@@ -246,3 +251,29 @@ async def test_thread_read_does_not_repeat_the_first_message_on_later_pages(monk
             break
 
     assert read == [m["ts"] for m in history]  # the first message appears exactly once
+
+
+async def test_budget_cursor_keeps_the_original_time_window(monkeypatch):
+    # A read limited to a time window (oldest, days_back, or since_date) must stay inside
+    # that window on later pages, even when the caller only sends next_cursor back.
+    history = _messages(10, 1_000)
+    window_start = history[4]["ts"]
+    seen_params: list[dict] = []
+    _install_mock_client(monkeypatch, _history_handler(history, seen_params))
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    read: list[str] = []
+    messages, has_more, cursor = await slack.read_conversation(
+        channel_id="C0001", limit=10, oldest=window_start, max_chars=2_500
+    )
+    read.extend(m.ts for m in messages)
+    while has_more:
+        # Follow next_cursor alone, without repeating oldest.
+        messages, has_more, cursor = await slack.read_conversation(
+            channel_id="C0001", limit=10, cursor=cursor, max_chars=2_500
+        )
+        read.extend(m.ts for m in messages)
+
+    assert read == [m["ts"] for m in reversed(history[4:])]  # nothing older than the window
+    assert len(seen_params) > 1
+    assert all(params["oldest"] == window_start for params in seen_params)
