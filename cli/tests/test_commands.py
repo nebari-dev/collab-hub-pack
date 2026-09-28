@@ -72,10 +72,10 @@ def test_cog_show_prints_the_card_and_a_missing_cog_is_the_hub_s_404(stub, cli):
 def test_profiles_choose_the_hub_and_flags_and_the_environment_override_them(tmp_path, monkeypatch):
     directory = tmp_path / "config"
     config.save(directory, {"default_profile": "work",
-                            "profiles": {"work": {"hub": "https://work.test/"}, "lab": {"hub": "http://lab.test"}}})
+                            "profiles": {"work": {"hub": "https://work.test/"}, "lab": {"hub": "https://lab.test"}}})
     assert config.resolve(None, None, directory).hub == "https://work.test"
-    assert config.resolve(None, "lab", directory).hub == "http://lab.test"
-    assert config.resolve("http://flag.test", "lab", directory).hub == "http://flag.test"
+    assert config.resolve(None, "lab", directory).hub == "https://lab.test"
+    assert config.resolve("https://flag.test", "lab", directory).hub == "https://flag.test"
     assert config.resolve(None, "fresh", directory).hub is None
 
 

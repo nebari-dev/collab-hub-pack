@@ -26,7 +26,11 @@ The CLI signs in the way the Collab desktop does, against the same Keycloak real
 - `--no-browser` prints the sign-in URL instead of opening it. The browser still has to run on the same machine, since the redirect goes to its loopback address; on a remote host, forward the port with SSH or use `--with-token`.
 - `--with-token` reads a bearer token from stdin, for CI or a script that already holds one: `make -C dev token | collab-hub login --with-token`. Such a token is used until it expires and never renewed.
 
-The session is kept in `credentials/<profile>.json` in the configuration directory, readable only by you (the directory is `0700`, the file `0600`), and is sent only to the hub it was obtained for. It is renewed with its refresh token before it expires.
+The session is kept in `credentials/<profile>.json` in the configuration directory, readable only by you (the directory is `0700`, the file `0600`), and is sent only to the hub it was obtained for. It is renewed with its refresh token before it expires. Only a refresh the realm refuses (`invalid_grant`) ends it; a realm that is down or failing is exit 1, and the session is kept for the next command.
+
+Signing in again replaces the profile's session, and the old one is ended at its realm rather than left open — unless both belong to the same realm session (the same `sid`), as when the browser was still signed in, since ending it would end the new one too. A sign-in the hub then refuses is ended the same way and never stored.
+
+**What the CLI trusts.** Plain `http` is accepted only for a hub on this machine (`localhost`, `*.localhost`, loopback addresses); anywhere else the issuer that `GET /v1/auth/cli` names could be swapped on the way, and every token would cross in clear. `--insecure` accepts it anyway. The realm's discovery document must name the issuer the hub named, and its endpoints must be `https`, or `http` on this machine.
 
 ```sh
 collab-hub whoami            # the user, organization and roles the hub resolved, and the token's expiry
@@ -76,7 +80,7 @@ Tables for people by default; `--json`, which every command takes, prints one JS
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | the hub refused or failed the request, or could not be reached |
+| 1 | the hub or the realm refused or failed the request, or could not be reached; a session is kept |
 | 2 | a usage error: a bad option, a missing hub |
 | 5 | not signed in, or the session has expired and could not be renewed |
 

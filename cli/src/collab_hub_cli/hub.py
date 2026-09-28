@@ -75,11 +75,13 @@ class Hub:
             return
         if not session.refresh_token or not session.issuer or not session.client_id:
             raise AuthError(f"the token for {self.url} has expired; sign in again with `collab-hub login`")
-        metadata = oidc.discover(self.http, session.issuer)
+        # A realm that is down or failing raises RealmError and keeps the session,
+        # so the next command can renew it; only a grant the realm refused ends it.
+        metadata = oidc.discover(self.http, session.issuer, self.target.insecure)
         try:
             tokens = oidc.refresh(self.http, metadata, session.client_id, session.refresh_token)
         except AuthError:
-            # A refresh token the realm refused will not work next time either.
+            # The realm refused the refresh token itself: it will not work next time either.
             credentials.delete(self.target.directory, self.target.profile)
             self.session = None
             raise
@@ -99,6 +101,10 @@ class Hub:
             response = self.http.request(method, f"{self.url}{path}", headers=headers, **kwargs)
         except httpx.HTTPError as exc:
             raise HubError(f"cannot reach the hub at {self.url}: {exc}") from exc
+        if not authenticate and response.status_code in (401, 404):
+            # Asked without credentials, so a 401 is not about a session: the hub has no such public route.
+            raise HubError(f"{self.url} does not offer {path} (HTTP {response.status_code}); "
+                           "it may predate this version of collab-hub and need upgrading")
         if response.status_code == 401:
             if self.session is None:
                 raise AuthError(f"not signed in to {self.url}; run `collab-hub login --hub {self.url}`")

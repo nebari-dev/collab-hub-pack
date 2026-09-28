@@ -33,7 +33,8 @@ def test_login_signs_in_with_pkce_on_a_loopback_redirect_and_keeps_the_session(s
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     saved = json.loads(path.read_text())
-    assert saved["hub"] == HUB and saved["issuer"] == ISSUER and saved["refresh_token"] == "refresh-1"
+    assert saved["hub"] == HUB and saved["issuer"] == ISSUER
+    assert saved["refresh_token"] == stub.issued[0]["refresh_token"]
     assert saved["obtained_by"] == "browser"
     # The hub is remembered, so later commands need no --hub.
     whoami = cli("whoami", "--json")
@@ -77,8 +78,9 @@ def test_an_expired_token_is_renewed_before_the_request_and_the_new_one_kept(stu
     result = cli("whoami", "--json")
     assert result.exit_code == 0, result.output
     saved = json.loads(_session_file(tmp_path).read_text())
-    assert saved["access_token"] == "access-2" and saved["refresh_token"] == "refresh-2"
-    assert stub.requests[-1].headers["authorization"] == "Bearer access-2"
+    renewed = stub.issued[1]
+    assert saved["access_token"] == renewed["access_token"] and saved["refresh_token"] == renewed["refresh_token"]
+    assert stub.requests[-1].headers["authorization"] == f"Bearer {stub.issued[1]['access_token']}"
 
 
 def test_a_session_the_realm_will_not_renew_exits_5_and_is_forgotten(stub, cli, tmp_path, monkeypatch):
@@ -97,9 +99,10 @@ def test_logout_ends_the_realm_session_revokes_the_token_and_leaves_nothing_on_d
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"hub": HUB, "profile": "default", "was_signed_in": True, "revoked": True,
                                          "warning": None}
-    assert stub.ended == [{"client_id": CLIENT, "refresh_token": "refresh-1"}]
+    first = stub.issued[0]["refresh_token"]
+    assert stub.ended == [{"client_id": CLIENT, "refresh_token": first}]
     # Revocation is what the standard guarantees, so it happens whatever the end-session call did.
-    assert stub.revoked == [{"client_id": CLIENT, "token": "refresh-1", "token_type_hint": "refresh_token"}]
+    assert stub.revoked == [{"client_id": CLIENT, "token": first, "token_type_hint": "refresh_token"}]
     assert list((tmp_path / "config" / "credentials").iterdir()) == []
     assert cli("whoami").exit_code == 5  # the hub now sees no one
 
@@ -123,7 +126,7 @@ def test_login_json_reports_who_signed_in(stub, cli):
 
 def test_a_session_is_never_sent_to_another_hub(stub, cli):
     assert cli("--hub", HUB, "login").exit_code == 0
-    result = cli("--hub", "http://other.test", "whoami")
+    result = cli("--hub", "https://other.test", "whoami")
     assert result.exit_code == 1  # the stub does not serve it; what matters is what was sent
     [sent] = [r for r in stub.requests if r.url.host == "other.test"]
     assert "authorization" not in sent.headers

@@ -86,5 +86,12 @@ async def test_a_rejected_credential_is_a_401_even_where_dev_auth_would_answer(d
     assert response.status_code == 401
 
 
+async def test_a_header_the_hub_does_not_read_is_reported_as_the_dev_shortcut(dev_client):
+    # get_auth_context ignores these and answers as the dev user, so /v1/me must not call that a token.
+    for header in ("Basic Zm9vOmJhcg==", "Bearer ", "Bearer"):
+        me = (await dev_client.get("/v1/me", headers={"Authorization": header})).json()
+        assert me["user"] == "dev-user" and me["authenticated_by"] == "dev", header
+
+
 async def test_me_requires_a_caller(client):
     assert (await client.get("/v1/me")).status_code == 401

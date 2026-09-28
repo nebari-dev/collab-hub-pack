@@ -26,8 +26,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
-from ..frames.auth import AuthContext, _dev_auth_user, get_auth_context
-from .cogs import presents_credentials
+from ..frames.auth import AuthContext, _credential_claims, _dev_auth_user, get_auth_context
 
 CLI_CLIENT_ID_ENV = "COLLAB_HUB_CLI_CLIENT_ID"
 DEFAULT_CLI_CLIENT_ID = "apollo-desktop"
@@ -82,10 +81,12 @@ def cli_auth_config() -> CliAuthConfig:
 
 @router.get("/me", response_model=Me, summary="The caller as the hub resolved them")
 def me(request: Request, auth: AuthDep) -> Me:
-    # get_auth_context tries the request's credential first and falls back to
-    # the dev shortcut only when there is none, so a request that presented
-    # one and still got here was verified.
-    presented = presents_credentials(request)
+    # The resolver's own test: get_auth_context authenticates from a credential
+    # whenever _credential_claims finds one (a non-empty Bearer token or IdToken
+    # cookie), and 401s if it does not verify; only when it finds none does the
+    # dev shortcut answer. A header it does not read, such as Basic, or an empty
+    # Bearer, is no credential to it, so the answer is `dev` then, not `token`.
+    presented = _credential_claims(request) is not None
     return Me(
         user=auth.user,
         org_id=auth.home_org_id,

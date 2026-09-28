@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
 import threading
 import time
@@ -24,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+
+from .config import is_loopback
 
 SCOPES = ("openid", "profile", "email", "offline_access")
 LOGIN_TIMEOUT_SECONDS = 300
@@ -36,6 +39,18 @@ class AuthError(Exception):
     """Not signed in, or the session cannot be used: exit code 5."""
 
 
+class RealmError(Exception):
+    """The realm could not be reached, failed, or cannot be trusted: exit code 1.
+
+    Unlike :class:`AuthError` it says nothing about the session itself, so a
+    session is never forgotten for it: the next command can try again.
+    """
+
+
+# RFC 6749 §5.2: the realm refused the grant itself, so the token is dead.
+REFUSED_GRANT = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
+
+
 @dataclass(frozen=True)
 class Tokens:
     access_token: str
@@ -43,14 +58,59 @@ class Tokens:
     expires_at: float | None
 
 
-def discover(http: httpx.Client, issuer: str) -> dict:
+def _secure(url: str, insecure: bool = False) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" or (parsed.scheme == "http" and (insecure or is_loopback(parsed.hostname)))
+
+
+def discover(http: httpx.Client, issuer: str, insecure: bool = False) -> dict:
+    """The issuer's discovery document, checked before any of it is used.
+
+    The issuer came from the hub, so the document must name that same issuer
+    (OpenID Connect Discovery §4.3), and every endpoint the sign-in sends a
+    code, a verifier or a token to must be ``https``, or loopback ``http``
+    (any ``http`` with ``insecure``).
+    """
+
+    if not _secure(issuer, insecure):
+        raise RealmError(f"refusing the issuer {issuer}: it is neither https nor on this machine")
     try:
         response = http.get(f"{issuer.rstrip('/')}/.well-known/openid-configuration")
     except httpx.HTTPError as exc:
-        raise AuthError(f"cannot reach the issuer {issuer}: {exc}") from exc
+        raise RealmError(f"cannot reach the issuer {issuer}: {exc}") from exc
     if response.status_code != 200:
-        raise AuthError(f"the issuer {issuer} has no discovery document (HTTP {response.status_code})")
-    return response.json()
+        raise RealmError(f"the issuer {issuer} has no discovery document (HTTP {response.status_code})")
+    try:
+        metadata = response.json()
+    except ValueError as exc:
+        raise RealmError(f"the issuer {issuer} answered its discovery document with something not JSON") from exc
+    if not isinstance(metadata, dict) or str(metadata.get("issuer", "")).rstrip("/") != issuer.rstrip("/"):
+        found = metadata.get("issuer") if isinstance(metadata, dict) else None
+        raise RealmError(f"the discovery document at {issuer} names another issuer ({found!r}); refusing it")
+    for name in ("authorization_endpoint", "token_endpoint", "end_session_endpoint", "revocation_endpoint"):
+        endpoint = metadata.get(name)
+        if endpoint is not None and not _secure(str(endpoint), insecure):
+            raise RealmError(f"refusing the realm's {name} {endpoint}: it is neither https nor on this machine")
+    return metadata
+
+
+def _post(http: httpx.Client, url: str, data: dict) -> httpx.Response:
+    try:
+        return http.post(url, data=data)
+    except httpx.HTTPError as exc:
+        raise RealmError(f"cannot reach the realm at {url}: {exc}") from exc
+
+
+def session_id(token: str | None) -> str | None:
+    """The realm session a token belongs to (its ``sid`` claim), read without verifying it."""
+
+    try:
+        payload = str(token).split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError):
+        return None
+    sid = claims.get("sid") if isinstance(claims, dict) else None
+    return sid if isinstance(sid, str) and sid else None
 
 
 def _tokens(body: dict) -> Tokens:
@@ -154,7 +214,7 @@ def browser_login(
     if "code" not in params:
         detail = params.get("error_description") or params.get("error") or "no code"
         raise AuthError(f"the realm did not sign you in: {detail}")
-    response = http.post(metadata["token_endpoint"], data={
+    response = _post(http, metadata["token_endpoint"], {
         "grant_type": "authorization_code",
         "code": params["code"],
         "redirect_uri": redirect_uri,
@@ -163,17 +223,23 @@ def browser_login(
     })
     if response.status_code != 200:
         code, detail = _error(response)
+        if response.status_code >= 500:
+            raise RealmError(f"the realm failed to exchange the sign-in code: HTTP {response.status_code}")
         raise AuthError(f"the realm refused the sign-in code: {code} {detail}".rstrip())
     return _tokens(response.json())
 
 
 def refresh(http: httpx.Client, metadata: dict, client_id: str, refresh_token: str) -> Tokens:
-    response = http.post(metadata["token_endpoint"], data={
+    response = _post(http, metadata["token_endpoint"], {
         "grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id,
     })
     if response.status_code != 200:
         code, _ = _error(response)
-        raise AuthError(f"the session could not be renewed ({code}); run `collab-hub login` again")
+        if response.status_code in (400, 401) and code in REFUSED_GRANT:
+            raise AuthError(f"the session could not be renewed ({code}); run `collab-hub login` again")
+        # A realm restarting or a proxy error page: the session may be fine, so keep it.
+        raise RealmError(f"the realm could not renew the session right now (HTTP {response.status_code}, {code}); "
+                         "try again")
     tokens = _tokens(response.json())
     # A realm that does not rotate refresh tokens omits the new one: keep the old.
     return Tokens(tokens.access_token, tokens.refresh_token or refresh_token, tokens.expires_at)
@@ -192,16 +258,16 @@ def sign_out(http: httpx.Client, metadata: dict, client_id: str, refresh_token: 
 
     revocation = metadata.get("revocation_endpoint")
     if not revocation:
-        raise AuthError("the realm publishes no revocation endpoint, so the session cannot be revoked")
+        raise RealmError("the realm publishes no revocation endpoint, so the session cannot be revoked")
     ended = metadata.get("end_session_endpoint")
     if ended:
-        response = http.post(ended, data={"client_id": client_id, "refresh_token": refresh_token})
+        response = _post(http, ended, {"client_id": client_id, "refresh_token": refresh_token})
         if response.status_code not in (200, 204):
             code, detail = _error(response)
-            raise AuthError(f"the realm did not end the session: {code} {detail}".rstrip())
-    response = http.post(revocation, data={
+            raise RealmError(f"the realm did not end the session: {code} {detail}".rstrip())
+    response = _post(http, revocation, {
         "client_id": client_id, "token": refresh_token, "token_type_hint": "refresh_token",
     })
     if response.status_code != 200:
         code, detail = _error(response)
-        raise AuthError(f"the realm did not revoke the refresh token: {code} {detail}".rstrip())
+        raise RealmError(f"the realm did not revoke the refresh token: {code} {detail}".rstrip())

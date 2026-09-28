@@ -22,7 +22,7 @@ import typer
 from . import config, credentials, oidc
 from .credentials import Credentials
 from .hub import Hub, HubError, http_client
-from .oidc import AuthError
+from .oidc import AuthError, RealmError
 
 EXIT_HUB = 1
 EXIT_USAGE = 2
@@ -43,20 +43,23 @@ HubOption = Annotated[
 ProfileOption = Annotated[
     str | None, typer.Option("--profile", envvar="COLLAB_HUB_PROFILE", help="The profile to use.")
 ]
+InsecureOption = Annotated[bool, typer.Option(
+    "--insecure", help="Accept plain http for a hub or realm off this machine: tokens then cross in clear.")]
 JsonOption = Annotated[bool, typer.Option("--json", help="Print one JSON document for scripts.")]
 
 
 class State:
     hub: str | None = None
     profile: str | None = None
+    insecure: bool = False
 
 
 state = State()
 
 
 @app.callback()
-def main(hub: HubOption = None, profile: ProfileOption = None) -> None:
-    state.hub, state.profile = hub, profile
+def main(hub: HubOption = None, profile: ProfileOption = None, insecure: InsecureOption = False) -> None:
+    state.hub, state.profile, state.insecure = hub, profile, insecure
 
 
 def _err(message: str) -> None:
@@ -76,7 +79,7 @@ def handled(command: Callable) -> Callable:
         except AuthError as exc:
             _err(f"error: {exc}")
             raise typer.Exit(EXIT_AUTH) from None
-        except HubError as exc:
+        except (HubError, RealmError) as exc:
             _err(f"error: {exc}")
             raise typer.Exit(EXIT_HUB) from None
 
@@ -84,7 +87,7 @@ def handled(command: Callable) -> Callable:
 
 
 def _target() -> config.Target:
-    return config.resolve(state.hub, state.profile)
+    return config.resolve(state.hub, state.profile, insecure=state.insecure)
 
 
 def _print_json(value: Any) -> None:
@@ -118,6 +121,36 @@ def _token_expiry(token: str) -> float | None:
 # --- signing in ------------------------------------------------------------------------------
 
 
+def _end(session: Credentials, insecure: bool) -> str | None:
+    """End a session at its realm, best effort: ``None`` when it ended, else why it may still be open."""
+
+    if not (session.refresh_token and session.issuer and session.client_id):
+        return None
+    http = http_client()
+    try:
+        oidc.sign_out(http, oidc.discover(http, session.issuer, insecure), session.client_id, session.refresh_token)
+        return None
+    except (AuthError, RealmError) as exc:
+        return str(exc)
+    finally:
+        http.close()
+
+
+def _same_realm_session(old: Credentials, new: Credentials) -> bool:
+    """Whether two sessions are one realm session, which ending the old one would end for the new one too.
+
+    A browser that is still signed in to the realm hands a second sign-in the
+    same realm session (the same ``sid``). When either ``sid`` is unknown the
+    answer is yes, so a session is never ended from under the one replacing it.
+    """
+
+    if old.issuer != new.issuer:
+        return False
+    old_sid = oidc.session_id(old.access_token) or oidc.session_id(old.refresh_token)
+    new_sid = oidc.session_id(new.access_token) or oidc.session_id(new.refresh_token)
+    return old_sid is None or new_sid is None or old_sid == new_sid
+
+
 @app.command()
 @handled
 def login(
@@ -137,6 +170,7 @@ def login(
 
     target = _target()
     url = target.require_hub()
+    previous = credentials.load(target.directory, target.profile)
     with Hub(target) as hub:
         auth = hub.get_json("/v1/auth/cli", authenticate=False)
         issuer, client_id = auth.get("issuer"), auth["client_id"]
@@ -157,7 +191,7 @@ def login(
                 _print_json({"hub": url, "profile": target.profile, "signed_in": False, "dev_auth": True})
             return
         else:
-            metadata = oidc.discover(hub.http, issuer)
+            metadata = oidc.discover(hub.http, issuer, target.insecure)
 
             def show(sign_in_url: str) -> None:
                 _err(f"Sign in to {url} in your browser:\n\n  {sign_in_url}\n")
@@ -170,16 +204,32 @@ def login(
             session = Credentials(hub=url, access_token=tokens.access_token, issuer=issuer, client_id=client_id,
                                   refresh_token=tokens.refresh_token, expires_at=tokens.expires_at)
 
-        # Keep the session only once the hub accepts it.
+        # Keep the session only once the hub accepts it; a browser session it
+        # refused is ended rather than left open at the realm with nothing holding it.
         hub.session = session
-        me = hub.get_json("/v1/me")
+        try:
+            me = hub.get_json("/v1/me")
+        except (AuthError, HubError, RealmError):
+            if session.obtained_by == "browser":
+                _end(session, target.insecure)
+            raise
         credentials.save(target.directory, target.profile, session)
         config.remember(target)
+    # The session this profile held before is replaced, so end it at its realm, unless it is
+    # the same realm session the new one belongs to. A failure warns and never undoes the sign-in.
+    ended_previous, warning = False, None
+    if previous is not None and previous.refresh_token and not _same_realm_session(previous, session):
+        warning = _end(previous, target.insecure)
+        ended_previous = warning is None
+        if warning:
+            warning = f"the previous session ({previous.hub}) may still be open at its realm: {warning}"
+            _err(f"warning: {warning}")
     organization = f" in {me['org_id']}" if me.get("org_id") else ""
     _err(f"Signed in to {url} as {me['user']}{organization}.")
     if as_json:
         _print_json({**me, "hub": url, "profile": target.profile, "signed_in": True, "dev_auth": False,
-                     "obtained_by": session.obtained_by, "token_expires_at": _when(session.expires_at)})
+                     "obtained_by": session.obtained_by, "token_expires_at": _when(session.expires_at),
+                     "previous_session_ended": ended_previous, "warning": warning})
 
 
 @app.command()
@@ -198,14 +248,10 @@ def logout(as_json: JsonOption = False) -> None:
     problem = None
     revoked = False
     if session.refresh_token and session.issuer and session.client_id:
-        http = http_client()
-        try:
-            oidc.sign_out(http, oidc.discover(http, session.issuer), session.client_id, session.refresh_token)
-            revoked = True
-        except AuthError as exc:
-            problem = f"{exc}; the stored token is deleted, but the realm session may still be open"
-        finally:
-            http.close()
+        failure = _end(session, target.insecure)
+        revoked = failure is None
+        if failure:
+            problem = f"{failure}; the stored token is deleted, but the realm session may still be open"
     elif session.obtained_by == "token":
         problem = "the token was given to `login --with-token`; it is forgotten here and stays valid until it expires"
     credentials.delete(target.directory, target.profile)
