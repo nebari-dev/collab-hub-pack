@@ -1,39 +1,37 @@
 # Feature flags
 
-Trunk-based development lands work in progress on `main`, so a feature can
-reach a deployment before it is ready to expose. Feature flags keep such a
-feature dark by default and let an operator turn it on per deployment with an
-environment variable — no code change, no long-lived branch.
+Work in progress lands on `main`, so a feature can reach a deployment before it is ready to expose. Feature flags keep such a feature dark by default and let an operator turn it on per deployment, with no code change and no long-lived branch.
 
-## Setting a flag
+The mechanism is always on and needs no registration. Every flag is off until a deployment sets it to true.
 
-A flag is off unless its variable is set to a truthy value (`1`, `true`,
-`yes`, `on`, any case):
+## Turning a flag on
+
+With the Helm chart, add the flag to `features` and set it to `true`:
+
+```yaml
+features:
+  cogs_ui: true
+```
+
+The chart renders each entry as an environment variable, `COLLAB_HUB_API__FEATURES__<NAME>`, which is also how to set a flag without the chart:
 
 ```sh
 COLLAB_HUB_API__FEATURES__COGS_UI=true
 ```
 
-With the Helm chart, set it through the API deployment's environment the same
-way as any other `COLLAB_HUB_API__*` setting.
+The variable name follows pydantic-settings' [nested environment variables](https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values), and the value is parsed with pydantic's [boolean rules](https://docs.pydantic.dev/latest/api/standard_library_types/#booleans): `true`, `1`, `yes` and `on` (any case) turn a flag on, and `false`, `0`, `no` and `off` keep it off. Any other value stops the API at startup with an error naming the flag, so a typo never silently leaves a feature off.
 
 ## Reading a flag
 
-All reads go through the one accessor on the config — never a bare
-`os.environ` lookup:
+Code reads flags only through the one accessor on the config, never with a bare `os.environ` lookup:
 
 ```python
 if config.features.enabled("cogs_ui"):
     ...
 ```
 
-Unknown flags read as off, so checking a flag never needs registration.
+A flag that nobody set reads as off.
 
 ## Adding a flag
 
-Pick a name, gate the code path on `config.features.enabled("<name>")`, and
-list the flag with one line on what it exposes in the feature's own docs or
-PR. Flags in this block are expected to disappear once the feature ships: a
-shipped capability that needs a permanent operational off-switch belongs on
-its own config section as an explicit `bool` field with a documented default
-(the `connectors.github.api_get_enabled` pattern), not here.
+Pick a name, gate the code path on `config.features.enabled("<name>")`, and describe what the flag exposes in the feature's own docs. Flags are expected to disappear once the feature ships. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`.

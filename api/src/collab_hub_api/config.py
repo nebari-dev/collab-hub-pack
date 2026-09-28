@@ -5,7 +5,16 @@ from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from .cogs.catalog import (
@@ -980,36 +989,50 @@ class CogsConfig(BaseModel):
         return self
 
 
+_FLAG_VALUE = TypeAdapter(bool)
+
+
+def _flag_name(name: str) -> str:
+    return name.strip().lower().replace("-", "_")
+
+
 class FeaturesConfig(BaseModel):
-    """Deployment feature flags (#135). Off unless the environment says on.
+    """Per-deployment switches for features that are on ``main`` but not yet exposed.
 
-    Trunk-based development lands unfinished features on ``main``; this is the
-    per-deployment switch that keeps them dark until an operator opts in. A
-    flag needs no code registration: setting
-    ``COLLAB_HUB_API__FEATURES__<NAME>`` to a truthy value ("1", "true",
-    "yes", "on", any case) turns ``<name>`` on for that deployment, and every
-    read goes through :meth:`enabled` — never a bare ``os.environ`` lookup.
+    The mechanism is always on and needs no registration. Every flag is off
+    until a deployment sets it to true, either in the chart's ``features``
+    values or as the environment variable ``COLLAB_HUB_API__FEATURES__<NAME>``,
+    following pydantic-settings' nested variables:
+    https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values
 
-    This is for dark-launching work in progress. A shipped capability with an
-    operational off-switch belongs on its own sub-config as an explicit
-    ``bool`` field with a documented default (the ``api_get_enabled`` pattern
-    on :class:`GitHubConnectorConfig`), not here — flags in this block are
-    expected to disappear once the feature ships. See docs/feature-flags.md.
+    Values are parsed with pydantic's boolean rules, so ``true``, ``1``,
+    ``yes`` and ``on`` (any case) turn a flag on, and a value those rules
+    cannot parse stops startup instead of reading as off:
+    https://docs.pydantic.dev/latest/api/standard_library_types/#booleans
+
+    Code reads flags only through :meth:`enabled`. Flags are for work in
+    progress and are removed once the feature ships; a permanent operational
+    switch belongs in its own section as a documented ``bool`` field.
     """
 
     model_config = ConfigDict(extra="allow")
 
-    _TRUTHY = frozenset({"1", "true", "yes", "on"})
+    @model_validator(mode="before")
+    @classmethod
+    def _parse_flags(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        flags: dict[str, bool] = {}
+        for name, value in data.items():
+            try:
+                flags[_flag_name(str(name))] = _FLAG_VALUE.validate_python(value)
+            except ValidationError:
+                raise ValueError(f"feature flag {name!r} must be a boolean, got {value!r}") from None
+        return flags
 
     def enabled(self, name: str) -> bool:
-        """Whether the named flag is on for this deployment. Unknown = off."""
-        value = getattr(self, name.strip().lower().replace("-", "_"), None)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in self._TRUTHY
-        return False
-
+        """Whether the named flag is on for this deployment; a flag nobody set is off."""
+        return bool((self.__pydantic_extra__ or {}).get(_flag_name(name), False))
 
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
