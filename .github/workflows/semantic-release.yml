@@ -20,8 +20,9 @@ name: Semantic Release
 #    ref, then packages, releases, and syncs to nebari-dev/helm-repository as
 #    it does for every pack.
 #
-# Chart.yaml on main keeps a placeholder version; the released version lives
-# in the tags and the GitHub Release. GITHUB_TOKEN is enough throughout: tags
+# Chart.yaml and api/pyproject.toml on main keep a 0.0.0 development
+# placeholder; the released version lives in the tags and the GitHub Release.
+# CONTRIBUTING.md describes this flow for contributors. GITHUB_TOKEN is enough throughout: tags
 # are not branch-protected, and workflow_dispatch is the one event it may start.
 #
 # The repo has no root package.json for this; semantic-release and its plugins

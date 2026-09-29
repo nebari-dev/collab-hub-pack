@@ -79,6 +79,42 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
   (D9); and update every document the change makes stale, naming them in the
   PR description (D10).
 
+## PR titles and releases
+
+PRs are squash-merged, and the squash commit takes the PR title as its
+subject and the PR description as its body. Every merge to `main` whose title
+calls for a release is released automatically, so the title decides the
+version.
+
+Titles follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
+`type(scope): description`, for example `fix(connectors): retry a Slack
+token refresh once`. The `PR Title` check enforces the format. The scope is
+optional and names the area the change touches, such as `connectors`,
+`config` or `deps`.
+
+| Type | Release |
+| --- | --- |
+| `feat` | minor (0.2.0 to 0.3.0) |
+| `fix`, `perf` | patch (0.2.0 to 0.2.1) |
+| `refactor`, `docs`, `test`, `build`, `ci`, `chore`, `style` | none |
+| `revert` | none, or patch when the description keeps git's `This reverts commit <sha>.` line |
+
+A `!` after the type or scope (`feat!: ...`), or a line in the PR description
+that starts with `BREAKING CHANGE:`, is a major release, which from 0.x goes
+straight to 1.0.0. Keep `BREAKING CHANGE:` out of a description unless that is
+the intent. A title the check would reject releases nothing, so a fix merged
+under one waits for the next releasing merge.
+
+Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+The version in `helm/collab-hub/Chart.yaml` and `api/pyproject.toml` on `main`
+is a development placeholder (`0.0.0-dev`, spelled `0.0.0.dev0` in Python),
+and a build from `main` reports it. A release never writes to `main`:
+[`semantic-release.yml`](.github/workflows/semantic-release.yml) tags the
+merged commit `v<version>`, pins the version into those two files in a commit
+that exists only under the tag `collab-hub-<version>`, and builds the image
+and the chart from that tag. To work with a released version, check out
+its `collab-hub-<version>` tag.
+
 ## Reporting security issues
 
 Do not open a public issue for vulnerabilities. Use GitHub's

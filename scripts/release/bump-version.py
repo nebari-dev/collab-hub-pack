@@ -11,34 +11,41 @@ only as the collab-hub-<version> tag. build-images.yaml and release.yaml run
 from that tag, so the chart, image, and tag all describe the same commit.
 """
 
+import argparse
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+CHART = ROOT / "helm" / "collab-hub" / "Chart.yaml"
+PYPROJECT = ROOT / "api" / "pyproject.toml"
+SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
 
 def sub(path: Path, pattern: str, replacement: str, count: int) -> None:
-    text = path.read_text()
+    text = path.read_text(encoding="UTF-8")
     new, n = re.subn(pattern, replacement, text, count=count, flags=re.MULTILINE)
     if n != count:
         sys.exit(f"{path}: expected {count} substitution(s) for {pattern!r}, made {n}")
-    path.write_text(new)
+    path.write_text(new, encoding="UTF-8")
+
+
+def semver(value: str) -> str:
+    if not SEMVER.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a semantic version such as 1.2.3 or 1.2.3-rc.1")
+    return value
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", sys.argv[1]):
-        sys.exit(f"usage: {sys.argv[0]} <semver-version>")
-    version = sys.argv[1]
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("version", type=semver, help="the release version, e.g. 1.2.3")
+    version = parser.parse_args().version
 
-    chart = ROOT / "helm" / "collab-hub" / "Chart.yaml"
-    sub(chart, r'^version: ".*"$', f'version: "{version}"', 1)
-    sub(chart, r'^appVersion: ".*"$', f'appVersion: "{version}"', 1)
+    sub(CHART, r'^version: ".*"$', f'version: "{version}"', 1)
+    sub(CHART, r'^appVersion: ".*"$', f'appVersion: "{version}"', 1)
+    sub(PYPROJECT, r'^version = ".*"$', f'version = "{version}"', 1)
 
-    pyproject = ROOT / "api" / "pyproject.toml"
-    sub(pyproject, r'^version = ".*"$', f'version = "{version}"', 1)
-
-    print(f"pinned {version} into {chart.relative_to(ROOT)} and {pyproject.relative_to(ROOT)}")
+    print(f"pinned {version} into {CHART.relative_to(ROOT)} and {PYPROJECT.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
