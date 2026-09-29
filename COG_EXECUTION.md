@@ -297,7 +297,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | merged, #158 |
 | 6 | #125, in part | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | merged, #159 |
 | 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | merged, #162 |
-| 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | in review |
+| 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | in review, #163 |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | not started |
 | 10 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9 | M | not started |
 | 11 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10 | M | not started |
@@ -509,7 +509,7 @@ A pure refactor, so the phase that changes behaviour is reviewed against a known
 - [x] `DurableWorkflowEngine` makes no lifecycle decision itself.
 
 #### Phase 8 — The durability seam and the `none` backend
-**Issue** #101 · **Branch** `feat/cog-durability-none` · **Depends on** Phase 7 · **Size** L · **Status** in review
+**Issue** #101 · **Branch** `feat/cog-durability-none` · **Depends on** Phase 7 · **Size** L · **Status** in review, #163
 
 The runner, with the durability engine plugged in or absent — and `none`, the absent case, ships first.
 
@@ -526,10 +526,10 @@ The runner, with the durability engine plugged in or absent — and `none`, the 
 *Dev and CI* — `make op OP=<name>` at level 1 runs a fake Op in process and prints its Track; Op definitions live in `dev/ops/<name>.yaml`, fake Cogs under `dev/cogs/` (`echo`, `needs-review`, `fails`, `slow`, `spender`); both suites run in `test-execution.yaml`. *Docs* — a new `docs/cog-execution/runs.md` opening with the backends table; the root `README.md` gains *Known limitations*, starting with "`none` does not survive a restart".
 
 *Acceptance*
-- [ ] A multi-step Op with a Gate completes on `none` through the runner.
-- [ ] After a restart, every run `none` had in flight is `interrupted` on the Track, and none of them resumes.
-- [ ] No caller imports a concrete backend; the configuration value is the only switch.
-- [ ] A test proves all backends call the same step functions, by spying on `STEP_FUNCTIONS` under each, and none reimplements the driver.
+- [x] A multi-step Op with a Gate completes on `none` through the runner.
+- [x] After a restart, every run `none` had in flight is `interrupted` on the Track, and none of them resumes.
+- [x] No caller imports a concrete backend; the configuration value is the only switch.
+- [x] A test proves all backends call the same step functions, by spying on `STEP_FUNCTIONS` under each, and none reimplements the driver.
 
 #### Phase 9 — Agent location: `local` first, `remote` behind the same switch
 **Issue** #109 · **Branch** `feat/cog-agent-location` · **Depends on** Phase 8 · **Size** M
