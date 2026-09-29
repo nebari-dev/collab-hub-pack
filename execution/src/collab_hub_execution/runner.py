@@ -1,19 +1,28 @@
-"""The lifecycle runner: a Cog's lifecycle, written once, as plain step functions.
+"""The lifecycle runner: a Cog's lifecycle, written once, as step functions and the driver that runs them.
 
 ADR-0002 D1 puts the lifecycle in one component that every durability backend
-schedules. This is that component. A run advances step by step through the
-functions registered in ``STEP_FUNCTIONS``. An attempt resolves its identity,
-materializes its worker, interacts and reads the envelope, and then tears the
-worker down, whatever happened: the worker is one-shot. Only then does the step
-end — failed if it produced no result, or through its Gate, which completes it
-or escalates it. Budgets and Track recording surround them. Each function
+schedules. This is that component, in two parts.
+
+The *step functions*, registered in ``STEP_FUNCTIONS``, are the units of work.
+An attempt resolves its identity, materializes its worker, interacts and reads
+the envelope, then tears the worker down whatever happened, since the worker is
+one-shot. Only then does the step end: failed if it produced no result,
+otherwise through its Gate, which completes it or escalates it. Each function
 moves the state machines of ``states`` by asking them for a transition and
 writing the records it returns; none assigns a state itself.
 
-A durability backend decides only how these functions are scheduled and whether
-progress between them is checkpointed. Until one exists, ``DurableWorkflowEngine``
-calls them in process and recovers from the Track, which Phase 8 of the plan
-removes.
+The *driver*, ``_advance`` with ``_run_attempt``, sequences them, and is
+lifecycle logic too: it picks the run up and completes it, skips the steps
+already completed, completes an approved escalation instead of running the step
+again, checks and consumes the budget at step boundaries, and maps a failure to
+the attempt's outcome and its unknown usage.
+
+There is one driver and it is shared: a durability backend reuses it, deciding
+only how each step function is scheduled and whether progress between them is
+checkpointed, and never copies it. How the driver hands the step functions to a
+backend, and the test that holds every backend to the same ones, are Phase 8's
+(#101). Until then ``DurableWorkflowEngine`` runs the driver in process and
+recovers from the Track, which Phase 8 also removes.
 """
 
 from __future__ import annotations
@@ -157,9 +166,11 @@ and ``complete`` or ``escalate`` when it produced a result, ``fail`` when it did
 not. Outside an attempt, ``complete_approved`` completes a step from an approved
 escalation, and ``stop_for_budget`` stops a run at a boundary.
 
-The lifecycle is these and nothing else: a durability backend schedules them and
-contains no lifecycle logic of its own, and a test holds every backend to calling
-the same ones.
+They are the units a durability backend schedules and checkpoints. The order
+they run in, and the decisions between them, are the driver's (``_advance``),
+which every backend reuses rather than reimplements. A test that holds every
+backend to calling these same functions arrives with the first backend
+(Phase 8, #101); for now ``test_lifecycle_runner.py`` holds the one engine to them.
 """
 
 
@@ -474,7 +485,7 @@ class LifecycleRunner:
                 try:
                     tracker.check()
                 except BudgetExceeded as exc:
-                    return self.stop_for_budget(run, step.name, exc)
+                    return self.stop_for_budget(now, run, step.name, exc)
             attempt = self.resolve(now, op, step, run, retries)
             self._run_attempt(now, op, attempt)
             if attempt.teardown_error is not None or attempt.outcome[0] != "ok":
@@ -495,14 +506,14 @@ class LifecycleRunner:
                 return self.escalate(now, op, run, attempt, envelope, why)
             self.complete(now, op, attempt, envelope)
             if budget_stop is not None:
-                return self.stop_for_budget(run, step.name, budget_stop)
+                return self.stop_for_budget(now, run, step.name, budget_stop)
         if tracker is not None and spent_on is not None:
             # The end of a run is a boundary too: one that overspent on its last step
             # stops here instead of completing over its budget.
             try:
                 tracker.check()
             except BudgetExceeded as exc:
-                return self.stop_for_budget(run, spent_on, exc)
+                return self.stop_for_budget(now, run, spent_on, exc)
         run = now.record(run.complete())
         return run.state
 
@@ -538,7 +549,7 @@ class LifecycleRunner:
             attempt.outcome = ("broken", type(exc).__name__)
         finally:
             if attempt.worker is not None:
-                attempt.teardown_error = self.teardown(op.run_id, attempt)
+                attempt.teardown_error = self.teardown(now, attempt)
 
     # --- the step functions ---------------------------------------------------------------------
 
@@ -604,7 +615,7 @@ class LifecycleRunner:
             raise not_json
 
     @step_function
-    def teardown(self, run_id: str, attempt: Attempt) -> str | None:
+    def teardown(self, now: _Pass, attempt: Attempt) -> str | None:
         """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
 
         A worker that answered — with an envelope, ok or not — goes IDLE and
@@ -616,15 +627,15 @@ class LifecycleRunner:
         cog_worker = attempt.cog_worker
         tearing_down = attempt.answered and cog_worker is not None
         if tearing_down:
-            cog_worker = self._record(run_id, cog_worker.envelope_returned())
-            cog_worker = self._record(run_id, cog_worker.tear_down(reason="one_shot"))
+            cog_worker = now.record(cog_worker.envelope_returned())
+            cog_worker = now.record(cog_worker.tear_down(reason="one_shot"))
         elif cog_worker is not None:
-            cog_worker = self._record(run_id, cog_worker.fail(error=str(attempt.outcome[1])))
+            cog_worker = now.record(cog_worker.fail(error=str(attempt.outcome[1])))
         try:
             self.executor.teardown(attempt.worker)
         except Exception as exc:  # noqa: BLE001 - never crash on cleanup
             if tearing_down:
-                self._record(run_id, cog_worker.fail(error=type(exc).__name__))
+                now.record(cog_worker.fail(error=type(exc).__name__))
             return type(exc).__name__
         return None
 
@@ -693,6 +704,10 @@ class LifecycleRunner:
             now.append("step_failed", self._step_failed(step, number, key, detail, attempt.failure_reason))
             run = now.record(run.fail(step=step.name, error=detail, reason=_bound(attempt.failure_reason)))
             return run.state
+        if kind != "error":
+            # Only an attempt without a result ends here: one that broke, answered ok: false,
+            # or whose worker could not be torn down. An ok answer goes through the Gate instead.
+            raise ValueError(f"fail() is for an attempt without a result; step {step.name!r} answered {kind!r}")
         # The worker answered, and said no. The code is what a client acts
         # on, so it is the event's error, verbatim; the detail is the reason.
         now.append("step_failed", self._step_failed(step, number, key, detail.error.code, detail.error.detail,
@@ -712,9 +727,9 @@ class LifecycleRunner:
                                                           approved.get("usage"), result, approved["escalation"]))
 
     @step_function
-    def stop_for_budget(self, run: Run, step: str, exc: BudgetExceeded) -> RunState:
+    def stop_for_budget(self, now: _Pass, run: Run, step: str, exc: BudgetExceeded) -> RunState:
         """Stop the run at a boundary its budget has passed; a duration stop keeps the Track's `timed_out` event."""
-        run = self._record(run.run_id, run.exhaust_budget(dimension=exc.dimension, step=step, reason=str(exc)))
+        run = now.record(run.exhaust_budget(dimension=exc.dimension, step=step, reason=str(exc)))
         return run.state
 
     def decide(

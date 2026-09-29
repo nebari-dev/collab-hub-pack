@@ -41,8 +41,12 @@ transitions and writes the records they return; none assigns a state itself.
 
 `DurableWorkflowEngine` is the `WorkflowEngine` contract in front of it, and
 makes no lifecycle decision of its own: every method delegates to its runner.
-A durability backend (ADR-0002 D1) will schedule the same step functions; until
-then the engine calls them in process. The Op and the seam's types —
+The step functions are sequenced by the runner's driver (`_advance`), which is
+lifecycle logic too: it picks the run up and completes it, skips completed
+steps, completes an approved escalation, checks and consumes the budget at step
+boundaries, and maps a failure to the attempt's outcome. A durability backend
+(ADR-0002 D1) will reuse that one driver and schedule the step functions it
+calls, never copying it; until then the engine runs it in process. The Op and the seam's types —
 `OpDefinition`, `OpStep`, `CogWorker`, `CogExecutor`, `InMemoryCogExecutor` —
 are in `collab_hub_execution.ops`.
 

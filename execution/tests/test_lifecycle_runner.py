@@ -104,3 +104,48 @@ def test_no_step_function_assigns_a_state_itself():
         if isinstance(target, ast.Attribute) and target.attr == "state"
     ]
     assert assigned == []
+
+
+def test_every_write_while_a_run_advances_reaches_the_pass_history():
+    # Worker records from teardown, and a budget stop, included: a history that silently
+    # lacks events would be a trap for anything that reads it later in the pass.
+    class FailingTeardown(InMemoryCogExecutor):
+        def teardown(self, worker):
+            raise ConnectionError("delete failed")
+
+    bypassed: list[str] = []
+
+    def watched(engine: DurableWorkflowEngine) -> DurableWorkflowEngine:
+        runner = engine.runner
+        real = runner._append
+
+        def append(run_id, event_type, payload, into=None):
+            if into is None:
+                bypassed.append(event_type)
+            return real(run_id, event_type, payload, into)
+
+        runner._append = append
+        return engine
+
+    spender = {"c": lambda entry, value: ResultEnvelope.success(value, usage={"tokens": 10})}
+    watched(DurableWorkflowEngine(executor=InMemoryCogExecutor(spender), track=InMemoryTrackStore(),
+                                  budget=RunBudget(max_tokens=5))).submit(
+        OpDefinition("spent", (OpStep("a", "c", "run"), OpStep("b", "c", "run"))))
+    watched(DurableWorkflowEngine(executor=FailingTeardown({"c": lambda entry, value: value}),
+                                  track=InMemoryTrackStore())).submit(OpDefinition("leak", (OpStep("s", "c", "run"),)))
+    gated = watched(DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda entry, value: value}),
+                                          track=InMemoryTrackStore()))
+    gated.submit(OpDefinition("gated", (OpStep("s", "c", "run", gate=Gate(escalate="always")),)))
+    gated.decide("gated", escalation=gated.open_escalation("gated")["escalation"], actor="alice", outcome="approve")
+    assert bypassed == []
+
+
+def test_fail_refuses_an_attempt_that_produced_a_result():
+    # fail() is a step function a backend can call; its precondition is stated, not an AttributeError.
+    from collab_hub_execution.runner import Attempt, _Pass
+
+    runner = LifecycleRunner(executor=InMemoryCogExecutor({}), track=InMemoryTrackStore())
+    attempt = Attempt(step=OpStep("s", "c", "run"), number=0, instance="s:0", key="r:s:0",
+                      outcome=("ok", ResultEnvelope.success({"answer": 1})))
+    with pytest.raises(ValueError, match="fail\\(\\) is for an attempt without a result"):
+        runner.fail(_Pass(runner, "r", ()), None, attempt)
