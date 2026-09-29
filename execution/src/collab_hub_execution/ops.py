@@ -8,12 +8,13 @@ them.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .envelope import ResultEnvelope
 from .gates import Gate
+from .states import RunState
 
 # Distinguishes "no external signal" (a fresh submit/retry) from a signal whose
 # value is genuinely None (a human resuming a Gate with an empty decision). None
@@ -80,6 +81,35 @@ class CogExecutor(Protocol):
 
     def teardown(self, worker: CogWorker) -> None:
         """Release a materialized worker."""
+
+
+class WorkflowEngine(Protocol):
+    """Experimental boundary used by callers, independent of how runs are scheduled.
+
+    ``LifecycleRunner`` implements it; the durability backend behind it is chosen
+    by configuration.
+    """
+
+    def submit(self, op: OpDefinition) -> RunState:
+        """Start an Op; submitting one already started returns its state and never resumes it."""
+
+    def open_escalation(self, run_id: str) -> Mapping[str, Any] | None:
+        """What a run waiting at a Gate waits on, or ``None``: what ``decide`` answers."""
+
+    def decide(
+        self, run_id: str, *, escalation: str | None, actor: str, outcome: str,
+        findings: Sequence[Any] | None = (),
+    ) -> RunState:
+        """Answer the escalation a run waits on: approve, reject or send back."""
+
+    def retry(self, run_id: str) -> RunState:
+        """Run an ended run again: an interrupted attempt continues under its key, a failed one starts anew."""
+
+    def cancel(self, run_id: str, *, actor: str) -> RunState:
+        """End a run ``cancelled``, recording who cancelled it."""
+
+    def observe(self, run_id: str) -> RunState | None:
+        """Return the run's state reconstructed from the Track; ``None`` if never submitted."""
 
 
 class InMemoryCogExecutor(CogExecutor):

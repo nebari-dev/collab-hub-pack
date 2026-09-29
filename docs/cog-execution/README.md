@@ -22,6 +22,8 @@ Contents:
   by reference, the three stores, and how a Track written before v1 is read.
 - [States](states.md) — the four state machines (install, worker, step
   attempt, run): every state, every transition, and what each records.
+- [Running Ops](runs.md) — the durability backends, what each run status
+  means, what a restart does under `none`, and cancelling a run.
 - [Sensitivity](sensitivity.md) — how data-sensitivity labels are born,
   propagated, and enforced (the basis of ADR-0001 D10).
 

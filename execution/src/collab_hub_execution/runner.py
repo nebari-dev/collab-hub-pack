@@ -17,12 +17,12 @@ already completed, completes an approved escalation instead of running the step
 again, checks and consumes the budget at step boundaries, and maps a failure to
 the attempt's outcome and its unknown usage.
 
-There is one driver and it is shared: a durability backend reuses it, deciding
-only how each step function is scheduled and whether progress between them is
-checkpointed, and never copies it. How the driver hands the step functions to a
-backend, and the test that holds every backend to the same ones, are Phase 8's
-(#101). Until then ``DurableWorkflowEngine`` runs the driver in process and
-recovers from the Track, which Phase 8 also removes.
+There is one driver and it is shared: every durability backend (``backends/``)
+is handed each step function through ``DurabilityBackend.run_step`` and decides
+only how it is scheduled and whether what it returned is checkpointed, never
+what runs next. ``none``, the only backend built, calls them in process and
+keeps nothing, so ``start()`` records a run a stopped host left unfinished as
+``interrupted`` rather than resuming it (ADR-0002 D2).
 """
 
 from __future__ import annotations
@@ -30,10 +30,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
+from .backends import DurabilityBackend, select_backend
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
@@ -43,6 +46,7 @@ from .ops import (
     CogWorker,
     OpDefinition,
     OpStep,
+    WorkflowEngine,
     _canonical_op,
     _deserialize_op,
     _serialize_op,
@@ -168,9 +172,8 @@ escalation, and ``stop_for_budget`` stops a run at a boundary.
 
 They are the units a durability backend schedules and checkpoints. The order
 they run in, and the decisions between them, are the driver's (``_advance``),
-which every backend reuses rather than reimplements. A test that holds every
-backend to calling these same functions arrives with the first backend
-(Phase 8, #101); for now ``test_lifecycle_runner.py`` holds the one engine to them.
+which every backend reuses rather than reimplements; ``test_durability_backends.py``
+holds every backend to being handed exactly these.
 """
 
 
@@ -199,6 +202,9 @@ class Attempt:
     outcome: tuple[str, Any] = ("broken", "Unknown")
     failure_reason: str | None = None
     teardown_error: str | None = None
+    released: bool = False
+    """Whoever tears the worker down has claimed it: the teardown step, or ``cancel()`` from another
+    thread. Set under the runner's lock, so the worker is torn down once."""
 
 
 class _Pass:
@@ -208,10 +214,12 @@ class _Pass:
     reads what the ones before it wrote without reading the Track again.
     """
 
-    def __init__(self, runner: LifecycleRunner, run_id: str, events: Sequence[TrackEvent]) -> None:
+    def __init__(self, runner: LifecycleRunner, run_id: str, events: Sequence[TrackEvent],
+                 advancing: _Advancing | None = None) -> None:
         self.runner = runner
         self.run_id = run_id
         self.history = list(events)
+        self.advancing = advancing or _Advancing()
 
     def append(self, event_type: str, payload: Mapping[str, Any]) -> None:
         self.runner._append(self.run_id, event_type, payload, self.history)
@@ -220,11 +228,24 @@ class _Pass:
         return self.runner._record(self.run_id, transition, self.history)
 
 
-class LifecycleRunner:
+@dataclass
+class _Advancing:
+    """A run this host is advancing right now, and whether someone asked to cancel it."""
+
+    attempt: Attempt | None = None
+    cancelled_by: str | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+class LifecycleRunner(WorkflowEngine):
     """Runs Ops step by step through the step functions, recording every move on the Track.
 
     Experimental: interfaces may change. ``submit()``, ``decide()`` and ``retry()``
-    run synchronously until the run completes, fails, or waits at a Gate.
+    run synchronously until the run completes, fails, waits at a Gate, or is
+    cancelled. The ``backend`` setting (``none``, ``dbos`` or ``temporal``) chooses
+    how the step functions are scheduled; only ``none`` is built, and it keeps
+    nothing across a restart: ``start()`` records every run a stopped host left
+    unfinished as ``interrupted``, and a person retries it.
 
     Every change of a run's or a worker's state is a transition of its machine
     (``states/``): the runner asks, and writes the records the machine returns.
@@ -238,12 +259,17 @@ class LifecycleRunner:
         budget: RunBudget | None = None,
         max_revisions: int | None = None,
         payload_inline_max_bytes: int = PAYLOAD_INLINE_MAX_BYTES,
+        backend: str = "none",
     ) -> None:
         self.executor = executor
         self.track = track
         self.budget = budget
         self.max_revisions = max_revisions
         self.payload_inline_max_bytes = payload_inline_max_bytes
+        # The configuration value is the only switch; a backend not built yet is refused here.
+        self.backend: DurabilityBackend = select_backend(backend)
+        self._lock = threading.Lock()
+        self._advancing: dict[str, _Advancing] = {}
 
     def _append(self, run_id: str, event_type: str, payload: Mapping[str, Any],
                 into: list[TrackEvent] | None = None) -> TrackEvent:
@@ -400,6 +426,89 @@ class LifecycleRunner:
         events = self._read(run_id)
         return self._open_escalation(events, Run.replay(events))
 
+    # --- the host ------------------------------------------------------------------------------
+
+    def start(self) -> tuple[str, ...]:
+        """What a host does when it starts: under ``none``, end every run left unfinished as ``interrupted``.
+
+        ``none`` keeps nothing across a restart, so a run a stopped host was
+        advancing — running, or waiting at a Gate — can never resume; it is
+        recorded ``interrupted`` rather than left looking alive, and continues only
+        when a person retries it (ADR-0002 D2). A run this host is advancing right
+        now is left alone. Returns the runs it interrupted. A durable backend
+        resumes its runs instead, which Phases 25 and 31 build.
+
+        Every unfinished run on the Track is taken as this host's, the single
+        owner the runner assumes; run pickup by a controller (Phase 10) narrows
+        this to the runs the starting controller picked up.
+        """
+        if self.backend.durable:
+            return ()
+        interrupted = []
+        for run_id in self.track.run_ids():
+            with self._lock:
+                if run_id in self._advancing:
+                    continue
+            run = Run.replay(self._read(run_id))
+            if run is not None and run.state in (RunState.RUNNING, RunState.WAITING_AT_GATE):
+                self._record(run_id, run.host_stopped(backend=self.backend.name))
+                interrupted.append(run_id)
+        return tuple(interrupted)
+
+    def cancel(self, run_id: str, *, actor: str) -> RunState:
+        """End a run ``cancelled``, recording who cancelled it, and tear its worker down.
+
+        A run this host is advancing is cancelled at its next step boundary: the
+        request is recorded against it here, its live worker is torn down now, and
+        the call advancing it records ``cancelled`` and returns — so this returns
+        the state the run is in until then. Any other run that can still be
+        cancelled — submitted, running, or waiting at a Gate — is cancelled at once;
+        an ended run cannot be, and raises ``InvalidTransition``.
+        """
+        if not actor:
+            raise ValueError("a cancellation names its actor")
+        worker = None
+        with self._lock:
+            advancing = self._advancing.get(run_id)
+            if advancing is not None:
+                advancing.cancelled_by = advancing.cancelled_by or actor
+                attempt = advancing.attempt
+                if attempt is not None and attempt.worker is not None and not attempt.released:
+                    attempt.released, worker = True, attempt.worker
+        if advancing is not None:
+            if worker is not None:
+                try:
+                    self.executor.teardown(worker)
+                except Exception:  # noqa: BLE001 - the run ends cancelled whatever the executor says
+                    pass
+            return self.observe(run_id)
+        run = Run.replay(self._read(run_id))
+        if run is None:
+            raise LookupError(f"no run {run_id!r} on the Track")
+        return self._record(run_id, run.cancel(actor=actor)).state
+
+    @contextmanager
+    def _advancing_run(self, run_id: str) -> Iterator[_Advancing]:
+        """Mark a run as advancing in this host for the length of one call, so cancel() and start() see it."""
+        advancing = _Advancing()
+        with self._lock:
+            if run_id in self._advancing:
+                raise RuntimeError(f"run {run_id!r} is already advancing in this host")
+            self._advancing[run_id] = advancing
+        try:
+            yield advancing
+        finally:
+            with self._lock:
+                del self._advancing[run_id]
+            advancing.done.set()
+
+    def _step(self, now: _Pass, name: str, *args: Any) -> Any:
+        """Hand one step function to the backend, which runs it and decides what survives."""
+        return self.backend.run_step(now.run_id, name, getattr(self, name), *args)
+
+    def _cancelled(self, now: _Pass, run: Run) -> RunState:
+        return now.record(run.cancel(actor=now.advancing.cancelled_by)).state
+
     def submit(self, op: OpDefinition) -> RunState:
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
@@ -417,12 +526,12 @@ class LifecycleRunner:
                 # re-drive steps (and repeat side effects). Re-running a failed run
                 # is a deliberate act — call retry().
                 return run.state
-            if run is not None and run.state is RunState.WAITING_AT_GATE:
-                # A run waiting at a Gate resumes only through decide(), which
-                # carries the decision. Re-submitting must not re-invoke the gated
-                # step behind the gate's back with its original input. A decision
-                # already recorded moved the run back to RUNNING, so a crash between
-                # recording it and advancing resumes below, like a mid-step crash.
+            if run is not None and run.state is not RunState.SUBMITTED:
+                # Submitting again never resumes a run (ADR-0002 D2): one waiting at a
+                # Gate resumes through decide(), one another call is advancing keeps
+                # going there, and one a stopped host left running is recorded
+                # `interrupted` by start() and continues only through retry(). Only
+                # a run that was submitted and never picked up is started here.
                 return run.state
         return self._advance(op, (*existing, *written))
 
@@ -459,7 +568,12 @@ class LifecycleRunner:
 
     def _advance(self, op: OpDefinition, events: tuple[TrackEvent, ...] | None = None) -> RunState:
         # The caller passes the Track it has already read, so one call reads it once.
-        now = _Pass(self, op.run_id, self._read(op.run_id) if events is None else events)
+        with self._advancing_run(op.run_id) as advancing:
+            now = _Pass(self, op.run_id, self._read(op.run_id) if events is None else events, advancing)
+            return self._drive(now, op)
+
+    def _drive(self, now: _Pass, op: OpDefinition) -> RunState:
+        """The driver: the order the step functions run in, and every decision between them."""
         run = Run.replay(now.history)
         if run.state is RunState.SUBMITTED:
             run = now.record(run.pickup())
@@ -474,22 +588,29 @@ class LifecycleRunner:
         for step in op.steps:
             if step.name in completed:
                 continue
+            if now.advancing.cancelled_by:
+                return self._cancelled(now, run)
             # The last step this call reaches names the budget stop, if one lands at the end.
             spent_on = step.name
             approved = self._approved(now.history, step.name)
             if approved is not None:
                 # The approver saw this envelope, so it is the step's result; the step does not run again.
-                self.complete_approved(now, step, approved)
+                self._step(now, "complete_approved", now, step, approved)
                 continue
             if tracker is not None:
                 try:
                     tracker.check()
                 except BudgetExceeded as exc:
-                    return self.stop_for_budget(now, run, step.name, exc)
-            attempt = self.resolve(now, op, step, run, retries)
+                    return self._step(now, "stop_for_budget", now, run, step.name, exc)
+            attempt = self._step(now, "resolve", now, op, step, run, retries)
+            with self._lock:
+                now.advancing.attempt = attempt
             self._run_attempt(now, op, attempt)
+            if now.advancing.cancelled_by:
+                # Cancelled while the attempt ran: its worker is torn down, and its result is not kept.
+                return self._cancelled(now, run)
             if attempt.teardown_error is not None or attempt.outcome[0] != "ok":
-                return self.fail(now, run, attempt)
+                return self._step(now, "fail", now, run, attempt)
             budget_stop = None
             if tracker is not None:
                 usage = attempt.usage or {}
@@ -498,22 +619,22 @@ class LifecycleRunner:
                 except BudgetExceeded as exc:
                     budget_stop = exc
             envelope = attempt.outcome[1]
-            verdict, why = self.evaluate_gate(step, envelope)
+            verdict, why = self._step(now, "evaluate_gate", step, envelope)
             if verdict is GateOutcome.ESCALATE:
                 # A budget stop never discards a result that was paid for: the escalation
                 # is recorded, and the stop lands at the next boundary — the end of the
                 # run included — by when no further work has been spent.
-                return self.escalate(now, op, run, attempt, envelope, why)
-            self.complete(now, op, attempt, envelope)
+                return self._step(now, "escalate", now, op, run, attempt, envelope, why)
+            self._step(now, "complete", now, op, attempt, envelope)
             if budget_stop is not None:
-                return self.stop_for_budget(now, run, step.name, budget_stop)
+                return self._step(now, "stop_for_budget", now, run, step.name, budget_stop)
         if tracker is not None and spent_on is not None:
             # The end of a run is a boundary too: one that overspent on its last step
             # stops here instead of completing over its budget.
             try:
                 tracker.check()
             except BudgetExceeded as exc:
-                return self.stop_for_budget(now, run, spent_on, exc)
+                return self._step(now, "stop_for_budget", now, run, spent_on, exc)
         run = now.record(run.complete())
         return run.state
 
@@ -525,9 +646,9 @@ class LifecycleRunner:
         """
         step = attempt.step
         try:
-            self.materialize(now, op, attempt)
-            self.interact(now, attempt)
-            self.read_envelope(now, attempt)
+            self._step(now, "materialize", now, op, attempt)
+            self._step(now, "interact", now, attempt)
+            self._step(now, "read_envelope", now, attempt)
         except UsageUnavailable as exc:
             # Persist unknown accounting so recovery/retry cannot forget it.
             now.append("interaction_usage", {"step": step.name, "attempt": attempt.number, "usage": None})
@@ -549,7 +670,7 @@ class LifecycleRunner:
             attempt.outcome = ("broken", type(exc).__name__)
         finally:
             if attempt.worker is not None:
-                attempt.teardown_error = self.teardown(now, attempt)
+                attempt.teardown_error = self._step(now, "teardown", now, attempt)
 
     # --- the step functions ---------------------------------------------------------------------
 
@@ -623,8 +744,16 @@ class LifecycleRunner:
         `teardown_failed`. One that did not answer has failed: the executor reclaims
         what is left of it, and if that fails the run's `failed` record says so.
         ``TORN_DOWN`` is never recorded, so the runner does not move the worker there.
+        A worker ``cancel()`` already tore down is not torn down again; its machine
+        records why it stopped.
         """
         cog_worker = attempt.cog_worker
+        with self._lock:
+            by_cancel, attempt.released = attempt.released, True
+        if by_cancel:
+            if cog_worker is not None:
+                now.record(cog_worker.fail(error="Cancelled"))
+            return None
         tearing_down = attempt.answered and cog_worker is not None
         if tearing_down:
             cog_worker = now.record(cog_worker.envelope_returned())

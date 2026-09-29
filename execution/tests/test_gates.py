@@ -7,12 +7,12 @@ import pytest
 
 from collab_hub_execution import (
     DEFAULT_APPROVERS,
-    DurableWorkflowEngine,
     EnvelopeInvalid,
     Gate,
     GateOutcome,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     Problem,
@@ -76,7 +76,7 @@ def test_a_run_whose_recorded_gate_is_unknown_can_still_be_decided():
     op = {"run_id": "future", "steps": [{"name": "s", "cog": "c", "entry_point": "run", "input": "draft",
                                          "digest": None, "gate": {"escalate": "sometimes", "approvers": 7}}]}
     track.append(TrackEvent(run_id="future", event_type="op_submitted", payload={"op": op}))
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track)
     # The unknown policy reads as `always`, so the step escalates and can be approved.
     assert engine.submit(OpDefinition("future", (OpStep("s", "c", "run", "draft",
                                                         gate=Gate(escalate="always")),))) is RunState.WAITING_AT_GATE
@@ -102,7 +102,7 @@ def test_a_cog_asking_to_pause_never_pauses_a_run_at_either_boundary():
     # payload by that executor's contract, so `{"pause": true}` is just data, and the
     # run completes rather than waiting. A Cog cannot reach WAITING_AT_GATE.
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: {"pause": True}}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: {"pause": True}}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.COMPLETED
     [completed] = [e for e in track.replay("r") if e.event_type == "step_completed"]
     assert completed.payload["payload"] == {"pause": True}  # the payload, not a pause
@@ -118,7 +118,7 @@ def test_a_cog_asking_to_pause_never_pauses_a_run_at_either_boundary():
 def test_an_error_problem_escalates_through_the_default_gate_without_the_cog_asking():
     track = InMemoryTrackStore()
     cog = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, problems=[ERROR])})
-    engine = DurableWorkflowEngine(executor=cog, track=track)
+    engine = LifecycleRunner(executor=cog, track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run", "draft"),))) is RunState.WAITING_AT_GATE
     escalation = engine.open_escalation("r")
     assert escalation["step"] == "s" and escalation["reason"] == "a problem with severity error"
@@ -150,7 +150,7 @@ class _Engine:
 
     def engine(self, **kwargs):
         executor = InMemoryCogExecutor({"writer": self.writer, "publisher": self.publisher})
-        return DurableWorkflowEngine(executor=executor, track=self.track, **kwargs)
+        return LifecycleRunner(executor=executor, track=self.track, **kwargs)
 
     def open(self):
         return self.engine().open_escalation("r")["escalation"]
@@ -253,7 +253,9 @@ def test_an_approval_survives_a_crash_before_the_step_is_completed_without_runni
     with pytest.raises(Crash):
         op.engine().decide("r", escalation=escalation, actor="alice", outcome="approve")
     assert op.engine().observe("r") is RunState.RUNNING  # the approval is on the Track
-    assert op.engine().submit(op.op) is RunState.COMPLETED
+    host = op.engine()  # the host starts again: the run is interrupted, and its retry completes the step
+    assert host.start() == ("r",)
+    assert host.retry("r") is RunState.COMPLETED
     assert op.calls == [("draft", None), ("publish", None)]
 
 
@@ -297,7 +299,7 @@ def test_findings_may_be_absent():
 def test_the_engine_implements_the_contract_a_caller_codes_against(method):
     # A caller coded against WorkflowEngine — the #103 run API — needs the engine's
     # methods to take and return what the contract says, `decide`'s escalation included.
-    assert inspect.signature(getattr(DurableWorkflowEngine, method)) == \
+    assert inspect.signature(getattr(LifecycleRunner, method)) == \
         inspect.signature(getattr(WorkflowEngine, method))
 
 
@@ -317,7 +319,7 @@ def _paused_before_gates():
 
 
 def test_an_escalation_recorded_before_gates_reads_with_the_shape_callers_expect():
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({}), track=_paused_before_gates())
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({}), track=_paused_before_gates())
     escalation = engine.open_escalation("old")
     assert escalation["escalation"] is None  # it never had an id: a decision names None
     assert escalation["step"] == "s" and escalation["envelope"] is None
@@ -327,7 +329,7 @@ def test_an_escalation_recorded_before_gates_reads_with_the_shape_callers_expect
 def test_an_escalation_recorded_before_gates_has_no_result_to_approve_but_can_be_sent_back():
     track = _paused_before_gates()
     calls = []
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v, signal=None: calls.append(v) or ResultEnvelope.success(v)}),
         track=track,
     )
@@ -349,5 +351,5 @@ def test_a_step_recorded_before_gates_has_the_default_gate():
                                            "digest": None}]},
     }))
     cog = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, problems=[ERROR])})
-    engine = DurableWorkflowEngine(executor=cog, track=track)
+    engine = LifecycleRunner(executor=cog, track=track)
     assert engine.submit(OpDefinition("old", (OpStep("s", "c", "run"),))) is RunState.WAITING_AT_GATE

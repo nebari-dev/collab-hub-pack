@@ -10,10 +10,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     Problem,
@@ -54,7 +54,7 @@ def test_token_budget_survives_restart_and_stops_the_run():
     op = OpDefinition("run-budget", (OpStep("s1", "a", "run", "x"), OpStep("s2", "b", "run", "y")))
 
     def engine():
-        return DurableWorkflowEngine(
+        return LifecycleRunner(
             executor=InMemoryCogExecutor({"a": always_usage, "b": review_then_usage}), track=track, budget=budget,
         )
 
@@ -66,7 +66,7 @@ def test_token_budget_survives_restart_and_stops_the_run():
 
 def test_duration_budget_stops_run_before_any_step_as_timed_out():
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"a": lambda e, v: v}),
         track=track,
         budget=RunBudget(max_duration=timedelta(0)),
@@ -88,7 +88,7 @@ def test_bounded_revise_loop_fails_after_max_revisions():
     op = OpDefinition("run-revise", (OpStep("draft", "writer", "revise", "v0"),))
 
     def engine():
-        return DurableWorkflowEngine(
+        return LifecycleRunner(
             executor=InMemoryCogExecutor({"writer": always_needs_review}), track=track, max_revisions=2,
         )
 
@@ -113,7 +113,7 @@ def test_an_approval_is_never_charged_as_a_revision(max_revisions):
         return _review({"draft": len(signals)})
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track,
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": reviewer}), track=track,
                                    max_revisions=max_revisions)
     op = OpDefinition("run-approve", (OpStep("s", "c", "review", "draft"),))
     assert engine.submit(op) is RunState.WAITING_AT_GATE
@@ -136,7 +136,7 @@ def test_a_rejected_or_cancelled_run_is_refused_a_retry_before_anything_is_read_
                           ("gate_escalated", {"step": "s"}), ending):
         track.append(TrackEvent(run_id="r", event_type=kind, payload=payload))
     before = track.replay("r")
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({}), track=track)
     with pytest.raises(ValueError, match=f"was {state}; nothing to retry"):
         engine.retry("r")
     assert track.replay("r") == before
@@ -160,7 +160,7 @@ def test_a_call_reads_the_track_once_and_advances_on_what_it_read_and_wrote():
     def reviewer(entry, value, *, signal=None):
         return ResultEnvelope.success(value) if signal else _review(value)
 
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": reviewer}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": reviewer}), track=track)
     op = OpDefinition("run-reads", (OpStep("s0", "c", "run"), OpStep("s1", "c", "run", gate=Gate(escalate="never"))))
     assert engine.submit(op) is RunState.WAITING_AT_GATE
     assert track.reads == 1
@@ -175,7 +175,7 @@ def test_step_digest_is_recorded_and_survives_restart():
 
     def engine():
         # A handler that is sent back receives the findings as a keyword `signal`.
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"cog": lambda e, v, signal=None: v}), track=track)
+        return LifecycleRunner(executor=InMemoryCogExecutor({"cog": lambda e, v, signal=None: v}), track=track)
 
     engine().submit(op)
     started = [e for e in track.replay("run-digest") if e.event_type == "step_started"]
@@ -201,7 +201,7 @@ class _FailingMaterializeExecutor:
 
 def test_materialize_failure_is_recorded_durably_not_left_hanging():
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=_FailingMaterializeExecutor(), track=track)
+    engine = LifecycleRunner(executor=_FailingMaterializeExecutor(), track=track)
     status = engine.submit(OpDefinition("run-mat", (OpStep("s", "c", "run"),)))
     assert status is RunState.FAILED
     events = [e.event_type for e in track.replay("run-mat")]
@@ -232,14 +232,14 @@ class _CapturingExecutor:
 def test_engine_passes_a_stable_idempotency_key_and_tears_down_in_finally():
     worker = _CapturingWorker()
     ex = _CapturingExecutor(worker)
-    engine = DurableWorkflowEngine(executor=ex, track=InMemoryTrackStore())
+    engine = LifecycleRunner(executor=ex, track=InMemoryTrackStore())
     engine.submit(OpDefinition("run-key", (OpStep("draft", "c", "run"),)))
     assert worker.keys == ["run-key:draft:0"]
     assert ex.torn == 1
 
 
 def test_duplicate_step_names_are_rejected_at_submit():
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore()
     )
     with pytest.raises(ValueError):
@@ -287,14 +287,17 @@ class _KeyHonoringWorker:
         return self._seen[idempotency_key]
 
 
-def test_crash_recovery_resumes_with_the_same_key_so_the_side_effect_runs_once():
+def test_a_retried_interrupted_run_continues_with_the_same_key_so_the_side_effect_runs_once():
     worker = _KeyHonoringWorker()
-    engine = DurableWorkflowEngine(executor=_SameWorkerExecutor(worker), track=InMemoryTrackStore())
+    track = InMemoryTrackStore()
     op = OpDefinition("run-idem", (OpStep("s", "c", "run"),))
-    with pytest.raises(SystemExit):  # process dies mid-step; run left non-terminal
-        engine.submit(op)
-    assert engine.observe("run-idem") not in (RunState.COMPLETED, RunState.FAILED)
-    assert engine.submit(op) is RunState.COMPLETED  # resume re-drives with the SAME key
+    with pytest.raises(SystemExit):  # the host dies mid-step; the run is left running
+        LifecycleRunner(executor=_SameWorkerExecutor(worker), track=track).submit(op)
+    host = LifecycleRunner(executor=_SameWorkerExecutor(worker), track=track)  # the host starts again
+    assert host.start() == ("run-idem",)
+    assert host.observe("run-idem") is RunState.INTERRUPTED
+    assert host.submit(op) is RunState.INTERRUPTED  # submitting again never resumes it
+    assert host.retry("run-idem") is RunState.COMPLETED  # the attempt continues with the SAME key
     assert worker.side_effects == ["run-idem:s:0"]  # performed exactly once
 
 
@@ -309,7 +312,7 @@ def test_re_submitting_a_failed_run_is_a_no_op_not_a_silent_re_execution():
         raise RuntimeError("boom")
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": fail}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": fail}), track=track)
     op = OpDefinition("run-term", (OpStep("s", "c", "run"),))
     assert engine.submit(op) is RunState.FAILED
     before = len(track.replay("run-term"))
@@ -347,7 +350,7 @@ class _RetryProbeExecutor:
 
 def test_retry_re_drives_a_failed_run_under_a_fresh_key():
     ex = _RetryProbeExecutor()
-    engine = DurableWorkflowEngine(executor=ex, track=InMemoryTrackStore())
+    engine = LifecycleRunner(executor=ex, track=InMemoryTrackStore())
     op = OpDefinition("run-retry", (OpStep("s", "c", "run"),))
     assert engine.submit(op) is RunState.FAILED
     assert engine.retry("run-retry") is RunState.COMPLETED
@@ -356,7 +359,7 @@ def test_retry_re_drives_a_failed_run_under_a_fresh_key():
 
 
 def test_retry_rejects_a_non_terminal_run():
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore())
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore())
     assert engine.submit(OpDefinition("run-waiting", (OpStep("s", "c", "run", gate=SIGN_OFF),))) \
         is RunState.WAITING_AT_GATE
     with pytest.raises(ValueError):
@@ -364,7 +367,7 @@ def test_retry_rejects_a_non_terminal_run():
 
 
 def test_retry_rejects_a_completed_run():
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=InMemoryTrackStore()
     )
     assert engine.submit(OpDefinition("run-ok", (OpStep("s", "c", "run"),))) is RunState.COMPLETED
@@ -385,7 +388,7 @@ def test_re_submitting_a_run_waiting_at_a_gate_does_not_resume_it_behind_the_gat
     track = InMemoryTrackStore()
 
     def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": cog}), track=track)
+        return LifecycleRunner(executor=InMemoryCogExecutor({"c": cog}), track=track)
 
     op = OpDefinition("run-gate", (OpStep("s", "c", "run", "x", gate=SIGN_OFF),))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
@@ -414,7 +417,7 @@ def test_duration_budget_survives_a_crash_after_submission():
             occurred_at=long_ago,
         )
     )
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: v}),
         track=track,
         budget=RunBudget(max_duration=timedelta(minutes=5)),
@@ -443,14 +446,16 @@ def test_send_back_findings_are_durable_across_a_crash_mid_revision():
     track = InMemoryTrackStore()
 
     def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
+        return LifecycleRunner(executor=InMemoryCogExecutor({"c": handler}), track=track)
 
     op = OpDefinition("run-sig", (OpStep("s", "c", "review", "draft-v1"),))
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     with pytest.raises(SystemExit):  # crash while re-running with the findings
         _decide(engine(), "run-sig", "send_back", "cite the source")
-    # Recovery must preserve both input and findings from the Track.
-    assert engine().submit(op) is RunState.COMPLETED
+    # The host starts again: the run is interrupted, and a retry reads both input and findings from the Track.
+    host = engine()
+    assert host.start() == ("run-sig",)
+    assert host.retry("run-sig") is RunState.COMPLETED
     assert seen == [("draft-v1", ["cite the source"]), ("draft-v1", ["cite the source"])]
 
 
@@ -464,7 +469,7 @@ def test_a_send_back_with_no_findings_still_re_runs_the_step_with_a_signal():
         return ResultEnvelope.success({"ok": True})
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": handler}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": handler}), track=track)
     op = OpDefinition("run-none", (OpStep("s", "c", "run", "GATE"),))
     assert engine.submit(op) is RunState.WAITING_AT_GATE
     assert _decide(engine, "run-none", "send_back") is RunState.COMPLETED
@@ -497,11 +502,11 @@ class _KeyCapture:
 
 def test_idempotency_keys_are_injective_across_ids_containing_the_delimiter():
     cap1 = _KeyCapture()
-    DurableWorkflowEngine(executor=cap1, track=InMemoryTrackStore()).submit(
+    LifecycleRunner(executor=cap1, track=InMemoryTrackStore()).submit(
         OpDefinition("a:b", (OpStep("c", "c", "run"),))
     )
     cap2 = _KeyCapture()
-    DurableWorkflowEngine(executor=cap2, track=InMemoryTrackStore()).submit(
+    LifecycleRunner(executor=cap2, track=InMemoryTrackStore()).submit(
         OpDefinition("a", (OpStep("b:c", "c", "run"),))
     )
     # ("a:b", "c") and ("a", "b:c") must not collapse to the same key
@@ -526,7 +531,7 @@ def test_between_steps_status_is_running_not_tearing_down():
 
 def test_a_budget_stop_keeps_an_escalated_result_rather_than_discarding_it():
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v, signal=None: _review({"draft": v}, tokens=60)}),
         track=track,
         budget=RunBudget(max_tokens=50),
@@ -545,7 +550,7 @@ def test_a_budget_stop_keeps_an_escalated_result_rather_than_discarding_it():
 
 
 def test_budget_boundary_is_inclusive_so_exact_max_is_exceeded():
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage={"tokens": 60})}),
         track=InMemoryTrackStore(),
         budget=RunBudget(max_tokens=60),
@@ -569,7 +574,7 @@ class _TeardownFailsExecutor:
 
 def test_teardown_failure_fails_the_run_rather_than_reporting_success():
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=_TeardownFailsExecutor(), track=track)
+    engine = LifecycleRunner(executor=_TeardownFailsExecutor(), track=track)
     status = engine.submit(OpDefinition("run-td", (OpStep("s", "c", "run"),)))
     assert status is RunState.FAILED  # a leaked worker is not success
     events = [e.event_type for e in track.replay("run-td")]
@@ -590,7 +595,7 @@ def test_a_failed_worker_that_cannot_be_reclaimed_is_recorded_on_the_run_not_aro
             return _Broken()
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=_Executor(), track=track)
+    engine = LifecycleRunner(executor=_Executor(), track=track)
     assert engine.submit(OpDefinition("run-lost", (OpStep("s", "c", "run"),))) is RunState.FAILED
     events = track.replay("run-lost")
     assert "teardown_failed" not in [e.event_type for e in events]  # the worker had already failed

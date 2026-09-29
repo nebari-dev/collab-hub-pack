@@ -11,8 +11,8 @@ import os
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     InMemoryCogExecutor,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     PostgresTrackStore,
@@ -75,7 +75,7 @@ def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
     op = OpDefinition("recover", (OpStep("s", "c", "run", {"items": ("a", "b")}),))
     store.append(TrackEvent(run_id=op.run_id, event_type="op_submitted", payload={"op": _serialize_op(op)}))
     calls = []
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda entry, value: calls.append(value) or value}),
         track=store,
     )
@@ -92,7 +92,7 @@ def test_escalation_accounting_survives_postgres_recovery(store):
         return ResultEnvelope.success(value, usage={"tokens": 6}, problems=problems)
 
     def engine():
-        return DurableWorkflowEngine(
+        return LifecycleRunner(
             executor=InMemoryCogExecutor({"c": handler}), track=store, budget=RunBudget(max_tokens=15),
         )
 
@@ -105,7 +105,7 @@ def test_escalation_accounting_survives_postgres_recovery(store):
     second = engine().open_escalation(op.run_id)["escalation"]
     assert engine().decide(op.run_id, escalation=second, actor="alice",
                            outcome="approve") is RunState.BUDGET_EXCEEDED
-    assert engine()._budget_tracker(store.replay(op.run_id)).tokens == 18
+    assert engine().budget_tracker(store.replay(op.run_id)).tokens == 18
 
 
 def test_a_live_stream_never_skips_an_event_that_commits_after_a_later_one(store):

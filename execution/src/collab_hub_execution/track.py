@@ -74,6 +74,12 @@ class TrackStore(Protocol):
     def get_payload(self, ref: str) -> Any:
         """The payload kept under ``ref``; ``KeyError`` when there is none."""
 
+    def run_ids(self) -> tuple[str, ...]:
+        """Every run submitted to this Track, in the order they were submitted.
+
+        What a host reads when it starts, to find the runs it left unfinished.
+        """
+
 
 class OneSubmissionPerRun(ValueError):
     """A second ``op_submitted`` for a run: two callers tried to start it."""
@@ -209,6 +215,15 @@ class InMemoryTrackStore:
         with self._lock:
             return self._payloads[ref]
 
+    def run_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            submitted = [
+                (event.sequence or 0, run_id)
+                for run_id, events in self._events.items()
+                for event in events if event.event_type == "op_submitted"
+            ]
+        return tuple(run_id for _, run_id in sorted(submitted))
+
 
 class SqliteTrackStore:
     """TrackStore on one SQLite file, shared by the processes of one host.
@@ -322,6 +337,13 @@ class SqliteTrackStore:
         if row is None:
             raise KeyError(ref)
         return json.loads(row[0])
+
+    def run_ids(self) -> tuple[str, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM collab_track_events WHERE event_type = 'op_submitted' ORDER BY sequence"
+            ).fetchall()
+        return tuple(row[0] for row in rows)
 
 
 class PostgresTrackStore:
@@ -472,3 +494,11 @@ class PostgresTrackStore:
         if row is None:
             raise KeyError(ref)
         return _column(row, 0, "payload")
+
+    def run_ids(self) -> tuple[str, ...]:
+        # One op_submitted per run, which the partial unique index on run_id enforces and serves.
+        with self.pool.connection() as connection:
+            rows = connection.execute(
+                "SELECT run_id FROM collab_track_events WHERE event_type = 'op_submitted' ORDER BY sequence"
+            ).fetchall()
+        return tuple(_column(row, 0, "run_id") for row in rows)

@@ -12,10 +12,10 @@ import os
 import sys
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     Gate,
     InMemoryTrackStore,
     KubernetesCogExecutor,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     RunBudget,
@@ -39,7 +39,8 @@ def main() -> int:
     )
     track = InMemoryTrackStore()
     # Three interactions of 10 tokens: research, the review, and its revision.
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=35))
+    # The durability backend is configuration: none runs the step functions in this process.
+    engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=35), backend="none")
 
     op = OpDefinition(
         "e2e-run",
