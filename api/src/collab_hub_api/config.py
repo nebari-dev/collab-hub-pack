@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import sys
@@ -998,6 +999,14 @@ appears: set in the environment or the chart, it stops startup; passed to
 instead of silently reading as off.
 """
 
+RETIRED_FEATURE_FLAGS: frozenset[str] = frozenset()
+"""Flags that have been removed but that deployments may still set.
+
+When a flag's feature ships, move its name here from :data:`FEATURE_FLAGS`.
+A retired name is logged and ignored instead of stopping startup, so the chart
+that drops a flag can roll out before every deployment's values drop it.
+"""
+
 _FLAG_VALUE = TypeAdapter(bool)
 
 
@@ -1037,6 +1046,11 @@ class FeaturesConfig(BaseModel):
         flags: dict[str, bool] = {}
         for name, value in data.items():
             flag = _flag_name(str(name))
+            if flag in RETIRED_FEATURE_FLAGS:
+                logging.getLogger(__name__).warning(
+                    "ignoring retired feature flag %r; remove it from this deployment", name
+                )
+                continue
             if flag not in FEATURE_FLAGS:
                 known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
                 raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
@@ -1056,6 +1070,7 @@ class FeaturesConfig(BaseModel):
     def enabled_names(self) -> list[str]:
         """The flags that are on for this deployment, sorted."""
         return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)
+
 
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)

@@ -16,11 +16,11 @@ FEATURE_FLAGS: dict[str, str] = {
 
 Then gate the code path on it. A name that is not declared is refused wherever it appears: set in the environment or the chart, it stops the API at startup, and passed to `enabled()`, it raises. A misspelled flag therefore fails loudly instead of silently reading as off.
 
-Flags are for work in progress: remove the flag, from `FEATURE_FLAGS` and from the code, once the feature ships. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`. Deployments that still set a removed flag fail at startup until their values drop it.
+Flags are for work in progress: once the feature ships, remove the flag from the code and move its name from `FEATURE_FLAGS` to `RETIRED_FEATURE_FLAGS`. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`. A deployment that still sets a retired flag starts with a warning naming it, so the chart that retires a flag can roll out before every deployment's values drop it. A name that was never declared still stops startup.
 
 ## Turning a flag on
 
-With the Helm chart, add the flag to `features` and set it to `true`:
+With the Helm chart, add the flag to `features` and set it to `true`. The chart accepts only lowercase names made of words joined by single underscores, so every name maps to exactly one environment variable:
 
 ```yaml
 features:

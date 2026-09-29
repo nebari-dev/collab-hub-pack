@@ -414,7 +414,7 @@ spec:
             {{- end }}
             {{- end }}
             {{- range $name, $on := .Values.features }}
-            - name: {{ printf "COLLAB_HUB_API__FEATURES__%s" ($name | upper | replace "-" "_") | quote }}
+            - name: {{ printf "COLLAB_HUB_API__FEATURES__%s" ($name | upper) | quote }}
               value: {{ $on | toString | quote }}
             {{- end }}
             {{- with .Values.api.deployment.extraEnv }}

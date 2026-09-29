@@ -161,7 +161,6 @@ def make_router() -> APIRouter:
         the same rule :func:`~..web.operator.operator_context` keeps.
         """
 
-        features = getattr(request.app.state, "features", None)
         return {
             "user": session.user,
             "name": session.name,
@@ -170,7 +169,7 @@ def make_router() -> APIRouter:
             "role": resolve_platform_role(request, session.user),
             "csrf_token": session.csrf,
             "version": _running_version(),
-            "features": features.enabled_names() if features is not None else [],
+            "features": request.app.state.features.enabled_names(),
         }
 
     @router.get("/invitations")

@@ -60,6 +60,15 @@ def test_name_lookup_normalizes_case_and_dashes():
     assert features.enabled(" cogs_ui ") is True
 
 
+def test_a_retired_name_is_ignored_with_a_warning(monkeypatch, caplog):
+    monkeypatch.setattr(config_module, "RETIRED_FEATURE_FLAGS", frozenset({"old_ui"}))
+    features = FeaturesConfig.model_validate({"old_ui": "true", "cogs_ui": "true"})
+    assert features.enabled_names() == ["cogs_ui"]
+    assert "ignoring retired feature flag 'old_ui'" in caplog.text
+    with pytest.raises(KeyError, match="'old_ui' is not registered"):
+        features.enabled("old_ui")
+
+
 def test_flag_arrives_through_the_environment(monkeypatch):
     monkeypatch.setenv(f"{FLAG_ENV_PREFIX}COGS_UI", "true")
     assert Config().features.enabled("cogs_ui") is True
