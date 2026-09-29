@@ -67,14 +67,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -s .next-release ]]; then
-            echo "No releasable commits since the last release; nothing to release."
-            exit 0
+          if [[ -s .next-release ]]; then
+            version="$(cat .next-release)"
+          else
+            # A lineage tag already on this commit means an earlier run released
+            # it and may have stopped before the chart tag or the dispatches:
+            # recover its version and finish instead of treating it as done.
+            lineage="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+            if [[ -z "${lineage}" ]]; then
+              echo "No releasable commits since the last release; nothing to release."
+              exit 0
+            fi
+            version="${lineage#v}"
+            echo "${lineage} already marks this commit; resuming its release."
           fi
-          version="$(cat .next-release)"
           tag="collab-hub-${version}"
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
-            echo "::warning::${tag} already exists; not re-tagging."
+            # Tagged by an earlier run whose dispatches may not have run. Both
+            # are safe to repeat: pack-release skips a release that exists.
+            echo "${tag} already exists; dispatching its build and release again."
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "OpenTeams Release Bot"
