@@ -42,6 +42,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 - **#133** — Phase 3: the four state machines on the state pattern, in `collab_hub_execution.states` — a Cog's install, a worker, a step attempt and a run. The engine moves the run and worker machines and writes the records they return; a run's status is its Track replayed through the run machine, and a Track the machine could not have written is refused. `CogLifecycle` and `RunStatus` are gone: a paused run reports `WAITING_AT_GATE`, a duration stop `BUDGET_EXCEEDED`, and a revise limit of N allows N revisions. [`docs/cog-execution/states.md`](docs/cog-execution/states.md) is the reference, held to the code by a test, and ADR-0002 gains D11.
 - **#134** — Phase 4: every Op step has a Gate, evaluated over the step's envelope, and a Cog can no longer pause a run — `PauseRequest` and `signal()` are gone. An escalation is recorded with its attempt, envelope and approvers under an id minted over both; `decide()` answers it as an actor, approve completing the step with the envelope its approver saw, reject ending the run `REJECTED`, send back re-running the step with the findings, and a decision on a closed escalation refused. The dev S3 frame store moved off MinIO on the way, whose images left quay.io as they had left Docker Hub (#114, #115), to SeaweedFS with the AWS CLI creating its bucket.
 - **#158** — Phase 5: Track event schema v1, versioned on every event. `step_completed` names the Cog, its digest, the binding, the problems, the usage and the Frames behind a result, inline or by reference above a threshold; `step_failed` carries the key, the worker, the code and a bounded message; `gate_escalated` and `gate_decided` carry the escalation id, the actor and the digest of the result decided on. A Track written before v1 reads through `track.upgrade`. A SQLite store joins the in-memory and Postgres ones under one conformance suite, and the hub's tables come from migration 12, which CI asserts. [`docs/cog-execution/track.md`](docs/cog-execution/track.md) is the reference.
+- **#159** — Phase 6: the `collab-hub` CLI under `cli/`, on Typer. `login` signs in the way the desktop does — the realm's `apollo-desktop` client, authorization code with PKCE and a `127.0.0.1` loopback redirect, with `--port` for an SSH forward and `--with-token` for scripts — and `logout` ends the realm session and revokes its refresh token. The session is stored `0600`, sent only to its own hub, renewed before it expires, kept through a realm outage, and ended at the realm when a new sign-in replaces it. `whoami` reads the new `GET /v1/me`; the public `GET /v1/auth/cli` names the issuer and client, so the hub's URL is all a user types. `cog list` and `cog show` read the catalog. CI signs in against the real dev realm at level 3. #125, which asked for a device flow, stays open.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -293,7 +294,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 3 | #130 | State machines for the Cog, the worker, the step attempt and the run, on the state pattern | `feat/cog-state-machines` | 2 | M | merged, #133 |
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | merged, #158 |
-| 6 | #125 | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | in review, #159 |
+| 6 | #125 | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | merged, #159 |
 | 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | not started |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | not started |
@@ -455,7 +456,7 @@ Make the Track answer "what produced this, and who signed it".
 The hub's first client, built first: it needs nothing the phases after it build, and each of them adds its commands to it instead of waiting for a client to exist. Every Cog execution feature is reachable from a terminal over the same REST endpoints Collab uses, which is also how a script, a CI job or an operator drives the hub. It starts with what every other command needs, signing in, and with the one Cog surface the hub already serves, its catalog.
 
 #### Phase 6 — The `collab-hub` CLI: sign in, and list the Cogs the hub offers
-**Issue** #125 · **Branch** `feat/cli-auth` · **Depends on** nothing in this plan · **Size** M · **Status** in review, #159
+**Issue** #125 · **Branch** `feat/cli-auth` · **Depends on** nothing in this plan · **Size** M · **Status** merged as #159
 
 A terminal client for the hub, and the thing every later command needs first: a way to sign in. It is a client, not a second implementation — every command is an HTTP call to the hub's REST API.
 
@@ -477,11 +478,11 @@ A terminal client for the hub, and the thing every later command needs first: a 
 *Docs* — a new `cli/README.md`: installing, signing in, profiles, the catalog commands, output and exit codes. `dev/README.md` gains *Signing in from the CLI* at level 3 and a table of the dev realm's users; the root `README.md` links the CLI from its documentation section; `docs/standalone-deployment.md` says the CLI reuses `apollo-desktop`, which must keep its loopback redirect, and lists the public protection-map entry `GET /v1/auth/cli` needs.
 
 *Acceptance*
-- [ ] `collab-hub login` signs in through the desktop's flow against the dev realm, `whoami` names the signed-in user, and `logout` ends the realm session and leaves nothing on disk.
-- [ ] The stored token is readable only by its owner and is refreshed when it expires.
-- [ ] At level 1 the CLI works against dev auth and says the session is unauthenticated.
-- [ ] `collab-hub cog list` lists every Cog the catalog serves, across pages, as a table and as `--json`.
-- [ ] The CLI imports no hub package, enforced by a test.
+- [x] `collab-hub login` signs in through the desktop's flow against the dev realm, `whoami` names the signed-in user, and `logout` ends the realm session and leaves nothing on disk.
+- [x] The stored token is readable only by its owner and is refreshed when it expires.
+- [x] At level 1 the CLI works against dev auth and says the session is unauthenticated.
+- [x] `collab-hub cog list` lists every Cog the catalog serves, across pages, as a table and as `--json`.
+- [x] The CLI imports no hub package, enforced by a test.
 
 ---
 
