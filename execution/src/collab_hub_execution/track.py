@@ -75,10 +75,20 @@ class TrackStore(Protocol):
         """The payload kept under ``ref``; ``KeyError`` when there is none."""
 
     def run_ids(self) -> tuple[str, ...]:
-        """Every run submitted to this Track, in the order they were submitted.
+        """Every run submitted to this Track, once each, in the order they were submitted.
 
-        What a host reads when it starts, to find the runs it left unfinished.
+        What a host reads when it starts, to find the runs it left unfinished. A run
+        submitted before schema v1 is recorded as ``submitted``, and is listed too.
         """
+
+
+_SUBMITTED = frozenset({"op_submitted", "submitted"})
+"""What submits a run: ``op_submitted`` in schema v1, ``submitted`` before it."""
+
+
+def _once(run_ids: Iterable[str]) -> tuple[str, ...]:
+    """Each run once, where it first appears."""
+    return tuple(dict.fromkeys(run_ids))
 
 
 class OneSubmissionPerRun(ValueError):
@@ -220,9 +230,9 @@ class InMemoryTrackStore:
             submitted = [
                 (event.sequence or 0, run_id)
                 for run_id, events in self._events.items()
-                for event in events if event.event_type == "op_submitted"
+                for event in events if event.event_type in _SUBMITTED
             ]
-        return tuple(run_id for _, run_id in sorted(submitted))
+        return _once(run_id for _, run_id in sorted(submitted))
 
 
 class SqliteTrackStore:
@@ -341,9 +351,10 @@ class SqliteTrackStore:
     def run_ids(self) -> tuple[str, ...]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT run_id FROM collab_track_events WHERE event_type = 'op_submitted' ORDER BY sequence"
+                "SELECT run_id FROM collab_track_events WHERE event_type IN ('op_submitted', 'submitted') "
+                "ORDER BY sequence"
             ).fetchall()
-        return tuple(row[0] for row in rows)
+        return _once(row[0] for row in rows)
 
 
 class PostgresTrackStore:
@@ -496,9 +507,11 @@ class PostgresTrackStore:
         return _column(row, 0, "payload")
 
     def run_ids(self) -> tuple[str, ...]:
-        # One op_submitted per run, which the partial unique index on run_id enforces and serves.
+        # One op_submitted per run, which the partial unique index on run_id enforces; a Track
+        # written before v1 records `submitted` instead.
         with self.pool.connection() as connection:
             rows = connection.execute(
-                "SELECT run_id FROM collab_track_events WHERE event_type = 'op_submitted' ORDER BY sequence"
+                "SELECT run_id FROM collab_track_events WHERE event_type IN ('op_submitted', 'submitted') "
+                "ORDER BY sequence"
             ).fetchall()
-        return tuple(_column(row, 0, "run_id") for row in rows)
+        return _once(_column(row, 0, "run_id") for row in rows)

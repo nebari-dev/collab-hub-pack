@@ -132,7 +132,10 @@ def test_the_runs_on_a_track_are_listed_in_the_order_they_were_submitted(store):
     store.append(_event("op_submitted", run_id="a"))
     store.append(_event("run_picked_up", run_id="b"))
     store.append(_event("step_started", run_id="orphan"))  # never submitted: not a run
-    assert store.run_ids() == ("b", "a")
+    # Submitted before schema v1, where the event was `submitted`: listed too, once, in its place.
+    store.append(TrackEvent(run_id="old", event_type="submitted", payload={}, schema=0))
+    store.append(TrackEvent(run_id="old", event_type="step_started", payload={"step": "s"}, schema=0))
+    assert store.run_ids() == ("b", "a", "old")
 
 
 # --- status from the Track ----------------------------------------------------------------

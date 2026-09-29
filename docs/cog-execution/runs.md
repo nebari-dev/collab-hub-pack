@@ -77,12 +77,27 @@ reason.
 `cancel(run_id, actor=...)` ends a run `cancelled` and records the actor.
 
 - **A run the host is advancing** is cancelled at its next step boundary. Its
-  live worker is torn down at once, so an interaction in flight stops; the call
-  advancing the run then records `cancelled`, and keeps no result from that
-  interaction. `cancel` returns the status the run has until then.
+  live worker is torn down at once, so an interaction in flight stops; a worker
+  still being brought up is torn down before it is invoked. The call advancing
+  the run then records `cancelled`, and keeps no result from an interaction
+  that was in flight. `cancel` returns the status the run has until then.
 - **A run submitted, running on no host, or waiting at a Gate** is cancelled at
   once.
-- **An ended run** cannot be cancelled.
+- **An ended run** cannot be cancelled, and that includes one that ends while
+  the request is on its way: a cancel and a run's end are never both recorded.
+- **A worker that could not be torn down** is not hidden by the cancel: the
+  teardown is tried again, and if that fails too, a `step_failed` with
+  `TeardownFailed` and the executor's error is recorded beside `cancelled`.
+
+## One run, one call at a time
+
+Within a host, every call that moves a run — `submit`, `retry`, `decide`,
+`cancel` of a run nothing is advancing, and `start` — claims the run before it
+reads or writes it, so no two of them move one run at once. A cancel is taken
+only while the driver advances the run, under the same lock the driver holds to
+write a step's result or the run's end, so the cancel lands before one of those
+writes or not at all. A second `submit` of a run another call is moving returns
+its status; a `retry` or `decide` of it is refused; `start` leaves it alone.
 
 ## Trying it
 

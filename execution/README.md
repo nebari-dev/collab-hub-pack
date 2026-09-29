@@ -24,10 +24,18 @@ starts it. See [`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md).
 
 **`cancel(run_id, actor=...)`** ends a run `CANCELLED` and records the actor. A
 run this host is advancing is cancelled at its next step boundary: its live
-worker is torn down at once, and the call advancing it records `cancelled`
-without keeping the result of an interaction that was in flight. A run that is
+worker is torn down at once, a worker still being brought up is torn down
+before it is invoked, and the call advancing it records `cancelled` without
+keeping the result of an interaction that was in flight. A run that is
 submitted, running or waiting at a Gate and not advancing here is cancelled at
-once; an ended run cannot be.
+once; an ended run cannot be, even one that ends while the request is on its
+way. A worker the cancel could not tear down is tried again, and recorded as a
+`step_failed` with `TeardownFailed` beside `cancelled` if that fails too.
+
+Every call that moves a run claims it first, so two calls in one host never
+move one run at once: a second `submit` returns its status, a second `retry` or
+`decide` is refused, and `start()` leaves a claimed run alone. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#one-run-one-call-at-a-time).
 
 Only one host may advance the runs on a Track at a time: `start()` takes every
 unfinished run as its own, and run pickup by a controller (#121) is what lets

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -58,22 +59,62 @@ def test_an_unknown_backend_is_refused():
         LifecycleRunner(executor=InMemoryCogExecutor({}), track=InMemoryTrackStore(), backend="redis")
 
 
+def _backend_imports(path: Path) -> list[str]:
+    """Every import of a concrete backend in one file: a module below ``backends``, or a backend class."""
+    source = path.read_text()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # The API targets a newer Python than this package's floor, whose parser may refuse its
+        # syntax (PEP 701 f-strings on 3.11); the same rule, read line by line.
+        pattern = re.compile(r"^\s*(?:from\s+\S*\bbackends\.\w+|import\s+\S*\bbackends\.\w+|from\s+\S*\bbackends\s+"
+                             r"import\s+.*\b(?!DurabilityBackend\b)\w+Backend\b)")
+        return [line.strip() for line in source.splitlines() if pattern.search(line)]
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and ".backends." in f".{node.module}.":
+            if node.module.split(".")[-1] != "backends":
+                found.append(f"from {node.module}")
+            if any(alias.name.endswith("Backend") and alias.name != "DurabilityBackend" for alias in node.names):
+                found.append(f"imports {[a.name for a in node.names]}")
+    return found
+
+
 def test_no_caller_imports_a_concrete_backend():
     # The configuration value is the only switch: nothing outside backends/ reaches a backend module.
-    roots = [SOURCE, SOURCE.parents[2] / "scripts", SOURCE.parents[2].parent / "api" / "src"]
-    offenders = []
+    repository = SOURCE.parents[2]
+    roots = [SOURCE, repository / "scripts", repository / "api" / "src"]
+    assert all(root.is_dir() for root in roots), roots  # a wrong path would scan nothing and pass
+    offenders, scanned = [], set()
     for root in roots:
         for path in root.rglob("*.py"):
+            scanned.add(root)
             if SOURCE / "backends" in path.parents:
                 continue
-            for node in ast.walk(ast.parse(path.read_text())):
-                if isinstance(node, ast.ImportFrom) and node.module and ".backends." in f".{node.module}.":
-                    if node.module.split(".")[-1] != "backends":
-                        offenders.append(f"{path}: from {node.module}")
-                    if any(alias.name.endswith("Backend") and alias.name != "DurabilityBackend"
-                           for alias in node.names):
-                        offenders.append(f"{path}: imports {[a.name for a in node.names]}")
-    assert offenders == []
+            offenders += [f"{path}: {found}" for found in _backend_imports(path)]
+    assert scanned == set(roots) and offenders == []
+
+
+def test_the_boundary_check_finds_a_concrete_backend_import_either_way(tmp_path):
+    # Both readings of the rule catch the imports it forbids, and pass the ones it allows.
+    for body, caught in (("from collab_hub_execution.backends.none import NoneBackend\n", True),
+                         ("from collab_hub_execution.backends import NoneBackend\n", True),
+                         ("from collab_hub_execution.backends import DurabilityBackend, select_backend\n", False)):
+        path = tmp_path / "caller.py"
+        path.write_text(body)
+        assert bool(_backend_imports(path)) is caught, body
+        path.write_text(body + 'x = f"{\'\\\\\' + \'a\'!r}"\n')  # unparseable before 3.12: the line reading
+        if _parses(path):
+            continue
+        assert bool(_backend_imports(path)) is caught, body
+
+
+def _parses(path: Path) -> bool:
+    try:
+        ast.parse(path.read_text())
+    except SyntaxError:
+        return False
+    return True
 
 
 def test_a_backend_reimplements_no_part_of_the_driver():

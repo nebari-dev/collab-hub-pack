@@ -105,6 +105,17 @@ def test_retrying_an_interrupted_run_continues_the_attempt_in_flight_under_its_k
     assert retry.payload == {"from_status": "interrupted", "attempt": "same"}
 
 
+def test_a_run_submitted_before_schema_v1_and_left_running_is_interrupted_too():
+    from collab_hub_execution import TrackEvent
+
+    track = InMemoryTrackStore()
+    for kind, payload in (("submitted", {}), ("step_started", {"step": "s"})):
+        track.append(TrackEvent(run_id="old", event_type=kind, payload=payload, schema=0))
+    host = _runner(track, _Executor())
+    assert host.start() == ("old",)
+    assert host.observe("old") is RunState.INTERRUPTED
+
+
 def test_a_run_waiting_at_a_gate_when_its_host_stopped_is_interrupted_too():
     # A pause cannot survive a restart on none (decision 3); the run is not left waiting on nothing.
     track = InMemoryTrackStore()
