@@ -28,14 +28,15 @@ Token and cost accounting happens after an interaction and can overshoot.
 ## The lifecycle runner
 
 The lifecycle lives in `LifecycleRunner` (`collab_hub_execution.runner`), as
-plain step functions registered in `STEP_FUNCTIONS`: `resolve` names the step
-attempt and its idempotency key, `materialize` brings up its worker,
-`interact` invokes the entry point, `read_envelope` checks the answer and
-accounts for its usage, `evaluate_gate` asks the step's Gate, and the attempt
-ends in `complete`, `escalate` or `fail`, with `teardown` releasing the worker
-whatever happened; `complete_approved` completes a step from an approved
-escalation, and `stop_for_budget` stops a run at a boundary its budget has
-passed. Each step function moves the state machines below by their
+plain step functions registered in `STEP_FUNCTIONS`, in the order an attempt
+reaches them: `resolve` names the step attempt and its idempotency key,
+`materialize` brings up its worker, `interact` invokes the entry point,
+`read_envelope` checks the answer and accounts for its usage, and `teardown`
+releases the worker, whatever happened, since it is one-shot. Only then does
+the step end: `fail` when it produced no result; otherwise `evaluate_gate` asks
+the step's Gate, which leads to `complete` or `escalate`. Outside an attempt,
+`complete_approved` completes a step from an approved escalation, and
+`stop_for_budget` stops a run at a boundary its budget has passed. Each step function moves the state machines below by their
 transitions and writes the records they return; none assigns a state itself.
 
 `DurableWorkflowEngine` is the `WorkflowEngine` contract in front of it, and

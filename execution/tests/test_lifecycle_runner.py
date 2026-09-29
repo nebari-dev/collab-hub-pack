@@ -27,8 +27,8 @@ SOURCE = Path(__file__).resolve().parents[1] / "src" / "collab_hub_execution"
 
 def test_the_step_functions_are_registered():
     assert list(STEP_FUNCTIONS) == [
-        "resolve", "materialize", "interact", "read_envelope", "evaluate_gate",
-        "complete", "complete_approved", "escalate", "fail", "teardown", "stop_for_budget",
+        "resolve", "materialize", "interact", "read_envelope", "teardown", "evaluate_gate",
+        "complete", "escalate", "fail", "complete_approved", "stop_for_budget",
     ]
     assert all(getattr(LifecycleRunner, name) is function for name, function in STEP_FUNCTIONS.items())
 

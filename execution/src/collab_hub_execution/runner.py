@@ -2,11 +2,13 @@
 
 ADR-0002 D1 puts the lifecycle in one component that every durability backend
 schedules. This is that component. A run advances step by step through the
-functions registered in ``STEP_FUNCTIONS`` — resolve the attempt, materialize its
-worker, interact, read the envelope, evaluate the Gate, then complete, escalate
-or fail the step, and tear the worker down — with budgets and Track recording
-around them. Each function moves the state machines of ``states`` by asking them
-for a transition and writing the records it returns; none assigns a state itself.
+functions registered in ``STEP_FUNCTIONS``. An attempt resolves its identity,
+materializes its worker, interacts and reads the envelope, and then tears the
+worker down, whatever happened: the worker is one-shot. Only then does the step
+end — failed if it produced no result, or through its Gate, which completes it
+or escalates it. Budgets and Track recording surround them. Each function
+moves the state machines of ``states`` by asking them for a transition and
+writing the records it returns; none assigns a state itself.
 
 A durability backend decides only how these functions are scheduled and whether
 progress between them is checkpointed. Until one exists, ``DurableWorkflowEngine``
@@ -147,7 +149,13 @@ def _escalation(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 STEP_FUNCTIONS: dict[str, Callable[..., Any]] = {}
-"""The runner's step functions, by name: a step attempt's in the order it reaches them, then the budget stop.
+"""The runner's step functions, by name, in the order an attempt reaches them.
+
+``resolve``, ``materialize``, ``interact``, ``read_envelope``, then ``teardown``
+of the one-shot worker whatever happened; then the step ends: ``evaluate_gate``
+and ``complete`` or ``escalate`` when it produced a result, ``fail`` when it did
+not. Outside an attempt, ``complete_approved`` completes a step from an approved
+escalation, and ``stop_for_budget`` stops a run at a boundary.
 
 The lifecycle is these and nothing else: a durability backend schedules them and
 contains no lifecycle logic of its own, and a test holds every backend to calling
@@ -596,6 +604,31 @@ class LifecycleRunner:
             raise not_json
 
     @step_function
+    def teardown(self, run_id: str, attempt: Attempt) -> str | None:
+        """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
+
+        A worker that answered — with an envelope, ok or not — goes IDLE and
+        is torn down as a one-shot, and a teardown that fails is its machine's
+        `teardown_failed`. One that did not answer has failed: the executor reclaims
+        what is left of it, and if that fails the run's `failed` record says so.
+        ``TORN_DOWN`` is never recorded, so the runner does not move the worker there.
+        """
+        cog_worker = attempt.cog_worker
+        tearing_down = attempt.answered and cog_worker is not None
+        if tearing_down:
+            cog_worker = self._record(run_id, cog_worker.envelope_returned())
+            cog_worker = self._record(run_id, cog_worker.tear_down(reason="one_shot"))
+        elif cog_worker is not None:
+            cog_worker = self._record(run_id, cog_worker.fail(error=str(attempt.outcome[1])))
+        try:
+            self.executor.teardown(attempt.worker)
+        except Exception as exc:  # noqa: BLE001 - never crash on cleanup
+            if tearing_down:
+                self._record(run_id, cog_worker.fail(error=type(exc).__name__))
+            return type(exc).__name__
+        return None
+
+    @step_function
     def evaluate_gate(self, step: OpStep, envelope: ResultEnvelope) -> tuple[GateOutcome, str | None]:
         """What the step's Gate decides about its envelope, and why."""
         return step.gate.evaluate(envelope)
@@ -606,15 +639,6 @@ class LifecycleRunner:
         result = self._result(op.run_id, attempt.key, envelope.payload, attempt.rendered)
         now.append("step_completed", self._step_completed(attempt.step, attempt.number, envelope, attempt.usage,
                                                           result))
-
-    @step_function
-    def complete_approved(self, now: _Pass, step: OpStep, approved: Mapping[str, Any]) -> None:
-        """Complete a step whose escalated result was approved, from the envelope its approver saw."""
-        envelope = ResultEnvelope.parse(approved["envelope"])
-        kept = approved.get("payload_ref")
-        result = {"payload_ref": kept} if kept else {"payload": envelope.payload}
-        now.append("step_completed", self._step_completed(step, approved.get("attempt", 0), envelope,
-                                                          approved.get("usage"), result, approved["escalation"]))
 
     @step_function
     def escalate(self, now: _Pass, op: OpDefinition, run: Run, attempt: Attempt, envelope: ResultEnvelope,
@@ -679,29 +703,13 @@ class LifecycleRunner:
         return run.state
 
     @step_function
-    def teardown(self, run_id: str, attempt: Attempt) -> str | None:
-        """Tear a step's worker down, moving it through its machine; the executor's error if teardown failed.
-
-        A worker that answered — with an envelope, ok or not — goes IDLE and
-        is torn down as a one-shot, and a teardown that fails is its machine's
-        `teardown_failed`. One that did not answer has failed: the executor reclaims
-        what is left of it, and if that fails the run's `failed` record says so.
-        ``TORN_DOWN`` is never recorded, so the runner does not move the worker there.
-        """
-        cog_worker = attempt.cog_worker
-        tearing_down = attempt.answered and cog_worker is not None
-        if tearing_down:
-            cog_worker = self._record(run_id, cog_worker.envelope_returned())
-            cog_worker = self._record(run_id, cog_worker.tear_down(reason="one_shot"))
-        elif cog_worker is not None:
-            cog_worker = self._record(run_id, cog_worker.fail(error=str(attempt.outcome[1])))
-        try:
-            self.executor.teardown(attempt.worker)
-        except Exception as exc:  # noqa: BLE001 - never crash on cleanup
-            if tearing_down:
-                self._record(run_id, cog_worker.fail(error=type(exc).__name__))
-            return type(exc).__name__
-        return None
+    def complete_approved(self, now: _Pass, step: OpStep, approved: Mapping[str, Any]) -> None:
+        """Complete a step whose escalated result was approved, from the envelope its approver saw."""
+        envelope = ResultEnvelope.parse(approved["envelope"])
+        kept = approved.get("payload_ref")
+        result = {"payload_ref": kept} if kept else {"payload": envelope.payload}
+        now.append("step_completed", self._step_completed(step, approved.get("attempt", 0), envelope,
+                                                          approved.get("usage"), result, approved["escalation"]))
 
     @step_function
     def stop_for_budget(self, run: Run, step: str, exc: BudgetExceeded) -> RunState:
