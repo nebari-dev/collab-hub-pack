@@ -72,6 +72,9 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
 - A [code owner](.github/CODEOWNERS) must approve before merge. Take PRs out of
   draft before requesting code-owner review.
 - Keep the change focused; describe *how* it addresses the issue.
+- Work that lands on `main` before it's ready to expose goes behind a feature
+  flag: declare the flag, gate the code on it, and retire it once the feature
+  ships. [Feature flags](docs/feature-flags.md) covers how.
 - Cog execution changes follow two same-PR rules from
   [ADR-0002](docs/adr/0002-lifecycle-runner-durability-and-placement.md):
   make what you add runnable from [`dev/`](dev/README.md#running-cogs-and-ops)

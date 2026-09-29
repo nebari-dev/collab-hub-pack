@@ -313,6 +313,10 @@ def make_app(config: BaseConfig) -> FastAPI:
                 "member_sources": sorted(single_org.member_sources),
             },
         )
+    # Logged here rather than during config validation, which runs before
+    # logging is configured.
+    for flag in config.features.retired_names():
+        logger.warning("feature_flag_retired_ignored", extra={"flag": flag})
     mcp = create_mcp_server(frames_store, active_store=active_frame_store)
     mcp_app = mcp.streamable_http_app()
     # MCP traffic authenticates through the same get_auth_context, which

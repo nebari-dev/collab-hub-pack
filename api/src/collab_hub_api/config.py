@@ -1,4 +1,3 @@
-import logging
 import os
 import re
 import sys
@@ -10,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     TypeAdapter,
     ValidationError,
@@ -1003,15 +1003,12 @@ RETIRED_FEATURE_FLAGS: frozenset[str] = frozenset()
 """Flags that have been removed but that deployments may still set.
 
 When a flag's feature ships, move its name here from :data:`FEATURE_FLAGS`.
-A retired name is logged and ignored instead of stopping startup, so the chart
+A retired name is ignored, and the app logs a warning naming it, instead of
+stopping startup, so the chart
 that drops a flag can roll out before every deployment's values drop it.
 """
 
 _FLAG_VALUE = TypeAdapter(bool)
-
-
-def _flag_name(name: str) -> str:
-    return name.strip().lower().replace("-", "_")
 
 
 class FeaturesConfig(BaseModel):
@@ -1038,34 +1035,43 @@ class FeaturesConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    @model_validator(mode="before")
+    _retired: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="wrap")
     @classmethod
-    def _parse_flags(cls, data: Any) -> Any:
+    def _parse_flags(cls, data: Any, handler: Any) -> Any:
         if not isinstance(data, Mapping):
-            return data
+            return handler(data)
         flags: dict[str, bool] = {}
-        for name, value in data.items():
-            flag = _flag_name(str(name))
+        retired: list[str] = []
+        for name in data:
+            # pydantic-settings lowercases environment keys; the chart's
+            # schema admits only lowercase names. Anything else is a typo.
+            flag = str(name)
             if flag in RETIRED_FEATURE_FLAGS:
-                logging.getLogger(__name__).warning(
-                    "ignoring retired feature flag %r; remove it from this deployment", name
-                )
+                retired.append(flag)
                 continue
             if flag not in FEATURE_FLAGS:
                 known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
                 raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
             try:
-                flags[flag] = _FLAG_VALUE.validate_python(value)
+                flags[flag] = _FLAG_VALUE.validate_python(data[name])
             except ValidationError:
-                raise ValueError(f"feature flag {name!r} must be a boolean, got {value!r}") from None
-        return flags
+                # Name only the flag: Config hides input values in errors.
+                raise ValueError(f"feature flag {name!r} must be a boolean") from None
+        features = handler(flags)
+        features._retired = sorted(retired)
+        return features
 
     def enabled(self, name: str) -> bool:
         """Whether the named flag is on for this deployment. An unregistered name raises ``KeyError``."""
-        flag = _flag_name(name)
-        if flag not in FEATURE_FLAGS:
+        if name not in FEATURE_FLAGS:
             raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
-        return bool((self.__pydantic_extra__ or {}).get(flag, False))
+        return bool((self.__pydantic_extra__ or {}).get(name, False))
+
+    def retired_names(self) -> list[str]:
+        """The retired flags this deployment still sets, sorted. The app factory logs them."""
+        return list(self._retired)
 
     def enabled_names(self) -> list[str]:
         """The flags that are on for this deployment, sorted."""
