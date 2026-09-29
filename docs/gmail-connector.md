@@ -53,11 +53,37 @@ Reads return bounded normalized text. MIME attachments are not returned;
 alternative exists. The response reports `body_format` (`plain_text`, `html`,
 `multipart`, or `empty`) plus `has_attachments` and `attachment_count`, so an
 agent can distinguish converted HTML and omitted attachments from an empty
-message body without exposing attachment contents.
+message body without exposing attachment contents. A read leaves the message's
+`snippet` empty whenever it returns body text, because Gmail's snippet is a
+preview of the body's opening and `text` already contains it; with no body
+text (for example an attachment-only message) the snippet is kept. Search hits
+always keep their snippet, since search returns no body.
 
 Search responses include `next_page_token` and `result_size_estimate`. To fetch
 the next page, repeat the same request fields and pass `next_page_token` as
 `page_token`. An empty token means the search is complete.
+
+Each search hit carries at most the first 10 `recipients` (To, then Cc). Every
+hit repeats its full recipient list, so an uncapped company-wide thread would
+dominate the response a model receives. When the cap cuts a list, the hit also
+carries `recipients_omitted`, the number of addresses left out; a complete list
+has no `recipients_omitted` key at all. The message read is never capped: it
+returns every recipient, and never carries `recipients_omitted`. To check
+whether a particular person received a message, use Gmail's `to:` and `cc:`
+operators in the query — Gmail matches them against the full list.
+
+A hit from a message sent to 42 people, for example, carries 10 addresses and:
+
+```json
+"recipients_omitted": 32
+```
+
+Search hits also leave out labels that repeat on nearly every hit without
+informing the answer: Gmail's automatic `IMPORTANT` and `CATEGORY_PERSONAL`
+(the default Primary tab), and any label the request filtered on through
+`label_ids`, which every hit carries by construction. They remain searchable
+(`is:important`, `category:primary`, `label_ids`) and the message read returns
+every label.
 
 Example search and continuation:
 
@@ -81,6 +107,10 @@ Example search and continuation:
       "thread_id": "thread-id",
       "subject": "Connector rollout",
       "sender": "Mark <mark [at] example [dot] com>",
+      "recipients": [
+        "Alice <alice [at] example [dot] com>",
+        "Bob <bob [at] example [dot] com>"
+      ],
       "snippet": "Please verify the remaining rollout items.",
       "label_ids": ["INBOX"]
     }

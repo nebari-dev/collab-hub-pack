@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from .connector_text import sanitize_connector_text
 
@@ -175,10 +175,25 @@ class GmailMessageMetadata(BaseModel):
     thread_id: str = ""
     subject: str = ""
     sender: str = ""
+    # To then Cc. Search hits carry only the first few addresses; the message
+    # read carries all of them.
     recipients: list[str] = Field(default_factory=list)
+    # Addresses cut from ``recipients`` by the search cap (#140). Serialized
+    # only when non-zero, so complete lists -- most mail -- pay nothing for it.
+    recipients_omitted: int = 0
     sent_at: datetime | None = None
     snippet: str = ""
     label_ids: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _drop_zero_recipients_omitted(self, handler):
+        # Removes only this key. A route-wide exclude_none/exclude_defaults
+        # would also drop unrelated fields (and, on the response envelope,
+        # the content_trust notice).
+        data = handler(self)
+        if isinstance(data, dict) and not self.recipients_omitted:
+            data.pop("recipients_omitted", None)
+        return data
 
 
 class GmailSearchResponse(UntrustedConnectorResponse):

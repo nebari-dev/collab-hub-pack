@@ -15,6 +15,15 @@ from .connector_text import sanitize_connector_text
 from .models import GmailMessageMetadata
 
 _MAX_METADATA_CONCURRENCY = 5
+# Recipients kept per search hit. Every hit repeats its full To/Cc list, so a
+# large distribution list dominates the response a model receives (#140).
+# The message read is uncapped, so the full list stays reachable.
+_SEARCH_MAX_RECIPIENTS = 10
+# Labels hidden from search hits (#140). Gmail applies these automatically to
+# most mail, so they repeat on nearly every hit while telling a model little:
+# IMPORTANT is Gmail's own guess, CATEGORY_PERSONAL the default Primary tab.
+# Both stay searchable (is:important, category:primary) and on the message read.
+_SEARCH_HIDDEN_LABELS = frozenset({"IMPORTANT", "CATEGORY_PERSONAL"})
 
 
 class GmailUpstreamError(RuntimeError):
@@ -85,6 +94,9 @@ class GmailClient:
         params.extend(("labelIds", value) for value in label_ids or [] if value.strip())
         if page_token.strip():
             params.append(("pageToken", page_token.strip()))
+        # Labels the caller filtered on are on every hit by construction, so
+        # repeating them on each one tells the caller nothing new.
+        hidden_labels = _SEARCH_HIDDEN_LABELS | {value.strip() for value in label_ids or [] if value.strip()}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             payload = await self._get_json(
                 "/users/me/messages",
@@ -117,7 +129,11 @@ class GmailClient:
                         operation="message metadata",
                         client=client,
                     )
-                return _message_metadata(detail)
+                return _message_metadata(
+                    detail,
+                    max_recipients=_SEARCH_MAX_RECIPIENTS,
+                    hidden_labels=hidden_labels,
+                )
 
             results = list(await asyncio.gather(*(fetch_metadata(message_id) for message_id in message_ids)))
         next_page_token = _string(payload.get("nextPageToken"))
@@ -139,6 +155,11 @@ class GmailClient:
         message = _message_metadata(payload)
         message_payload = payload.get("payload")
         text = _message_text(message_payload)
+        if text:
+            # Gmail's snippet previews the opening of the body, which ``text``
+            # already carries (#140). Keep it only when there is no body text
+            # to repeat, e.g. an attachment-only message.
+            message = message.model_copy(update={"snippet": ""})
         body_format, attachment_count = _message_content_info(message_payload)
         truncated = len(text) > max_chars
         return message, text[:max_chars], truncated, body_format, attachment_count
@@ -204,8 +225,23 @@ def _gmail_query(
     return " ".join(part for part in parts if part)
 
 
-def _message_metadata(payload: dict) -> GmailMessageMetadata:
+def _message_metadata(
+    payload: dict,
+    *,
+    max_recipients: int | None = None,
+    hidden_labels: frozenset[str] = frozenset(),
+) -> GmailMessageMetadata:
+    """Build safe message metadata.
+
+    ``max_recipients`` caps the recipient list (None keeps all) and
+    ``hidden_labels`` are left out of ``label_ids``. The message read passes
+    neither, so it always returns the complete metadata.
+    """
     headers = _headers(payload.get("payload"))
+    recipients = _recipient_headers(headers)
+    # Slice before sanitizing so dropped addresses are never processed; a None
+    # cap slices nothing off.
+    shown = recipients[:max_recipients]
     raw_label_ids = payload.get("labelIds", [])
     if not isinstance(raw_label_ids, list):
         raw_label_ids = []
@@ -214,10 +250,11 @@ def _message_metadata(payload: dict) -> GmailMessageMetadata:
         thread_id=_string(payload.get("threadId")),
         subject=sanitize_connector_text(headers.get("subject", "")),
         sender=sanitize_connector_text(headers.get("from", "")),
-        recipients=[sanitize_connector_text(value) for value in _recipient_headers(headers)],
+        recipients=[sanitize_connector_text(value) for value in shown],
+        recipients_omitted=len(recipients) - len(shown),
         sent_at=_sent_at(payload, headers),
         snippet=sanitize_connector_text(_string(payload.get("snippet"))),
-        label_ids=[value for value in raw_label_ids if isinstance(value, str)],
+        label_ids=[value for value in raw_label_ids if isinstance(value, str) and value not in hidden_labels],
     )
 
 
