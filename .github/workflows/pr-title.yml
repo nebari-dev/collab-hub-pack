@@ -1,8 +1,9 @@
 name: PR Title
 
 # The squash commit that lands on main takes its message from the PR title,
-# and semantic-release derives the version from those messages. This check makes the title machine-parseable before the PR
-# can merge. The format is Conventional Commits 1.0.0:
+# and semantic-release derives the version from those messages. This check
+# makes the title machine-parseable before the PR can merge. The format is
+# Conventional Commits 1.0.0:
 # https://www.conventionalcommits.org/en/v1.0.0/
 # No third-party action: the contract is one regex, asserted here.
 # synchronize is kept so the check reports on every head commit; a required

@@ -5,8 +5,9 @@ The version is a Semantic Versioning 2.0.0 version, pre-release suffix allowed:
 https://semver.org/spec/v2.0.0.html
 
 Called by .github/workflows/semantic-release.yml with the computed version.
-Updates helm/collab-hub/Chart.yaml (version + appVersion) and
-api/pyproject.toml (project version) for the release commit, which is pushed
+Updates helm/collab-hub/Chart.yaml (version + appVersion),
+api/pyproject.toml and cli/pyproject.toml (project version) for the release
+commit, which is pushed
 only as the collab-hub-<version> tag. build-images.yaml and release.yaml run
 from that tag, so the chart, image, and tag all describe the same commit.
 """
@@ -18,7 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "helm" / "collab-hub" / "Chart.yaml"
-PYPROJECT = ROOT / "api" / "pyproject.toml"
+API_PYPROJECT = ROOT / "api" / "pyproject.toml"
+CLI_PYPROJECT = ROOT / "cli" / "pyproject.toml"
 SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
 
@@ -43,9 +45,11 @@ def main() -> None:
 
     sub(CHART, r'^version: ".*"$', f'version: "{version}"', 1)
     sub(CHART, r'^appVersion: ".*"$', f'appVersion: "{version}"', 1)
-    sub(PYPROJECT, r'^version = ".*"$', f'version = "{version}"', 1)
+    for pyproject in (API_PYPROJECT, CLI_PYPROJECT):
+        sub(pyproject, r'^version = ".*"$', f'version = "{version}"', 1)
 
-    print(f"pinned {version} into {CHART.relative_to(ROOT)} and {PYPROJECT.relative_to(ROOT)}")
+    pinned = ", ".join(str(path.relative_to(ROOT)) for path in (CHART, API_PYPROJECT, CLI_PYPROJECT))
+    print(f"pinned {version} into {pinned}")
 
 
 if __name__ == "__main__":

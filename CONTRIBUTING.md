@@ -106,11 +106,12 @@ the intent. A title the check would reject releases nothing, so a fix merged
 under one waits for the next releasing merge.
 
 Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
-The version in `helm/collab-hub/Chart.yaml` and `api/pyproject.toml` on `main`
-is a development placeholder (`0.0.0-dev`, spelled `0.0.0.dev0` in Python),
-and a build from `main` reports it. A release never writes to `main`:
+The chart, the API and the CLI share one version. On `main`, it's a
+development placeholder in `helm/collab-hub/Chart.yaml` (`0.0.0-dev`) and in
+`api/pyproject.toml` and `cli/pyproject.toml` (`0.0.0.dev0`, as Python spells
+it), and a build from `main` reports it. A release never writes to `main`:
 [`semantic-release.yml`](.github/workflows/semantic-release.yml) tags the
-merged commit `v<version>`, pins the version into those two files in a commit
+merged commit `v<version>`, pins the version into those files in a commit
 that exists only under the tag `collab-hub-<version>`, and builds the image
 and the chart from that tag. To work with a released version, check out
 its `collab-hub-<version>` tag.
