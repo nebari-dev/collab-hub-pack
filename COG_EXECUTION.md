@@ -295,7 +295,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | merged, #158 |
 | 6 | #125, in part | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | merged, #159 |
-| 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | not started |
+| 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | in review, #162 |
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | not started |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | not started |
 | 10 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9 | M | not started |
@@ -491,7 +491,7 @@ A terminal client for the hub, and the thing every later command needs first: a 
 Where the two configuration axes are born, each with its first value: `none` for durability, `local` for location. By the end of it the hub's controller runs a fake Cog as a child process, picks runs up from the Track, and answers honestly when it is killed.
 
 #### Phase 7 — Extract the lifecycle runner, no behaviour change
-**Issue** #100 · **Branch** `enh/cog-lifecycle-runner` · **Depends on** Phases 3, 5 · **Size** M
+**Issue** #100 · **Branch** `enh/cog-lifecycle-runner` · **Depends on** Phases 3, 5 · **Size** M · **Status** in review, #162
 
 A pure refactor, so the phase that changes behaviour is reviewed against a known baseline rather than inside a move.
 
@@ -504,8 +504,8 @@ A pure refactor, so the phase that changes behaviour is reviewed against a known
 *Dev and CI* — no new target; every existing test passes unmodified — a PR that has to change an existing test is not a refactor. *Docs* — `execution/README.md` names `LifecycleRunner` as where the lifecycle lives.
 
 *Acceptance*
-- [ ] Every existing execution test passes unmodified.
-- [ ] `DurableWorkflowEngine` makes no lifecycle decision itself.
+- [x] Every existing execution test passes unmodified.
+- [x] `DurableWorkflowEngine` makes no lifecycle decision itself.
 
 #### Phase 8 — The durability seam and the `none` backend
 **Issue** #101 · **Branch** `feat/cog-durability-none` · **Depends on** Phase 7 · **Size** L
