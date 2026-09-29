@@ -254,7 +254,7 @@ def test_gmail_decode_body_returns_empty_text_for_malformed_base64():
     assert _decode_body("aGVsbG8") == "hello"
 
 
-## The following tests are parameterized to run against a variety of mailbox configurations.
+# A fake mailbox shared by the payload, recipient, label and snippet tests below.
 
 SNIPPET = "Reminder: the quarterly all-hands is moved to Thursday at 10am."
 LABELS = ["INBOX", "UNREAD", "IMPORTANT", "CATEGORY_UPDATES", "Label_42"]
@@ -275,19 +275,20 @@ BASE = dict(
     max_chars=12_000,
 )
 
+# Payload-size regression cases for #140. Each is a settings override on BASE
+# plus the largest search response, in bytes, it may produce.
 CASES = {
-    "worst": {},
-    "no-recipients": {"to_count": 0},
-    "no-labels": {"labels": []},
-    "no-snippet": {"snippet": ""},
-    "3-recipients": {"to_count": 3},
-    "20-recipients": {"to_count": 20},
-    "to-and-cc": {"to_count": 50, "cc_count": 100},
-    "many-labels": {"labels": LABELS + ["STARRED", "TRASH", "SPAM"] + [f"Label_{i}" for i in range(10)]},
-    "long-body": {"body": "word " * 12_000},
-    "long-body-max-cap": {"body": "word " * 12_000, "max_chars": 50_000},
-    "html-only": {"html_only": True, "body": "<p>The all-hands moves to Thursday.</p>" * 100},
-    "typical": {"to_count": 3, "limit": 10},
+    # The issue's scenario: a full 25-hit page (the maximum limit), every hit a
+    # company-wide email to 150 people in To, with 5 labels. Before the fix the
+    # search was 182,234 B, 96% of it recipients; with the 10-recipient preview
+    # it is ~19 KB. Fails if the cap is removed or raised past about 15
+    # (each extra recipient adds ~1.2 KB across the page).
+    "worst": ({}, 25_000),
+    # An ordinary search: 10 hits (Apollo's default limit), each to 3 people, so
+    # no list is cut. Before the fix the search was 4,614 B. Complete lists carry
+    # no recipients_omitted, so this must never grow past its pre-fix size.
+    # Fails if every hit grows by more than ~12 B, e.g. a count on every hit.
+    "typical": ({"to_count": 3, "limit": 10}, 4_614),
 }
 
 
@@ -351,17 +352,16 @@ async def _search_and_read(p: dict, tmp_path, monkeypatch) -> tuple[Response, Re
 
 @pytest.mark.parametrize("case", CASES)
 async def test_gmail_payload_breakdown(case, tmp_path, monkeypatch):
-    p = {**BASE, **CASES[case]}  # defaults, overridden by this case
+    overrides, max_search_bytes = CASES[case]
+    p = {**BASE, **overrides}  # defaults, overridden by this case
     search, read = await _search_and_read(p, tmp_path, monkeypatch)
 
+    # Printed so the test doubles as a measurement tool: run with -s to see it.
     hit = search.json()["messages"][0]
     per_hit = {field: len(json.dumps(hit[field])) for field in ("recipients", "label_ids", "snippet")}
     print(f"\n{case:>18}: search={len(search.content):>7}  read={len(read.content):>6}  per-hit={per_hit}")
 
-
-        # Regression guard for #140: uncapped, this search is ~182 KB (25 hits x 150 recipients).
-    if case == "worst":
-        assert len(search.content) < 25_000
+    assert len(search.content) <= max_search_bytes
 
 
 # Recipients each search hit may carry (#140). Kept as a literal rather than
