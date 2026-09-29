@@ -57,6 +57,7 @@ from .orchestration import (
     UsageUnavailable,
     WorkflowEngine,
 )
+from .runner import STEP_FUNCTIONS, LifecycleRunner
 from .states import (
     CogInstall,
     InstallState,
@@ -113,6 +114,8 @@ __all__ = [
     "ModelBinding",
     "ModelCog",
     "DurableWorkflowEngine",
+    "LifecycleRunner",
+    "STEP_FUNCTIONS",
     "InMemoryCogExecutor",
     "ENVELOPE_VERSION",
     "ERROR_CODES",

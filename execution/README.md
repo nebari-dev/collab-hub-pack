@@ -25,6 +25,26 @@ budget epoch; the engine does not offer it until #4 builds epochs.) Budgets are
 not reset by retrying. Duration is checked at step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
+## The lifecycle runner
+
+The lifecycle lives in `LifecycleRunner` (`collab_hub_execution.runner`), as
+plain step functions registered in `STEP_FUNCTIONS`: `resolve` names the step
+attempt and its idempotency key, `materialize` brings up its worker,
+`interact` invokes the entry point, `read_envelope` checks the answer and
+accounts for its usage, `evaluate_gate` asks the step's Gate, and the attempt
+ends in `complete`, `escalate` or `fail`, with `teardown` releasing the worker
+whatever happened; `complete_approved` completes a step from an approved
+escalation, and `stop_for_budget` stops a run at a boundary its budget has
+passed. Each step function moves the state machines below by their
+transitions and writes the records they return; none assigns a state itself.
+
+`DurableWorkflowEngine` is the `WorkflowEngine` contract in front of it, and
+makes no lifecycle decision of its own: every method delegates to its runner.
+A durability backend (ADR-0002 D1) will schedule the same step functions; until
+then the engine calls them in process. The Op and the seam's types —
+`OpDefinition`, `OpStep`, `CogWorker`, `CogExecutor`, `InMemoryCogExecutor` —
+are in `collab_hub_execution.ops`.
+
 ## States
 
 Every state is one of four state machines in `collab_hub_execution.states`,
@@ -33,8 +53,8 @@ built on the state pattern: a Cog's install (`CogInstall`), a worker
 (`Run`). Each state is a class behind its machine's interface; the context
 object delegates every event to its current state, and an event the state does
 not accept raises `InvalidTransition`, naming both. Transitions are pure: an
-event returns a `Transition(after, records)` and the engine writes the records
-to the Track. The states, their transitions and what each records are
+event returns a `Transition(after, records)` and the lifecycle runner writes the
+records to the Track. The states, their transitions and what each records are
 [`docs/cog-execution/states.md`](../docs/cog-execution/states.md), which a test
 holds to the code.
 
