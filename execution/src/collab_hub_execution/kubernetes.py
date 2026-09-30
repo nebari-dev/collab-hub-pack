@@ -38,7 +38,7 @@ from typing import Any, Protocol
 from httpx import ConnectError, ConnectTimeout
 
 from .envelope import CODE_FOR_STATUS, EnvelopeInvalid, ResultEnvelope
-from .orchestration import _NO_SIGNAL
+from .ops import _NO_SIGNAL
 
 _log = logging.getLogger(__name__)
 

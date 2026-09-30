@@ -25,6 +25,31 @@ budget epoch; the engine does not offer it until #4 builds epochs.) Budgets are
 not reset by retrying. Duration is checked at step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
+## The lifecycle runner
+
+The lifecycle lives in `LifecycleRunner` (`collab_hub_execution.runner`), as
+plain step functions registered in `STEP_FUNCTIONS`, in the order an attempt
+reaches them: `resolve` names the step attempt and its idempotency key,
+`materialize` brings up its worker, `interact` invokes the entry point,
+`read_envelope` checks the answer and accounts for its usage, and `teardown`
+releases the worker, whatever happened, since it is one-shot. Only then does
+the step end: `fail` when it produced no result; otherwise `evaluate_gate` asks
+the step's Gate, which leads to `complete` or `escalate`. Outside an attempt,
+`complete_approved` completes a step from an approved escalation, and
+`stop_for_budget` stops a run at a boundary its budget has passed. Each step function moves the state machines below by their
+transitions and writes the records they return; none assigns a state itself.
+
+`DurableWorkflowEngine` is the `WorkflowEngine` contract in front of it, and
+makes no lifecycle decision of its own: every method delegates to its runner.
+The step functions are sequenced by the runner's driver (`_advance`), which is
+lifecycle logic too: it picks the run up and completes it, skips completed
+steps, completes an approved escalation, checks and consumes the budget at step
+boundaries, and maps a failure to the attempt's outcome. A durability backend
+(ADR-0002 D1) will reuse that one driver and schedule the step functions it
+calls, never copying it; until then the engine runs it in process. The Op and the seam's types —
+`OpDefinition`, `OpStep`, `CogWorker`, `CogExecutor`, `InMemoryCogExecutor` —
+are in `collab_hub_execution.ops`.
+
 ## States
 
 Every state is one of four state machines in `collab_hub_execution.states`,
@@ -33,8 +58,8 @@ built on the state pattern: a Cog's install (`CogInstall`), a worker
 (`Run`). Each state is a class behind its machine's interface; the context
 object delegates every event to its current state, and an event the state does
 not accept raises `InvalidTransition`, naming both. Transitions are pure: an
-event returns a `Transition(after, records)` and the engine writes the records
-to the Track. The states, their transitions and what each records are
+event returns a `Transition(after, records)` and the lifecycle runner writes the
+records to the Track. The states, their transitions and what each records are
 [`docs/cog-execution/states.md`](../docs/cog-execution/states.md), which a test
 holds to the code.
 

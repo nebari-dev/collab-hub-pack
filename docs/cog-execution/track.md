@@ -5,8 +5,8 @@ bindings, what came out, which Gates escalated, who decided, and how it ended.
 It is the only source of a run's status (ADR-0002 D3), and it is the
 accountability record — a Gate signature is worth something because the Track
 can say what was signed. This page is the reference for what the Track holds.
-The code is `collab_hub_execution.track` and the engine that writes it,
-`collab_hub_execution.orchestration`.
+The code is `collab_hub_execution.track` and the lifecycle runner that writes
+it, `collab_hub_execution.runner`, which `DurableWorkflowEngine` delegates to.
 
 ## Events
 
