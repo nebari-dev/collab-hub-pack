@@ -10,8 +10,8 @@ name: Semantic Release
 #    v<version> tag and tags the merged commit on main as v<version>. That tag
 #    is the version lineage; nothing else is pushed to main.
 # 2. A release commit is made on top of that commit, pinning the version into
-#    helm/collab-hub/Chart.yaml, api/pyproject.toml and cli/pyproject.toml
-#    (scripts/release/bump-version.py). It is pushed only as the tag
+#    helm/collab-hub/Chart.yaml, api/pyproject.toml, cli/pyproject.toml and
+#    the CLI's __version__ (scripts/release/bump-version.py). It is pushed only as the tag
 #    collab-hub-<version>, the name pack-release gives the release, and never
 #    to a branch.
 # 3. build-images.yaml and release.yaml are dispatched from that tag. The

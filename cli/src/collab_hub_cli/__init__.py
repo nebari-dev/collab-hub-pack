@@ -5,11 +5,6 @@ hub's REST API, and this package imports nothing from the hub's own packages.
 See cli/README.md.
 """
 
-from importlib.metadata import PackageNotFoundError, version
-
-try:
-    # From the installed metadata, so pyproject.toml is the one place the
-    # version is set (scripts/release/bump-version.py pins it per release).
-    __version__ = version("collab-hub-cli")
-except PackageNotFoundError:  # a source tree that was never installed
-    __version__ = "unknown"
+# Pinned per release with pyproject.toml by scripts/release/bump-version.py, so
+# it names the code that is running rather than whichever copy is installed.
+__version__ = "0.0.0.dev0"

@@ -6,9 +6,9 @@ https://semver.org/spec/v2.0.0.html
 
 Called by .github/workflows/semantic-release.yml with the computed version.
 Updates helm/collab-hub/Chart.yaml (version + appVersion),
-api/pyproject.toml and cli/pyproject.toml (project version) for the release
-commit, which is pushed
-only as the collab-hub-<version> tag. build-images.yaml and release.yaml run
+api/pyproject.toml and cli/pyproject.toml (project version) and the CLI's
+__version__ for the release commit, which is pushed only as the
+collab-hub-<version> tag. build-images.yaml and release.yaml run
 from that tag, so the chart, image, and tag all describe the same commit.
 """
 
@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CHART = ROOT / "helm" / "collab-hub" / "Chart.yaml"
 API_PYPROJECT = ROOT / "api" / "pyproject.toml"
 CLI_PYPROJECT = ROOT / "cli" / "pyproject.toml"
+CLI_INIT = ROOT / "cli" / "src" / "collab_hub_cli" / "__init__.py"
 SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?")
 
 
@@ -47,8 +48,9 @@ def main() -> None:
     sub(CHART, r'^appVersion: ".*"$', f'appVersion: "{version}"', 1)
     for pyproject in (API_PYPROJECT, CLI_PYPROJECT):
         sub(pyproject, r'^version = ".*"$', f'version = "{version}"', 1)
+    sub(CLI_INIT, r'^__version__ = ".*"$', f'__version__ = "{version}"', 1)
 
-    pinned = ", ".join(str(path.relative_to(ROOT)) for path in (CHART, API_PYPROJECT, CLI_PYPROJECT))
+    pinned = ", ".join(str(path.relative_to(ROOT)) for path in (CHART, API_PYPROJECT, CLI_PYPROJECT, CLI_INIT))
     print(f"pinned {version} into {pinned}")
 
 
