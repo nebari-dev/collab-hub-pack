@@ -7,13 +7,13 @@ name: Semantic Release
 #   https://semver.org/spec/v2.0.0.html
 #
 # 1. semantic-release names the version from the squash commits since the last
-#    v<version> tag and tags the merged commit on main as v<version>. That tag
-#    is the version lineage; nothing else is pushed to main.
+#    v<version> tag, and the merged commit on main is tagged v<version>. That
+#    tag is the version lineage; nothing else is pushed to main.
 # 2. A release commit is made on top of that commit, pinning the version into
 #    helm/collab-hub/Chart.yaml, api/pyproject.toml, cli/pyproject.toml and
-#    the CLI's __version__ (scripts/release/bump-version.py). It is pushed only as the tag
-#    collab-hub-<version>, the name pack-release gives the release, and never
-#    to a branch.
+#    the CLI's __version__ (scripts/release/bump-version.py). It is pushed
+#    only as the tag collab-hub-<version>, the name pack-release gives the
+#    release, and never to a branch.
 # 3. build-images.yaml and release.yaml are dispatched from that tag. The
 #    shared pack-release reads the version from the tag's Chart.yaml and pins
 #    the chart to the sha-<short> image that build-images builds from the same
@@ -25,46 +25,53 @@ name: Semantic Release
 # this flow for contributors. GITHUB_TOKEN is enough throughout: tags are not
 # branch-protected, and workflow_dispatch is the one event it may start.
 #
-# The repo has no root package.json for this; semantic-release and its plugins
-# are resolved by npx per run and pinned here.
+# Two jobs, so that no npm code runs with write access: `version` runs
+# semantic-release as a read-only dry run with no credentials, and `tag` pushes
+# the tags and dispatches from a fresh checkout, running no npm code.
+# semantic-release and its plugins install with npm ci from
+# scripts/release/semantic-release/package-lock.json.
 on:
   push:
     branches:
       - main
 
 permissions:
-  contents: write # push the two tags
-  actions: write # dispatch build-images.yaml and release.yaml
+  contents: read
 
 concurrency:
   group: semantic-release
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Tag and dispatch the chart release
+  version:
+    name: Name the version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
-      - name: Name the version and tag it on main
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          npx --yes \
-            -p semantic-release@24.2.9 \
-            -p conventional-changelog-conventionalcommits@8.0.0 \
-            -p @semantic-release/exec@6.0.3 \
-            semantic-release
+      # Every package, transitive ones included, comes from the lockfile, so
+      # an upstream release can't change what runs here between merges.
+      - name: Install semantic-release
+        run: npm ci --prefix scripts/release/semantic-release --ignore-scripts --no-audit --no-fund
 
-      - id: release
-        name: Tag the release commit
+      - name: Name the next version
+        # Pointed at the checkout itself, so semantic-release's push-permission
+        # check passes without any credential; the checkout holds every tag.
+        run: |
+          scripts/release/semantic-release/node_modules/.bin/semantic-release \
+            --dry-run --repository-url "file://${GITHUB_WORKSPACE}"
+
+      - id: version
+        name: Resolve the version
         shell: bash
         run: |
           set -euo pipefail
@@ -82,27 +89,57 @@ jobs:
             version="${lineage#v}"
             echo "${lineage} already marks this commit; resuming its release."
           fi
-          tag="collab-hub-${version}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+  tag:
+    name: Tag and dispatch the chart release
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the two tags
+      actions: write # dispatch build-images.yaml and release.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: release
+        name: Tag the merge and the release commit
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The version comes from the job that ran npm code, so it is checked
+          # here rather than trusted.
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Refusing version ${VERSION}." >&2; exit 1; }
+          lineage="v${VERSION}"
+          tag="collab-hub-${VERSION}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify --quiet "refs/tags/${lineage}" >/dev/null; then
+            [[ "$(git rev-parse "refs/tags/${lineage}^{commit}")" == "${GITHUB_SHA}" ]] || { echo "${lineage} already marks another commit." >&2; exit 1; }
+          else
+            git tag "${lineage}" "${GITHUB_SHA}"
+            git push origin "refs/tags/${lineage}"
+          fi
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
             # Tagged by an earlier run whose dispatches may not have run. Both
             # are safe to repeat: pack-release skips a release that exists.
             echo "${tag} already exists; dispatching its build and release again."
-            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "OpenTeams Release Bot"
           git config user.email "releases@openteams.com"
           # Detached, so the release commit exists only under its tag and no
           # branch ref, local or remote, ever moves to it.
-          git checkout -q --detach
-          python3 scripts/release/bump-version.py "${version}"
-          git commit -q -am "chore(release): ${version}"
-          git tag -a "${tag}" -m "collab-hub ${version}"
+          git checkout -q --detach "${GITHUB_SHA}"
+          python3 scripts/release/bump-version.py "${VERSION}"
+          git commit -q -am "chore(release): ${VERSION}"
+          git tag -a "${tag}" -m "collab-hub ${VERSION}"
           git push origin "refs/tags/${tag}"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch the image build and the chart release
-        if: steps.release.outputs.tag != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
