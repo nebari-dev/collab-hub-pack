@@ -53,11 +53,13 @@ Reads return bounded normalized text. MIME attachments are not returned;
 alternative exists. The response reports `body_format` (`plain_text`, `html`,
 `multipart`, or `empty`) plus `has_attachments` and `attachment_count`, so an
 agent can distinguish converted HTML and omitted attachments from an empty
-message body without exposing attachment contents. A read leaves the message's
-`snippet` empty whenever it returns body text, because Gmail's snippet is a
-preview of the body's opening and `text` already contains it; with no body
-text (for example an attachment-only message) the snippet is kept. Search hits
-always keep their snippet, since search returns no body.
+message body without exposing attachment contents. A read omits the message's
+`snippet` only when the returned `text` (after `max_chars`) already
+contains it, allowing only for Gmail's HTML escaping, whitespace and invisible
+formatting characters. Otherwise the snippet is kept: Gmail may build it from a
+part the read did not select, such as an HTML body behind a plain-text stub,
+and `max_chars` may cut the text short. Search hits always keep their snippet,
+since search returns no body.
 
 Search responses include `next_page_token` and `result_size_estimate`. To fetch
 the next page, repeat the same request fields and pass `next_page_token` as
@@ -78,12 +80,13 @@ A hit from a message sent to 42 people, for example, carries 10 addresses and:
 "recipients_omitted": 32
 ```
 
-Search hits also leave out labels that repeat on nearly every hit without
-informing the answer: Gmail's automatic `IMPORTANT` and `CATEGORY_PERSONAL`
-(the default Primary tab), and any label the request filtered on through
-`label_ids`, which every hit carries by construction. They remain searchable
-(`is:important`, `category:primary`, `label_ids`) and the message read returns
-every label.
+A message field left at its empty default is not sent: an empty `snippet`, an
+empty `label_ids` or `recipients` list, a missing `sent_at`, and so on. Its absence
+means exactly that default. Labels are always sent in full, because a missing
+label reads as "not marked": hiding Gmail's `IMPORTANT` from search hits made a
+model answer "not important" for mail that was. The response-level fields are
+always present, including `content_trust`, `security_notice` and
+`next_page_token`, whose empty value means the search is complete.
 
 Example search and continuation:
 
