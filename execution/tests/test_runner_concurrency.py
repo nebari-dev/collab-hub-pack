@@ -108,6 +108,43 @@ def test_a_cancel_during_submission_ends_the_run_cancelled():
     assert _kinds(track, "r")[-1] == "cancelled" and "step_completed" not in _kinds(track, "r")
 
 
+def test_a_second_submission_while_the_first_is_being_written_is_checked_and_answered():
+    track, release = _PausingTrack(), threading.Event()
+    track.pause_on = "op_submitted"
+    runner = LifecycleRunner(executor=InMemoryCogExecutor({"c": _held_until(release)}), track=track)
+    op = OpDefinition("r", (OpStep("s", "c", "run"),))
+    first, submitted = _thread(lambda: runner.submit(op))
+    assert track.reached.wait(5)
+    same, again = _thread(lambda: runner.submit(op))
+    other, different = _thread(lambda: runner.submit(OpDefinition("r", (OpStep("different", "c", "run"),))))
+    same.join(0.3)
+    assert same.is_alive() and other.is_alive()  # nothing is recorded yet, so there is nothing to answer with
+    track.go.set()
+    same.join(5)
+    other.join(5)
+    # A status once the submission is written, not None: submitted, or picked up already.
+    assert again["value"] in (RunState.SUBMITTED, RunState.RUNNING)
+    assert isinstance(different.get("error"), ValueError) and "different Op" in str(different["error"])
+    release.set()
+    first.join(5)
+    assert submitted["value"] is RunState.COMPLETED
+    assert _kinds(track, "r").count("step_started") == 1  # the second submission did not run it again
+
+
+def test_a_second_submission_is_claimed_again_when_the_first_gave_the_run_up_unsubmitted():
+    # The first call claimed the run and let it go without writing it (it raised): the second submits it.
+    runner = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda entry, value: value}),
+                             track=InMemoryTrackStore())
+    holder = runner._acquire("r")
+    op = OpDefinition("r", (OpStep("s", "c", "run"),))
+    second, submitted = _thread(lambda: runner.submit(op))
+    second.join(0.3)
+    assert second.is_alive()
+    runner._release("r", holder)
+    second.join(5)
+    assert submitted["value"] is RunState.COMPLETED
+
+
 def test_a_cancel_arriving_as_a_step_completes_lands_after_that_result_and_ends_the_run():
     track, release = _PausingTrack(), threading.Event()
     track.pause_on = "step_completed"

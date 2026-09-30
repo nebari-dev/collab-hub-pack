@@ -249,6 +249,12 @@ class _Advancing:
     run's end, under ``changed`` — the same condition ``cancel()`` takes — so a
     cancel and a run's end never interleave. ``finished`` is set when the claim
     is released.
+
+    ``_keep`` and ``_finish`` hold ``changed`` across ``backend.run_step`` for the
+    step function that writes the result or the end. Under ``none`` that is a
+    few Track writes, so a cancel waits briefly; a durable backend's
+    ``run_step`` is where it checkpoints, which may be a round trip to its
+    engine, and a ``cancel()`` of the run waits that long.
     """
 
     attempt: Attempt | None = None
@@ -607,11 +613,17 @@ class LifecycleRunner(WorkflowEngine):
         names = [step.name for step in op.steps]
         if len(names) != len(set(names)):
             raise ValueError(f"Op {op.run_id!r} has duplicate step names: {names}")
-        try:
-            advancing = self._acquire(op.run_id)
-        except RunBusy:
-            # Another call in this host is moving it; submitting again never resumes a run.
-            return self.observe(op.run_id)
+        while True:
+            try:
+                advancing = self._acquire(op.run_id)
+                break
+            except RunBusy:
+                # Another call in this host is moving it, and submitting again never resumes a
+                # run. Once that call is advancing it — its submission written — or done, this
+                # submission is checked against the recorded Op and answered with the status.
+                state = self._submitted_elsewhere(op)
+                if state is not None:
+                    return state
         try:
             existing = self._read(op.run_id)
             written: list[TrackEvent] = []
@@ -635,6 +647,25 @@ class LifecycleRunner(WorkflowEngine):
             return self._advance(_Pass(self, op.run_id, (*existing, *written), advancing), op)
         finally:
             self._release(op.run_id, advancing)
+
+    def _submitted_elsewhere(self, op: OpDefinition) -> RunState | None:
+        """A resubmission of a run another call holds: its status, once there is a submission to check.
+
+        Waits only until the holder is advancing the run or has let it go, never for
+        the run itself. ``None`` when the holder let it go without submitting it, so
+        the caller claims it again.
+        """
+        with self._lock:
+            holder = self._advancing.get(op.run_id)
+        if holder is not None:
+            with holder.changed:
+                holder.changed.wait_for(lambda: holder.accepting or holder.finished)
+        existing = self._read(op.run_id)
+        if not existing:
+            return None
+        if _canonical_op(self._submitted_definition(op.run_id, existing)) != _canonical_op(op):
+            raise ValueError(f"run {op.run_id!r} was submitted with a different Op")
+        return Run.replay(existing).state
 
     def retry(self, run_id: str) -> RunState:
         """Re-drive an unsuccessfully-ended run from its first incomplete step.

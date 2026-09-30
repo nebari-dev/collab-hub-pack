@@ -33,8 +33,9 @@ way. A worker the cancel could not tear down is tried again, and recorded as a
 `step_failed` with `TeardownFailed` beside `cancelled` if that fails too.
 
 Every call that moves a run claims it first, so two calls in one host never
-move one run at once: a second `submit` returns its status, a second `retry` or
-`decide` is refused, and `start()` leaves a claimed run alone. See
+move one run at once: a second `submit` waits for the first to write the
+submission, is refused if its Op differs, and otherwise returns the status; a
+second `retry` or `decide` is refused; and `start()` leaves a claimed run alone. See
 [`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#one-run-one-call-at-a-time).
 
 Only one host may advance the runs on a Track at a time: `start()` takes every

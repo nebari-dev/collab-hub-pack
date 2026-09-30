@@ -96,8 +96,10 @@ Within a host, every call that moves a run — `submit`, `retry`, `decide`,
 reads or writes it, so no two of them move one run at once. A cancel is taken
 only while the driver advances the run, under the same lock the driver holds to
 write a step's result or the run's end, so the cancel lands before one of those
-writes or not at all. A second `submit` of a run another call is moving returns
-its status; a `retry` or `decide` of it is refused; `start` leaves it alone.
+writes or not at all. A second `submit` of a run another call is moving waits until
+that call has written the submission, is refused if its Op differs, and returns
+the run's status otherwise; a `retry` or `decide` of it is refused; `start`
+leaves it alone.
 
 ## Trying it
 
