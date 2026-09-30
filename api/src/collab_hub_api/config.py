@@ -1069,10 +1069,12 @@ class FeaturesConfig(BaseModel):
             raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
         return bool((self.__pydantic_extra__ or {}).get(name, False))
 
+    @property
     def retired_names(self) -> list[str]:
         """The retired flags this deployment still sets, sorted. The app factory logs them."""
         return list(self._retired)
 
+    @property
     def enabled_names(self) -> list[str]:
         """The flags that are on for this deployment, sorted."""
         return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)

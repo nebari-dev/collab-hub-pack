@@ -32,14 +32,14 @@ def test_unset_flag_is_off():
 def test_true_values_turn_a_flag_on(value):
     features = FeaturesConfig.model_validate({"cogs_ui": value})
     assert features.enabled("cogs_ui") is True
-    assert features.enabled_names() == ["cogs_ui"]
+    assert features.enabled_names == ["cogs_ui"]
 
 
 @pytest.mark.parametrize("value", [False, 0, "0", "false", "off", "no", "f", "n"])
 def test_false_values_keep_a_flag_off(value):
     features = FeaturesConfig.model_validate({"cogs_ui": value})
     assert features.enabled("cogs_ui") is False
-    assert features.enabled_names() == []
+    assert features.enabled_names == []
 
 
 @pytest.mark.parametrize("value", ["", "enabled", "2", "ture", " on "])
@@ -69,8 +69,8 @@ def test_only_the_registered_spelling_is_accepted(name):
 def test_a_retired_name_is_ignored_and_recorded(monkeypatch):
     monkeypatch.setattr(config_module, "RETIRED_FEATURE_FLAGS", frozenset({"old_ui"}))
     features = FeaturesConfig.model_validate({"old_ui": "true", "cogs_ui": "true"})
-    assert features.enabled_names() == ["cogs_ui"]
-    assert features.retired_names() == ["old_ui"]
+    assert features.enabled_names == ["cogs_ui"]
+    assert features.retired_names == ["old_ui"]
     with pytest.raises(KeyError, match="'old_ui' is not registered"):
         features.enabled("old_ui")
 
@@ -102,7 +102,7 @@ def test_an_unparseable_environment_value_stops_startup(monkeypatch):
 def test_default_config_has_no_flags_on():
     features = Config.parse().features
     assert features.enabled("cogs_ui") is False
-    assert features.enabled_names() == []
+    assert features.enabled_names == []
 
 
 def _app_config(tmp_path, features: dict) -> Config:
