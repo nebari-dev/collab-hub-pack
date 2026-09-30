@@ -85,9 +85,10 @@ helm template helm/collab-hub | kubeconform -strict -ignore-missing-schemas -
 ## PR titles and releases
 
 PRs are squash-merged, and the squash commit takes the PR title as its
-subject and the PR description as its body. Every merge to `main` whose title
-calls for a release is released automatically, so the title decides the
-version.
+subject and the PR description as its body. Leave both as they are in the
+merge dialog: the squash commit is what the release reads. Every merge to
+`main` whose title calls for a release is released automatically, so the
+title decides the version.
 
 Titles follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/):
 `type(scope): description`, for example `fix(connectors): retry a Slack
@@ -108,11 +109,14 @@ straight to 1.0.0. Keep `BREAKING CHANGE:` out of a description unless that is
 the intent. A title the check would reject releases nothing, so a fix merged
 under one waits for the next releasing merge.
 
+Fix forward rather than reverting. GitHub's Revert button titles its PR
+`Revert "<original title>"`, which the check rejects.
+
 Versions follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 The chart, the API and the CLI share one version. On `main`, it's a
 development placeholder in `helm/collab-hub/Chart.yaml` (`0.0.0-dev`) and in
-`api/pyproject.toml` and `cli/pyproject.toml` (`0.0.0.dev0`, as Python spells
-it), and a build from `main` reports it. A release never writes to `main`:
+`api/pyproject.toml`, `cli/pyproject.toml` and the CLI's `__version__`
+(`0.0.0.dev0`, as Python spells it), and a build from `main` reports it. A release never writes to `main`:
 [`semantic-release.yml`](.github/workflows/semantic-release.yml) tags the
 merged commit `v<version>`, pins the version into those files in a commit
 that exists only under the tag `collab-hub-<version>`, and builds the image
