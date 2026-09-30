@@ -178,21 +178,26 @@ class GmailMessageMetadata(BaseModel):
     # To then Cc. Search hits carry only the first few addresses; the message
     # read carries all of them.
     recipients: list[str] = Field(default_factory=list)
-    # Addresses cut from ``recipients`` by the search cap (#140). Serialized
-    # only when non-zero, so complete lists -- most mail -- pay nothing for it.
+    # Addresses cut from ``recipients`` by the search cap (#140). Like every
+    # field left at its default, it is only serialized when set, so complete
+    # lists -- most mail -- pay nothing for it.
     recipients_omitted: int = 0
     sent_at: datetime | None = None
     snippet: str = ""
     label_ids: list[str] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
-    def _drop_zero_recipients_omitted(self, handler):
-        # Removes only this key. A route-wide exclude_none/exclude_defaults
-        # would also drop unrelated fields (and, on the response envelope,
-        # the content_trust notice).
+    def _drop_default_fields(self, handler):
+        # A message field left at its default ("", [], None, 0) says nothing its
+        # absence does not, and messages repeat once per search hit (#140, #137).
+        # Scoped to this model on purpose: a route-wide exclude_defaults would
+        # also drop the response envelope's content_trust and security_notice,
+        # and next_page_token, whose "" is how callers learn a search is done.
         data = handler(self)
-        if isinstance(data, dict) and not self.recipients_omitted:
-            data.pop("recipients_omitted", None)
+        if isinstance(data, dict):
+            for name, field in type(self).model_fields.items():
+                if not field.is_required() and getattr(self, name) == field.get_default(call_default_factory=True):
+                    data.pop(name, None)
         return data
 
 
