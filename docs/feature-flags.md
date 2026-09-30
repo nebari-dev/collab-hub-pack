@@ -14,6 +14,8 @@ FEATURE_FLAGS: dict[str, str] = {
 }
 ```
 
+Names are lowercase snake_case (`cogs_ui`, not `cogsUI` or `cogs-ui`), the form environment variables arrive in and the only form the chart accepts, and a name can't be both declared and retired. The API checks both when it loads its configuration, so a bad entry stops it at startup and fails every test.
+
 Then gate the code path on it. A name that is not declared is refused wherever it appears: set in the environment or the chart, it stops the API at startup, and passed to `enabled()`, it raises. A misspelled flag therefore fails loudly instead of silently reading as off.
 
 Flags are for work in progress: once the feature ships, remove the flag from the code and move its name from `FEATURE_FLAGS` to `RETIRED_FEATURE_FLAGS`. A shipped capability that needs a permanent operational switch belongs in its own config section as an explicit `bool` field with a documented default, such as `connectors.github.api_get_enabled`. A deployment that still sets a retired flag starts, and the API logs a `feature_flag_retired_ignored` warning naming it, so the chart that retires a flag can roll out before every deployment's values drop it. A name that was never declared still stops startup.

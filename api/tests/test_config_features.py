@@ -134,3 +134,23 @@ def test_the_app_logs_each_retired_flag_once_logging_is_up(tmp_path, monkeypatch
         make_app(_app_config(tmp_path, {"old_ui": True}))
     retired = [r for r in caplog.records if r.getMessage() == "feature_flag_retired_ignored"]
     assert [r.flag for r in retired] == ["old_ui"]
+
+
+def test_the_shipped_registry_is_well_formed():
+    config_module.check_feature_flag_registry(config_module.FEATURE_FLAGS, config_module.RETIRED_FEATURE_FLAGS)
+
+
+@pytest.mark.parametrize("name", ["cogsUI", "cogs-ui", "cogs__ui", "_cogs", "cogs_", "1cogs", "cogs ui"])
+def test_a_registered_name_outside_snake_case_is_refused(name):
+    with pytest.raises(ValueError, match="must be lowercase snake_case"):
+        config_module.check_feature_flag_registry({name: "A flag."}, frozenset())
+
+
+def test_a_retired_name_outside_snake_case_is_refused():
+    with pytest.raises(ValueError, match="must be lowercase snake_case: Old-UI"):
+        config_module.check_feature_flag_registry({}, frozenset({"Old-UI"}))
+
+
+def test_a_name_both_registered_and_retired_is_refused():
+    with pytest.raises(ValueError, match="both registered and retired: cogs_ui"):
+        config_module.check_feature_flag_registry({"cogs_ui": "A flag."}, frozenset({"cogs_ui"}))

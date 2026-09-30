@@ -1008,6 +1008,26 @@ stopping startup, so the chart
 that drops a flag can roll out before every deployment's values drop it.
 """
 
+FEATURE_FLAG_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+"""A flag name: lowercase snake_case, the form environment keys arrive in.
+
+The same pattern as ``features.propertyNames`` in the chart's
+values.schema.json, so a name the registry accepts is one the chart accepts.
+"""
+
+
+def check_feature_flag_registry(flags: Mapping[str, str], retired: frozenset[str]) -> None:
+    """Refuse a registry whose names could never be set, or that is both live and retired."""
+    bad = sorted(name for name in (*flags, *retired) if not FEATURE_FLAG_NAME.fullmatch(name))
+    if bad:
+        raise ValueError(f"feature flag names must be lowercase snake_case: {', '.join(bad)}")
+    both = sorted(set(flags) & retired)
+    if both:
+        raise ValueError(f"feature flags both registered and retired: {', '.join(both)}")
+
+
+check_feature_flag_registry(FEATURE_FLAGS, RETIRED_FEATURE_FLAGS)
+
 _FLAG_VALUE = TypeAdapter(bool)
 
 
