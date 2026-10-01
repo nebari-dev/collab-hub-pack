@@ -45,6 +45,22 @@ check "ci fixture: harbor + static, Secrets attached, CA mounted read-only" fixt
 check "sources with the indexer off: JSON renders, tuning vars do not" static-only $STATIC
 check "three sources: each credential attached to its own source" three-sources -f "$TESTDATA/cogs-three-sources.yaml"
 check "middle source removed and order reversed: attachments follow the id" reordered -f "$TESTDATA/cogs-reordered.yaml"
+check "feature flags: each entry renders as its variable" features --set features.cogs_ui=true --set features.new_thing=false
+refused() { # <label> <needle> <helm args...>: the chart must refuse to render, naming <needle>
+  local label="$1" needle="$2" out
+  shift 2
+  if out="$($HELM template t "$CHART" "$@" 2>&1)"; then
+    fail "$label" "rendered"
+  elif printf '%s' "$out" | grep -qF -- "$needle"; then
+    pass "$label"
+  else
+    fail "$label" "failed for another reason: $(printf '%s' "$out" | head -3)"
+  fi
+}
+refused "feature flags: a non-boolean value is refused" "/features/cogs_ui" --set-string features.cogs_ui=maybe
+refused "feature flags: a dashed name is refused" "cogs-ui" --set features.cogs-ui=true
+refused "feature flags: a name with a double underscore is refused" "cogs__ui" --set features.cogs__ui=true
+refused "feature flags: an uppercase name is refused" "Cogs_ui" --set features.Cogs_ui=true
 
 # --- negative: every refused configuration, from one fixture ------------------
 # scripts/testdata/chart/cogs-negative-cases.yaml holds each refusal once, in

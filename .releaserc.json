@@ -1,0 +1,11 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+    [
+      "@semantic-release/exec",
+      { "publishCmd": "echo ${nextRelease.version} > .next-release" }
+    ]
+  ]
+}
