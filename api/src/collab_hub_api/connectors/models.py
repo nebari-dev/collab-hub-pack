@@ -50,6 +50,16 @@ UNTRUSTED_CONNECTOR_CONTENT_NOTICE = (
 )
 
 
+def _omit_when_default(default: Any) -> Any:
+    """Leave a field out of the response while it still holds its default.
+
+    Drops empty scaffolding (``is_im: false``, ``next_cursor: ""``, ...) from Slack
+    payloads (#137, #139). The trust fields on UntrustedConnectorResponse are never
+    marked with this, so they're always sent.
+    """
+    return Field(default=default, exclude_if=lambda value: value == default)
+
+
 class UntrustedConnectorResponse(BaseModel):
     """A model-visible trust boundary shared by every data-bearing connector response."""
 
@@ -303,31 +313,31 @@ class SlackStatus(ConnectorSummary):
 class SlackChannel(BaseModel):
     id: str
     name: str
-    is_private: bool = False
-    is_im: bool = False
-    is_mpim: bool = False
-    user_id: str = ""
-    topic: str = ""
-    num_members: int | None = None
+    is_private: bool = _omit_when_default(False)
+    is_im: bool = _omit_when_default(False)
+    is_mpim: bool = _omit_when_default(False)
+    user_id: str = _omit_when_default("")
+    topic: str = _omit_when_default("")
+    num_members: int | None = _omit_when_default(None)
 
 
 class SlackChannelsResponse(UntrustedConnectorResponse):
     channels: list[SlackChannel]
-    next_cursor: str = ""
+    next_cursor: str = _omit_when_default("")
 
 
 class SlackDmsResponse(UntrustedConnectorResponse):
     dms: list[SlackChannel]
-    next_cursor: str = ""
+    next_cursor: str = _omit_when_default("")
 
 
 # No channel_id here: the read response already has it once at the top.
 class SlackMessage(BaseModel):
     ts: str
-    user_id: str = ""
-    text: str = ""
-    thread_ts: str = ""
-    reply_count: int = 0
+    user_id: str = _omit_when_default("")
+    text: str = _omit_when_default("")
+    thread_ts: str = _omit_when_default("")
+    reply_count: int = _omit_when_default(0)
 
 
 # Search hits intentionally omit Slack permalinks, and every Slack ``text`` field
@@ -337,15 +347,15 @@ class SlackMessage(BaseModel):
 # The model needs channel_id + ts, not a URL, to follow up with a read.
 class SlackSearchHit(BaseModel):
     channel_id: str
-    channel_name: str = ""
-    is_im: bool = False
-    is_mpim: bool = False
+    channel_name: str = _omit_when_default("")
+    is_im: bool = _omit_when_default(False)
+    is_mpim: bool = _omit_when_default(False)
     ts: str
-    user_id: str = ""
-    author_name: str = ""
-    text: str = ""
+    user_id: str = _omit_when_default("")
+    author_name: str = _omit_when_default("")
+    text: str = _omit_when_default("")
     # True when the text was shortened. Read the message by its ts to get the full text.
-    truncated: bool = False
+    truncated: bool = _omit_when_default(False)
 
 
 class SlackSearchRequest(BaseModel):
@@ -359,7 +369,7 @@ class SlackSearchRequest(BaseModel):
 
 class SlackSearchResponse(UntrustedConnectorResponse):
     hits: list[SlackSearchHit]
-    next_page: int | None = None
+    next_page: int | None = _omit_when_default(None)
 
 
 class SlackReadRequest(BaseModel):
@@ -421,9 +431,9 @@ class SlackReadRequest(BaseModel):
 class SlackReadResponse(UntrustedConnectorResponse):
     channel_id: str
     messages: list[SlackMessage]
-    has_more: bool = False
+    has_more: bool = _omit_when_default(False)
     # Feed back into ``cursor`` to fetch the next page while ``has_more`` is true.
-    next_cursor: str = ""
+    next_cursor: str = _omit_when_default("")
 
 
 class SlackThreadReadRequest(BaseModel):
@@ -438,9 +448,9 @@ class SlackThreadReadResponse(UntrustedConnectorResponse):
     channel_id: str
     message_ts: str
     messages: list[SlackMessage]
-    has_more: bool = False
+    has_more: bool = _omit_when_default(False)
     # Feed back into ``cursor`` to fetch the next page while ``has_more`` is true.
-    next_cursor: str = ""
+    next_cursor: str = _omit_when_default("")
 
 
 class GitHubStatus(ConnectorSummary):

@@ -965,14 +965,20 @@ async def test_slack_endpoints_cover_channels_dms_search_and_reads(tmp_path, mon
 
     assert search.status_code == 200
     assert [hit["channel_id"] for hit in search.json()["hits"]] == ["C0001"]
-    assert all(not hit["is_im"] and not hit["is_mpim"] for hit in search.json()["hits"])
+    assert all(not hit.get("is_im") and not hit.get("is_mpim") for hit in search.json()["hits"])
     assert search.json()["next_page"] == 2
 
     assert read.status_code == 403
 
     assert thread.status_code == 200
     assert len(thread.json()["messages"]) == 2
-    assert thread.json()["next_cursor"] == ""
+    # Default-valued fields are omitted on Slack routes (#139); the trust fields never are.
+    assert "next_cursor" not in thread.json()
+    assert "has_more" not in thread.json()
+    assert all("is_im" not in hit and "truncated" not in hit for hit in search.json()["hits"])
+    for response in (channels, dms, search, thread):
+        assert response.json()["content_trust"] == "external_untrusted"
+        assert response.json()["security_notice"]
 
     for response in (channels, dms, search, read, thread):
         assert "slack-token-alice" not in response.text

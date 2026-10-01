@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from httpx import Response
 from pydantic import ValidationError
 
-from collab_hub_api.connectors.models import SlackReadRequest, SlackReadResponse, SlackThreadReadRequest
+from collab_hub_api.connectors.models import (
+    UNTRUSTED_CONNECTOR_CONTENT_NOTICE,
+    SlackChannelsResponse,
+    SlackDmsResponse,
+    SlackMessage,
+    SlackReadRequest,
+    SlackReadResponse,
+    SlackSearchHit,
+    SlackSearchResponse,
+    SlackThreadReadRequest,
+    SlackThreadReadResponse,
+)
 from collab_hub_api.connectors.slack_client import SEARCH_SNIPPET_CHARS, SlackClient
 
 
@@ -277,3 +290,41 @@ async def test_budget_cursor_keeps_the_original_time_window(monkeypatch):
     assert read == [m["ts"] for m in reversed(history[4:])]  # nothing older than the window
     assert len(seen_params) > 1
     assert all(params["oldest"] == window_start for params in seen_params)
+
+
+def test_slack_payloads_leave_out_default_valued_fields_but_keep_the_trust_fields():
+    hit = SlackSearchHit(channel_id="C0001", ts="1790000000.000100", text="hello")
+    read = SlackReadResponse(channel_id="C0001", messages=[SlackMessage(ts="1790000000.000100", text="hi")])
+
+    # Empty scaffolding such as is_im: false or thread_ts: "" is left out (#137).
+    assert hit.model_dump() == {"channel_id": "C0001", "ts": "1790000000.000100", "text": "hello"}
+    assert read.model_dump()["messages"] == [{"ts": "1790000000.000100", "text": "hi"}]
+    assert "has_more" not in read.model_dump()
+    assert "next_cursor" not in read.model_dump()
+
+    # The untrusted-content warning is always sent, even though it is a default.
+    assert read.model_dump()["content_trust"] == "external_untrusted"
+    assert read.model_dump()["security_notice"]
+
+    # Real values are still sent.
+    more = SlackReadResponse(channel_id="C0001", messages=[], has_more=True, next_cursor="ts:1790000000.000100")
+    assert more.model_dump()["has_more"] is True
+    assert SlackSearchHit(channel_id="C0001", ts="1", truncated=True).model_dump()["truncated"] is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        SlackChannelsResponse(channels=[]),
+        SlackDmsResponse(dms=[]),
+        SlackSearchResponse(hits=[]),
+        SlackReadResponse(channel_id="C0001", messages=[]),
+        SlackThreadReadResponse(channel_id="C0001", message_ts="1790000000.000100", messages=[]),
+    ],
+    ids=["channels", "dms", "search", "read", "thread"],
+)
+def test_every_slack_response_keeps_both_trust_fields(response):
+    # Every other field here holds its default, so this is the case most likely to lose them.
+    payload = json.loads(response.model_dump_json())
+    assert payload["content_trust"] == "external_untrusted"
+    assert payload["security_notice"] == UNTRUSTED_CONNECTOR_CONTENT_NOTICE
