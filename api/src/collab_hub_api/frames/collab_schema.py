@@ -471,6 +471,280 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        7,
+        (
+            # Where a platform-role row came from, so that sync can remove its
+            # own rows without ever removing a hand-administered one.
+            #
+            # Sync has to be able to revoke: a copy of the identity provider's
+            # answer that only ever adds would leave a dropped admin's row
+            # standing forever, and the deployment would believe the provider
+            # had revoked them. But the bootstrap operator's row was inserted
+            # by hand, and their subject may be in no group at all -- so a sync
+            # that could revoke anything would lock the first admin out of the
+            # deployment they had just bootstrapped, on their next sign-in.
+            #
+            # The default is `manual`, which is what makes this migration safe
+            # on a live database: every row that exists when it runs was
+            # inserted by hand, and every one of them keeps its authority.
+            """
+            ALTER TABLE collab_platform_roles
+            ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual'
+            CHECK (source IN ('manual', 'idp'))
+            """,
+            # Widen the audit action vocabulary by two: `platform_role.grant`
+            # and `platform_role.revoke`. Same mechanics as v5 -- drop the
+            # constraint by the name v5 chose, add the replacement under that
+            # same name -- and the same test pins the effective constraint to
+            # AUDIT_ACTIONS, so widening one without the other fails at unit
+            # speed rather than on a production sign-in.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        8,
+        (
+            # Version 2 shipped this table with no index beyond its primary
+            # key, and said so deliberately: the log was read from psql at
+            # beta volume. It now has a paginated reader behind the admin
+            # panel, so the two filters that reader offers need to be seeks
+            # rather than scans over a table that only grows.
+            #
+            # `id DESC` in both, matching the reader's ORDER BY exactly: an
+            # index whose order disagrees with the query's is read forwards
+            # and then sorted, which is the cost this exists to avoid. The
+            # unfiltered listing is already served by the primary key.
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_actor_idx
+            ON collab_audit_events (actor, id DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_action_idx
+            ON collab_audit_events (action, id DESC)
+            """,
+        ),
+    ),
+    (
+        9,
+        (
+            # Widen the action vocabulary by one: `service_access.revoke`.
+            # Same mechanics as v5 and v7. It had no counterpart before because
+            # nothing in this codebase could take service access away; the
+            # admin panel can.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        10,
+        (
+            # Which connectors an administrator has switched off.
+            #
+            # One bit per connector and nothing else. Credentials stay in
+            # deployment configuration, which is what decides whether a
+            # connector is possible at all; this decides whether it is
+            # currently offered. A row here can only ever take a configured
+            # connector away, never conjure an unconfigured one -- there is no
+            # credential column for it to supply.
+            #
+            # Absence means enabled, so a deployment that never opens this
+            # screen behaves exactly as it did before the table existed.
+            """
+            CREATE TABLE IF NOT EXISTS collab_connector_state (
+                connector   text PRIMARY KEY,
+                enabled     boolean NOT NULL,
+                updated_at  timestamptz NOT NULL DEFAULT now(),
+                updated_by  text
+            )
+            """,
+            # Two more actions, and the first new target type since version 2:
+            # a connector is not an org, a user or an invitation.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke',
+                              'connector.enable', 'connector.disable'))
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_target_type_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_target_type_check
+            CHECK (target_type IN ('org', 'user', 'invitation', 'connector'))
+            """,
+        ),
+    ),
+    (
+        11,
+        (
+            # The Cog catalog (issue #84): one row per artifact the indexer has
+            # seen in a configured registry source, keyed by content digest.
+            #
+            # **Identity is the digest.** PRIMARY KEY (source_id, repository,
+            # digest) because the same bytes may legitimately be published to
+            # several repositories (and enumerated by several sources), and
+            # each such location is its own row; `cog_id`/`name` are search
+            # keys read out of the Cog's own declarations, and the repository
+            # path is NOT identity -- published repository names carry an id
+            # suffix and are free to change. `host` is the registry host of
+            # the source's *external* URL, so `<host>/<repository>@<digest>`
+            # is the pinned install reference and can be rebuilt from the row.
+            #
+            # `card` is the bundle reader's output, verbatim, as structured
+            # JSON: the whole profile is preserved (requires/provides/io stay
+            # objects, not strings), which is what the GIN index below makes
+            # filterable. `status` says what kind of row this is:
+            #   indexed  -- the reader produced a card (errors and all: a
+            #               draft or a broken profile is still a Cog);
+            #   non_cog  -- the manifest carries no COG.md (and no Prog
+            #               pixi.toml), recorded with a reason so a
+            #               repository full of images is not re-read every
+            #               sweep;
+            #   failed   -- the fetch or read failed; `read_errors` says how,
+            #               and the next sweep retries it.
+            # `read_errors` duplicates card.errors for indexed rows so a
+            # "what is broken" query never has to open the card.
+            #
+            # `removed_at` is NULL while the digest is present in the
+            # registry. Rows are never deleted by application code: an install
+            # or a run may reference a digest long after its publisher removed
+            # it, and "this once existed and is now gone" is an answer the
+            # catalog must be able to give.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_artifacts (
+                source_id            text NOT NULL,
+                host                 text NOT NULL,
+                repository           text NOT NULL,
+                digest               text NOT NULL,
+                tags                 text[] NOT NULL DEFAULT '{}',
+                pushed_at            timestamptz,
+                indexed_at           timestamptz NOT NULL DEFAULT now(),
+                manifest_media_type  text,
+                status               text NOT NULL
+                                     CHECK (status IN ('indexed', 'non_cog', 'failed')),
+                card                 jsonb,
+                cog_id               text,
+                name                 text,
+                version              text,
+                kind                 text,
+                publisher            text,
+                manifest_schema      text,
+                read_errors          jsonb NOT NULL DEFAULT '[]'::jsonb,
+                removed_at           timestamptz,
+                PRIMARY KEY (source_id, repository, digest)
+            )
+            """,
+            # "Every version of this Cog" (removed ones included) starts from
+            # cog_id, so that index is full; "every model Cog" from kind. The
+            # catalog's other reads -- the newest present row per Cog, the
+            # present rows per repository -- exclude removed rows, so a partial
+            # index on the present rows keeps those cheap as the removed tail
+            # grows, and it is what "WHERE removed_at IS NULL" plans against.
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx
+            ON collab_cog_artifacts (cog_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_kind_idx
+            ON collab_cog_artifacts (kind)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_present_idx
+            ON collab_cog_artifacts (cog_id, repository) WHERE removed_at IS NULL
+            """,
+            # Containment filters over the structured card ("requires
+            # capability X", "provides Y", "accepts io Z") are `card @> ...`
+            # queries; jsonb_path_ops is the GIN operator class built for
+            # exactly that operator, and it is smaller than the default class.
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_card_idx
+            ON collab_cog_artifacts USING GIN (card jsonb_path_ops)
+            """,
+        ),
+    ),
+    (
+        12,
+        (
+            # The Track (issue #5): the append-only record of every run, which is
+            # the only source of a run's status (ADR-0002 D3). The execution
+            # package's `PostgresTrackStore` reads and writes these tables; on the
+            # hub they are created here and never by that store's `ensure_schema`,
+            # which serves the standalone package and local use. That store's
+            # `_SCHEMA` is this registry's Track statements in order, and
+            # execution/tests/test_track_ddl.py holds the two equal. Like every
+            # released version this one is frozen by its checksum: a change to the
+            # Track tables is a new migration, with the same statements appended
+            # to `_SCHEMA`, never an edit here.
+            #
+            # `sequence` is global, so events written by several replicas replay
+            # in one stable order. `schema` is the version of the event's shape
+            # (docs/cog-execution/track.md); rows written before events carried
+            # one read as version 0, which the default records.
+            "CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence",
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_events (
+                sequence    bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence'),
+                event_id    text NOT NULL UNIQUE,
+                run_id      text NOT NULL,
+                event_type  text NOT NULL,
+                payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
+                occurred_at timestamptz NOT NULL,
+                schema      integer NOT NULL DEFAULT 0
+            )
+            """,
+            "ALTER TABLE collab_track_events ADD COLUMN IF NOT EXISTS schema integer NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
+            # At most one submission per run: two API replicas cannot both start
+            # the same run; the losing insert fails on this index.
+            "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission "
+            "ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
+            # A step's payload above the inline threshold, kept beside the Track
+            # and named by the `payload_ref` of its `step_completed` event.
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_payloads (
+                ref        text PRIMARY KEY,
+                run_id     text NOT NULL,
+                payload    jsonb NOT NULL,
+                stored_at  timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS collab_track_payloads_run ON collab_track_payloads (run_id)",
+        ),
+    ),
 )
 
 

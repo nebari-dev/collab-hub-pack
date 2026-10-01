@@ -132,8 +132,9 @@ def test_every_documented_code_has_a_status_and_every_status_a_code():
 # --- the engine's reading ----------------------------------------------------
 
 
-def test_ok_with_problems_completes_the_step_and_records_them():
-    problems = [Problem("grounding", "quote not verbatim", "error")]
+def test_ok_with_warnings_completes_the_step_and_records_them():
+    # Under the default Gate a `warn` problem passes with problems; an `error` one escalates (test_gates.py).
+    problems = [Problem("grounding", "quote not verbatim", "warn")]
     executor = InMemoryCogExecutor({
         "c": lambda e, v: ResultEnvelope.success(
             {"answer": v}, usage={"tokens": 1}, problems=problems, binding={"model": "m1"},
@@ -142,9 +143,9 @@ def test_ok_with_problems_completes_the_step_and_records_them():
     track = InMemoryTrackStore()
     assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.COMPLETED
     (completed,) = events(track, "env", "step_completed")
-    assert completed.payload["output"] == {"answer": "draft"}
+    assert completed.payload["payload"] == {"answer": "draft"}
     assert completed.payload["problems"] == [
-        {"check": "grounding", "detail": "quote not verbatim", "severity": "error"},
+        {"check": "grounding", "detail": "quote not verbatim", "severity": "warn"},
     ]
     assert completed.payload["binding"] == {"model": "m1"}
     assert not events(track, "env", "failed")
@@ -202,15 +203,16 @@ def test_missing_usage_under_a_budget_fails_even_in_a_valid_envelope():
 
 def test_in_memory_handler_may_return_an_envelope_shaped_mapping_or_a_raw_value():
     executor = InMemoryCogExecutor({
-        "c": lambda e, v: {"envelope": 1, "ok": True, "payload": v, "problems": [{"check": "schema", "detail": "d"}]},
+        "c": lambda e, v: {"envelope": 1, "ok": True, "payload": v,
+                           "problems": [{"check": "schema", "detail": "d", "severity": "warn"}]},
         "raw": lambda e, v: {"answer": v},  # no envelope key: a plain payload
     })
     track = InMemoryTrackStore()
     definition = OpDefinition("mix", (OpStep("a", "c", "run", "x"), OpStep("b", "raw", "run", "y")))
     assert DurableWorkflowEngine(executor=executor, track=track).submit(definition) is RunState.COMPLETED
     first, second = events(track, "mix", "step_completed")
-    assert first.payload["output"] == "x" and first.payload["problems"][0]["check"] == "schema"
-    assert second.payload["output"] == {"answer": "y"} and "problems" not in second.payload
+    assert first.payload["payload"] == "x" and first.payload["problems"][0]["check"] == "schema"
+    assert second.payload["payload"] == {"answer": "y"} and "problems" not in second.payload
 
 
 def test_a_worker_returning_something_else_fails_durably_as_envelope_invalid():
@@ -290,11 +292,8 @@ def test_http_envelope_with_an_unknown_pause_field_is_an_envelope_not_a_pause():
     assert worker.interact("run", "x") == ResultEnvelope.success("p")
 
 
-def test_http_pause_answer_is_still_a_pause_until_gates_move_to_the_step():
-    from collab_hub_execution import PauseRequest
-
+def test_an_http_pause_answer_is_not_an_envelope_so_a_cog_cannot_pause_a_run():
     answer = {"pause": True, "reason": "review", "usage": {"tokens": 0}}
     worker = http_worker(lambda _: httpx.Response(200, json=answer))
-    with pytest.raises(PauseRequest) as caught:
+    with pytest.raises(EnvelopeInvalid):
         worker.interact("run", "x")
-    assert caught.value.usage == {"tokens": 0}

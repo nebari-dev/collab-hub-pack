@@ -1246,7 +1246,7 @@ def test_scan_and_read_only_enforcement_against_a_real_database() -> None:
 
 
 def test_s3_scan_and_write_refusal_against_a_real_object_store() -> None:
-    """The S3 path against a real endpoint (MinIO), including the write refusal.
+    """The S3 path against a real endpoint (SeaweedFS in dev), including the write refusal.
 
     Gated on ``NEXUS_TEST_S3_ENDPOINT_URL`` the way the Postgres tests are gated
     on ``COLLAB_HUB_TEST_POSTGRES_URL``. Worth a live endpoint because the botocore

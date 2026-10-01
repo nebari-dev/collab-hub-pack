@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 orgs_logger = logging.getLogger("frames_server.orgs")
@@ -238,7 +239,7 @@ class InMemoryOrgStore(OrgStore):
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._memberships: dict[str, OrgMembership] = {}
-        self._platform_roles: dict[str, tuple[str, str]] = {}
+        self._platform_roles: dict[str, tuple[str, str, str]] = {}
 
     def set_membership(
         self,
@@ -263,11 +264,48 @@ class InMemoryOrgStore(OrgStore):
         user_id: str,
         role: str = PLATFORM_ROLE_OPERATOR,
         status: str = PLATFORM_ROLE_ACTIVE,
+        source: str = "manual",
     ) -> None:
-        """Seed or replace a platform-role row (dev/test only; grants have no API)."""
+        """Seed or replace a platform-role row (dev/test only; grants have no API).
+
+        ``source`` defaults to ``manual`` to match the column default the
+        Postgres table carries: a row put here by hand is hand-administered,
+        and the identity-provider sync must leave it alone. See
+        :mod:`.platform_role_sync`.
+        """
 
         with self._lock:
-            self._platform_roles[user_id] = (role, status)
+            self._platform_roles[user_id] = (role, status, source)
+
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored row, shaped like the Postgres read, or ``None``.
+
+        Exists so the identity-provider sync can take one decision against
+        either backend instead of carrying two copies of the rule.
+        """
+
+        return self.get_platform_role_rows([user_id]).get(user_id)
+
+    def active_operator_ids(self) -> set[str]:
+        """Everyone holding an active operator role."""
+
+        with self._lock:
+            return {
+                user_id
+                for user_id, (role, status, _source) in self._platform_roles.items()
+                if role == PLATFORM_ROLE_OPERATOR and status == PLATFORM_ROLE_ACTIVE
+            }
+
+    def get_platform_role_rows(self, user_ids: Sequence[str]) -> dict[str, dict]:
+        """The stored rows for *user_ids*, keyed by id; absent ids have none."""
+
+        with self._lock:
+            stored = {user_id: self._platform_roles.get(user_id) for user_id in user_ids}
+        return {
+            user_id: {"role": row[0], "status": row[1], "source": row[2]}
+            for user_id, row in stored.items()
+            if row is not None
+        }
 
     def resolve_principal(self, user_id: str) -> ResolvedPrincipal:
         # Through get_membership on purpose, so a test subclass that counts or
@@ -448,6 +486,40 @@ class PostgresOrgStore(OrgStore):
                 extra={"user": user_id, "org": org_id},
             )
         return membership, created
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored role row, or ``None``.
+
+        Separate from :meth:`resolve_principal`, which deliberately collapses a
+        revoked grant to "no role": the admin panel needs the row as written --
+        including where it came from -- to explain what revoking will actually
+        do. Not on the auth path, so it costs nothing there.
+        """
+
+        return self.get_platform_role_rows([user_id]).get(user_id)
+
+    def get_platform_role_rows(self, user_ids: Sequence[str]) -> dict[str, dict]:
+        """The stored rows for *user_ids* in one round trip, keyed by id.
+
+        For the admin panel's user listing, which would otherwise read one row
+        per person on the page.
+        """
+
+        import psycopg
+
+        if not user_ids:
+            return {}
+        try:
+            with self._db.connection() as conn:
+                rows = conn.execute(
+                    "SELECT user_id, role, status, source FROM collab_platform_roles WHERE user_id = ANY(%s)",
+                    (list(user_ids),),
+                ).fetchall()
+        except psycopg.errors.UndefinedTable as exc:
+            raise self._missing_schema() from exc
+        return {
+            row["user_id"]: {"role": row["role"], "status": row["status"], "source": row["source"]}
+            for row in rows
+        }
 
     def _missing_schema(self) -> OrgSchemaMissingError:
         message = (

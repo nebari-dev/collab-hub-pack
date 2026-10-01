@@ -5,10 +5,27 @@ from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-from .cogs.registry import CogRegistrySourceConfig
+from .cogs.catalog import (
+    CogCatalogStore,
+    InMemoryCogCatalogStore,
+    PostgresCogCatalogStore,
+    UnavailableCogCatalogStore,
+)
+from .cogs.indexer import CogIndexer
+from .cogs.registry import CogRegistrySourceConfig, build_registry_sources
 from .frames.account_provisioning import DisabledServiceAccessGranter, ServiceAccessGranter
 from .frames.active_state import (
     ActiveFrameStore,
@@ -170,12 +187,16 @@ def recommended_path_rules() -> list[PathRule]:
 
     ``/health`` and ``/health/db`` stay public because kubelet probes and
     uptime checks carry no credentials: a hardened map that drops them stops
-    the pod passing its own probes.
+    the pod passing its own probes. ``/v1/auth/cli`` stays public because a
+    command-line client asks it how to sign in before it holds any credential;
+    it names only what the realm's own discovery document publishes.
     """
 
     return [
         PathRule(path="/health", match="exact", access="public"),
         PathRule(path="/health/db", match="exact", access="public"),
+        # Where the collab-hub CLI learns how to sign in, asked before it holds a token.
+        PathRule(path="/v1/auth/cli", match="exact", access="public"),
         PathRule(path="/", match="exact", access="authenticated"),
         PathRule(path="/metrics", match="exact", access="authenticated"),
     ]
@@ -265,6 +286,29 @@ class WebConfig(BaseModel):
         le=WEB_SESSION_LIFETIME_CEILING_SECONDS,
     )
     public_base_url: str = ""
+    admin_ui_dist: str = ""
+    """Where the built admin panel lives, if this deployment ships one.
+
+    Empty, or a directory with no ``index.html``, mounts no panel routes at
+    all: ``/admin`` then answers exactly as it did before the panel existed.
+    That is deliberate -- a route that exists but cannot find its own index
+    would turn a missing build step into a 500 on somebody's first visit.
+    """
+    admin_group: str = ""
+    """The identity-provider group whose members hold the operator role.
+
+    Unset means no sync: roles come from ``collab_platform_roles`` and only
+    from there, exactly as they did before the sync existed. That is the
+    default on purpose -- an empty group name would match nothing, and a sync
+    that matched nothing would revoke every synced row on first sign-in.
+
+    Carrying the group into the token is realm configuration, not a setting
+    here: the client needs a groups mapper (or the ``groups`` client scope) so
+    that the ID token actually holds the claim. Without it the claim is absent,
+    and sign-in skips the sync entirely (logging
+    ``platform_role_sync_no_groups_claim``): nobody is granted and nobody is
+    revoked.
+    """
 
     @field_validator(
         "client_id",
@@ -272,6 +316,8 @@ class WebConfig(BaseModel):
         "issuer_url",
         "session_secret",
         "public_base_url",
+        "admin_ui_dist",
+        "admin_group",
         mode="before",
     )
     @classmethod
@@ -521,6 +567,54 @@ class FramesServiceAccessConfig(BaseModel):
         return self
 
 
+class ModelAccessKeycloakConfig(BaseModel):
+    """The credential the admin panel uses to change group membership.
+
+    Separate from ``frames.service_access``'s credential on purpose: that one
+    can only add a new account to a group and deliberately cannot read
+    anything, while this one must list members and remove them. Widening the
+    first would grow the invitation path's authority because an admin screen
+    needed something.
+
+    Whatever client this names must hold ``Groups/view-members``,
+    ``Groups/manage-membership`` and ``Users/manage-group-membership``, and
+    must **not** hold ``Groups/manage-members``: over a member of a group that
+    scope also permits password reset and deletion, and membership control plus
+    account control compose into account takeover. See
+    :mod:`.frames.group_membership`.
+    """
+
+    token_url: str = ""
+    admin_api_base_url: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+
+
+class ModelAccessConfig(BaseModel):
+    """The models the hub offers and the groups that gate them."""
+
+    catalog_base_url: str = ""
+    """The serving layer's origin, read for ``GET /v1/models``. Empty disables
+    the catalogue view rather than failing the panel."""
+
+    keycloak: ModelAccessKeycloakConfig = Field(default_factory=ModelAccessKeycloakConfig)
+
+    group_ids: dict[str, str] = Field(default_factory=dict)
+    """Group path to Keycloak group id, and the managed set.
+
+    Both a lookup table and a boundary: a group absent from this map is refused
+    before any request is made, so the panel can only ever touch groups a
+    values file named. Ids rather than lookups for the reason
+    ``frames.service_access`` documents -- resolving a path needs group-read
+    authority, and startup should not depend on the identity provider.
+    """
+
+    model_groups: dict[str, str] = Field(default_factory=dict)
+    """Model id to the group path gating it. A model with no entry is shown as
+    ungated rather than hidden: the catalogue is the serving layer's, and a
+    panel that silently dropped models would misrepresent it."""
+
+
 class FramesInvitationsConfig(BaseModel):
     """What invitation acceptance requires of the accepter's identity."""
 
@@ -572,7 +666,6 @@ class FramesInvitationsConfig(BaseModel):
     friction rather than assurance.
     """
 
-
 class FramesConfig(BaseModel):
     storage_backend: str = "local"
     s3: FramesS3Config = Field(default_factory=FramesS3Config)
@@ -584,6 +677,7 @@ class FramesConfig(BaseModel):
     orgs: FramesOrgsConfig = Field(default_factory=FramesOrgsConfig)
     email: FramesEmailConfig = Field(default_factory=FramesEmailConfig)
     service_access: FramesServiceAccessConfig = Field(default_factory=FramesServiceAccessConfig)
+    model_access: ModelAccessConfig = Field(default_factory=ModelAccessConfig)
     invitations: FramesInvitationsConfig = Field(default_factory=FramesInvitationsConfig)
     mcp_session_manager_enabled: bool = True
 
@@ -719,6 +813,23 @@ class CogIndexConfig(BaseModel):
     run_on_startup: bool = True
 
 
+class CogCatalogConfig(BaseModel):
+    """Where the Cog catalog lives (#85).
+
+    ``backend`` is a development override only, like ``frames.groups.backend``:
+    ``"memory"`` keeps the catalog in the process (``make api``, level 1, so
+    the read API answers without a database); empty -- the default -- rides
+    the shared ``frames.postgres``, or refuses with 503 when there is none.
+    Deliberately no chart value: an in-memory catalog is process-local, so on
+    a deployment every replica would list something different and forget it
+    all on restart.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["", "memory"] = ""
+
+
 COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("username_env", "username", False),
     ("password_env", "password", True),
@@ -850,6 +961,7 @@ class CogsConfig(BaseModel):
 
     registry_sources: list[CogRegistrySourceConfig] = Field(default_factory=list)
     index: CogIndexConfig = Field(default_factory=CogIndexConfig)
+    catalog: CogCatalogConfig = Field(default_factory=CogCatalogConfig)
 
     @field_validator("registry_sources", mode="before")
     @classmethod
@@ -878,6 +990,116 @@ class CogsConfig(BaseModel):
         return self
 
 
+FEATURE_FLAGS: dict[str, str] = {}
+"""Every feature flag this hub knows: name to one line on what it exposes.
+
+Adding a flag starts here. A name that is not listed is refused wherever it
+appears: set in the environment or the chart, it stops startup; passed to
+:meth:`FeaturesConfig.enabled`, it raises. So a misspelled flag fails loudly
+instead of silently reading as off.
+"""
+
+RETIRED_FEATURE_FLAGS: frozenset[str] = frozenset()
+"""Flags that have been removed but that deployments may still set.
+
+When a flag's feature ships, move its name here from :data:`FEATURE_FLAGS`.
+A retired name is ignored, and the app logs a warning naming it, instead of
+stopping startup, so the chart
+that drops a flag can roll out before every deployment's values drop it.
+"""
+
+FEATURE_FLAG_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+"""A flag name: lowercase snake_case, the form environment keys arrive in.
+
+The same pattern as ``features.propertyNames`` in the chart's
+values.schema.json, so a name the registry accepts is one the chart accepts.
+"""
+
+
+def check_feature_flag_registry(flags: Mapping[str, str], retired: frozenset[str]) -> None:
+    """Refuse a registry whose names could never be set, or that is both live and retired."""
+    bad = sorted(name for name in (*flags, *retired) if not FEATURE_FLAG_NAME.fullmatch(name))
+    if bad:
+        raise ValueError(f"feature flag names must be lowercase snake_case: {', '.join(bad)}")
+    both = sorted(set(flags) & retired)
+    if both:
+        raise ValueError(f"feature flags both registered and retired: {', '.join(both)}")
+
+
+check_feature_flag_registry(FEATURE_FLAGS, RETIRED_FEATURE_FLAGS)
+
+_FLAG_VALUE = TypeAdapter(bool)
+
+
+class FeaturesConfig(BaseModel):
+    """Per-deployment switches for features that are on ``main`` but not yet exposed.
+
+    The mechanism is always on. Each flag is declared once in
+    :data:`FEATURE_FLAGS` and is off until a deployment sets it to true,
+    either in the chart's ``features`` values or as the environment variable
+    ``COLLAB_HUB_API__FEATURES__<NAME>``, following pydantic-settings' nested
+    variables:
+    https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values
+
+    Values are parsed with pydantic's boolean rules, so ``true``, ``1``,
+    ``yes`` and ``on`` (any case) turn a flag on, and a value those rules
+    cannot parse stops startup instead of reading as off:
+    https://docs.pydantic.dev/latest/api/standard_library_types/#booleans
+
+    Code reads flags only through :meth:`enabled`: routes through the
+    ``get_features`` dependency, the admin UI through the ``features`` list in
+    its session payload. Flags are for work in progress and are removed once
+    the feature ships; a permanent operational switch belongs in its own
+    section as a documented ``bool`` field.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    _retired: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _parse_flags(cls, data: Any, handler: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return handler(data)
+        flags: dict[str, bool] = {}
+        retired: list[str] = []
+        for name in data:
+            # pydantic-settings lowercases environment keys; the chart's
+            # schema admits only lowercase names. Anything else is a typo.
+            flag = str(name)
+            if flag in RETIRED_FEATURE_FLAGS:
+                retired.append(flag)
+                continue
+            if flag not in FEATURE_FLAGS:
+                known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
+                raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
+            try:
+                flags[flag] = _FLAG_VALUE.validate_python(data[name])
+            except ValidationError:
+                # Name only the flag: Config hides input values in errors.
+                raise ValueError(f"feature flag {name!r} must be a boolean") from None
+        features = handler(flags)
+        features._retired = sorted(retired)
+        return features
+
+    def enabled(self, name: str) -> bool:
+        """Whether the named flag is on for this deployment. An unregistered name raises ``KeyError``."""
+        if name not in FEATURE_FLAGS:
+            raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
+        return bool((self.__pydantic_extra__ or {}).get(name, False))
+
+    @property
+    def retired_names(self) -> list[str]:
+        """The retired flags this deployment still sets, sorted. The app factory logs them."""
+        return list(self._retired)
+
+    @property
+    def enabled_names(self) -> list[str]:
+        """The flags that are on for this deployment, sorted."""
+        return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)
+
+
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -889,6 +1111,7 @@ class BaseConfig(BaseSettings):
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     cogs: CogsConfig = Field(default_factory=CogsConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
 
 
 class Config(BaseConfig):
@@ -1018,6 +1241,186 @@ def build_org_store(config: BaseConfig, pools: PostgresPools) -> OrgStore:
     if url:
         return PostgresOrgStore(pools.database(url))
     return UnavailableOrgStore()
+
+
+def build_cog_catalog_store(config: BaseConfig, pools: PostgresPools) -> CogCatalogStore:
+    """The Cog catalog (issue #84): the shared frames.postgres, else a store that refuses (503).
+
+    Always built, whether or not indexing is enabled -- the catalog read API
+    stays up on a deployment that only reads a catalog another replica or an
+    out-of-band job fills. The table is created by the ``collab_`` migration
+    runner (version 11), so there is no ``auto_migrate`` argument here.
+    ``cogs.catalog.backend=memory`` is the development override (#85) that
+    lets level 1 of ``dev/`` serve the read API with no database.
+    """
+
+    if config.cogs.catalog.backend == "memory":
+        return InMemoryCogCatalogStore()
+    url = config.frames.postgres.url
+    if url:
+        return PostgresCogCatalogStore(pools.database(url))
+    return UnavailableCogCatalogStore()
+
+
+class CogIndexing:
+    """A built indexer plus the loop parameters the app lifespan runs it with."""
+
+    def __init__(self, indexer: CogIndexer, *, interval_seconds: float, run_on_startup: bool) -> None:
+        self.indexer = indexer
+        self.interval_seconds = interval_seconds
+        self.run_on_startup = run_on_startup
+
+
+def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexing | None:
+    """The reconciliation indexer (issue #84) when ``cogs.index.enabled``, else ``None``.
+
+    Reads the ``cogs`` block (issue #87): ``cogs.registry_sources`` and
+    ``cogs.index`` (``enabled``, ``interval_seconds``, ``run_on_startup``).
+    ``CogsConfig`` has already refused an enabled index with no sources and
+    resolved every credential indirection, so what arrives here is complete.
+
+    Sources are constructed here, once, so a duplicate id or an unsupported
+    kind fails the rollout rather than the first sweep, and are not
+    constructed at all when indexing is disabled. Indexing into the
+    unavailable store is refused: the store is what a sweep writes, and a
+    deployment that enables sweeping without a database would otherwise fail
+    every interval for as long as the pod lived.
+    """
+
+    cogs = config.cogs
+    index = cogs.index
+    if not index.enabled:
+        return None
+    if isinstance(store, UnavailableCogCatalogStore):
+        raise RuntimeError(
+            "cogs.index.enabled requires the Cog catalog store: set the shared "
+            "COLLAB_HUB_API__FRAMES__POSTGRES__URL (frames.postgres.url), or disable indexing."
+        )
+    pool = config.frames.postgres.pool
+    if pool.max_size < 2:
+        # A sweep occupies one pooled connection for its whole duration: the
+        # session-level advisory lock is held on it, and the sweep's reads and
+        # writes ride it too (issue #128). With max_size=1 that is the pool's
+        # only connection gone for minutes at a time -- every API read and
+        # every webhook write would wait on the sweep and time out, silently,
+        # at runtime. Refuse the rollout instead.
+        raise RuntimeError(
+            "cogs.index.enabled requires frames.postgres.pool.max_size >= 2 "
+            f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
+            "connection for the whole sweep while everything else needs another."
+        )
+    sources = build_registry_sources(list(cogs.registry_sources))
+    return CogIndexing(
+        CogIndexer(store, sources),
+        interval_seconds=float(index.interval_seconds),
+        run_on_startup=index.run_on_startup,
+    )
+
+
+def build_model_catalog(config: BaseConfig):
+    """The serving layer's catalogue reader, configured or not."""
+
+    from .frames.model_catalog import ModelCatalogClient
+
+    return ModelCatalogClient(base_url=config.frames.model_access.catalog_base_url)
+
+
+def build_model_access(config: BaseConfig, pools: PostgresPools):
+    """The membership writer and its audited service, or ``None``.
+
+    ``None`` when the credential or the database is missing, and the panel then
+    reports model access as unavailable. A half-built service that could change
+    Keycloak but not record it would be worse than none at all.
+    """
+
+    from .frames.group_membership import GroupMembershipClient
+    from .frames.model_access import ModelAccessService
+
+    access = config.frames.model_access
+    keycloak = access.keycloak
+    url = config.frames.postgres.url
+    if not (keycloak.token_url and keycloak.admin_api_base_url and keycloak.client_id and access.group_ids):
+        return None
+    if not url:
+        return None
+    membership = GroupMembershipClient(
+        token_url=keycloak.token_url,
+        admin_api_base_url=keycloak.admin_api_base_url,
+        client_id=keycloak.client_id,
+        client_secret=keycloak.client_secret,
+        group_ids=access.group_ids,
+    )
+    return ModelAccessService(db=pools.database(url), membership=membership)
+
+
+def build_connector_store(config: BaseConfig, pools: PostgresPools):
+    """The connector switches, or ``None`` without a database.
+
+    ``None`` means nothing is switched off and nothing can be, which is how
+    every deployment behaved before the switch existed.
+    """
+
+    from .frames.connector_store import PostgresConnectorStore
+
+    url = config.frames.postgres.url
+    return PostgresConnectorStore(pools.database(url)) if url else None
+
+
+def build_platform_role_admin(config: BaseConfig, pools: PostgresPools):
+    """Operator-role changes made from the panel, or ``None`` without a database.
+
+    ``None`` rather than a refusing stand-in, because the panel asks whether
+    roles are manageable before it renders the controls: a deployment with no
+    database shows no buttons rather than buttons that always fail.
+    """
+
+    from .frames.platform_role_admin import PostgresPlatformRoleAdmin
+
+    url = config.frames.postgres.url
+    return PostgresPlatformRoleAdmin(pools.database(url)) if url else None
+
+
+def build_audit_log(config: BaseConfig, pools: PostgresPools):
+    """The audit reader, or the one that refuses.
+
+    No ``"memory"`` override, for the reason ``build_invitation_service`` has
+    none: there is no in-memory audit log, because ``audited()`` writes to
+    Postgres inside the transaction it is auditing. A stand-in would answer an
+    empty page to somebody investigating an incident, which is the worst
+    possible lie for this particular store to tell.
+    """
+
+    from .frames.audit_log import PostgresAuditLog, UnavailableAuditLog
+
+    url = config.frames.postgres.url
+    return PostgresAuditLog(pools.database(url)) if url else UnavailableAuditLog()
+
+
+def build_platform_role_sync(config: BaseConfig, pools: PostgresPools, org_store: OrgStore):
+    """The sign-in reconcile, paired to whatever backend holds the roles.
+
+    Returns the refusing-to-act implementation unless a deployment has named an
+    admin group, so this is inert on every deployment that has not opted in.
+    """
+
+    from .frames.platform_role_sync import (
+        DisabledPlatformRoleSync,
+        InMemoryPlatformRoleSync,
+        PostgresPlatformRoleSync,
+    )
+
+    admin_group = config.web.admin_group
+    if not admin_group:
+        return DisabledPlatformRoleSync()
+    if isinstance(org_store, InMemoryOrgStore):
+        return InMemoryPlatformRoleSync(org_store, admin_group=admin_group)
+    url = config.frames.postgres.url
+    if url:
+        return PostgresPlatformRoleSync(pools.database(url), admin_group=admin_group)
+    # No store to reconcile against. Refusing to sync is the correct state for
+    # such a deployment, and make_app already refuses to start a
+    # membership-resolving one whose store is the unavailable store.
+    return DisabledPlatformRoleSync()
 
 
 def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> InvitationService:

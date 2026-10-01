@@ -18,6 +18,8 @@ Contents:
   a Cog, and why nothing else crosses.
 - [The result envelope](result-envelope.md) — the shape a Cog's entry point
   returns; what Guards check, Gates read, and Tracks record.
+- [The Track](track.md) — event schema v1: what each event carries, payloads
+  by reference, the three stores, and how a Track written before v1 is read.
 - [States](states.md) — the four state machines (install, worker, step
   attempt, run): every state, every transition, and what each records.
 - [Sensitivity](sensitivity.md) — how data-sensitivity labels are born,
@@ -109,7 +111,7 @@ Bare decision and invariant numbers are ADR-0001's.
 | #2 durable Op engine | D2, D5, D8, invariant 5; ADR-0002 D1–D3, D8 | One lifecycle runner with a durability backend (`none`, `dbos`, `temporal`). Gates are declared on the step; recovery must not depend on a caller re-submitting. |
 | #3 model binding | D3, invariant 4 | The hub offers the inventory; the Cog's `resolve` selects; the binding record is the output. |
 | #4 budgets and idle workers | invariant 3 | Duration is a hard pre-check; token/cost is post-interaction accounting. |
-| #5 durable Track | D8; ADR-0002 D3 | Carry binding identity per step and actor per gate decision. Run status comes only from the Track, under every backend. Catalog persistence belongs to #7. |
+| #5 durable Track | D8; ADR-0002 D3 | Event schema v1 ([track](track.md)): binding identity per step, actor per gate decision, a bounded failure record with the key and worker; payloads by reference; in-memory, SQLite and Postgres stores under one conformance suite; the hub's tables from migration 12. Catalog persistence belongs to #7. |
 | #6 the remote location and least-privilege RBAC | invariant 2; ADR-0002 D4, invariant 3 | `location: remote` puts the Kubernetes executor behind the switch #109 adds; a namespace-scoped grant to the controller only; workers carry no ServiceAccount token. |
 | #7 registry and catalog | D6, D9 | The catalog card derives from the manifest; index the full profile as declared. |
 | #8 delegated connector access | "deferred" list | The hub's brokered connectors act as the user; no credential enters the worker. |
