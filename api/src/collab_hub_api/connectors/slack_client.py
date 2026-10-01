@@ -25,6 +25,11 @@ DEFAULT_READ_BUDGET_CHARS = 12_000
 # next page stays inside the requested window.
 _BUDGET_CURSOR_PREFIX = "ts:"
 
+# Slack's own cursor only records a position, not the time window. When a channel
+# read has a lower time bound, its Slack cursor is wrapped as
+# "slack:<oldest>:<slack cursor>" so the bound survives that page too.
+_WINDOWED_SLACK_CURSOR_PREFIX = "slack:"
+
 # ``auth.test`` errors that mean the brokered token is not a usable Slack Web API
 # user token -- e.g. Keycloak brokered an OpenID sign-in/identity token instead of an
 # ``xoxp`` user token. These map the connector status to "reconnect required" so a
@@ -163,20 +168,30 @@ class SlackClient:
         if latest:
             params["latest"] = latest
         budget = _decode_budget_cursor(cursor)
+        windowed = _decode_windowed_slack_cursor(cursor)
+        window_oldest = ""
         if budget is not None:
             budget_ts, window_oldest = budget
             # A budget cursor picks up where the last page's budget stopped:
             # everything at or before that ts, i.e. the next (older) page.
             params["latest"] = budget_ts
-            # Keep the original lower time bound (from oldest, days_back or
-            # since_date) so later pages don't drift outside the window.
-            if window_oldest and not oldest:
-                params["oldest"] = window_oldest
+        elif windowed is not None:
+            slack_cursor, window_oldest = windowed
+            params["cursor"] = slack_cursor
         elif cursor:
             params["cursor"] = cursor
+        # Keep the original lower time bound (from oldest, days_back or
+        # since_date) so later pages don't drift outside the window.
+        if window_oldest and not oldest:
+            params["oldest"] = window_oldest
         payload = await self._get_json("/conversations.history", params=params, operation="conversation read")
         messages, has_more, next_cursor = _messages_page(payload)
-        return _apply_read_budget(messages, has_more, next_cursor, max_chars, oldest=params.get("oldest", ""))
+        window = params.get("oldest", "")
+        messages, has_more, next_cursor = _apply_read_budget(messages, has_more, next_cursor, max_chars, oldest=window)
+        if window and next_cursor and _decode_budget_cursor(next_cursor) is None:
+            # Slack's cursor would lose the window, so carry it along.
+            next_cursor = _encode_windowed_slack_cursor(next_cursor, window)
+        return messages, has_more, next_cursor
 
     async def read_thread(
         self,
@@ -373,6 +388,18 @@ def _decode_budget_cursor(cursor: str) -> tuple[str, str] | None:
         return None
     ts, _, oldest = cursor[len(_BUDGET_CURSOR_PREFIX) :].partition(":")
     return ts, oldest
+
+
+def _encode_windowed_slack_cursor(slack_cursor: str, oldest: str) -> str:
+    return f"{_WINDOWED_SLACK_CURSOR_PREFIX}{oldest}:{slack_cursor}"
+
+
+def _decode_windowed_slack_cursor(cursor: str) -> tuple[str, str] | None:
+    """Return (Slack cursor, lower time bound) for a windowed Slack cursor, else None."""
+    if not cursor.startswith(_WINDOWED_SLACK_CURSOR_PREFIX):
+        return None
+    oldest, _, slack_cursor = cursor[len(_WINDOWED_SLACK_CURSOR_PREFIX) :].partition(":")
+    return slack_cursor, oldest
 
 
 def _encode_channel_cursor(phase: str, upstream_cursor: str) -> str:

@@ -328,3 +328,59 @@ def test_every_slack_response_keeps_both_trust_fields(response):
     payload = json.loads(response.model_dump_json())
     assert payload["content_trust"] == "external_untrusted"
     assert payload["security_notice"] == UNTRUSTED_CONNECTOR_CONTENT_NOTICE
+
+
+async def test_time_window_survives_a_switch_from_the_budget_cursor_to_slacks_cursor(monkeypatch):
+    # Page 1 stops on the budget (our ts: cursor), page 2 fits the budget while Slack has
+    # more (Slack's own cursor), and page 3 must still be inside the original window.
+    sizes = [500, 500, 500, 500, 500, 500, 1_000, 1_000, 2_000]  # oldest first
+    history = [{"ts": f"17900000{i:02d}.000100", "user": "U0001", "text": "x" * size} for i, size in enumerate(sizes)]
+    window_start = history[2]["ts"]
+    seen_params: list[dict] = []
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        params = dict(request.url.params)
+        seen_params.append(params)
+        latest, oldest = params.get("latest"), params.get("oldest")
+        # Like Slack, the cursor only records a position ("next_ts:<ts>"), not the window.
+        resume = params.get("cursor", "").removeprefix("next_ts:")
+        pool = [
+            m
+            for m in reversed(history)
+            if (not latest or float(m["ts"]) <= float(latest))
+            and (not oldest or float(m["ts"]) >= float(oldest))
+            and (not resume or float(m["ts"]) <= float(resume))
+        ]
+        limit = int(params["limit"])
+        page, rest = pool[:limit], pool[limit:]
+        next_cursor = f"next_ts:{rest[0]['ts']}" if rest else ""
+        return Response(
+            200,
+            json={
+                "ok": True,
+                "messages": page,
+                "has_more": bool(rest),
+                "response_metadata": {"next_cursor": next_cursor},
+            },
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    read: list[str] = []
+    messages, has_more, cursor = await slack.read_conversation(
+        channel_id="C0001", limit=2, oldest=window_start, max_chars=2_500
+    )
+    read.extend(m.ts for m in messages)
+    while has_more:
+        # Follow next_cursor alone, without repeating oldest.
+        messages, has_more, cursor = await slack.read_conversation(
+            channel_id="C0001", limit=2, cursor=cursor, max_chars=2_500
+        )
+        read.extend(m.ts for m in messages)
+
+    assert read == [m["ts"] for m in reversed(history[2:])]  # every message in the window, none older
+    assert any("cursor" in params for params in seen_params)  # Slack's own cursor was used along the way
+    assert all(params["oldest"] == window_start for params in seen_params)
