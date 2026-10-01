@@ -112,6 +112,21 @@ the glossary, and updating its issue's row in the
 *(Extends the glossary's rule — a term lands in the PR that introduces it — from
 ADRs to code.)*
 
+**D11 — The lifecycle's states are state machines on the state pattern.** Every
+state a Cog's install, a worker, a step attempt and a run can be in is held by
+one machine per level. Each state is a class behind its machine's interface,
+and an event the current state does not accept is refused, naming both, so an
+illegal move fails instead of becoming a status. Transitions are pure — they
+return the next state and the records that report it — so every durability
+backend moves the same machines, and a run's status is its Track replayed
+through the run machine. The states and transitions are in
+[states](../cog-execution/states.md), and a test holds that page to the code. A
+transition table was the alternative; with the pattern each state owns its
+guards and its records, and a state added later is a class added rather than a
+table edited in several places. *(Builds ADR-0001 invariant 3, a tested
+lifecycle state machine, and keeps D3: status comes from the Track, through one
+derivation.)*
+
 ## Backends at a glance
 
 | | `none` | `dbos` | `temporal` |

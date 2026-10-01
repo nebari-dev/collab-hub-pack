@@ -5,8 +5,13 @@
 dev/.cache/
 
 # Helm
+.chart-parity-*/
 examples/wrap-existing-chart/chart/charts/
 *.tgz
+
+# Release tooling (scripts/release/semantic-release)
+scripts/release/semantic-release/node_modules/
+.next-release
 
 # Python
 __pycache__/

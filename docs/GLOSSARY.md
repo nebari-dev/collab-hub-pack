@@ -47,14 +47,27 @@ check*, not a Guard — see below.
 **Gate.** The decision point on a step: ok / ok-with-problems / escalate
 to a human (whitepaper §5). Gates consume the envelope (payload and
 problems) and Guard findings. Gates decide; Cogs never do. A gate is
-declared on the Op step, not implemented inside the Cog.
+declared on the Op step, not implemented inside the Cog, and a Cog cannot
+pause a run. Its outcomes are `pass`, `pass_with_problems` and `escalate`;
+by default any problem with severity `error` escalates. An escalation has
+an id minted over the step attempt and the envelope, and names who may
+decide it (its `approvers`, organization owners and platform operators when
+it names none). A decision answers one escalation, as an actor, with an
+outcome — **approve** completes the step with the result the approver saw,
+**reject** ends the run `REJECTED`, **send back** re-runs the step with the
+findings — and a decision on an escalation that is no longer open is
+refused as stale. (ADR-0002 D8; [states](cog-execution/states.md).)
 
 **Track.** The durable, append-only record of a run: which Cogs ran under
 which bindings, which Guards and Gates fired, who approved, what came out
 (whitepaper §5.3). Status is derived from the Track, never held only in
 memory. The Track is the accountability record — a Gate signature is only
 meaningful because the Track can say *which* model, *which* weights,
-*which* evidence produced the thing that was signed.
+*which* evidence produced the thing that was signed. Its events follow a
+versioned schema ([track](cog-execution/track.md)): `step_completed` names
+the Cog, its digest, the binding, the problems, the usage and the Frames
+behind a result, `gate_decided` names the escalation, the actor and the
+result decided on, and `step_failed` carries more than a class name.
 
 ## Hub execution vocabulary (defined by ADR-0001, ADR-0002 and the cog-execution docs)
 
@@ -167,10 +180,19 @@ environment, run its checks, resolve its requirements, record the binding,
 derive its catalog card. Distinct from materialize — installing does not
 start a worker. (Cog-execution README, "Materialize / worker".)
 
+**Install reference.** The pinned `<host>/<repository>@<digest>` of one
+indexed Cog version — what a client hands to `nebi import`, and what the
+catalog read API answers at `…/versions/{digest}/reference`. It names one
+location of the artifact; identity is the digest, so the same digest may have
+several install references across sources and repositories.
+([cog-registry.md](cog-registry.md#read-api).)
+
 **Interrupted.** The terminal status of a run that a host was advancing
 when it stopped, under a backend that cannot resume it (`none`). Recorded
 on the Track when the host next starts. The run is never resumed; retrying
-it is a new attempt. (ADR-0002 D2.)
+it continues the attempt that was in flight, under the same idempotency key,
+so a committed claim answers instead of the work running again. (ADR-0002 D2;
+[states](cog-execution/states.md).)
 
 **Keyed claim.** How a step executed again within the same attempt avoids
 repeating a side effect: each interaction carries an idempotency key for its
@@ -240,6 +262,19 @@ is the strictest value on each axis across the sources actually bound; a
 step's output label is at least the strictest of its inputs, absent a
 declared, Guard-verified, Gate-signed downgrade. (ADR-0001 D10, invariants
 6–7; sensitivity doc.)
+
+**State machines.** The four machines that hold every state of Cog
+execution, built on the state pattern: one class per state, the context
+delegating each event to its current state, and an event the state does not
+accept refused. A Cog's **install**: `PUBLISHED`, `FETCHED`, `BOUND`,
+`INVOKABLE`, `UNINSTALLED`. A **worker**: `MATERIALIZED`, `READY`,
+`INTERACTING`, `IDLE`, `TEARING_DOWN`, `TORN_DOWN`, `WORKER_FAILED`. A **step
+attempt** under the keyed claim: `INVOKED`, `RESERVED`, `COMMITTED`,
+`RECORDED`, `OUTCOME_UNKNOWN`. A **run**: `SUBMITTED`, `RUNNING`,
+`WAITING_AT_GATE`, `COMPLETED`, `FAILED`, `REJECTED`, `CANCELLED`,
+`BUDGET_EXCEEDED`, `INTERRUPTED`. A run's status is its Track replayed through
+the run machine. Each state is described in
+[states](cog-execution/states.md). (ADR-0002 D11; ADR-0001 invariant 3.)
 
 **Worker SDK.** An optional library that implements the worker side of the
 seam once — `/invoke` returning an envelope, the health probe, the keyed

@@ -4,15 +4,15 @@ name: Build Docker Images
 # no ECR). Uses the built-in GITHUB_TOKEN — no external registry creds. On PRs
 # it builds without pushing (a CI check); on main / manual dispatch it pushes.
 #
-# The Chart.yaml path is in the trigger because release.yaml pins image tags to
-# the release commit's sha, so a Chart.yaml bump must produce that image.
+# semantic-release.yml dispatches this from each collab-hub-<version> tag, so
+# the image a release pins (sha-<short> of the release commit) is built from
+# that same commit.
 
 on:
   push:
-    branches: [main, "release/**"]
+    branches: [main]
     paths:
       - "api/**"
-      - "helm/collab-hub/Chart.yaml"
       - ".github/workflows/build-images.yaml"
   pull_request:
     paths:

@@ -5,18 +5,14 @@ name: Release Chart
 # packages the chart, creates a GitHub Release, and opens a PR in
 # nebari-dev/helm-repository.
 #
-# Releases on a chart version bump: a push to main that changes
-# helm/collab-hub/Chart.yaml cuts the release (build-images produces the
-# matching sha-<short> image on the same commit). workflow_dispatch is kept
-# for manual re-runs. Publishing relies on the org-provided
-# NEBARI_HELM_REPO_TOKEN secret — confirm it's available to this repo before
-# the first release.
+# Runs only when dispatched. semantic-release.yml dispatches it from a
+# collab-hub-<version> tag, whose Chart.yaml carries the release version, after
+# dispatching build-images.yaml from the same tag for the matching
+# sha-<short> image. Chart.yaml on main holds a placeholder version and never
+# releases. Publishing relies on the org-provided NEBARI_HELM_REPO_TOKEN
+# secret.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "helm/collab-hub/Chart.yaml"
   workflow_dispatch:
 
 jobs:

@@ -16,7 +16,7 @@ durability is Track-based recovery, not distributed ownership:
   Kubernetes workers do not persist keys, so a replaced worker re-runs the side
   effect. Terminal runs are immutable; failed runs can be retried explicitly.
   Runs that exhausted a duration/token/cost budget require a new run id.
-- **Caller-driven recovery.** submit(), signal(), and retry() are synchronous.
+- **Caller-driven recovery.** submit(), decide(), and retry() are synchronous.
   After a process restart, a caller must resubmit the same incomplete Op. This
   package provides no startup reconciliation or background recovery loop.
 
@@ -42,12 +42,11 @@ from .envelope import (
     Problem,
     ResultEnvelope,
 )
+from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .kubernetes import KubernetesCogExecutor, cog_slug, label_value, resource_name
 from .lifecycle import (
     BudgetExceeded,
     BudgetTracker,
-    CogLifecycle,
-    LifecycleState,
     RunBudget,
 )
 from .orchestration import (
@@ -55,17 +54,33 @@ from .orchestration import (
     InMemoryCogExecutor,
     OpDefinition,
     OpStep,
-    PauseRequest,
     UsageUnavailable,
     WorkflowEngine,
 )
+from .runner import STEP_FUNCTIONS, LifecycleRunner
+from .states import (
+    CogInstall,
+    InstallState,
+    InvalidTransition,
+    Run,
+    RunState,
+    StaleEscalation,
+    StepAttempt,
+    StepAttemptState,
+    Worker,
+    WorkerState,
+)
 from .track import (
+    PAYLOAD_INLINE_MAX_BYTES,
+    SCHEMA_VERSION,
     InMemoryTrackStore,
+    OneSubmissionPerRun,
     PostgresTrackStore,
-    RunStatus,
+    SqliteTrackStore,
     TrackEvent,
     TrackStore,
     derive_run_status,
+    upgrade,
 )
 
 __all__ = [
@@ -75,18 +90,32 @@ __all__ = [
     "DeclaredCapabilityResolver",
     "BudgetExceeded",
     "BudgetTracker",
-    "CogLifecycle",
     "InMemoryTrackStore",
-    "LifecycleState",
+    "OneSubmissionPerRun",
+    "PAYLOAD_INLINE_MAX_BYTES",
+    "SCHEMA_VERSION",
+    "SqliteTrackStore",
+    "upgrade",
     "PostgresTrackStore",
     "RunBudget",
-    "RunStatus",
+    "CogInstall",
+    "InstallState",
+    "InvalidTransition",
+    "Run",
+    "RunState",
+    "StaleEscalation",
+    "StepAttempt",
+    "StepAttemptState",
+    "Worker",
+    "WorkerState",
     "TrackEvent",
     "TrackStore",
     "derive_run_status",
     "ModelBinding",
     "ModelCog",
     "DurableWorkflowEngine",
+    "LifecycleRunner",
+    "STEP_FUNCTIONS",
     "InMemoryCogExecutor",
     "ENVELOPE_VERSION",
     "ERROR_CODES",
@@ -97,7 +126,11 @@ __all__ = [
     "UsageUnavailable",
     "OpDefinition",
     "OpStep",
-    "PauseRequest",
+    "DEFAULT_APPROVERS",
+    "Gate",
+    "GateOutcome",
+    "envelope_digest",
+    "escalation_id",
     "WorkflowEngine",
     "KubernetesCogExecutor",
     "cog_slug",

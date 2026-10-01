@@ -63,12 +63,64 @@ class UsageUser:
 
 
 @dataclass(frozen=True)
+class HubOrganizationUsage:
+    """One organization's share of the hub, for the operator roll-up."""
+
+    org_id: str
+    users: int
+    events: int
+
+
+@dataclass(frozen=True)
+class HubUsage:
+    """Activity across the whole deployment.
+
+    ``users_total`` counts **people**, not memberships: somebody who belongs to
+    two organizations is one user of this hub. The per-organization numbers do
+    count them in each, because "how big is org-a" and "how big is this hub"
+    are different questions and only one of them is a sum.
+    """
+
+    users_total: int
+    events_total: int
+    events: list[tuple[str, int]]
+    organizations: list[HubOrganizationUsage]
+
+
+@dataclass(frozen=True)
 class UsageEventCount:
     """Aggregated count of one client-reported event kind for one user."""
 
     event: str
     user: str
     count: int
+
+
+def _within(at: datetime, since: datetime | None, until: datetime | None) -> bool:
+    """Whether *at* falls inside ``[since, until)``, either end optional.
+
+    Half-open, matching the Postgres queries (``>= since``, ``< until``).
+    """
+
+    if since is not None and at < since:
+        return False
+    if until is not None and at >= until:
+        return False
+    return True
+
+
+def _organizations(users: dict[str, int], events: dict[str, int]) -> list[HubOrganizationUsage]:
+    """One row per organization that has people *or* events in the window.
+
+    From both sides, because an organization whose events are counted in the
+    hub total but which has no roster row would otherwise be missing from the
+    breakdown the total is supposed to add up from.
+    """
+
+    return [
+        HubOrganizationUsage(org_id=org_id, users=users.get(org_id, 0), events=events.get(org_id, 0))
+        for org_id in sorted(users.keys() | events.keys())
+    ]
 
 
 def _now() -> datetime:
@@ -138,6 +190,28 @@ class UsageStore(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    def hub_summary(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> HubUsage:
+        """Return activity across every organization on this deployment.
+
+        Takes no tenant arguments, which is the whole point: every other read
+        here is scoped to one, and this is the operator's question rather than
+        a member's. It is a single method rather than hub-wide variants of the
+        three reads above because the roll-up is one answer -- returning it in
+        pieces would let a caller mix a users figure from one moment with an
+        events figure from another and present the pair as a summary.
+
+        The window bounds events only. The roster is current state: "how many
+        people does this hub have" does not become a smaller number because you
+        asked about last week.
+        """
+
+        raise NotImplementedError
+
 
 class UnavailableUsageStore(UsageStore):
     """Store returned when no shared frames Postgres is configured.
@@ -183,6 +257,19 @@ class UnavailableUsageStore(UsageStore):
         until: datetime | None = None,
     ) -> list[UsageEventCount]:
         """Reject reads because no frames Postgres is configured (→ 503)."""
+
+        raise UsageUnavailableError("Usage statistics are not configured")
+
+    def hub_summary(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> HubUsage:
+        """Refused for the same reason every other read here is.
+
+        An operator looking at a hub-wide page must never be shown zeros that
+        mean "no database" while reading as "no activity".
+        """
 
         raise UsageUnavailableError("Usage statistics are not configured")
 
@@ -277,6 +364,38 @@ class InMemoryUsageStore(UsageStore):
         users.sort(key=lambda u: u.last_seen, reverse=True)
         return users
 
+    def hub_summary(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> HubUsage:
+        """Aggregate every organization from process-local memory."""
+
+        with self._lock:
+            users = list(self._users.items())
+            events = [entry for entry in self._events if _within(entry.created_at, since, until)]
+
+        people: set[str] = set()
+        org_users: dict[str, set[str]] = {}
+        for (org_id, _workspace_id, user), _seen in users:
+            people.add(user)
+            org_users.setdefault(org_id, set()).add(user)
+
+        org_events: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        for entry in events:
+            org_events[entry.org_id] = org_events.get(entry.org_id, 0) + 1
+            by_kind[entry.event] = by_kind.get(entry.event, 0) + 1
+
+        return HubUsage(
+            users_total=len(people),
+            events_total=len(events),
+            events=sorted(by_kind.items()),
+            organizations=_organizations(
+                {org_id: len(members) for org_id, members in org_users.items()}, org_events
+            ),
+        )
+
     def count_events(
         self,
         org_id: str,
@@ -291,9 +410,7 @@ class InMemoryUsageStore(UsageStore):
             for entry in self._events:
                 if entry.org_id != org_id or entry.workspace_id != workspace_id:
                     continue
-                if since is not None and entry.created_at < since:
-                    continue
-                if until is not None and entry.created_at >= until:
+                if not _within(entry.created_at, since, until):
                     continue
                 key = (entry.event, entry.user)
                 counts[key] = counts.get(key, 0) + 1
@@ -465,6 +582,69 @@ class PostgresUsageStore(UsageStore):
             )
             for row in rows
         ]
+
+    def hub_summary(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> HubUsage:
+        """Aggregate every organization, in three grouped reads.
+
+        Three statements on one connection rather than one statement with two
+        joins: the roster and the events have different shapes (current state
+        against a windowed count) and joining them would multiply rows before
+        aggregating, which is the classic way to report a user count that grows
+        with how chatty people were.
+
+        The distinct-user total is asked of the database rather than assembled
+        in Python, so a hub with a large roster does not stream the whole table
+        into this process to count it.
+        """
+
+        window = ""
+        window_params: list[object] = []
+        if since is not None:
+            window += " AND created_at >= %s"
+            window_params.append(since)
+        if until is not None:
+            window += " AND created_at < %s"
+            window_params.append(until)
+
+        with self._connect() as conn:
+            org_rows = conn.execute(
+                """
+                SELECT org_id, count(DISTINCT user_id) AS users
+                FROM frames_server_usage_users
+                GROUP BY org_id
+                ORDER BY org_id
+                """
+            ).fetchall()
+            people = conn.execute(
+                "SELECT count(DISTINCT user_id) AS users FROM frames_server_usage_users"
+            ).fetchone()
+            event_rows = conn.execute(
+                f"""
+                SELECT org_id, event, count(*) AS count
+                FROM frames_server_usage_events
+                WHERE true{window}
+                GROUP BY org_id, event
+                ORDER BY org_id, event
+                """,
+                tuple(window_params),
+            ).fetchall()
+
+        org_events: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        for row in event_rows:
+            org_events[row["org_id"]] = org_events.get(row["org_id"], 0) + row["count"]
+            by_kind[row["event"]] = by_kind.get(row["event"], 0) + row["count"]
+
+        return HubUsage(
+            users_total=(people or {}).get("users", 0),
+            events_total=sum(by_kind.values()),
+            events=sorted(by_kind.items()),
+            organizations=_organizations({row["org_id"]: row["users"] for row in org_rows}, org_events),
+        )
 
     def count_events(
         self,

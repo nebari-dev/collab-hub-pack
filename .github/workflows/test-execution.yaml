@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - "execution/**"
+      - "docs/cog-execution/states.md"
       - ".github/workflows/test-execution.yaml"
   pull_request: {}   # runs on every PR so it can be a required status check
 
