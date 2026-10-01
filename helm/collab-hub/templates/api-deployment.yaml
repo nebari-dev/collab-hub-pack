@@ -182,6 +182,20 @@ spec:
               value: {{ .Values.connectors.github.apiBaseUrl | quote }}
             - name: COLLAB_HUB_API__CONNECTORS__GITHUB__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.connectors.github.requestTimeoutSeconds | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GITHUB__ALLOWED_ORGS
+              value: {{ toJson .Values.connectors.github.allowedOrgs | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GITHUB__API_GET_ENABLED
+              value: {{ .Values.connectors.github.apiGetEnabled | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__GITHUB__API_GET_MAX_CONCURRENCY
+              value: {{ .Values.connectors.github.apiGetMaxConcurrency | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__BROKER_TOKEN_URL
+              value: {{ .Values.connectors.notion.brokerTokenUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__API_BASE_URL
+              value: {{ .Values.connectors.notion.apiBaseUrl | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__NOTION_VERSION
+              value: {{ .Values.connectors.notion.notionVersion | quote }}
+            - name: COLLAB_HUB_API__CONNECTORS__NOTION__REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.connectors.notion.requestTimeoutSeconds | quote }}
             {{- with .Values.frames.auth.idToken.jwksUrl }}
             - name: FRAMES_IDTOKEN_JWKS_URL
               value: {{ . | quote }}
@@ -206,6 +220,10 @@ spec:
             - name: FRAMES_BEARER_AUDIENCE
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.frames.auth.cliClientId }}
+            - name: COLLAB_HUB_CLI_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.frames.auth.identityClaim }}
             - name: FRAMES_AUTH_IDENTITY_CLAIM
               value: {{ . | quote }}
@@ -213,6 +231,14 @@ spec:
             {{- with .Values.frames.auth.orgSource }}
             - name: FRAMES_AUTH_ORG_SOURCE
               value: {{ . | quote }}
+            {{- end }}
+            {{- if eq .Values.frames.auth.orgSource "single" }}
+            - name: FRAMES_AUTH_SINGLE_ORG_ID
+              value: {{ .Values.frames.auth.singleOrg.id | quote }}
+            - name: FRAMES_AUTH_SINGLE_ORG_NAME
+              value: {{ .Values.frames.auth.singleOrg.name | quote }}
+            - name: FRAMES_AUTH_SINGLE_ORG_MEMBER_SOURCES
+              value: {{ join "," .Values.frames.auth.singleOrg.memberSources | quote }}
             {{- end }}
             {{- with .Values.frames.auth.defaults.orgId }}
             - name: FRAMES_AUTH_DEFAULT_ORG
@@ -251,6 +277,32 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__EMAIL__SES__REQUEST_TIMEOUT_SECONDS
               value: {{ .Values.frames.email.ses.requestTimeoutSeconds | quote }}
             {{- end }}
+            {{- /* Two hazards, both the same reflowing mistake at different
+                   depths, and neither caught by the schema because the key is
+                   gone before validation.
+
+                   `eq ... "false"` and not `if not`: a nil value is falsy, and
+                   Helm strips null-valued keys during coalescing rather than
+                   falling back to the chart default -- so `requireVerifiedEmail:`
+                   left empty rendered "false" and relaxed Gate B on a
+                   deployment that never asked.
+
+                   `dig` with `default dict`: commenting out the key and leaving
+                   the `invitations:` header made the whole submap nil, and
+                   indexing it was a template error rather than a fallback.
+                   Failing closed, but a deployment that cannot render at all is
+                   still a deployment down. Only an explicit false renders. */}}
+            {{- if eq (dig "requireVerifiedEmail" true (.Values.frames.invitations | default dict) | toString) "false" }}
+            {{- /*
+              Rendered only when turned OFF, so the strict default needs no env
+              var and cannot be weakened by an empty or malformed value. A
+              deployment that wants the relaxation says so explicitly, and the
+              rendered manifest shows it -- which is the point, since it is a
+              security trade rather than a preference.
+            */}}
+            - name: COLLAB_HUB_API__FRAMES__INVITATIONS__REQUIRE_VERIFIED_EMAIL
+              value: "false"
+            {{- end }}
             {{- if .Values.frames.serviceAccess.grantOnAcceptance }}
             {{- /*
               Rendered only when there is something to grant. An empty list is
@@ -273,7 +325,7 @@ spec:
             - name: COLLAB_HUB_API__FRAMES__SERVICE_ACCESS__KEYCLOAK__ADMIN_API_BASE_URL
               value: {{ .Values.frames.serviceAccess.keycloak.adminApiBaseUrl | quote }}
             {{- if .Values.frames.serviceAccess.keycloak.groupIds }}
-            {{/*
+            {{- /*
               Rendered only when set: an empty mapping means "look every path
               up", and an env var holding `{}` would be indistinguishable from
               that while still occupying it -- the same reasoning as the group
@@ -316,6 +368,55 @@ spec:
                   name: {{ .Values.userDirectory.keycloak.existingSecret | quote }}
                   key: {{ .Values.userDirectory.keycloak.clientSecretKey | quote }}
             {{- end }}
+            {{- /*
+              Cog registry (issue #87). The enabled flag always renders so the
+              deployment states its intent; the tuning and the source list
+              render only when there is something for them to govern, which
+              keeps a deployment without Cogs free of cogs env beyond that one
+              line. Secrets are never in the JSON: each source's Secret keys
+              are mounted as their own env vars below, under the names the JSON
+              points at (see _helpers.tpl "collab-hub.cogs-source-env-name").
+            */}}
+            - name: COLLAB_HUB_API__COGS__INDEX__ENABLED
+              value: {{ .Values.cogs.index.enabled | quote }}
+            {{- if .Values.cogs.index.enabled }}
+            - name: COLLAB_HUB_API__COGS__INDEX__INTERVAL_SECONDS
+              value: {{ .Values.cogs.index.intervalSeconds | quote }}
+            - name: COLLAB_HUB_API__COGS__INDEX__RUN_ON_STARTUP
+              value: {{ .Values.cogs.index.runOnStartup | quote }}
+            {{- end }}
+            {{- if .Values.cogs.registry.sources }}
+            - name: COLLAB_HUB_API__COGS__REGISTRY_SOURCES
+              value: {{ include "collab-hub.cogs-registry-sources" . | quote }}
+            {{- range .Values.cogs.registry.sources }}
+            {{- $sourceId := .id }}
+            {{- $credentials := .credentials | default dict }}
+            {{- with $credentials.existingSecret }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "USERNAME") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $credentials.usernameKey | default "username" | quote }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "PASSWORD") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $credentials.passwordKey | default "password" | quote }}
+            {{- end }}
+            {{- $webhook := .webhook | default dict }}
+            {{- with $webhook.existingSecret }}
+            - name: {{ include "collab-hub.cogs-source-env-name" (dict "id" $sourceId "suffix" "WEBHOOK_SECRET") }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $webhook.secretKey | default "secret" | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range $name, $on := .Values.features }}
+            - name: {{ printf "COLLAB_HUB_API__FEATURES__%s" ($name | upper) | quote }}
+              value: {{ $on | toString | quote }}
+            {{- end }}
             {{- with .Values.api.deployment.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -326,6 +427,11 @@ spec:
           volumeMounts:
             - name: frames-storage
               mountPath: {{ .Values.frames.storage.mountPath }}
+            {{- if .Values.cogs.caBundle.configMap }}
+            - name: cogs-ca-bundle
+              mountPath: {{ include "collab-hub.cogs-ca-bundle-mount-path" . }}
+              readOnly: true
+            {{- end }}
           startupProbe:
             httpGet:
               port: {{ .Values.api.service.targetPort }}
@@ -348,4 +454,12 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.cogs.caBundle.configMap }}
+        - name: cogs-ca-bundle
+          configMap:
+            name: {{ .Values.cogs.caBundle.configMap | quote }}
+            items:
+              - key: {{ .Values.cogs.caBundle.key | quote }}
+                path: {{ .Values.cogs.caBundle.key | quote }}
+        {{- end }}
 {{- end }}

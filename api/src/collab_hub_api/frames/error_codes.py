@@ -92,6 +92,14 @@ EMAIL_NOT_VERIFIED = "email_not_verified"
 Covers ``email_verified`` absent, false, or non-boolean and ``email`` absent
 or unusable, deliberately as one state: the differences are IdP configuration,
 not something the invitee can act on differently.
+
+Since #190 this code also covers "the signed-in account carried no usable email
+address". That is the *only* way it is reachable where
+``frames.invitations.require_verified_email`` is off -- and it is reachable on a
+**strict** deployment too, when a client's scopes omit ``email``. The code stays
+one value so the desktop app and the acceptance page keep one state to handle;
+the message distinguishes the two conditions, and the page copy offers a remedy
+for each.
 """
 
 INVITATION_EMAIL_MISMATCH = "invitation_email_mismatch"
@@ -99,6 +107,15 @@ INVITATION_EMAIL_MISMATCH = "invitation_email_mismatch"
 
 Gate B chose **exact** match (2026-08-03), so this is reachable for addresses
 that differ only in case. Does not consume the invitation.
+"""
+
+ORGANIZATION_CREATION_REFUSED = "organization_creation_refused"
+"""An org-creating invitation on a single-organization deployment (409).
+
+`frames.auth.orgSource=single` declares that the hub hosts exactly one
+organization; an invitation with no `org_id` would mint another on
+acceptance. Raised at issuance and, for invitations issued before the
+deployment flipped to `single`, at acceptance — where it consumes nothing.
 """
 
 INVITATIONS_UNAVAILABLE = "invitations_unavailable"

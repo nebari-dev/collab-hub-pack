@@ -1,0 +1,26 @@
+{
+  "type": "PUSH_ARTIFACT",
+  "occur_at": 1788000000,
+  "operator": "robot$cogs+publisher",
+  "event_data": {
+    "resources": [
+      {
+        "digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "tag": "latest",
+        "resource_url": "harbor.example.com/cogs/cog-alpha-1a2b3c4d:latest"
+      },
+      {
+        "digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "tag": "sha-1a2b3c4d5e6f",
+        "resource_url": "harbor.example.com/cogs/cog-alpha-1a2b3c4d:sha-1a2b3c4d5e6f"
+      }
+    ],
+    "repository": {
+      "date_created": 1787990000,
+      "name": "cog-alpha-1a2b3c4d",
+      "namespace": "cogs",
+      "repo_full_name": "cogs/cog-alpha-1a2b3c4d",
+      "repo_type": "private"
+    }
+  }
+}

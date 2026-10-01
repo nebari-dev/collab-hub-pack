@@ -223,3 +223,68 @@ spec:
     {{- end }}
   {{- end }}
 {{- end -}}
+
+{{/*
+Cog registry (issue #87).
+
+Where the CA bundle ConfigMap is mounted. Fixed rather than configurable: the
+path is an implementation detail shared by the volumeMount and every source's
+ca_bundle_path, and nothing outside the pod needs to know it.
+*/}}
+{{- define "collab-hub.cogs-ca-bundle-mount-path" -}}
+/etc/collab-hub/cogs-ca
+{{- end -}}
+
+{{- define "collab-hub.cogs-ca-bundle-path" -}}
+{{- if .Values.cogs.caBundle.configMap -}}
+{{- printf "%s/%s" (include "collab-hub.cogs-ca-bundle-mount-path" .) .Values.cogs.caBundle.key -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The environment variable a source's Secret key is mounted under. Takes
+(dict "id" <source id> "suffix" <USERNAME|PASSWORD|WEBHOOK_SECRET>). The id is
+upper-cased and every character outside [A-Z0-9] becomes "_", so the name is
+a valid POSIX identifier; cogs-validations.yaml fails the render if two ids
+collapse to the same name. config.py reads exactly the names rendered here
+(the JSON carries them as credentials.username_env / password_env and
+webhook_secret_env), so this template is the single source of the convention.
+*/}}
+{{- define "collab-hub.cogs-source-env-name" -}}
+{{- printf "COLLAB_HUB_COGS_SOURCE_%s_%s" (regexReplaceAll "[^A-Z0-9]" (upper .id) "_") .suffix -}}
+{{- end -}}
+
+{{/*
+The value of COLLAB_HUB_API__COGS__REGISTRY_SOURCES: the source list as JSON
+in the API's snake_case shape, with every empty optional field omitted and
+NO secret values — only the env var names the API resolves them from.
+pydantic-settings parses list-valued settings from the environment as JSON;
+toJson sorts keys, so the rendering is deterministic.
+*/}}
+{{- define "collab-hub.cogs-registry-sources" -}}
+{{- $top := . -}}
+{{- $caBundlePath := include "collab-hub.cogs-ca-bundle-path" . -}}
+{{- $out := list -}}
+{{- range .Values.cogs.registry.sources -}}
+{{- $source := dict "id" .id "kind" .kind "url" .url -}}
+{{- with .apiUrl }}{{ $_ := set $source "api_url" . }}{{ end -}}
+{{- with .tokenUrl }}{{ $_ := set $source "token_url" . }}{{ end -}}
+{{- with .projects }}{{ $_ := set $source "projects" . }}{{ end -}}
+{{- with .repositories }}{{ $_ := set $source "repositories" . }}{{ end -}}
+{{- with .indexUrl }}{{ $_ := set $source "index_url" . }}{{ end -}}
+{{- with (default $caBundlePath .caBundlePath) }}{{ $_ := set $source "ca_bundle_path" . }}{{ end -}}
+{{- if hasKey . "requestTimeoutSeconds" }}{{ $_ := set $source "request_timeout_seconds" .requestTimeoutSeconds }}{{ end -}}
+{{- $credentials := .credentials | default dict -}}
+{{- if $credentials.existingSecret -}}
+{{- $_ := set $source "credentials" (dict
+      "username_env" (include "collab-hub.cogs-source-env-name" (dict "id" .id "suffix" "USERNAME"))
+      "password_env" (include "collab-hub.cogs-source-env-name" (dict "id" .id "suffix" "PASSWORD"))) -}}
+{{- end -}}
+{{- $webhook := .webhook | default dict -}}
+{{- if $webhook.existingSecret -}}
+{{- $_ := set $source "webhook_secret_env" (include "collab-hub.cogs-source-env-name" (dict "id" .id "suffix" "WEBHOOK_SECRET")) -}}
+{{- end -}}
+{{- $out = append $out $source -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}

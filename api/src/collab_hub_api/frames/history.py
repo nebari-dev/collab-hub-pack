@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from .db import locked_schema_connection
+
 # Defensive cap on the JSON-encoded ``detail`` payload. History is metadata, not
 # content; anything larger is a bug or an attempt to smuggle a body in.
 DETAIL_MAX_BYTES = 4096
@@ -427,7 +429,9 @@ class PostgresFrameHistoryStore(FrameHistoryStore):
         ]
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        # Advisory-locked (issue #42): bare CREATE TABLE IF NOT EXISTS races
+        # under concurrent replica startup.
+        with locked_schema_connection(self.db) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS frames_server_history (

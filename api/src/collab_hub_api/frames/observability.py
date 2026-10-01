@@ -41,6 +41,25 @@ USAGE_WRITE_FAILURES = Counter(
     "Usage rows dropped because the persistent write failed.",
     ["kind"],
 )
+# The Cog catalog indexer (cogs/indexer.py). Both label sets are closed
+# vocabularies chosen by the indexer, never by a registry: outcome is one of
+# indexed/skipped/retagged/non_cog/failed/removed, result one of
+# completed/locked_out/failed.
+COG_INDEX_ARTIFACTS = Counter(
+    "frames_server_cog_index_artifacts_total",
+    "Artifacts handled by Cog catalog sweeps, by outcome.",
+    ["outcome"],
+)
+COG_INDEX_SWEEPS = Counter(
+    "frames_server_cog_index_sweeps_total",
+    "Cog catalog sweeps, by result.",
+    ["result"],
+)
+COG_INDEX_SWEEP_DURATION = Histogram(
+    "frames_server_cog_index_sweep_duration_seconds",
+    "Wall-clock duration of one Cog catalog sweep.",
+    buckets=(0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600),
+)
 
 
 UNMATCHED_PATH_LABEL = "<unmatched>"

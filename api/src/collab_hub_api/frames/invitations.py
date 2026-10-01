@@ -61,7 +61,19 @@ to prevent. So each mutation here declares one action:
 - accepting into an **existing** organization → ``invitation.redeem``;
 - accepting an org-creating invitation → ``org.create``, with the accepter as
   actor, in the same transaction that creates the organization and the
-  membership — the ratified requirement.
+  membership — the ratified requirement;
+- an owner giving their placeholder-named organization its name →
+  ``org.rename`` (:meth:`PostgresInvitationService.name_organization`, the
+  first-invite naming flow of #92, reopened as #44). It lives on this
+  service because it is the write half of
+  :meth:`~PostgresInvitationService.organization_name` and exists for one
+  caller: the owner invitation page, which refuses to issue while the
+  placeholder stands, so an owner has identified the organization they are
+  inviting people into before the first invitation leaves. The invitation
+  email itself is organization-neutral by decision
+  (:func:`.invitation_email.render_invitation_email` discards the name, and
+  a regression pins that); the name is for the owner's page, the
+  organization's record, and the audit row.
 
 That last case therefore produces no ``invitation.redeem`` row, which is a
 real asymmetry and is stated rather than hidden: both acceptance rows carry
@@ -71,11 +83,20 @@ action alone.
 
 Address matching (Gate B, ratified 2026-08-03; amended on #157)
 ---------------------------------------------------------------
-Acceptance requires the caller's OIDC ``email_verified`` claim to be boolean
-``true`` and their ``email`` claim to equal the invited address **but for
-ASCII case**. Gate B chose exact match over canonicalization, and that still
-holds for everything except case: there is no plus-tag stripping, no
+Acceptance requires the caller's ``email`` claim to equal the invited address
+**but for ASCII case**. Gate B chose exact match over canonicalization, and that
+still holds for everything except case: there is no plus-tag stripping, no
 dot-folding, no provider-specific rule, and no canonical column.
+
+Gate B's *other* half — that the caller's OIDC ``email_verified`` claim is
+boolean ``true`` — is a deployment setting since #190:
+``frames.invitations.require_verified_email``, default on. Where it is off, the
+invitation token stands in for the proof of mailbox control and **the address
+match above still applies unchanged**. This paragraph exists because the
+unconditional version of it was the canonical description of Gate B, and a
+reader reasoning from it would conclude a claim with ``email_verified: false``
+can never reach :func:`emails_match` — and might remove the ``require_verified``
+plumbing as dead code.
 
 The original rule was byte-exact, and it was wrong for one specific reason.
 **Keycloak lowercases the email on every account it holds**, so the claim it
@@ -196,6 +217,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -206,12 +228,14 @@ from .audit import (
     AUDIT_ACTION_INVITATION_REVOKE,
     AUDIT_ACTION_INVITATION_SEND,
     AUDIT_ACTION_ORG_CREATE,
+    AUDIT_ACTION_ORG_RENAME,
     AUDIT_ACTION_SERVICE_ACCESS_GRANT,
     audited,
 )
 from .auth import WORKSPACE_DEFAULT, AuthContext, DisplayIdentity
 from .credentials import REDACTED, InvitationSecret, refuse_to_serialize
 from .invitation_email import validate_mailbox
+from .org_source import org_source_is_single
 from .orgs import ROLE_MEMBER, ROLE_OWNER
 from .service_access_state import OutstandingGrant, ServiceAccessStateStore, claim_pending
 
@@ -292,6 +316,18 @@ class EmailNotVerifiedError(InvitationError):
     the login's IdP configuration, not something the invitee can act on
     differently, and enumerating them would describe another account's claims
     to whoever holds the link.
+
+    **Two conditions share this one state, and only one of them is always
+    reachable.** With ``frames.invitations.require_verified_email`` on -- the
+    default -- it is raised for an unverified or non-boolean claim *and* for a
+    missing address. With it off, only the missing address can raise it, and
+    the message says so, because ``routers/invitations.py`` returns
+    ``str(exc)`` verbatim to every non-browser client.
+
+    They share the exception and the wire code deliberately: widening either is
+    a contract change for the desktop app and the acceptance page, and the
+    remedy a caller has is the same in both cases -- sign in with an account
+    that carries the invited address.
     """
 
 
@@ -315,8 +351,59 @@ class AlreadyInOrganizationError(InvitationError):
     """
 
 
+class OrganizationAlreadyNamedError(Exception):
+    """The organization already carries a real name, so naming it is refused.
+
+    :meth:`PostgresInvitationService.name_organization` is the *first* naming
+    only — the step #92 specified so an owner names their organization before
+    inviting anyone into it. Changing a name that was already chosen
+    is a different action with a different audience (an operator, or a future
+    owner settings page) and is not reachable through this one.
+
+    Deliberately **not** an :class:`InvitationError`: that hierarchy is the set
+    of acceptance outcomes the wire distinguishes, and the acceptance page's
+    test enumerates it to prove every member has a page outcome. Naming is
+    not an acceptance state and never reaches that page; the owner page
+    catches this class by name.
+    """
+
+
 class OrgNotFoundError(InvitationError):
     """The invitation names an organization that does not exist."""
+
+
+class OrganizationCreationRefusedError(InvitationError):
+    """An org-creating invitation on a deployment that declares a single organization.
+
+    ``frames.auth.orgSource=single`` (issue #91) is a declaration that this hub
+    hosts exactly one organization, and an invitation with no ``org_id`` mints
+    a new one on acceptance — the one write that would make the declaration
+    false. Refused at **both** ends: at issuance, so the operator hears it
+    while they can still act on it, and at acceptance, because an invitation
+    issued before the deployment flipped to ``single`` is still live and
+    acceptance is where the organization row is actually created. The
+    acceptance-side refusal consumes nothing: the token stays live, exactly
+    like the other fixable refusals, because the state is the deployment's
+    configuration and not the invitation's.
+
+    Invitations *into* an existing organization are untouched — they are how a
+    single-organization hub grants the ``owner`` role, which auto-admission
+    never does.
+    """
+
+
+_ORGANIZATION_CREATION_REFUSED_MESSAGE = (
+    "This deployment declares a single organization (orgSource=single), so an invitation that"
+    " would create another organization is refused. Invite into the declared organization, or"
+    " move the deployment to orgSource=membership first."
+)
+
+
+def _refuse_org_creation_under_single_org(org_id: str | None) -> None:
+    """The single-organization guard, shared by issuance and acceptance."""
+
+    if org_id is None and org_source_is_single():
+        raise OrganizationCreationRefusedError(_ORGANIZATION_CREATION_REFUSED_MESSAGE)
 
 
 class InvitationsUnavailableError(RuntimeError):
@@ -600,23 +687,142 @@ def validate_invited_email(value: str) -> str:
     return ascii_folded_bytes(validated).decode("ascii")
 
 
-def verified_claim_email(email: object, email_verified: object) -> str:
-    """The caller's verified email, or raise :class:`EmailNotVerifiedError`.
+MAX_ORGANIZATION_NAME_LENGTH = 120
+"""Bound on an organization's display name, in characters.
+
+Long enough for any real organization, short enough that the name fits the
+audit row's ``target_label`` (bounded at :data:`~.audit.AUDIT_LABEL_MAX_CHARS`)
+and the page's intro sentence without wrapping into a paragraph. The page's
+``maxlength`` restates it as a hint; the bound is enforced here.
+"""
+
+
+def is_placeholder_organization_name(name: str | None) -> bool:
+    """Whether *name* is the neutral placeholder every organization starts with.
+
+    ``NULL``, blank, and the placeholder string itself (compared without
+    regard to ASCII case) all count: the column is nullable and defaults to
+    the placeholder, and :meth:`PostgresInvitationService.organization_name`
+    already words all three the same way. This is the predicate the owner page
+    branches on — an organization for which it holds has never been named by
+    anyone, and an owner inviting into it has never seen it identified as
+    anything but the placeholder.
+
+    The comparison is :func:`ascii_folded_bytes`, this module's one fold: the
+    placeholder is ASCII, so an ASCII fold catches every capitalization of it,
+    and no wider equivalence is introduced here any more than for addresses.
+    """
+
+    from .collab_schema import NEUTRAL_ORG_NAME
+
+    if name is None:
+        return True
+    stripped = name.strip()
+    return not stripped or ascii_folded_bytes(stripped) == ascii_folded_bytes(NEUTRAL_ORG_NAME)
+
+
+def validate_organization_name(value: str) -> str:
+    """Validate a display name an owner typed, returning it normalized.
+
+    Display-only text, so the rule is deliberately thin: one line, between 1
+    and :data:`MAX_ORGANIZATION_NAME_LENGTH` characters once whitespace is
+    normalized, containing at least one letter or digit, and not the
+    placeholder itself in any capitalization — "Unnamed organization" typed
+    by hand is not a name, and accepting it would satisfy the page's check
+    while leaving the owner exactly as uninformed as before.
+
+    Whitespace is normalized rather than merely stripped: every Unicode space
+    separator (``Zs`` — NBSP, ideographic space, and the rest) becomes an
+    ASCII space and runs collapse to one, so ``Unnamed\u00a0organization`` is
+    the placeholder, and a name cannot differ from another only in invisible
+    spacing. "At least one letter or digit" (categories ``L*``/``N*``) is what
+    rules out the visually blank: a Braille blank (U+2800), a string of
+    combining marks, or punctuation alone renders as nothing an owner could
+    recognize their organization by, and naming is one shot.
+
+    "One line" is decided by Unicode category, not by the ASCII range: every
+    control character (``Cc`` — C0, DEL, and the C1 block including NEL), the
+    line and paragraph separators (``Zl``/``Zp``, U+2028/U+2029), and the
+    format characters (``Cf`` — among them the bidirectional overrides that
+    make text render as something other than what it is) are refused. The
+    name becomes an audit ``target_label`` and a heading on the owner page,
+    and a value that can forge a line break or reorder its own rendering in
+    either is not a name. The audit primitive's own check
+    covers only the ASCII controls; this rule is deliberately wider than
+    that, so nothing this function accepts is later refused there. No other
+    normalization — the owner's spelling is stored.
+
+    Raises :class:`ValueError`; the page words that as its own fixed notice.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError("organization name must be a string")
+    if any(unicodedata.category(ch) in _NOT_A_NAME_CATEGORIES for ch in value):
+        raise ValueError("organization name contains control, separator, or format characters")
+    spaced = "".join(" " if unicodedata.category(ch) == "Zs" else ch for ch in value)
+    name = " ".join(spaced.split())
+    if not name:
+        raise ValueError("organization name is empty")
+    if len(name) > MAX_ORGANIZATION_NAME_LENGTH:
+        raise ValueError(f"organization name exceeds {MAX_ORGANIZATION_NAME_LENGTH} characters")
+    if not any(unicodedata.category(ch)[0] in "LN" for ch in name):
+        raise ValueError("organization name has no letter or digit")
+    if is_placeholder_organization_name(name):
+        raise ValueError("organization name is the placeholder")
+    return name
+
+
+_NOT_A_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+"""Unicode general categories :func:`validate_organization_name` refuses.
+
+``Cc`` is every control character (ASCII C0 and DEL, and the C1 block —
+U+0085 NEL is a line break to many renderers); ``Zl``/``Zp`` are the line and
+paragraph separators; ``Cf`` the format characters, which include the bidi
+overrides (U+202E and kin) and the zero-width joiners a display name has no
+honest use for. Everything else — letters, marks, digits, punctuation, symbols,
+ordinary spaces — is a name's business.
+"""
+
+
+def verified_claim_email(email: object, email_verified: object, *, require_verified: bool = True) -> str:
+    """The caller's usable email, or raise :class:`EmailNotVerifiedError`.
 
     ``email_verified`` must be the boolean ``True``. The string ``"true"``
     is rejected: some IdPs render claims as strings, and accepting the string
     would mean accepting ``"false"``-shaped truthiness from any IdP that ever
     emits a non-empty value here. This deployment's IdP contract (see
     ``docs/frames-operations.md``) is a boolean claim.
+
+    **``require_verified=False`` drops the verification requirement and nothing
+    else.** The address must still be a non-empty string, and the caller still
+    compares it to the invited address with :func:`emails_match` — dropping the
+    flag must never be mistaken for dropping the match, which is the check that
+    makes an invitation an invitation. See
+    :class:`~...config.FramesInvitationsConfig` for what the deployment is
+    trading: the token is a 256-bit secret delivered only to the invited
+    address, so holding it is itself proof of mailbox control, and the cost is
+    that a forwarded invitation becomes usable by whoever received it.
+
+    The default is ``True`` here as well as in configuration, so a caller that
+    forgets to thread the setting fails closed.
     """
 
-    if email_verified is not True:
+    if require_verified and email_verified is not True:
         raise EmailNotVerifiedError(
             "Accepting an invitation requires a verified email address on your account."
         )
     if not isinstance(email, str) or not email:
+        # A DIFFERENT condition, and the only one reachable when verification is
+        # not required: the signed-in account carried no usable address. It shares
+        # the exception and the wire code -- widening either is a contract
+        # change -- but not the sentence, because `routers/invitations.py`
+        # returns `str(exc)` verbatim and this is the one string every
+        # non-browser client sees. Telling an API caller on a relaxed
+        # deployment to "verify an address" points them at mail that deployment
+        # never sends.
         raise EmailNotVerifiedError(
-            "Accepting an invitation requires a verified email address on your account."
+            "Accepting an invitation requires an email address on your account, and the"
+            " account you signed in with did not provide one."
         )
     return email
 
@@ -780,6 +986,9 @@ class UnavailableInvitationService:
     def organization_name(self, *args, **kwargs) -> str | None:
         raise self._unavailable()
 
+    def name_organization(self, *args, **kwargs) -> str:
+        raise self._unavailable()
+
     def record_service_access_grant(self, *args, **kwargs) -> None:
         raise self._unavailable()
 
@@ -827,8 +1036,13 @@ class PostgresInvitationService:
 
     available = True
 
-    def __init__(self, db):
+    def __init__(self, db, *, require_verified_email: bool = True):
         self._db = db
+        # A deployment property, so it is read once here rather than per
+        # request: nothing about a single acceptance should be able to change
+        # what the deployment requires of an identity. Defaults to the strict
+        # value so a construction that forgets it fails closed.
+        self._require_verified_email = require_verified_email
 
     # --- Reads --------------------------------------------------------------
 
@@ -871,6 +1085,61 @@ class PostgresInvitationService:
         if row is None or not row["name"]:
             return NEUTRAL_ORG_NAME
         return row["name"]
+
+    # --- Naming -------------------------------------------------------------
+
+    def name_organization(self, ctx: AuthContext, *, org_id: str, name: str) -> str:
+        """Give a placeholder-named organization its name, recorded as ``org.rename``.
+
+        The first-invite naming flow (#92 criterion 4, observed missing live
+        on #44): every organization starts as ``NEUTRAL_ORG_NAME`` —
+        acceptance of an org-creating invitation never supplies a name — and
+        the owner page refuses to issue while that placeholder stands. This
+        is the step that clears it.
+
+        Same authorization contract as every other mutation here: the caller
+        has already been authorized by :func:`~.authorization.requires_org_role`
+        pinned to *org_id*, and the row is written inside :func:`~.audit.audited`
+        with the owner as actor, the organization as target, and the new name
+        as ``target_label`` — so the log answers "who named it, and what" from
+        one row.
+
+        **One shot.** The organization's current name is read ``FOR UPDATE``
+        inside the transaction, and if it is not the placeholder the call
+        raises :class:`OrganizationAlreadyNamedError` and writes nothing: two
+        owners naming at once resolve to one ``org.rename`` row and one
+        refusal, and a stale page cannot silently overwrite a name that was
+        already chosen. Renaming a named organization is not this method's
+        job (see the error's docstring).
+
+        *name* goes through :func:`validate_organization_name`; the page has
+        already applied it and worded a failure, so a :class:`ValueError`
+        here is a programming error rather than the owner's typo.
+        """
+
+        return _retrying(lambda: self._name_organization_once(ctx, org_id=org_id, name=name))
+
+    def _name_organization_once(self, ctx: AuthContext, *, org_id: str, name: str) -> str:
+        new_name = validate_organization_name(name)
+        with audited(
+            self._db,
+            ctx,
+            AUDIT_ACTION_ORG_RENAME,
+            target_type="org",
+            target_id=org_id,
+            target_label=new_name,
+            org_id=org_id,
+            detail={"replaced_placeholder": True},
+        ) as event:
+            row = event.conn.execute(
+                "SELECT name FROM collab_orgs WHERE id = %s FOR UPDATE", (org_id,)
+            ).fetchone()
+            if row is None:
+                raise OrgNotFoundError("Organization not found")
+            if not is_placeholder_organization_name(row["name"]):
+                raise OrganizationAlreadyNamedError("Organization already has a name")
+            event.conn.execute("UPDATE collab_orgs SET name = %s WHERE id = %s", (new_name, org_id))
+        return new_name
 
     def get(self, invitation_id: str) -> Invitation | None:
         with self._db.connection() as conn:
@@ -937,6 +1206,7 @@ class PostgresInvitationService:
         is unrecoverable and must happen after this transaction commits.
         """
 
+        _refuse_org_creation_under_single_org(org_id)
         return _retrying(lambda: self._create_once(ctx, email=email, org_id=org_id))
 
     def _create_once(self, ctx: AuthContext, *, email: str, org_id: str | None) -> IssuedInvitation:
@@ -1015,6 +1285,7 @@ class PostgresInvitationService:
         rather than belt-and-braces.
         """
 
+        _refuse_org_creation_under_single_org(org_id)
         return _retrying(lambda: self._create_unless_live_once(ctx, email=email, org_id=org_id))
 
     def _create_unless_live_once(
@@ -1262,13 +1533,31 @@ class PostgresInvitationService:
         if row is None:
             raise InvitationNotFoundError("Invitation not found")
         invitation = _invitation(row)
-        replay = _evaluate_acceptance(invitation, row["server_now"], user_id, claim_email, email_verified)
+        replay = _evaluate_acceptance(
+            invitation,
+            row["server_now"],
+            user_id,
+            claim_email,
+            email_verified,
+            require_verified=self._require_verified_email,
+        )
         if replay is not None:
             return replay
-        # Cannot raise: the evaluation above returned, so the claim is
-        # verified and matches. Re-derived rather than threaded through, so
-        # there is one function that decides what a usable claim is.
-        verified_email = verified_claim_email(claim_email, email_verified)
+        # Cannot raise: the evaluation above returned, so the claim is usable
+        # and matches. Re-derived rather than threaded through, so there is one
+        # function that decides what a usable claim is -- and it is asked the
+        # same question, with the same setting, both times.
+        #
+        # `matched_email`, not `verified_email`. On a relaxed deployment this
+        # value is not verified by anyone, and it is *persisted* -- it becomes
+        # `collab_org_members.email`. A name asserting a property the code no
+        # longer establishes is the exact reading this change has to avoid,
+        # since a reader who trusts it might treat the column as evidence of
+        # verification. What is always true of it is that it matched the
+        # invited address.
+        matched_email = verified_claim_email(
+            claim_email, email_verified, require_verified=self._require_verified_email
+        )
 
         # Minted before the transaction so the audit scope can be declared;
         # discarded with the transaction if the body does not commit. Org ids
@@ -1314,6 +1603,15 @@ class PostgresInvitationService:
                     "invitation_id": invitation.id,
                     "role": invitation.granted_role,
                     "org_created": invitation.creates_organization,
+                    # Whether this acceptance required a verified address (#190).
+                    # The docs describe the relaxed trade honestly -- "usable by
+                    # anyone who obtains the link" -- but without this there is
+                    # no way to answer "which memberships were granted without a
+                    # verified address" during an incident, and the membership
+                    # row cannot say: it stores the matched address either way.
+                    # One boolean makes the documented trade reviewable after
+                    # the fact.
+                    "verified_email_required": self._require_verified_email,
                 },
             ) as event:
                 acceptance = self._redeem(
@@ -1321,7 +1619,7 @@ class PostgresInvitationService:
                     token_hash=token_hash,
                     user_id=user_id,
                     display=display,
-                    verified_email=verified_email,
+                    matched_email=matched_email,
                     expect_invitation_id=invitation.id,
                     new_org_id=new_org_id,
                     service_groups=service_groups,
@@ -1337,7 +1635,7 @@ class PostgresInvitationService:
         token_hash: str,
         user_id: str,
         display: DisplayIdentity,
-        verified_email: str,
+        matched_email: str,
         expect_invitation_id: str,
         new_org_id: str | None,
         service_groups: Sequence[str] = (),
@@ -1360,7 +1658,16 @@ class PostgresInvitationService:
         invitation = _invitation(locked)
         if invitation.id != expect_invitation_id:  # pragma: no cover - the hash is unique
             raise InvitationNotFoundError("Invitation not found")
-        replay = _evaluate_acceptance(invitation, locked["server_now"], user_id, verified_email, True)
+        # `True` and no `require_verified`, deliberately: this is the re-check
+        # against the LOCKED row, and what it re-decides is the invitation's
+        # state, not the identity. `matched_email` is already the string the
+        # outer evaluation produced under whatever the deployment requires, so
+        # asking the question again here would either be a no-op or would let a
+        # setting change mid-acceptance. The address match still runs, against
+        # the locked row's email.
+        replay = _evaluate_acceptance(
+            invitation, locked["server_now"], user_id, matched_email, True, require_verified=True
+        )
         if replay is not None:
             # Raced by this same login's own duplicate submit. The right
             # answer is the same success, and no second audit row.
@@ -1381,6 +1688,12 @@ class PostgresInvitationService:
 
         org_id = invitation.org_id
         if org_id is None:
+            # The guard runs at issuance too, but acceptance is where the
+            # organization row is actually created — and an org-creating
+            # invitation issued before the deployment flipped to
+            # orgSource=single is still live. Raising here rolls the whole
+            # transaction back: nothing is created, nothing is consumed.
+            _refuse_org_creation_under_single_org(org_id)
             org_id = new_org_id
             # `name` is deliberately not supplied: the column's schema default
             # is the neutral placeholder, and a name derived from the
@@ -1404,7 +1717,7 @@ class PostgresInvitationService:
             ON CONFLICT (user_id) DO NOTHING
             RETURNING user_id
             """,
-            (user_id, org_id, invitation.granted_role, verified_email, display.name),
+            (user_id, org_id, invitation.granted_role, matched_email, display.name),
         ).fetchone()
         if member is None:
             # Lost the cross-token race on the membership primary key. The
@@ -1610,8 +1923,17 @@ def _evaluate_acceptance(
     user_id: str,
     claim_email: object,
     email_verified: object,
+    *,
+    require_verified: bool,
 ) -> InvitationAcceptance | None:
     """Run the accept-time checks; return a replay outcome or ``None``.
+
+    ``require_verified`` has **no default**, deliberately. It is an internal
+    hop, and a default here is the hazard rather than the safety property: a
+    caller that dropped the keyword would get working code that quietly ignored
+    the deployment's choice, which is exactly the defect review found in the
+    first version of this change (deleting both threads left the suite green).
+    Required, it is a ``TypeError`` at the first call instead.
 
     Raises the terminal state for every failure. The order is fixed and
     load-bearing: the token's own state is decided before anything about the
@@ -1644,8 +1966,20 @@ def _evaluate_acceptance(
         raise InvitationAlreadyUsedError("This invitation has already been used.")
     if status == STATUS_EXPIRED:
         raise InvitationExpiredError("This invitation has expired. Ask for a new one.")
-    verified_email = verified_claim_email(claim_email, email_verified)
-    if not emails_match(invitation.email, verified_email):
+    # The match is NOT conditional on `require_verified`, and it is worth being
+    # exact about why, because the reason differs by mode.
+    #
+    # Strict: the match is an access control. The accepter has proved control of
+    # a verified address, and this is what ties that proof to *this* invitation.
+    #
+    # Relaxed: the claim is self-asserted, so the match is not a barrier -- a
+    # link-holder can type the invited address. What it still buys is that the
+    # address recorded on the membership row is the invited one, which is worth
+    # keeping unconditional: an invitation that recorded any address would make
+    # the member list unreliable as well as the access. What it does not buy is
+    # protection against whoever holds the link.
+    matched_email = verified_claim_email(claim_email, email_verified, require_verified=require_verified)
+    if not emails_match(invitation.email, matched_email):
         raise InvitationEmailMismatchError(
             "This invitation was sent to a different email address. Sign in with the account "
             "for the address it was sent to."

@@ -35,6 +35,7 @@ Wiring follows the house pattern: the tables ride the shared
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 collab_logger = logging.getLogger("frames_server.collab_schema")
@@ -72,6 +73,13 @@ is written. A test pins the two spellings together.
 #   3. Statements stay idempotent where the DDL allows it (IF NOT EXISTS), so a
 #      database that was hand-patched between releases does not wedge the whole
 #      migration transaction.
+#
+# Rule 2 is enforced mechanically, not just by review (issue #73): the registry
+# stores a SHA-256 checksum of each applied version's statement text, and the
+# runner verifies every already-applied version against the code's current text
+# before applying anything. An in-place edit of a shipped version is therefore
+# a startup failure naming the version, instead of a silent fork between old
+# and new databases.
 COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         1,
@@ -463,6 +471,280 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        7,
+        (
+            # Where a platform-role row came from, so that sync can remove its
+            # own rows without ever removing a hand-administered one.
+            #
+            # Sync has to be able to revoke: a copy of the identity provider's
+            # answer that only ever adds would leave a dropped admin's row
+            # standing forever, and the deployment would believe the provider
+            # had revoked them. But the bootstrap operator's row was inserted
+            # by hand, and their subject may be in no group at all -- so a sync
+            # that could revoke anything would lock the first admin out of the
+            # deployment they had just bootstrapped, on their next sign-in.
+            #
+            # The default is `manual`, which is what makes this migration safe
+            # on a live database: every row that exists when it runs was
+            # inserted by hand, and every one of them keeps its authority.
+            """
+            ALTER TABLE collab_platform_roles
+            ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'manual'
+            CHECK (source IN ('manual', 'idp'))
+            """,
+            # Widen the audit action vocabulary by two: `platform_role.grant`
+            # and `platform_role.revoke`. Same mechanics as v5 -- drop the
+            # constraint by the name v5 chose, add the replacement under that
+            # same name -- and the same test pins the effective constraint to
+            # AUDIT_ACTIONS, so widening one without the other fails at unit
+            # speed rather than on a production sign-in.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        8,
+        (
+            # Version 2 shipped this table with no index beyond its primary
+            # key, and said so deliberately: the log was read from psql at
+            # beta volume. It now has a paginated reader behind the admin
+            # panel, so the two filters that reader offers need to be seeks
+            # rather than scans over a table that only grows.
+            #
+            # `id DESC` in both, matching the reader's ORDER BY exactly: an
+            # index whose order disagrees with the query's is read forwards
+            # and then sorted, which is the cost this exists to avoid. The
+            # unfiltered listing is already served by the primary key.
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_actor_idx
+            ON collab_audit_events (actor, id DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_audit_events_action_idx
+            ON collab_audit_events (action, id DESC)
+            """,
+        ),
+    ),
+    (
+        9,
+        (
+            # Widen the action vocabulary by one: `service_access.revoke`.
+            # Same mechanics as v5 and v7. It had no counterpart before because
+            # nothing in this codebase could take service access away; the
+            # admin panel can.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke'))
+            """,
+        ),
+    ),
+    (
+        10,
+        (
+            # Which connectors an administrator has switched off.
+            #
+            # One bit per connector and nothing else. Credentials stay in
+            # deployment configuration, which is what decides whether a
+            # connector is possible at all; this decides whether it is
+            # currently offered. A row here can only ever take a configured
+            # connector away, never conjure an unconfigured one -- there is no
+            # credential column for it to supply.
+            #
+            # Absence means enabled, so a deployment that never opens this
+            # screen behaves exactly as it did before the table existed.
+            """
+            CREATE TABLE IF NOT EXISTS collab_connector_state (
+                connector   text PRIMARY KEY,
+                enabled     boolean NOT NULL,
+                updated_at  timestamptz NOT NULL DEFAULT now(),
+                updated_by  text
+            )
+            """,
+            # Two more actions, and the first new target type since version 2:
+            # a connector is not an org, a user or an invitation.
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_action_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_action_check
+            CHECK (action IN ('invitation.send', 'invitation.redeem',
+                              'invitation.revoke', 'membership.create',
+                              'org.create', 'org.rename', 'operator.manual',
+                              'service_access.grant', 'service_access.revoke',
+                              'platform_role.grant', 'platform_role.revoke',
+                              'connector.enable', 'connector.disable'))
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            DROP CONSTRAINT IF EXISTS collab_audit_events_target_type_check
+            """,
+            """
+            ALTER TABLE collab_audit_events
+            ADD CONSTRAINT collab_audit_events_target_type_check
+            CHECK (target_type IN ('org', 'user', 'invitation', 'connector'))
+            """,
+        ),
+    ),
+    (
+        11,
+        (
+            # The Cog catalog (issue #84): one row per artifact the indexer has
+            # seen in a configured registry source, keyed by content digest.
+            #
+            # **Identity is the digest.** PRIMARY KEY (source_id, repository,
+            # digest) because the same bytes may legitimately be published to
+            # several repositories (and enumerated by several sources), and
+            # each such location is its own row; `cog_id`/`name` are search
+            # keys read out of the Cog's own declarations, and the repository
+            # path is NOT identity -- published repository names carry an id
+            # suffix and are free to change. `host` is the registry host of
+            # the source's *external* URL, so `<host>/<repository>@<digest>`
+            # is the pinned install reference and can be rebuilt from the row.
+            #
+            # `card` is the bundle reader's output, verbatim, as structured
+            # JSON: the whole profile is preserved (requires/provides/io stay
+            # objects, not strings), which is what the GIN index below makes
+            # filterable. `status` says what kind of row this is:
+            #   indexed  -- the reader produced a card (errors and all: a
+            #               draft or a broken profile is still a Cog);
+            #   non_cog  -- the manifest carries no COG.md (and no Prog
+            #               pixi.toml), recorded with a reason so a
+            #               repository full of images is not re-read every
+            #               sweep;
+            #   failed   -- the fetch or read failed; `read_errors` says how,
+            #               and the next sweep retries it.
+            # `read_errors` duplicates card.errors for indexed rows so a
+            # "what is broken" query never has to open the card.
+            #
+            # `removed_at` is NULL while the digest is present in the
+            # registry. Rows are never deleted by application code: an install
+            # or a run may reference a digest long after its publisher removed
+            # it, and "this once existed and is now gone" is an answer the
+            # catalog must be able to give.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_artifacts (
+                source_id            text NOT NULL,
+                host                 text NOT NULL,
+                repository           text NOT NULL,
+                digest               text NOT NULL,
+                tags                 text[] NOT NULL DEFAULT '{}',
+                pushed_at            timestamptz,
+                indexed_at           timestamptz NOT NULL DEFAULT now(),
+                manifest_media_type  text,
+                status               text NOT NULL
+                                     CHECK (status IN ('indexed', 'non_cog', 'failed')),
+                card                 jsonb,
+                cog_id               text,
+                name                 text,
+                version              text,
+                kind                 text,
+                publisher            text,
+                manifest_schema      text,
+                read_errors          jsonb NOT NULL DEFAULT '[]'::jsonb,
+                removed_at           timestamptz,
+                PRIMARY KEY (source_id, repository, digest)
+            )
+            """,
+            # "Every version of this Cog" (removed ones included) starts from
+            # cog_id, so that index is full; "every model Cog" from kind. The
+            # catalog's other reads -- the newest present row per Cog, the
+            # present rows per repository -- exclude removed rows, so a partial
+            # index on the present rows keeps those cheap as the removed tail
+            # grows, and it is what "WHERE removed_at IS NULL" plans against.
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_cog_id_idx
+            ON collab_cog_artifacts (cog_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_kind_idx
+            ON collab_cog_artifacts (kind)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_present_idx
+            ON collab_cog_artifacts (cog_id, repository) WHERE removed_at IS NULL
+            """,
+            # Containment filters over the structured card ("requires
+            # capability X", "provides Y", "accepts io Z") are `card @> ...`
+            # queries; jsonb_path_ops is the GIN operator class built for
+            # exactly that operator, and it is smaller than the default class.
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_artifacts_card_idx
+            ON collab_cog_artifacts USING GIN (card jsonb_path_ops)
+            """,
+        ),
+    ),
+    (
+        12,
+        (
+            # The Track (issue #5): the append-only record of every run, which is
+            # the only source of a run's status (ADR-0002 D3). The execution
+            # package's `PostgresTrackStore` reads and writes these tables; on the
+            # hub they are created here and never by that store's `ensure_schema`,
+            # which serves the standalone package and local use. That store's
+            # `_SCHEMA` is this registry's Track statements in order, and
+            # execution/tests/test_track_ddl.py holds the two equal. Like every
+            # released version this one is frozen by its checksum: a change to the
+            # Track tables is a new migration, with the same statements appended
+            # to `_SCHEMA`, never an edit here.
+            #
+            # `sequence` is global, so events written by several replicas replay
+            # in one stable order. `schema` is the version of the event's shape
+            # (docs/cog-execution/track.md); rows written before events carried
+            # one read as version 0, which the default records.
+            "CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence",
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_events (
+                sequence    bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence'),
+                event_id    text NOT NULL UNIQUE,
+                run_id      text NOT NULL,
+                event_type  text NOT NULL,
+                payload     jsonb NOT NULL DEFAULT '{}'::jsonb,
+                occurred_at timestamptz NOT NULL,
+                schema      integer NOT NULL DEFAULT 0
+            )
+            """,
+            "ALTER TABLE collab_track_events ADD COLUMN IF NOT EXISTS schema integer NOT NULL DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
+            # At most one submission per run: two API replicas cannot both start
+            # the same run; the losing insert fails on this index.
+            "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission "
+            "ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
+            # A step's payload above the inline threshold, kept beside the Track
+            # and named by the `payload_ref` of its `step_completed` event.
+            """
+            CREATE TABLE IF NOT EXISTS collab_track_payloads (
+                ref        text PRIMARY KEY,
+                run_id     text NOT NULL,
+                payload    jsonb NOT NULL,
+                stored_at  timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS collab_track_payloads_run ON collab_track_payloads (run_id)",
+        ),
+    ),
 )
 
 
@@ -485,6 +767,86 @@ LATEST_COLLAB_SCHEMA_VERSION = COLLAB_SCHEMA_MIGRATIONS[-1][0] if COLLAB_SCHEMA_
 """Highest migration version this build knows how to apply."""
 
 
+def collab_migration_checksum(statements: tuple[str, ...]) -> str:
+    """SHA-256 hex digest of a migration's statement text (issue #73).
+
+    Hashes the **exact** text, statements NUL-separated so a statement boundary
+    cannot be moved without changing the digest. Deliberately no whitespace or
+    comment normalization: rule 2 above freezes the *text* of a released
+    version, and the comments in this file are part of what review approved —
+    a "cosmetic" edit to shipped SQL is exactly the kind of drift the checksum
+    exists to surface. Cosmetic changes go in an appended version like any
+    other change, or nowhere.
+    """
+
+    hasher = hashlib.sha256()
+    for statement in statements:
+        hasher.update(statement.encode("utf-8"))
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+class CollabSchemaChecksumError(RuntimeError):
+    """An already-applied migration's text no longer matches what was applied."""
+
+
+def _verify_recorded_checksums(conn) -> dict[int, str]:
+    """Check every applied version's recorded checksum against the code's text.
+
+    Runs inside the runner's locked transaction, **before** anything is
+    applied. Returns ``{version: recorded_checksum}`` for the applied rows —
+    the caller only needs ``max()`` of the keys, but the full mapping is what
+    tests (and any future caller reporting on checksum state) assert against,
+    so don't simplify it to a version number.
+
+    Three cases per applied row:
+
+    * **Match** — fine.
+    * **NULL** — a legacy row, applied by a build that predates checksums
+      (issue #73). Nothing can be verified retroactively, so it is accepted
+      and backfilled with the current text's checksum; from the next startup
+      on it is a verified row like any other.
+    * **Mismatch** — fail fast, naming the version. The database applied one
+      text and the code now carries another; starting anyway would let old and
+      new databases diverge silently, which is the failure mode the checksum
+      exists to make mechanical. The fix is to restore the released text and
+      append a new version (rule 2), never to edit the recorded row.
+
+    A recorded version this build does not know (database ahead, mid-rolling-
+    update) is skipped: there is no code text to compare against, and the
+    version preflight already handles that case deliberately.
+    """
+
+    statements_by_version = dict(COLLAB_SCHEMA_MIGRATIONS)
+    recorded: dict[int, str] = {}
+    rows = conn.execute(f"SELECT version, checksum FROM {COLLAB_SCHEMA_VERSION_TABLE} ORDER BY version").fetchall()
+    for row in rows:
+        version, stored = row["version"], row["checksum"]
+        recorded[version] = stored
+        statements = statements_by_version.get(version)
+        if statements is None:
+            continue
+        expected = collab_migration_checksum(statements)
+        if stored is None:
+            conn.execute(
+                f"UPDATE {COLLAB_SCHEMA_VERSION_TABLE} SET checksum = %s WHERE version = %s",
+                (expected, version),
+            )
+            recorded[version] = expected
+            collab_logger.info(
+                "collab_schema_checksum_backfilled",
+                extra={"version": version, "checksum": expected},
+            )
+        elif stored != expected:
+            raise CollabSchemaChecksumError(
+                f"collab_ schema migration version {version} has been edited after it was applied: "
+                f"the database recorded checksum {stored} but this build's text hashes to {expected}. "
+                "Released migration text is frozen — restore the original statements for "
+                f"version {version} and append the change as a new version."
+            )
+    return recorded
+
+
 def run_collab_schema_migrations(db) -> None:
     """Apply any unapplied ``collab_`` migrations, safely under concurrency.
 
@@ -498,6 +860,11 @@ def run_collab_schema_migrations(db) -> None:
     already recorded, and applies nothing. Failure semantics match the existing
     stores' ``auto_migrate``: an unreachable database raises here and the pod
     fails to start rather than serving against a schema it cannot verify.
+
+    Before applying anything, every already-applied version's recorded checksum
+    is verified against the code's current text (issue #73); a mismatch raises
+    :class:`CollabSchemaChecksumError` naming the version, and a ``NULL``
+    checksum from a pre-checksum build is accepted once and backfilled.
     """
 
     with db.connection() as conn:
@@ -509,20 +876,32 @@ def run_collab_schema_migrations(db) -> None:
             f"""
             CREATE TABLE IF NOT EXISTS {COLLAB_SCHEMA_VERSION_TABLE} (
                 version     integer PRIMARY KEY,
-                applied_at  timestamptz NOT NULL DEFAULT now()
+                applied_at  timestamptz NOT NULL DEFAULT now(),
+                checksum    text
             )
             """
         )
-        row = conn.execute(f"SELECT COALESCE(MAX(version), 0) AS version FROM {COLLAB_SCHEMA_VERSION_TABLE}").fetchone()
-        applied = row["version"] if row else 0
+        # A registry created before checksums existed (issue #73) lacks the
+        # column; add it in place rather than as a numbered migration, because
+        # the registry table is the runner's own bookkeeping — it exists before
+        # the version list is even consulted. Idempotent and under the lock,
+        # like everything else here. Nullable on purpose: NULL means "applied
+        # by a pre-checksum build", which the verifier accepts once and
+        # backfills.
+        conn.execute(f"ALTER TABLE {COLLAB_SCHEMA_VERSION_TABLE} ADD COLUMN IF NOT EXISTS checksum text")
+        # Verify (and backfill) every already-applied version before applying
+        # anything: an edited released migration must fail the startup, not
+        # half-run whatever follows it.
+        recorded = _verify_recorded_checksums(conn)
+        applied = max(recorded, default=0)
         for version, statements in COLLAB_SCHEMA_MIGRATIONS:
             if version <= applied:
                 continue
             for statement in statements:
                 conn.execute(statement)
             conn.execute(
-                f"INSERT INTO {COLLAB_SCHEMA_VERSION_TABLE} (version) VALUES (%s)",
-                (version,),
+                f"INSERT INTO {COLLAB_SCHEMA_VERSION_TABLE} (version, checksum) VALUES (%s, %s)",
+                (version, collab_migration_checksum(statements)),
             )
 
 

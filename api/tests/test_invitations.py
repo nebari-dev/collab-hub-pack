@@ -88,13 +88,16 @@ from collab_hub_api.frames.invitations import (  # noqa: E402
     InvitationNotFoundError,
     InvitationRevokedError,
     InvitationsUnavailableError,
+    OrganizationAlreadyNamedError,
     PostgresInvitationService,
     UnavailableInvitationService,
     effective_status,
     emails_match,
     hash_invitation_secret,
+    is_placeholder_organization_name,
     mint_invitation_secret,
     validate_invited_email,
+    validate_organization_name,
     verified_claim_email,
 )
 from collab_hub_api.frames.org_source import (  # noqa: E402
@@ -274,6 +277,7 @@ def _carriers_of_the_secret() -> dict[str, object]:
             # app, and the renderer refuses to leave a placeholder in a message
             # nobody will proof-read.
             app_instructions="Download from https://example.test/download",
+            require_verified_email=True,
         ),
         # The wrapper itself: everything above inherits its behaviour, so it
         # is the one that actually has to hold.
@@ -1392,6 +1396,216 @@ def test_a_boolean_true_claim_with_an_address_is_accepted():
     assert verified_claim_email("someone@example.com", True) == "someone@example.com"
 
 
+# ---------------------------------------------------------------------------
+# The token as the proof of mailbox control (frames.invitations.requireVerifiedEmail)
+# ---------------------------------------------------------------------------
+
+
+def test_the_strict_check_is_the_default_everywhere_it_is_spelled():
+    """Fail closed. A caller that forgets the setting must get the strict rule,
+    and an upgrade must not weaken a deployment that never asked."""
+
+    from collab_hub_api.config import FramesInvitationsConfig
+
+    assert FramesInvitationsConfig().require_verified_email is True
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email("someone@example.com", False)  # no keyword passed
+
+
+@pytest.mark.parametrize("verified", [False, None, "true", 1, 0])
+def test_relaxed_accepts_an_unverified_address_whatever_the_claim_says(verified):
+    """The token stood in for the proof, so the flag stops being consulted --
+    including the string and integer shapes the strict path refuses."""
+
+    assert (
+        verified_claim_email("someone@example.com", verified, require_verified=False)
+        == "someone@example.com"
+    )
+
+
+@pytest.mark.parametrize("email", [None, "", 12345, [], {}])
+def test_relaxed_still_needs_an_actual_address(email):
+    """Dropping the verification requirement does not make the address optional.
+    Gate B's match has to compare something."""
+
+    with pytest.raises(EmailNotVerifiedError):
+        verified_claim_email(email, True, require_verified=False)
+
+
+def test_relaxing_verification_does_not_relax_the_address_match():
+    """**The property that matters.** Without this, the relaxation would turn an
+    invitation into a bearer token redeemable under any identity.
+
+    Asserted against `_evaluate_acceptance` rather than the helper, because the
+    helper cannot see the invitation -- the match is the caller's half, and the
+    question is whether the two halves are independently relaxable. They must
+    not be.
+    """
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    invitation = _invitation()
+
+    # Unverified AND the wrong address: still refused, and refused as a
+    # mismatch rather than as a verification failure -- the reader is told the
+    # true reason.
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, "someone-else@example.com", False, require_verified=False
+        )
+
+    # Unverified and the right address: accepted, which is the whole point.
+    assert (
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+        )
+        is None
+    )
+
+    # And with the strict setting the same right-address claim is refused, so
+    # the setting is what decides rather than the address.
+    with pytest.raises(EmailNotVerifiedError):
+        invitations_module._evaluate_acceptance(
+            invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=True
+        )
+
+
+def test_a_dead_token_is_still_dead_however_verification_is_configured():
+    """Order is load-bearing: the token's own state is decided before anything
+    about the caller, so relaxing the identity check cannot resurrect a revoked,
+    used, or expired link."""
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    cases = [
+        (_invitation(STATUS_REVOKED), invitations_module.InvitationRevokedError),
+        (_invitation(STATUS_ACCEPTED), invitations_module.InvitationAlreadyUsedError),
+        (_invitation(expires_in=-timedelta(days=1)), invitations_module.InvitationExpiredError),
+    ]
+    for invitation, expected in cases:
+        with pytest.raises(expected):
+            invitations_module._evaluate_acceptance(
+                invitation, now, INVITEE, INVITED_EMAIL, False, require_verified=False
+            )
+
+
+def test_accept_threads_the_setting_to_both_decisions_without_a_database(monkeypatch):
+    """Both threads, and it has to be both.
+
+    `_accept_once` consults the setting twice -- once through
+    `_evaluate_acceptance` and again through `verified_claim_email`, whose result
+    becomes the persisted membership address. An earlier version of this test
+    replaced the first with a spy that raised immediately, so execution never
+    reached the second: deleting *that* keyword left it green, and on a relaxed
+    deployment it would refuse every acceptance permanently, since the provider
+    has stopped verifying and no account can satisfy the strict check. The live
+    tests that would catch it are the ones CI skips, which is the gap this test
+    exists to close.
+
+    So the first spy returns a passing verdict and the second records and stops.
+    `monkeypatch` rather than hand-restoring: a raise before a `try` would
+    otherwise leak a spy into the next test.
+    """
+
+    import contextlib
+
+    now = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    row = {
+        "id": "inv-1",
+        "org_id": ORG,
+        "email": INVITED_EMAIL,
+        "status": STATUS_PENDING,
+        "created_at": now,
+        "created_by": OPERATOR,
+        "expires_at": now + timedelta(days=7),
+        "accepted_at": None,
+        "accepted_by": None,
+        "accepted_org_id": None,
+        "revoked_at": None,
+        "revoked_by": None,
+        "server_now": now,
+    }
+
+    class FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchone(self):
+            return row
+
+    class FakeDb:
+        @contextlib.contextmanager
+        def connection(self):
+            yield FakeConn()
+
+    class Stop(Exception):
+        pass
+
+    for flag in (True, False):
+        evaluated: list[bool] = []
+        claimed: list[bool] = []
+
+        def evaluate(*_args, require_verified: bool, **_kwargs):
+            evaluated.append(require_verified)
+            return None  # a passing verdict, so execution continues
+
+        def claim(email, _verified, *, require_verified: bool = True):
+            claimed.append(require_verified)
+            raise Stop
+
+        monkeypatch.setattr(invitations_module, "_evaluate_acceptance", evaluate)
+        monkeypatch.setattr(invitations_module, "verified_claim_email", claim)
+
+        service = invitations_module.PostgresInvitationService(
+            FakeDb(), require_verified_email=flag
+        )
+        with pytest.raises(Stop):
+            service.accept(
+                user_id=INVITEE,
+                display=display(INVITED_EMAIL, verified=False),
+                token_hash="h" * 64,
+                claim_email=INVITED_EMAIL,
+                email_verified=False,
+            )
+
+        assert evaluated == [flag], f"the evaluation thread lost the setting for {flag}"
+        assert claimed == [flag], f"the claim thread lost the setting for {flag}"
+
+
+def test_the_service_builder_passes_the_setting_through():
+    """Review finding: the seam moved up a level rather than closing.
+
+    The live tests construct `PostgresInvitationService(..., require_verified_email=False)`
+    directly, so deleting the keyword in `build_invitation_service` left the suite
+    green -- and the failure is the total one: a deployment sets the flag, gets
+    the relaxed copy, and every acceptance is still refused. The sibling email
+    builder had this test; the service builder was the asymmetry.
+    """
+
+    from collab_hub_api.config import Config, build_invitation_service
+    from collab_hub_api.frames.db import PostgresPools
+
+    def service_for(flag: bool):
+        config = Config.parse(
+            {
+                "frames": {
+                    "invitations": {"require_verified_email": flag},
+                    "postgres": {"url": "postgresql://user:pw@127.0.0.1:1/db"},
+                }
+            }
+        )
+        # Pools are lazy: `database()` does not connect, so this needs no server.
+        return build_invitation_service(config, PostgresPools())
+
+    assert service_for(True)._require_verified_email is True
+    assert service_for(False)._require_verified_email is False
+
+
+def test_the_service_carries_the_setting_and_defaults_it_closed():
+    from collab_hub_api.frames.invitations import PostgresInvitationService
+
+    assert PostgresInvitationService(object())._require_verified_email is True
+    assert PostgresInvitationService(object(), require_verified_email=False)._require_verified_email is False
+
+
 def test_email_verified_reaches_the_display_identity_only_as_a_boolean():
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": True}).email_verified is True
     assert display_identity_from_claims({"email": "a@b.com", "email_verified": "true"}).email_verified is False
@@ -1482,8 +1696,8 @@ def test_migrations_are_appended_and_shipped_versions_are_untouched():
     """
 
     versions = [version for version, _ in COLLAB_SCHEMA_MIGRATIONS]
-    assert versions == [1, 2, 3, 4, 5, 6]
-    assert LATEST_COLLAB_SCHEMA_VERSION == 6
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert LATEST_COLLAB_SCHEMA_VERSION == 12
 
     version_two = dict(COLLAB_SCHEMA_MIGRATIONS)[2]
     # v2 has shipped, so its statements are frozen text. If this ever fails,
@@ -1697,6 +1911,7 @@ def test_the_unavailable_service_refuses_every_operation():
             email_verified=False,
         ),
         lambda: service.organization_name(ORG),
+        lambda: service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets"),
         lambda: service.server_now(),
     ):
         with pytest.raises(InvitationsUnavailableError):
@@ -2297,6 +2512,10 @@ def test_live_accepting_an_org_creating_invitation_makes_exactly_one_neutral_org
         "invitation_id": issued.invitation.id,
         "role": ROLE_OWNER,
         "org_created": True,
+        # #190: which acceptances took the relaxed path has to be answerable
+        # after the fact. The membership row cannot say -- it stores the matched
+        # address either way.
+        "verified_email_required": True,
     }
 
 
@@ -2402,6 +2621,82 @@ def test_live_a_refused_acceptance_owes_nothing(service, live_db):
         _accept(service, secret=issued.raw_secret.reveal(), service_groups=["/llm"])
 
     assert _owed_rows(live_db) == []
+
+
+@live_postgres
+def test_live_a_relaxed_service_accepts_an_unverified_matching_account(live_db):
+    """The production chain, which the first version of this change never tested.
+
+    Review found that deleting **both** `require_verified` threads in
+    `_accept_once` left the suite green: the helper was tested, the private
+    attribute was read, and the path between them was not exercised at all.
+    The failure that hides behind that is total -- a deployment sets
+    `requireVerifiedEmail: false`, invitees get copy saying no verification is
+    needed, and every acceptance is still refused. Because the operator has
+    also flipped the realm by then, no account can ever verify, so every
+    invitation becomes unredeemable.
+
+    So this goes through the real service, built the way configuration builds
+    it, and asserts the membership landed.
+    """
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    outcome = relaxed.accept(
+        user_id=INVITEE,
+        display=display(INVITED_EMAIL, verified=False),
+        token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+        claim_email=INVITED_EMAIL,
+        email_verified=False,
+    )
+
+    assert outcome.org_id == ORG
+    assert _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_strict_service_refuses_the_same_unverified_account(live_db):
+    """The other half of the pair: same account, same token, strict service.
+
+    Without this, the test above would pass on a build that ignored the setting
+    entirely -- which is precisely the build review produced by deleting the
+    threads.
+    """
+
+    strict = invitations_module.PostgresInvitationService(live_db)
+    issued = strict.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(EmailNotVerifiedError):
+        strict.accept(
+            user_id=INVITEE,
+            display=display(INVITED_EMAIL, verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email=INVITED_EMAIL,
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
+
+
+@live_postgres
+def test_live_a_relaxed_service_still_refuses_a_mismatched_address(live_db):
+    """Relaxing verification must not relax the match, asserted through the
+    service rather than only through the helper."""
+
+    relaxed = invitations_module.PostgresInvitationService(live_db, require_verified_email=False)
+    issued = relaxed.create(OWNER_CTX, email=INVITED_EMAIL, org_id=ORG)
+
+    with pytest.raises(invitations_module.InvitationEmailMismatchError):
+        relaxed.accept(
+            user_id=INVITEE,
+            display=display("someone-else@example.com", verified=False),
+            token_hash=hash_invitation_secret(issued.raw_secret.reveal()),
+            claim_email="someone-else@example.com",
+            email_verified=False,
+        )
+
+    assert not _rows(live_db, "SELECT user_id FROM collab_org_members WHERE user_id = %s", (INVITEE,))
 
 
 @live_postgres
@@ -3596,3 +3891,208 @@ async def test_live_http_a_malformed_address_is_a_422_that_quotes_nothing(live_c
     assert "somebody@example.com" not in response.text
     with database.connection() as conn:
         assert conn.execute("SELECT count(*) AS n FROM collab_invitations").fetchone()["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Naming a placeholder organization (#44) — the first-invite flow's write half
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stored", [None, "", "  ", "Unnamed organization", "UNNAMED ORGANIZATION"])
+def test_the_placeholder_predicate_matches_what_the_column_default_writes(stored):
+    assert is_placeholder_organization_name(stored)
+
+
+def test_the_placeholder_predicate_agrees_with_the_schema_constant():
+    from collab_hub_api.frames.collab_schema import NEUTRAL_ORG_NAME
+
+    assert is_placeholder_organization_name(NEUTRAL_ORG_NAME)
+    assert not is_placeholder_organization_name("Acme Widgets")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "  ",
+        "Unnamed organization",
+        "unnamed ORGANIZATION",
+        "a" * 121,
+        "x\ny",
+        "x\x00",
+        "x\x7f",
+        "Acme\u0085Widgets",  # C1 NEL: a line break to many renderers, not an ASCII control
+        "Acme\u2028Widgets",  # LINE SEPARATOR
+        "Acme\u2029Widgets",  # PARAGRAPH SEPARATOR
+        "Acme\u202eWidgets",  # RIGHT-TO-LEFT OVERRIDE: renders as something other than itself
+        "Acme\u200dWidgets",  # ZERO WIDTH JOINER
+        "\u2800\u2800",  # Braille blanks: renders as nothing
+        "\u0301\u0308",  # combining marks alone: nothing to combine with
+        "---",  # punctuation alone
+        "Unnamed\u00a0organization",  # the placeholder with a no-break space
+        "Unnamed   organization",  # the placeholder with a run of spaces
+        None,  # not a string at all
+        42,  # nor is a number
+    ],
+)
+def test_an_unusable_organization_name_is_refused(bad):
+    with pytest.raises(ValueError):
+        validate_organization_name(bad)
+
+
+def test_a_usable_organization_name_has_its_spacing_normalized_and_is_otherwise_kept():
+    assert validate_organization_name("  Acme  Widgets ") == "Acme Widgets"
+    assert validate_organization_name("Acme\u00a0Widgets") == "Acme Widgets"
+    assert validate_organization_name("a" * 120) == "a" * 120
+    assert validate_organization_name("Ünïcode & Co.") == "Ünïcode & Co."
+    assert validate_organization_name("株式会社テスト") == "株式会社テスト"
+    assert validate_organization_name("42") == "42"
+
+
+def test_naming_is_one_audited_read_then_write_and_refuses_without_writing(monkeypatch):
+    """Non-live pin of the one-shot transaction body (the live tests own the
+    real ``FOR UPDATE`` semantics): a missing organization refuses, a named
+    one refuses **without writing**, and the placeholder case writes exactly
+    one UPDATE, with the normalized name, on the audited connection it was
+    handed — never a second checkout."""
+
+    missing = object()
+
+    class _Result:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __init__(self, current_name):
+            self._current = current_name
+            self.updates = []
+
+        def execute(self, sql, params=()):
+            if sql.lstrip().startswith("SELECT"):
+                assert "FOR UPDATE" in sql
+                return _Result(None if self._current is missing else {"name": self._current})
+            self.updates.append(params)
+            return _Result(None)
+
+    class _Event:
+        def __init__(self, conn):
+            self.conn = conn
+
+    audits = []
+
+    class _Audited:
+        def __init__(self, db, ctx, action, **kwargs):
+            audits.append((action, kwargs))
+
+        def __enter__(self):
+            return _Event(conn)
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(invitations_module, "audited", _Audited)
+    service = PostgresInvitationService(object())
+
+    conn = _Conn(missing)
+    with pytest.raises(invitations_module.OrgNotFoundError):
+        service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets")
+    assert conn.updates == []
+
+    conn = _Conn("Already Chosen")
+    with pytest.raises(invitations_module.OrganizationAlreadyNamedError):
+        service.name_organization(OPERATOR_CTX, org_id=ORG, name="Acme Widgets")
+    assert conn.updates == []
+
+    conn = _Conn("Unnamed organization")
+    named = service.name_organization(OPERATOR_CTX, org_id=ORG, name="  Acme  Widgets ")
+    assert named == "Acme Widgets"
+    assert conn.updates == [("Acme Widgets", ORG)]
+    action, kwargs = audits[-1]
+    assert action == invitations_module.AUDIT_ACTION_ORG_RENAME
+    assert kwargs["target_label"] == "Acme Widgets"
+    assert kwargs["org_id"] == ORG
+
+
+@live_postgres
+def test_live_naming_writes_the_name_and_its_event_together(service, live_db):
+    """The fixture seeds ORG the way acceptance really creates one: no name, so
+    the column default applies and the organization is the placeholder."""
+
+    assert service.organization_name(ORG) == "Unnamed organization"
+    assert service.name_organization(OWNER_CTX, org_id=ORG, name="  Acme Widgets ") == "Acme Widgets"
+    assert service.organization_name(ORG) == "Acme Widgets"
+    (event,) = _audit_rows(live_db)
+    assert (event["action"], event["actor"], event["target_type"], event["target_id"]) == (
+        "org.rename",
+        OWNER,
+        "org",
+        ORG,
+    )
+    assert event["target_label"] == "Acme Widgets"
+    assert event["org_id"] == ORG
+    assert event["detail"] == {"replaced_placeholder": True}
+
+
+@live_postgres
+def test_live_naming_is_one_shot_and_a_refusal_writes_no_row(service, live_db):
+    service.name_organization(OWNER_CTX, org_id=ORG, name="Acme Widgets")
+    with pytest.raises(OrganizationAlreadyNamedError):
+        service.name_organization(OWNER_CTX, org_id=ORG, name="Acme Corp")
+    assert service.organization_name(ORG) == "Acme Widgets"
+    assert [row["action"] for row in _audit_rows(live_db)] == ["org.rename"]
+    # The other organization is untouched: the pin is the org id, not the actor.
+    assert service.organization_name(OTHER_ORG) == "Unnamed organization"
+
+
+@live_postgres
+def test_live_two_owners_naming_at_once_resolve_to_one_row_and_one_refusal(service, live_db):
+    """The one-shot rule under real concurrency: the FOR UPDATE read inside the
+    audited transaction serializes the two, and the loser re-reads the
+    committed name rather than the placeholder it saw on its page."""
+
+    import threading
+
+    start = threading.Barrier(2)
+    outcomes: dict[str, object] = {}
+
+    def attempt(label: str, name: str) -> None:
+        start.wait()
+        try:
+            outcomes[label] = service.name_organization(OWNER_CTX, org_id=ORG, name=name)
+        except Exception as exc:  # noqa: BLE001 - the test classifies it below
+            outcomes[label] = exc
+
+    threads = [
+        threading.Thread(target=attempt, args=("a", "Acme Widgets")),
+        threading.Thread(target=attempt, args=("b", "Acme Corp")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+
+    winners = [v for v in outcomes.values() if isinstance(v, str)]
+    losers = [v for v in outcomes.values() if isinstance(v, OrganizationAlreadyNamedError)]
+    assert len(winners) == 1 and len(losers) == 1, outcomes
+    assert service.organization_name(ORG) == winners[0]
+    events = _audit_rows(live_db)
+    assert [(row["action"], row["target_label"]) for row in events] == [("org.rename", winners[0])]
+
+
+@live_postgres
+def test_live_naming_an_unknown_organization_is_not_found_and_writes_no_row(service, live_db):
+    with pytest.raises(invitations_module.OrgNotFoundError):
+        service.name_organization(OWNER_CTX, org_id="org-nope", name="Acme Widgets")
+    assert _audit_rows(live_db) == []
+
+
+@live_postgres
+def test_live_a_placeholder_name_never_reaches_the_row(service, live_db):
+    with pytest.raises(ValueError):
+        service.name_organization(OWNER_CTX, org_id=ORG, name="unnamed organization")
+    assert _audit_rows(live_db) == []
+    assert service.organization_name(ORG) == "Unnamed organization"

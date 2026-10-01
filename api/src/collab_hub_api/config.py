@@ -1,10 +1,31 @@
+import os
+import re
 import sys
+from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+from .cogs.catalog import (
+    CogCatalogStore,
+    InMemoryCogCatalogStore,
+    PostgresCogCatalogStore,
+    UnavailableCogCatalogStore,
+)
+from .cogs.indexer import CogIndexer
+from .cogs.registry import CogRegistrySourceConfig, build_registry_sources
 from .frames.account_provisioning import DisabledServiceAccessGranter, ServiceAccessGranter
 from .frames.active_state import (
     ActiveFrameStore,
@@ -166,12 +187,16 @@ def recommended_path_rules() -> list[PathRule]:
 
     ``/health`` and ``/health/db`` stay public because kubelet probes and
     uptime checks carry no credentials: a hardened map that drops them stops
-    the pod passing its own probes.
+    the pod passing its own probes. ``/v1/auth/cli`` stays public because a
+    command-line client asks it how to sign in before it holds any credential;
+    it names only what the realm's own discovery document publishes.
     """
 
     return [
         PathRule(path="/health", match="exact", access="public"),
         PathRule(path="/health/db", match="exact", access="public"),
+        # Where the collab-hub CLI learns how to sign in, asked before it holds a token.
+        PathRule(path="/v1/auth/cli", match="exact", access="public"),
         PathRule(path="/", match="exact", access="authenticated"),
         PathRule(path="/metrics", match="exact", access="authenticated"),
     ]
@@ -261,6 +286,29 @@ class WebConfig(BaseModel):
         le=WEB_SESSION_LIFETIME_CEILING_SECONDS,
     )
     public_base_url: str = ""
+    admin_ui_dist: str = ""
+    """Where the built admin panel lives, if this deployment ships one.
+
+    Empty, or a directory with no ``index.html``, mounts no panel routes at
+    all: ``/admin`` then answers exactly as it did before the panel existed.
+    That is deliberate -- a route that exists but cannot find its own index
+    would turn a missing build step into a 500 on somebody's first visit.
+    """
+    admin_group: str = ""
+    """The identity-provider group whose members hold the operator role.
+
+    Unset means no sync: roles come from ``collab_platform_roles`` and only
+    from there, exactly as they did before the sync existed. That is the
+    default on purpose -- an empty group name would match nothing, and a sync
+    that matched nothing would revoke every synced row on first sign-in.
+
+    Carrying the group into the token is realm configuration, not a setting
+    here: the client needs a groups mapper (or the ``groups`` client scope) so
+    that the ID token actually holds the claim. Without it the claim is absent,
+    and sign-in skips the sync entirely (logging
+    ``platform_role_sync_no_groups_claim``): nobody is granted and nobody is
+    revoked.
+    """
 
     @field_validator(
         "client_id",
@@ -268,6 +316,8 @@ class WebConfig(BaseModel):
         "issuer_url",
         "session_secret",
         "public_base_url",
+        "admin_ui_dist",
+        "admin_group",
         mode="before",
     )
     @classmethod
@@ -513,11 +563,108 @@ class FramesServiceAccessConfig(BaseModel):
                 )
         duplicates = {name for name in self.grant_on_acceptance if self.grant_on_acceptance.count(name) > 1}
         if duplicates:
-            raise ValueError(
-                f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once"
-            )
+            raise ValueError(f"frames.service_access.grant_on_acceptance lists {sorted(duplicates)} more than once")
         return self
 
+
+class ModelAccessKeycloakConfig(BaseModel):
+    """The credential the admin panel uses to change group membership.
+
+    Separate from ``frames.service_access``'s credential on purpose: that one
+    can only add a new account to a group and deliberately cannot read
+    anything, while this one must list members and remove them. Widening the
+    first would grow the invitation path's authority because an admin screen
+    needed something.
+
+    Whatever client this names must hold ``Groups/view-members``,
+    ``Groups/manage-membership`` and ``Users/manage-group-membership``, and
+    must **not** hold ``Groups/manage-members``: over a member of a group that
+    scope also permits password reset and deletion, and membership control plus
+    account control compose into account takeover. See
+    :mod:`.frames.group_membership`.
+    """
+
+    token_url: str = ""
+    admin_api_base_url: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+
+
+class ModelAccessConfig(BaseModel):
+    """The models the hub offers and the groups that gate them."""
+
+    catalog_base_url: str = ""
+    """The serving layer's origin, read for ``GET /v1/models``. Empty disables
+    the catalogue view rather than failing the panel."""
+
+    keycloak: ModelAccessKeycloakConfig = Field(default_factory=ModelAccessKeycloakConfig)
+
+    group_ids: dict[str, str] = Field(default_factory=dict)
+    """Group path to Keycloak group id, and the managed set.
+
+    Both a lookup table and a boundary: a group absent from this map is refused
+    before any request is made, so the panel can only ever touch groups a
+    values file named. Ids rather than lookups for the reason
+    ``frames.service_access`` documents -- resolving a path needs group-read
+    authority, and startup should not depend on the identity provider.
+    """
+
+    model_groups: dict[str, str] = Field(default_factory=dict)
+    """Model id to the group path gating it. A model with no entry is shown as
+    ungated rather than hidden: the catalogue is the serving layer's, and a
+    panel that silently dropped models would misrepresent it."""
+
+
+class FramesInvitationsConfig(BaseModel):
+    """What invitation acceptance requires of the accepter's identity."""
+
+    require_verified_email: bool = True
+    """Whether Gate B additionally requires the identity provider to have
+    verified the address (#190).
+
+    **True is the default and must stay the default.** Turning it off is a
+    deliberate deployment trade, and a default that silently weakened an
+    existing deployment on upgrade would be the wrong kind of convenient.
+
+    Gate B is two checks: the accepter's address is verified, *and* it equals
+    the invited address. Setting this false drops the first and keeps the
+    second, on the argument that the invitation token is itself proof of
+    mailbox control — it is a 256-bit secret delivered only to the invited
+    address, which is exactly what a verification link proves. Requiring both
+    is defence in depth rather than one necessary check.
+
+    **What is given up, stated so a deployment chooses it knowingly.** Once the
+    identity provider stops verifying addresses, the ``email`` claim is
+    *self-asserted*: whoever holds the invitation link can register an account
+    typing the invited address, or point an existing account at it, and redeem.
+    So the invitation becomes usable by **anyone who obtains the link by any
+    means** -- forwarding and shared mailboxes are the mundane cases, not the
+    boundary.
+
+    What they receive is the organization membership and role the invitation
+    grants, plus anything ``frames.service_access.grant_on_acceptance`` grants
+    at acceptance -- identity-provider group membership included. And the
+    account they end up with carries the invited person's address permanently,
+    which is an identity-confusion problem in the member list on top of the
+    access one.
+
+    **What the retained address match does and does not buy.** With verification
+    required it is an access control: an accepter must prove control of the
+    invited address. Without it, the match is a *labelling* property -- the
+    address recorded on the membership row is the invited one -- and not a
+    barrier, because the claim it compares is unverified. Keeping it
+    unconditional is still right; it is simply not the thing standing between a
+    link-holder and the grant.
+
+    **When to leave it true.** Any deployment whose invitees arrive through an
+    identity provider with ``trustEmail``: those accounts are already verified
+    on creation, so the check costs nothing and the invitee never sees a
+    verification step. Turning it off buys nothing there.
+
+    **When false is reasonable.** A password-based deployment with no identity
+    provider, a known invitee list, and a verification round trip that is
+    friction rather than assurance.
+    """
 
 class FramesConfig(BaseModel):
     storage_backend: str = "local"
@@ -530,6 +677,8 @@ class FramesConfig(BaseModel):
     orgs: FramesOrgsConfig = Field(default_factory=FramesOrgsConfig)
     email: FramesEmailConfig = Field(default_factory=FramesEmailConfig)
     service_access: FramesServiceAccessConfig = Field(default_factory=FramesServiceAccessConfig)
+    model_access: ModelAccessConfig = Field(default_factory=ModelAccessConfig)
+    invitations: FramesInvitationsConfig = Field(default_factory=FramesInvitationsConfig)
     mcp_session_manager_enabled: bool = True
 
 
@@ -549,10 +698,66 @@ class SlackConnectorConfig(BaseModel):
     request_timeout_seconds: float = 10.0
 
 
+# GitHub login: alphanumeric characters with single hyphens between them, no
+# leading/trailing/doubled hyphen (GitHub's own login rule). Deliberately
+# stricter than routers/connectors.py's ``_GITHUB_OWNER_PATTERN`` -- that one
+# only has to bound *request-time* free text, but an allowed_orgs entry is
+# deploy config that gets spliced directly into GitHub search-query syntax as
+# ``org:{org}``, so a value like "acme OR repo:other/private" would silently
+# widen the search instead of narrowing it. No lookahead, so the same pattern
+# also works as-is for the chart's values.schema.json (JSON Schema regexes
+# run through Go's RE2, which does not support it); the length half of
+# GitHub's rule is checked separately, mirroring the schema's ``maxLength``.
+_GITHUB_LOGIN_PATTERN = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+_GITHUB_LOGIN_MAX_LENGTH = 39
+
+
 class GitHubConnectorConfig(BaseModel):
     broker_token_url: str = ""
     api_base_url: str = "https://api.github.com"
     static_access_token: str = ""
+    request_timeout_seconds: float = 10.0
+    # Restrict the generic api_get read to these GitHub org logins. Empty = the
+    # token's full visibility (personal repos + every approved org). Set this in
+    # real deploys so the generic read cannot reach outside the allowlist. (The
+    # curated search reads the SAME key once PR #76 lands its _build_query
+    # enforcement; on this branch only api_get consults it.)
+    allowed_orgs: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_orgs")
+    @classmethod
+    def _check_allowed_orgs(cls, value: list[str]) -> list[str]:
+        for org in value:
+            if len(org) > _GITHUB_LOGIN_MAX_LENGTH or not _GITHUB_LOGIN_PATTERN.fullmatch(org):
+                raise ValueError(
+                    f"connectors.github.allowed_orgs entry {org!r} is not a valid GitHub org login: "
+                    "alphanumeric characters and single hyphens only, no leading/trailing hyphen, "
+                    f"max {_GITHUB_LOGIN_MAX_LENGTH} characters"
+                )
+        return value
+
+    # Kill switch for the generic /api/get read, distinct from blanking
+    # broker_token_url (which would also kill the curated reads). Defaults to
+    # False (fail-closed): the long-tail tool ships opt-in, so an upgraded hub
+    # gains full-token-visibility generic read only after an operator explicitly
+    # flips this on (and sets allowed_orgs). The curated tools work regardless.
+    api_get_enabled: bool = False
+    # Bound concurrent generic reads per hub process so an injected agent can't
+    # fan out unbounded outbound requests (each api_get opens its own client plus
+    # a token-broker fetch). Curated tools are unaffected.
+    api_get_max_concurrency: int = Field(default=8, ge=1)
+
+
+class NotionConnectorConfig(BaseModel):
+    # Option A: Keycloak generic-OAuth broker URL. Empty under Option B (the Hub
+    # owns the Notion OAuth flow and its own encrypted token store).
+    broker_token_url: str = ""
+    api_base_url: str = "https://api.notion.com"
+    # Pinned Notion API version, sent on every request. Do not float: newer
+    # versions (2025-09-03+) split databases into data sources and move the query
+    # endpoint, which is a migration, not a config change. See docs/notion-connector.md.
+    notion_version: str = "2022-06-28"
+    static_access_token: str = ""  # dev/CI only -- never in prod values
     request_timeout_seconds: float = 10.0
 
 
@@ -560,6 +765,7 @@ class ConnectorsConfig(BaseModel):
     google: GoogleConnectorConfig = Field(default_factory=GoogleConnectorConfig)
     slack: SlackConnectorConfig = Field(default_factory=SlackConnectorConfig)
     github: GitHubConnectorConfig = Field(default_factory=GitHubConnectorConfig)
+    notion: NotionConnectorConfig = Field(default_factory=NotionConnectorConfig)
 
 
 class KeycloakUserDirectoryConfig(BaseModel):
@@ -582,6 +788,318 @@ class TasksConfig(BaseModel):
     auto_migrate: bool = False
 
 
+COGS_INDEX_INTERVAL_MIN_SECONDS = 10
+COGS_INDEX_INTERVAL_MAX_SECONDS = 24 * 3600
+
+
+class CogIndexConfig(BaseModel):
+    """How often the Cog indexer sweeps the configured registry sources (#84).
+
+    ``enabled`` is the only switch that changes what the deployment *does*:
+    off, the read API stays up and serves whatever the index already holds,
+    and no registry is contacted. The interval floor exists because a sweep
+    lists every repository of every source; a one-second loop against a
+    real registry is a self-inflicted outage, not a tuning choice.
+    """
+
+    # extra="forbid" mirrors values.schema.json's additionalProperties: false.
+    # Without it a misspelled key (``interval_secs``) is dropped and the
+    # default runs, which is a silent misconfiguration of exactly the kind
+    # the chart refuses at render time.
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_seconds: int = Field(default=300, ge=COGS_INDEX_INTERVAL_MIN_SECONDS, le=COGS_INDEX_INTERVAL_MAX_SECONDS)
+    run_on_startup: bool = True
+
+
+class CogCatalogConfig(BaseModel):
+    """Where the Cog catalog lives (#85).
+
+    ``backend`` is a development override only, like ``frames.groups.backend``:
+    ``"memory"`` keeps the catalog in the process (``make api``, level 1, so
+    the read API answers without a database); empty -- the default -- rides
+    the shared ``frames.postgres``, or refuses with 503 when there is none.
+    Deliberately no chart value: an in-memory catalog is process-local, so on
+    a deployment every replica would list something different and forget it
+    all on restart.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["", "memory"] = ""
+
+
+COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
+    ("username_env", "username", False),
+    ("password_env", "password", True),
+)
+"""``credentials`` indirections: ``<name>_env`` names the environment variable holding ``<name>``.
+
+The third element says whether the value is a secret (wrapped in ``SecretStr``
+on insertion) or plain data like a robot account name.
+"""
+
+COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD = ("webhook_secret_env", "webhook_secret", True)
+
+
+def _pull_secret_from_env(
+    container: dict[str, Any],
+    env_field: str,
+    field: str,
+    *,
+    secret: bool,
+    label: str,
+    environ: Mapping[str, str],
+) -> None:
+    """Replace ``container[env_field]`` (an env var name) with ``container[field]`` (its value).
+
+    Refuses an ambiguous entry that carries both, and a name whose variable is
+    unset or blank — which is exactly what a missing Secret mount, a wrong
+    ``key`` in ``existingSecret``, or an empty Secret value looks like from
+    inside the pod. Failing here names the variable, so the fix is a values
+    change and not a search through adapter 401s on the first sweep.
+
+    A secret is inserted as a ``SecretStr``, never a plain string. Validation
+    runs *after* this and pydantic quotes the offending input in its error
+    text; a source whose username is missing would otherwise put the resolved
+    password into a ValidationError that ``__main__`` lets reach the startup
+    log. ``SecretStr`` reprs as ``**********`` wherever it is echoed, so no
+    downstream error path — this model's, a nested one's, or the settings
+    class's — can carry the value.
+
+    The value is stored with surrounding whitespace removed, deliberately and
+    on purpose rather than by accident: inline values already are (the
+    ``_strip`` validators on ``CogRegistryCredentials`` and ``WebConfig``), a
+    Secret created with ``--from-file`` carries the file's trailing newline,
+    and forwarding that verbatim fails authentication with an error that
+    names nothing useful. A ``SecretStr`` bypasses the model's own strip, so
+    the policy is applied here, once, for the environment route — both
+    routes yield the same bytes for string input (a ``SecretStr`` handed to
+    ``Config.parse`` programmatically is taken as is; no operator route does
+    that). A credential whose surrounding whitespace is significant is not
+    supported; docs/cog-registry.md says so.
+    """
+
+    if env_field not in container:
+        return
+    name = container.pop(env_field)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{label}.{env_field} must name an environment variable, got {name!r}")
+    name = name.strip()
+    if container.get(field):
+        raise ValueError(
+            f"{label} sets both {field} and {env_field}: the inline value and the environment "
+            f"indirection disagree about where the secret lives, so neither is trusted. Keep one."
+        )
+    value = environ.get(name)
+    if value is None or not value.strip():
+        state = "not set" if value is None else "empty"
+        raise ValueError(
+            f"{label}.{env_field} names {name}, which is {state} in the environment. With the Helm "
+            f"chart this means the Secret named in the source's existingSecret is missing or has no "
+            f"value under the configured key; the API refuses to start rather than run unauthenticated."
+        )
+    value = value.strip()
+    container[field] = SecretStr(value) if secret else value
+
+
+def resolve_cogs_source_secrets(raw: Any, index: int, environ: Mapping[str, str]) -> Any:
+    """Resolve one raw registry-source mapping's ``*_env`` indirections in place of the secrets.
+
+    Why indirection at all: the source list travels to the process as one JSON
+    environment variable (pydantic-settings parses complex fields that way),
+    while passwords and webhook secrets must come from Kubernetes Secrets and
+    never be rendered into values or that JSON. pydantic-settings does not
+    layer ``..._SOURCES__0__CREDENTIALS__PASSWORD`` over a JSON list — measured
+    on 2.14: the index form is silently ignored when the list is JSON, and
+    rejected as ``list_type`` when it is not — so each source instead names the
+    variable to read. The chart derives the names deterministically from the
+    source id (``COLLAB_HUB_COGS_SOURCE_<ID>_PASSWORD`` and friends, see
+    values.yaml) and mounts the Secret keys under them.
+
+    Anything that is not a mapping is returned untouched: an already-built
+    :class:`CogRegistrySourceConfig` has nothing to resolve, and a wrong type
+    is pydantic's error to report.
+    """
+
+    if not isinstance(raw, dict):
+        return raw
+    raw = dict(raw)
+    label = f"cogs.registry_sources[{index}] ({raw.get('id')!r})"
+    credentials = raw.get("credentials")
+    if isinstance(credentials, dict):
+        credentials = dict(credentials)
+        raw["credentials"] = credentials
+        for env_field, field, secret in COGS_SOURCE_SECRET_ENV_FIELDS:
+            _pull_secret_from_env(
+                credentials, env_field, field, secret=secret, label=f"{label}.credentials", environ=environ
+            )
+    env_field, field, secret = COGS_SOURCE_WEBHOOK_SECRET_ENV_FIELD
+    _pull_secret_from_env(raw, env_field, field, secret=secret, label=label, environ=environ)
+    return raw
+
+
+class CogsConfig(BaseModel):
+    """The Cog registry block (#87): which registries are indexed, and how.
+
+    Per-source rules (kind shape, URL grammar, credentials both-or-neither)
+    belong to :class:`~.cogs.registry.CogRegistrySourceConfig` and run when
+    each entry is built. What lives here is what no single source can see:
+    duplicate ids across the list, and an indexer that is switched on with
+    nothing to index. ``build_registry_sources`` re-checks duplicates when the
+    adapters are instantiated; this copy exists so the failure happens at
+    settings load with the rest of the configuration errors, not one step
+    later with a different exception type.
+    """
+
+    # extra="forbid": the chart's values.schema.json refuses unknown ``cogs``
+    # keys, and a bare-process deployment deserves the same — ``indx:`` would
+    # otherwise leave the indexer silently off. scripts/testdata/chart/
+    # cogs-negative-cases.yaml holds this rule once for both sides.
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
+
+    registry_sources: list[CogRegistrySourceConfig] = Field(default_factory=list)
+    index: CogIndexConfig = Field(default_factory=CogIndexConfig)
+    catalog: CogCatalogConfig = Field(default_factory=CogCatalogConfig)
+
+    @field_validator("registry_sources", mode="before")
+    @classmethod
+    def _resolve_secret_env(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [resolve_cogs_source_secrets(raw, index, os.environ) for index, raw in enumerate(value)]
+
+    @model_validator(mode="after")
+    def _check_across_sources(self) -> Self:
+        seen: dict[str, int] = {}
+        for index, source in enumerate(self.registry_sources):
+            if source.id in seen:
+                raise ValueError(
+                    f"cogs.registry_sources[{index}] reuses id {source.id!r}, already taken by "
+                    f"registry_sources[{seen[source.id]}]: the id is stored with every indexed row, "
+                    "so two sources sharing one would make their artifacts indistinguishable"
+                )
+            seen[source.id] = index
+        if self.index.enabled and not self.registry_sources:
+            raise ValueError(
+                "cogs.index.enabled is true but cogs.registry_sources is empty: an indexer with nothing "
+                "to index is a misconfiguration, not an idle worker. Add a source or set enabled=false "
+                "(the read API stays up either way)."
+            )
+        return self
+
+
+FEATURE_FLAGS: dict[str, str] = {}
+"""Every feature flag this hub knows: name to one line on what it exposes.
+
+Adding a flag starts here. A name that is not listed is refused wherever it
+appears: set in the environment or the chart, it stops startup; passed to
+:meth:`FeaturesConfig.enabled`, it raises. So a misspelled flag fails loudly
+instead of silently reading as off.
+"""
+
+RETIRED_FEATURE_FLAGS: frozenset[str] = frozenset()
+"""Flags that have been removed but that deployments may still set.
+
+When a flag's feature ships, move its name here from :data:`FEATURE_FLAGS`.
+A retired name is ignored, and the app logs a warning naming it, instead of
+stopping startup, so the chart
+that drops a flag can roll out before every deployment's values drop it.
+"""
+
+FEATURE_FLAG_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+"""A flag name: lowercase snake_case, the form environment keys arrive in.
+
+The same pattern as ``features.propertyNames`` in the chart's
+values.schema.json, so a name the registry accepts is one the chart accepts.
+"""
+
+
+def check_feature_flag_registry(flags: Mapping[str, str], retired: frozenset[str]) -> None:
+    """Refuse a registry whose names could never be set, or that is both live and retired."""
+    bad = sorted(name for name in (*flags, *retired) if not FEATURE_FLAG_NAME.fullmatch(name))
+    if bad:
+        raise ValueError(f"feature flag names must be lowercase snake_case: {', '.join(bad)}")
+    both = sorted(set(flags) & retired)
+    if both:
+        raise ValueError(f"feature flags both registered and retired: {', '.join(both)}")
+
+
+check_feature_flag_registry(FEATURE_FLAGS, RETIRED_FEATURE_FLAGS)
+
+_FLAG_VALUE = TypeAdapter(bool)
+
+
+class FeaturesConfig(BaseModel):
+    """Per-deployment switches for features that are on ``main`` but not yet exposed.
+
+    The mechanism is always on. Each flag is declared once in
+    :data:`FEATURE_FLAGS` and is off until a deployment sets it to true,
+    either in the chart's ``features`` values or as the environment variable
+    ``COLLAB_HUB_API__FEATURES__<NAME>``, following pydantic-settings' nested
+    variables:
+    https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values
+
+    Values are parsed with pydantic's boolean rules, so ``true``, ``1``,
+    ``yes`` and ``on`` (any case) turn a flag on, and a value those rules
+    cannot parse stops startup instead of reading as off:
+    https://docs.pydantic.dev/latest/api/standard_library_types/#booleans
+
+    Code reads flags only through :meth:`enabled`: routes through the
+    ``get_features`` dependency, the admin UI through the ``features`` list in
+    its session payload. Flags are for work in progress and are removed once
+    the feature ships; a permanent operational switch belongs in its own
+    section as a documented ``bool`` field.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    _retired: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _parse_flags(cls, data: Any, handler: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return handler(data)
+        flags: dict[str, bool] = {}
+        retired: list[str] = []
+        for name in data:
+            # pydantic-settings lowercases environment keys; the chart's
+            # schema admits only lowercase names. Anything else is a typo.
+            flag = str(name)
+            if flag in RETIRED_FEATURE_FLAGS:
+                retired.append(flag)
+                continue
+            if flag not in FEATURE_FLAGS:
+                known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
+                raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
+            try:
+                flags[flag] = _FLAG_VALUE.validate_python(data[name])
+            except ValidationError:
+                # Name only the flag: Config hides input values in errors.
+                raise ValueError(f"feature flag {name!r} must be a boolean") from None
+        features = handler(flags)
+        features._retired = sorted(retired)
+        return features
+
+    def enabled(self, name: str) -> bool:
+        """Whether the named flag is on for this deployment. An unregistered name raises ``KeyError``."""
+        if name not in FEATURE_FLAGS:
+            raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
+        return bool((self.__pydantic_extra__ or {}).get(name, False))
+
+    @property
+    def retired_names(self) -> list[str]:
+        """The retired flags this deployment still sets, sorted. The app factory logs them."""
+        return list(self._retired)
+
+    @property
+    def enabled_names(self) -> list[str]:
+        """The flags that are on for this deployment, sorted."""
+        return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)
+
+
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -592,10 +1110,20 @@ class BaseConfig(BaseSettings):
     connectors: ConnectorsConfig = Field(default_factory=ConnectorsConfig)
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
+    cogs: CogsConfig = Field(default_factory=CogsConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
 
 
 class Config(BaseConfig):
-    model_config = SettingsConfigDict(env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__")
+    # hide_input_in_errors at the outermost model: it is this class's config,
+    # not a nested model's, that decides whether pydantic quotes the offending
+    # input in a ValidationError, and the input here is the whole settings
+    # tree — Postgres URLs with passwords, client secrets, resolved registry
+    # credentials. __main__ lets that error reach the startup log. Field
+    # names and constraint messages remain; only the echoed value goes.
+    model_config = SettingsConfigDict(
+        env_prefix="COLLAB_HUB_API__", env_nested_delimiter="__", hide_input_in_errors=True
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -715,6 +1243,186 @@ def build_org_store(config: BaseConfig, pools: PostgresPools) -> OrgStore:
     return UnavailableOrgStore()
 
 
+def build_cog_catalog_store(config: BaseConfig, pools: PostgresPools) -> CogCatalogStore:
+    """The Cog catalog (issue #84): the shared frames.postgres, else a store that refuses (503).
+
+    Always built, whether or not indexing is enabled -- the catalog read API
+    stays up on a deployment that only reads a catalog another replica or an
+    out-of-band job fills. The table is created by the ``collab_`` migration
+    runner (version 11), so there is no ``auto_migrate`` argument here.
+    ``cogs.catalog.backend=memory`` is the development override (#85) that
+    lets level 1 of ``dev/`` serve the read API with no database.
+    """
+
+    if config.cogs.catalog.backend == "memory":
+        return InMemoryCogCatalogStore()
+    url = config.frames.postgres.url
+    if url:
+        return PostgresCogCatalogStore(pools.database(url))
+    return UnavailableCogCatalogStore()
+
+
+class CogIndexing:
+    """A built indexer plus the loop parameters the app lifespan runs it with."""
+
+    def __init__(self, indexer: CogIndexer, *, interval_seconds: float, run_on_startup: bool) -> None:
+        self.indexer = indexer
+        self.interval_seconds = interval_seconds
+        self.run_on_startup = run_on_startup
+
+
+def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexing | None:
+    """The reconciliation indexer (issue #84) when ``cogs.index.enabled``, else ``None``.
+
+    Reads the ``cogs`` block (issue #87): ``cogs.registry_sources`` and
+    ``cogs.index`` (``enabled``, ``interval_seconds``, ``run_on_startup``).
+    ``CogsConfig`` has already refused an enabled index with no sources and
+    resolved every credential indirection, so what arrives here is complete.
+
+    Sources are constructed here, once, so a duplicate id or an unsupported
+    kind fails the rollout rather than the first sweep, and are not
+    constructed at all when indexing is disabled. Indexing into the
+    unavailable store is refused: the store is what a sweep writes, and a
+    deployment that enables sweeping without a database would otherwise fail
+    every interval for as long as the pod lived.
+    """
+
+    cogs = config.cogs
+    index = cogs.index
+    if not index.enabled:
+        return None
+    if isinstance(store, UnavailableCogCatalogStore):
+        raise RuntimeError(
+            "cogs.index.enabled requires the Cog catalog store: set the shared "
+            "COLLAB_HUB_API__FRAMES__POSTGRES__URL (frames.postgres.url), or disable indexing."
+        )
+    pool = config.frames.postgres.pool
+    if pool.max_size < 2:
+        # A sweep occupies one pooled connection for its whole duration: the
+        # session-level advisory lock is held on it, and the sweep's reads and
+        # writes ride it too (issue #128). With max_size=1 that is the pool's
+        # only connection gone for minutes at a time -- every API read and
+        # every webhook write would wait on the sweep and time out, silently,
+        # at runtime. Refuse the rollout instead.
+        raise RuntimeError(
+            "cogs.index.enabled requires frames.postgres.pool.max_size >= 2 "
+            f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
+            "connection for the whole sweep while everything else needs another."
+        )
+    sources = build_registry_sources(list(cogs.registry_sources))
+    return CogIndexing(
+        CogIndexer(store, sources),
+        interval_seconds=float(index.interval_seconds),
+        run_on_startup=index.run_on_startup,
+    )
+
+
+def build_model_catalog(config: BaseConfig):
+    """The serving layer's catalogue reader, configured or not."""
+
+    from .frames.model_catalog import ModelCatalogClient
+
+    return ModelCatalogClient(base_url=config.frames.model_access.catalog_base_url)
+
+
+def build_model_access(config: BaseConfig, pools: PostgresPools):
+    """The membership writer and its audited service, or ``None``.
+
+    ``None`` when the credential or the database is missing, and the panel then
+    reports model access as unavailable. A half-built service that could change
+    Keycloak but not record it would be worse than none at all.
+    """
+
+    from .frames.group_membership import GroupMembershipClient
+    from .frames.model_access import ModelAccessService
+
+    access = config.frames.model_access
+    keycloak = access.keycloak
+    url = config.frames.postgres.url
+    if not (keycloak.token_url and keycloak.admin_api_base_url and keycloak.client_id and access.group_ids):
+        return None
+    if not url:
+        return None
+    membership = GroupMembershipClient(
+        token_url=keycloak.token_url,
+        admin_api_base_url=keycloak.admin_api_base_url,
+        client_id=keycloak.client_id,
+        client_secret=keycloak.client_secret,
+        group_ids=access.group_ids,
+    )
+    return ModelAccessService(db=pools.database(url), membership=membership)
+
+
+def build_connector_store(config: BaseConfig, pools: PostgresPools):
+    """The connector switches, or ``None`` without a database.
+
+    ``None`` means nothing is switched off and nothing can be, which is how
+    every deployment behaved before the switch existed.
+    """
+
+    from .frames.connector_store import PostgresConnectorStore
+
+    url = config.frames.postgres.url
+    return PostgresConnectorStore(pools.database(url)) if url else None
+
+
+def build_platform_role_admin(config: BaseConfig, pools: PostgresPools):
+    """Operator-role changes made from the panel, or ``None`` without a database.
+
+    ``None`` rather than a refusing stand-in, because the panel asks whether
+    roles are manageable before it renders the controls: a deployment with no
+    database shows no buttons rather than buttons that always fail.
+    """
+
+    from .frames.platform_role_admin import PostgresPlatformRoleAdmin
+
+    url = config.frames.postgres.url
+    return PostgresPlatformRoleAdmin(pools.database(url)) if url else None
+
+
+def build_audit_log(config: BaseConfig, pools: PostgresPools):
+    """The audit reader, or the one that refuses.
+
+    No ``"memory"`` override, for the reason ``build_invitation_service`` has
+    none: there is no in-memory audit log, because ``audited()`` writes to
+    Postgres inside the transaction it is auditing. A stand-in would answer an
+    empty page to somebody investigating an incident, which is the worst
+    possible lie for this particular store to tell.
+    """
+
+    from .frames.audit_log import PostgresAuditLog, UnavailableAuditLog
+
+    url = config.frames.postgres.url
+    return PostgresAuditLog(pools.database(url)) if url else UnavailableAuditLog()
+
+
+def build_platform_role_sync(config: BaseConfig, pools: PostgresPools, org_store: OrgStore):
+    """The sign-in reconcile, paired to whatever backend holds the roles.
+
+    Returns the refusing-to-act implementation unless a deployment has named an
+    admin group, so this is inert on every deployment that has not opted in.
+    """
+
+    from .frames.platform_role_sync import (
+        DisabledPlatformRoleSync,
+        InMemoryPlatformRoleSync,
+        PostgresPlatformRoleSync,
+    )
+
+    admin_group = config.web.admin_group
+    if not admin_group:
+        return DisabledPlatformRoleSync()
+    if isinstance(org_store, InMemoryOrgStore):
+        return InMemoryPlatformRoleSync(org_store, admin_group=admin_group)
+    url = config.frames.postgres.url
+    if url:
+        return PostgresPlatformRoleSync(pools.database(url), admin_group=admin_group)
+    # No store to reconcile against. Refusing to sync is the correct state for
+    # such a deployment, and make_app already refuses to start a
+    # membership-resolving one whose store is the unavailable store.
+    return DisabledPlatformRoleSync()
+
+
 def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> InvitationService:
     """Build the invitation lifecycle service, or the one that refuses (503).
 
@@ -730,7 +1438,10 @@ def build_invitation_service(config: BaseConfig, pools: PostgresPools) -> Invita
 
     url = config.frames.postgres.url
     if url:
-        return PostgresInvitationService(pools.database(url))
+        return PostgresInvitationService(
+            pools.database(url),
+            require_verified_email=config.frames.invitations.require_verified_email,
+        )
     return UnavailableInvitationService()
 
 
@@ -753,6 +1464,9 @@ def build_invitation_email_delivery(
             provider,
             accept_url=email.accept_url,
             app_instructions=email.app_instructions,
+            # The same value the acceptance check reads, so the copy and the
+            # rule it describes cannot disagree.
+            require_verified_email=config.frames.invitations.require_verified_email,
         )
     raise RuntimeError(f"Unsupported invitation email provider: {email.provider}")
 
@@ -855,9 +1569,7 @@ def build_service_access_granter(config: BaseConfig) -> ServiceAccessGranter:
             f"nothing grants is a typo in one of the two lists, and the harmless-looking "
             f"reading -- an unused entry -- is the one that leaves the real path unmapped."
         )
-    malformed = sorted(
-        path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id
-    )
+    malformed = sorted(path for path, group_id in keycloak.group_ids.items() if not group_id.strip() or "/" in group_id)
     if malformed:
         raise RuntimeError(
             f"frames.service_access.keycloak.group_ids has no usable id for {malformed}. "

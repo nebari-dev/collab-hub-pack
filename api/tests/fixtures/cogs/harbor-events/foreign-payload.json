@@ -1,0 +1,7 @@
+{
+  "ref": "refs/heads/main",
+  "action": "push",
+  "type": "repository",
+  "repository": {"full_name": "acme/widgets"},
+  "sender": {"login": "octocat"}
+}

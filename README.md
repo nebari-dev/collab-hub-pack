@@ -3,6 +3,7 @@
 ![Status: Beta](https://img.shields.io/badge/status-beta-orange)
 [![Lint](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/lint.yaml)
 [![Test](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/test.yaml)
+[![Dev Environment](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/dev-env.yaml/badge.svg)](https://github.com/nebari-dev/collab-hub-pack/actions/workflows/dev-env.yaml)
 
 > **Beta** — stable enough to deploy in your own environment with engineering
 > support. APIs and chart values may still change between releases. See the
@@ -23,6 +24,9 @@ The API is a FastAPI service exposing:
 - **User directory** — org/workspace identity resolved from Keycloak.
 - **Scheduled tasks**, **usage**, and an **MCP server** exposing the above to
   MCP-speaking clients.
+- **Admin panel**: a browser app at `/admin` where operators manage model
+  access, operator roles, connectors and invitations, and read hub usage and
+  the audit log.
 
 ## Prerequisites
 
@@ -67,17 +71,51 @@ flowchart LR
 
 ## Local development
 
+Everything is driven from [`dev/`](dev/), which runs the pack on your machine
+in four levels — from a bare process with no dependencies, up to real
+datastores, a real identity provider, and the chart on a kind cluster:
+
+```sh
+cd dev
+make help
+make api      # the API alone: no containers, no token needed
+```
+
+The full walkthrough, including the Keycloak setup each connector needs, is
+[`dev/README.md`](dev/README.md).
+
+The dev-auth shortcut needs **all three** of `FRAMES_UNSAFE_AUTH_ENABLED`,
+`DEV_AUTH_ENABLED` and `DEV_AUTH_USER`; setting only the last authenticates
+nothing and every route answers 401. `make api` sets them for you.
+
+To run the test suites:
+
 ```sh
 cd api
-uv sync
-uv run pytest
-uv run python -m collab_hub_api   # DEV_AUTH_USER for unsafe local auth
+uv sync --group test
+uv run pytest                                # the API (Python)
+
+cd admin-ui
+npm ci --ignore-scripts && npm test          # the admin panel (Vitest)
 ```
+
+CI runs both: the `test` job runs pytest against a real Postgres service, and
+the `admin-ui` job runs `npm ci`, `npm audit`, the typecheck, Vitest and the
+production build.
 
 ## Documentation
 
-Setup and reference docs — connector setup, Frames, operations — live in
-[`docs/`](docs/).
+Setup and reference docs — connector setup, Frames, operations, the
+[Cog registry](docs/cog-registry.md), [feature flags](docs/feature-flags.md) — live in [`docs/`](docs/).
+
+The basis for Cog and Op execution — vocabulary, the Op–Cog seam, the
+result envelope, the sensitivity model — is in
+[`docs/cog-execution/`](docs/cog-execution/); the decisions behind it are
+recorded in [`docs/adr/`](docs/adr/).
+
+The [`collab-hub` CLI](cli/README.md) is a terminal client for the hub's REST
+API: it signs in the way the Collab desktop does, and lists the Cogs the hub
+offers.
 
 ## Contributing
 

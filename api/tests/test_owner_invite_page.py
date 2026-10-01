@@ -16,7 +16,13 @@ pinned to the caller's
 organization inside the transaction (``expect_org_id``), so another
 organization's invitation is a plain not-found. And the live tests take an
 owner-issued invitation through #90's acceptance page into an **existing**
-organization — the flow #142 exists to make real.
+organization — the flow #142 exists to make real. And the first-invite naming
+step (#44): an organization still carrying the placeholder name shows a naming
+form instead of the issue form, issues nothing however the POST is shaped,
+takes exactly one audited ``org.rename``, and only then issues. The delivery
+adapter receives the resolved name as it always did; what the shipped renderer
+does with it is ``test_invitation_email.py``'s subject (today: deliberately
+nothing — the email is organization-neutral), not this file's.
 
 **Deliberately not re-proven here:** the form-handling properties
 (byte-counted caps, no ``request.form()``, ``Connection: close`` on refusal)
@@ -49,6 +55,7 @@ from test_web_surface import (  # noqa: E402
 from collab_hub_api.config import Config
 from collab_hub_api.core import make_app
 from collab_hub_api.frames.auth import WORKSPACE_DEFAULT, AuthContext, DisplayIdentity
+from collab_hub_api.frames.collab_schema import NEUTRAL_ORG_NAME
 from collab_hub_api.frames.credentials import InvitationSecret
 from collab_hub_api.frames.identity import IDENTITY_CLAIM_ENV
 from collab_hub_api.frames.invitation_email import (
@@ -58,6 +65,7 @@ from collab_hub_api.frames.invitation_email import (
     DeliveryOutcome,
 )
 from collab_hub_api.frames.invitations import (
+    MAX_ORGANIZATION_NAME_LENGTH,
     Invitation,
     InvitationAlreadyUsedError,
     InvitationNotFoundError,
@@ -65,6 +73,9 @@ from collab_hub_api.frames.invitations import (
     InvitationsUnavailableError,
     IssuedInvitation,
     LiveInvitationExists,
+    OrganizationAlreadyNamedError,
+    is_placeholder_organization_name,
+    validate_organization_name,
 )
 from collab_hub_api.frames.org_source import (
     DEFAULT_ORG_ENV,
@@ -78,17 +89,23 @@ from collab_hub_api.web.admin import EMAIL_FIELD, INVITATION_ID_FIELD
 from collab_hub_api.web.forms import MAX_FORM_BYTES, REQUEST_TOO_LARGE
 from collab_hub_api.web.org_invitations import (
     NOTICE_ALREADY_LIVE,
+    NOTICE_ALREADY_NAMED,
     NOTICE_INVALID_EMAIL,
+    NOTICE_INVALID_ORGANIZATION_NAME,
     NOTICE_ISSUED_SEND_FAILED,
     NOTICE_ISSUED_SEND_UNKNOWN,
     NOTICE_ISSUED_SENT,
+    NOTICE_NAMED,
     NOTICE_NOT_FOUND,
+    NOTICE_ORGANIZATION_UNNAMED,
     NOTICE_REVOKE_REFUSED,
     NOTICE_REVOKED,
     NOTICE_UNAVAILABLE,
     NOTICES,
+    ORGANIZATION_NAME_FIELD,
 )
 from collab_hub_api.web.surface import (
+    ORG_INVITATIONS_NAME_PATH,
     ORG_INVITATIONS_PATH,
     ORG_INVITATIONS_PATHS,
     ORG_INVITATIONS_REVOKE_PATH,
@@ -107,6 +124,7 @@ OUTSIDER_SUB = "subject-nobody"
 
 ORG_ID = "org-1"
 ORG_NAME = "Example Organization"
+CHOSEN_NAME = "Acme Widgets"
 OTHER_ORG_ID = "org-2"
 
 INVITEE = "carol@example.com"
@@ -187,10 +205,13 @@ class FakeInvitationService:
         issue_result=None,
         revoke_raises: Exception | None = None,
         unavailable: bool = False,
+        organization_name: str = ORG_NAME,
     ) -> None:
         self.rows = list(rows or [])
+        self.name = organization_name
         self.issue_calls: list[dict] = []
         self.revoke_calls: list[dict] = []
+        self.name_calls: list[dict] = []
         self.list_calls: list[str] = []
         self.plain_create_calls: list[dict] = []
         self.issue_result = issue_result
@@ -208,7 +229,15 @@ class FakeInvitationService:
     def organization_name(self, org_id: str) -> str:
         self._guard()
         assert org_id == ORG_ID, "the page may only name the caller's own organization"
-        return ORG_NAME
+        return self.name
+
+    def name_organization(self, ctx, *, org_id, name):
+        self._guard()
+        self.name_calls.append({"actor": ctx.user, "org_id": org_id, "name": name})
+        if not is_placeholder_organization_name(self.name):
+            raise OrganizationAlreadyNamedError("Organization already has a name")
+        self.name = validate_organization_name(name)
+        return self.name
 
     def list_for_org(self, org_id: str, *, limit: int, offset: int = 0) -> InvitationPage:
         self._guard()
@@ -362,6 +391,17 @@ async def issue(client: AsyncClient, *, email: str = INVITEE, csrf: str | None =
     )
 
 
+async def name_org(client: AsyncClient, *, name: str = CHOSEN_NAME, csrf: str | None = None):
+    page = await client.get(ORG_INVITATIONS_PATH)
+    return await client.post(
+        ORG_INVITATIONS_NAME_PATH,
+        data={
+            "csrf_token": csrf if csrf is not None else csrf_from(page.text),
+            ORGANIZATION_NAME_FIELD: name,
+        },
+    )
+
+
 async def revoke(client: AsyncClient, invitation_id: str, *, csrf: str | None = None):
     page = await client.get(ORG_INVITATIONS_PATH)
     return await client.post(
@@ -450,12 +490,14 @@ def test_the_actions_refuse_without_the_owner_org_role(role):
         lambda: org_router.revoke_invitation(
             _context(role), service, org_id=ORG_ID, invitation_id="inv-1"
         ),
+        lambda: org_router.name_organization(_context(role), service, org_id=ORG_ID, name=CHOSEN_NAME),
     ):
         with pytest.raises(HTTPException) as refused:
             action()
         assert refused.value.status_code == 403
     assert service.issue_calls == []
     assert service.revoke_calls == []
+    assert service.name_calls == []
 
 
 def test_the_actions_refuse_an_owner_of_a_different_organization():
@@ -468,11 +510,13 @@ def test_the_actions_refuse_an_owner_of_a_different_organization():
     for action in (
         lambda: org_router.issue_invitation(other, service, org_id=ORG_ID, email=INVITEE),
         lambda: org_router.revoke_invitation(other, service, org_id=ORG_ID, invitation_id="inv-1"),
+        lambda: org_router.name_organization(other, service, org_id=ORG_ID, name=CHOSEN_NAME),
     ):
         with pytest.raises(HTTPException) as refused:
             action()
         assert refused.value.status_code == 403
     assert service.issue_calls == []
+    assert service.name_calls == []
 
 
 def test_a_platform_operator_role_never_stands_in_for_ownership():
@@ -746,12 +790,15 @@ async def test_only_revocable_rows_get_a_revoke_control(tmp_path, idp):
 
 @pytest.mark.parametrize("csrf", ["", "wrong-token"])
 async def test_a_post_without_the_session_csrf_token_changes_nothing(tmp_path, idp, csrf):
-    app, service, _delivery = build_app(tmp_path, idp)
+    app, service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
     async with web_client(app) as client:
         await signed_in(client, idp)
+        named = await name_org(client, csrf=csrf)
+        assert named.status_code == 403
         response = await issue(client, csrf=csrf)
     assert response.status_code == 403
     assert service.issue_calls == []
+    assert service.name_calls == []
 
 
 @pytest.mark.parametrize("path", ORG_INVITATIONS_PATHS)
@@ -768,6 +815,7 @@ async def test_an_oversized_form_is_refused_before_it_is_parsed(tmp_path, idp, p
     assert response.headers.get("connection") == "close"
     assert service.issue_calls == []
     assert service.revoke_calls == []
+    assert service.name_calls == []
 
 
 # ===========================================================================
@@ -786,6 +834,10 @@ def test_every_notice_the_router_can_raise_has_copy():
         NOTICE_REVOKED,
         NOTICE_REVOKE_REFUSED,
         NOTICE_UNAVAILABLE,
+        NOTICE_ORGANIZATION_UNNAMED,
+        NOTICE_NAMED,
+        NOTICE_ALREADY_NAMED,
+        NOTICE_INVALID_ORGANIZATION_NAME,
     }
 
 
@@ -839,6 +891,154 @@ async def test_the_rendered_secret_reaches_no_log_record(tmp_path, idp, caplog):
         assert SENTINEL_TOKEN not in record.getMessage()
         assert SENTINEL_TOKEN not in str(record.__dict__)
         assert INVITEE not in record.getMessage()
+
+
+# ===========================================================================
+# The first-invite naming step (#44) — no invitation into "Unnamed organization"
+# ===========================================================================
+
+
+async def test_an_unnamed_organization_gets_the_naming_form_not_the_issue_form(tmp_path, idp):
+    app, _service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        page = await client.get(ORG_INVITATIONS_PATH)
+    assert page.status_code == 200
+    fields = re.findall(r'<input[^>]*name="([^"]+)"', page.text)
+    assert set(fields) == {"csrf_token", ORGANIZATION_NAME_FIELD}
+    assert ORG_INVITATIONS_NAME_PATH in page.text
+    assert "Invite someone to join" not in page.text
+    assert "does not have a name yet" in page.text
+
+
+@pytest.mark.parametrize("stored", [NEUTRAL_ORG_NAME, "unnamed organization", "", "   "])
+async def test_issuing_into_an_unnamed_organization_is_refused_by_the_server(tmp_path, idp, stored):
+    """The hidden form is the rendering; this is the refusal. A hand-built POST
+    changes nothing and reaches neither the service nor the mail seam."""
+
+    app, service, delivery = build_app(tmp_path, idp, organization_name=stored)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        response = await issue(client)
+    assert response.status_code == 409
+    assert notice_text(NOTICE_ORGANIZATION_UNNAMED, INVITEE) in response.text
+    assert service.issue_calls == []
+    assert delivery.calls == []
+
+
+async def test_naming_records_the_owner_and_the_callers_organization(tmp_path, idp):
+    app, service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        response = await name_org(client, name=f"  {CHOSEN_NAME}  ")
+    assert response.status_code == 200
+    assert service.name_calls == [{"actor": OWNER_SUB, "org_id": ORG_ID, "name": CHOSEN_NAME}]
+    assert notice_text(NOTICE_NAMED, CHOSEN_NAME) in response.text
+    # The page rendered after naming is #142's: the issue form, and the name.
+    fields = re.findall(r'<input[^>]*name="([^"]+)"', response.text)
+    assert set(fields) == {"csrf_token", EMAIL_FIELD}
+    assert f"Invite someone to join {CHOSEN_NAME}" in response.text
+
+
+async def test_naming_then_issuing_hands_the_new_name_to_the_mail_seam(tmp_path, idp):
+    app, service, delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        assert (await name_org(client)).status_code == 200
+        issued = await issue(client)
+    assert issued.status_code == 201
+    assert service.issue_calls == [{"actor": OWNER_SUB, "email": INVITEE, "org_id": ORG_ID}]
+    assert [call["organization_name"] for call in delivery.calls] == [CHOSEN_NAME]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        NEUTRAL_ORG_NAME,
+        "UNNAMED ORGANIZATION",
+        "  unnamed organization ",
+        "a" * (MAX_ORGANIZATION_NAME_LENGTH + 1),
+        "Acme\nWidgets",
+        "Acme\x00",
+        "Acme\x7f",
+    ],
+)
+async def test_an_unusable_name_changes_nothing(tmp_path, idp, bad):
+    app, service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        response = await name_org(client, name=bad)
+    assert response.status_code == 400
+    assert notice_text(NOTICE_INVALID_ORGANIZATION_NAME) in response.text
+    assert service.name_calls == []
+    assert service.name == NEUTRAL_ORG_NAME
+
+
+async def test_a_smuggled_org_id_does_not_redirect_the_naming(tmp_path, idp):
+    app, service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        page = await client.get(ORG_INVITATIONS_PATH)
+        response = await client.post(
+            ORG_INVITATIONS_NAME_PATH,
+            data={
+                "csrf_token": csrf_from(page.text),
+                ORGANIZATION_NAME_FIELD: CHOSEN_NAME,
+                "org_id": OTHER_ORG_ID,
+            },
+        )
+    assert response.status_code == 200
+    assert service.name_calls[-1]["org_id"] == ORG_ID
+
+
+async def test_a_named_organization_offers_no_naming_form_and_refuses_the_post(tmp_path, idp):
+    """One shot: once named, the form is gone and the route says so."""
+
+    app, service, _delivery = build_app(tmp_path, idp)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        page = await client.get(ORG_INVITATIONS_PATH)
+        assert ORG_INVITATIONS_NAME_PATH not in page.text
+        assert ORGANIZATION_NAME_FIELD not in page.text
+        response = await name_org(client, name="Something Else")
+    assert response.status_code == 409
+    assert notice_text(NOTICE_ALREADY_NAMED) in response.text
+    assert service.name == ORG_NAME
+    assert html.escape(ORG_NAME) in response.text
+
+
+async def test_a_hostile_name_cannot_inject_markup(tmp_path, idp):
+    hostile = 'Acme"><script>alert(1)</script>'
+    app, _service, _delivery = build_app(tmp_path, idp, organization_name=NEUTRAL_ORG_NAME)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        response = await name_org(client, name=hostile)
+    assert response.status_code == 200
+    assert "<script>alert(1)</script>" not in response.text
+    assert html.escape(hostile) in response.text
+
+
+async def test_naming_on_an_unavailable_service_changes_nothing_and_says_so(tmp_path, idp):
+    app, service, _delivery = build_app(tmp_path, idp, unavailable=True)
+    async with web_client(app) as client:
+        await signed_in(client, idp)
+        page = await client.get(ORG_INVITATIONS_PATH)
+        response = await client.post(
+            ORG_INVITATIONS_NAME_PATH,
+            data={"csrf_token": csrf_from(page.text), ORGANIZATION_NAME_FIELD: CHOSEN_NAME},
+        )
+    assert response.status_code == 503
+    assert notice_text(NOTICE_UNAVAILABLE) in response.text
+    assert service.name_calls == []
+
+
+def test_the_naming_route_is_in_the_pages_path_registry():
+    """So the CSRF-in-route registry and the oversized-form test both cover it."""
+
+    assert ORG_INVITATIONS_NAME_PATH in ORG_INVITATIONS_PATHS
+    assert ORG_INVITATIONS_NAME_PATH not in PUBLIC_WEB_PATHS
 
 
 # ===========================================================================
@@ -908,9 +1108,11 @@ async def live_app(tmp_path, idp, live_db):
     async with app.router.lifespan_context(app):
         app.state.invitation_email_delivery = CapturingDelivery()
         with live_db.connection() as conn:
+            # Seeded the way acceptance really creates one: no name supplied,
+            # so the column default — the placeholder — applies (#44).
             conn.execute(
-                "INSERT INTO collab_orgs (id, name, created_by) VALUES (%s, %s, %s)",
-                (ORG_ID, ORG_NAME, OWNER_SUB),
+                "INSERT INTO collab_orgs (id, created_by) VALUES (%s, %s)",
+                (ORG_ID, OWNER_SUB),
             )
             conn.execute(
                 "INSERT INTO collab_org_members (user_id, org_id, role) VALUES (%s, %s, 'owner')",
@@ -936,11 +1138,25 @@ async def test_live_an_owner_takes_an_address_into_their_existing_org(live_app, 
         await sign_in(owner, idp, next_path=ORG_INVITATIONS_PATH)
         page = await owner.get(ORG_INVITATIONS_PATH)
         assert page.status_code == 200
-        issued = await owner.post(
+        # #44: the organization was created by acceptance and carries the
+        # placeholder, so the page refuses to issue until it is named.
+        refused = await owner.post(
             ORG_INVITATIONS_PATH,
             data={"csrf_token": csrf_from(page.text), EMAIL_FIELD: INVITEE},
         )
+        assert refused.status_code == 409
+        assert live_app.state.invitation_email_delivery.calls == []
+        named = await owner.post(
+            ORG_INVITATIONS_NAME_PATH,
+            data={"csrf_token": csrf_from(page.text), ORGANIZATION_NAME_FIELD: CHOSEN_NAME},
+        )
+        assert named.status_code == 200
+        issued = await owner.post(
+            ORG_INVITATIONS_PATH,
+            data={"csrf_token": csrf_from(named.text), EMAIL_FIELD: INVITEE},
+        )
     assert issued.status_code == 201
+    assert live_app.state.invitation_email_delivery.calls[0]["organization_name"] == CHOSEN_NAME
     token = live_app.state.invitation_email_delivery.secret()
     assert token not in issued.text, "the page renders the outcome, never the secret"
     link = f"{ACCEPT_PAGE_PATH}#token={token}"
@@ -967,6 +1183,24 @@ async def test_live_an_owner_takes_an_address_into_their_existing_org(live_app, 
         ).fetchone()["n"]
 
     assert [row["id"] for row in orgs] == [ORG_ID], "no second organization may exist"
+    with live_db.connection() as conn:
+        org_name = conn.execute("SELECT name FROM collab_orgs WHERE id = %s", (ORG_ID,)).fetchone()["name"]
+        rename = conn.execute(
+            "SELECT actor, target_type, target_id, target_label, org_id, detail"
+            " FROM collab_audit_events WHERE action = 'org.rename'"
+        ).fetchall()
+    assert org_name == CHOSEN_NAME
+    assert [dict(row) for row in rename] == [
+        {
+            "actor": OWNER_SUB,
+            "target_type": "org",
+            "target_id": ORG_ID,
+            "target_label": CHOSEN_NAME,
+            "org_id": ORG_ID,
+            "detail": {"replaced_placeholder": True},
+        }
+    ]
+    assert [row["action"] for row in events][:2] == ["org.rename", "invitation.send"]
     assert {(row["user_id"], row["org_id"], row["role"]) for row in memberships} == {
         (OWNER_SUB, ORG_ID, "owner"),
         (idp.sub, ORG_ID, "member"),
@@ -979,6 +1213,8 @@ async def test_live_an_owner_takes_an_address_into_their_existing_org(live_app, 
 
 @live_postgres
 async def test_live_an_owner_revokes_and_the_link_dies(live_app, idp, live_db):
+    with live_db.connection() as conn:
+        conn.execute("UPDATE collab_orgs SET name = %s WHERE id = %s", (ORG_NAME, ORG_ID))
     async with web_client(live_app) as owner:
         await sign_in(owner, idp, next_path=ORG_INVITATIONS_PATH)
         page = await owner.get(ORG_INVITATIONS_PATH)
