@@ -226,9 +226,13 @@ class SlackClient:
             params["cursor"] = cursor
         payload = await self._get_json("/conversations.replies", params=params, operation="thread read")
         messages, has_more, next_cursor = _messages_page(payload)
+        if cursor:
+            # Slack can put the thread's first message (thread_ts == ts) at the top
+            # of every page. Past the first page it was already returned, so drop
+            # it whichever cursor got us here.
+            messages = [message for message in messages if not (message.thread_ts and message.ts == message.thread_ts)]
         if budget_ts is not None:
-            # Slack puts the thread's first message at the top of every page,
-            # so drop anything older than where the budget cursor resumes.
+            # Also drop anything older than where the budget cursor resumes.
             messages = [message for message in messages if float(message.ts) >= float(budget_ts)]
         return _apply_read_budget(messages, has_more, next_cursor, max_chars)
 
@@ -475,6 +479,7 @@ def _search_hit(item: dict) -> SlackSearchHit:
         author_name=str(item.get("username", "") or ""),
         text=text,
         truncated=truncated,
+        thread_ts=str(item.get("thread_ts", "") or ""),
     )
 
 

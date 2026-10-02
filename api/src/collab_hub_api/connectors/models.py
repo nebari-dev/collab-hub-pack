@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -340,6 +341,22 @@ class SlackMessage(BaseModel):
     reply_count: int = _omit_when_default(0)
 
 
+_SLACK_TS_PATTERN = r"\d{10,}\.\d{3,}"
+# The cursors the Slack reads hand out themselves: "ts:<ts>[:<oldest>]" after a
+# max_chars stop, and "slack:<oldest>:<Slack cursor>" for a time-windowed read.
+_SLACK_BUDGET_CURSOR = re.compile(rf"ts:{_SLACK_TS_PATTERN}(:{_SLACK_TS_PATTERN})?")
+_SLACK_WINDOWED_CURSOR = re.compile(rf"slack:{_SLACK_TS_PATTERN}:.+")
+
+
+def _check_slack_read_cursor(cursor: str) -> str:
+    """Reject a malformed ``ts:``/``slack:`` cursor with a 422; Slack's own cursors pass."""
+    if cursor.startswith("ts:") and not _SLACK_BUDGET_CURSOR.fullmatch(cursor):
+        raise ValueError("cursor must be a next_cursor value returned by an earlier read")
+    if cursor.startswith("slack:") and not _SLACK_WINDOWED_CURSOR.fullmatch(cursor):
+        raise ValueError("cursor must be a next_cursor value returned by an earlier read")
+    return cursor
+
+
 # Search hits intentionally omit Slack permalinks, and every Slack ``text`` field
 # (here and on SlackMessage) is link-sanitized in slack_client via
 # connectors/slack_text.py: the Apollo chat renderer crashes on link-shaped text
@@ -354,8 +371,12 @@ class SlackSearchHit(BaseModel):
     user_id: str = _omit_when_default("")
     author_name: str = _omit_when_default("")
     text: str = _omit_when_default("")
-    # True when the text was shortened. Read the message by its ts to get the full text.
+    # True when the text was shortened. Read the message by its ts to get the full
+    # text: a thread reply through the thread read (any ts in the thread works),
+    # anything else through the channel read with oldest = latest = ts.
     truncated: bool = _omit_when_default(False)
+    # Set when the hit is in a thread, so the model knows to use the thread read.
+    thread_ts: str = _omit_when_default("")
 
 
 class SlackSearchRequest(BaseModel):
@@ -387,6 +408,8 @@ class SlackReadRequest(BaseModel):
     cursor: str = Field(default="", max_length=256)
     # Stop adding messages once their text would go over this many characters.
     max_chars: int = Field(default=12_000, ge=1, le=50_000)
+
+    _check_cursor = field_validator("cursor")(lambda cls, value: _check_slack_read_cursor(value))
 
     @model_validator(mode="after")
     def _derive_oldest_latest(self) -> SlackReadRequest:
@@ -442,6 +465,8 @@ class SlackThreadReadRequest(BaseModel):
     cursor: str = Field(default="", max_length=256)
     # Stop adding messages once their text would go over this many characters.
     max_chars: int = Field(default=12_000, ge=1, le=50_000)
+
+    _check_cursor = field_validator("cursor")(lambda cls, value: _check_slack_read_cursor(value))
 
 
 class SlackThreadReadResponse(UntrustedConnectorResponse):

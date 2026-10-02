@@ -9,6 +9,7 @@ import pytest
 from httpx import Response
 from pydantic import ValidationError
 
+from collab_hub_api.connectors import slack_client as slack_client_module
 from collab_hub_api.connectors.models import (
     UNTRUSTED_CONNECTOR_CONTENT_NOTICE,
     SlackChannelsResponse,
@@ -412,3 +413,90 @@ async def test_budget_cursor_never_reads_past_the_callers_own_latest(monkeypatch
     )
 
     assert seen_params[0]["latest"] == "1790000001.000100"
+
+
+async def test_thread_read_never_repeats_the_first_message_on_slack_cursor_pages(monkeypatch):
+    # The parent (thread_ts == ts) comes back at the top of every page, and the read
+    # mixes our ts: cursor with Slack's own cursor.
+    sizes = [100, 2_000, 500, 500, 500, 500, 500]  # parent first, then replies, oldest first
+    parent_ts = "1790000000.000100"
+    thread = [
+        {"ts": f"17900000{i:02d}.000100", "thread_ts": parent_ts, "user": "U0001", "text": "x" * size}
+        for i, size in enumerate(sizes)
+    ]
+    parent, replies = thread[0], thread[1:]
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        params = dict(request.url.params)
+        oldest = params.get("oldest")
+        resume = params.get("cursor", "").removeprefix("next_ts:")
+        pool = [
+            m
+            for m in replies
+            if (not oldest or float(m["ts"]) >= float(oldest)) and (not resume or float(m["ts"]) >= float(resume))
+        ]
+        limit = int(params["limit"]) - 1  # the parent takes one slot on every page
+        page, rest = pool[:limit], pool[limit:]
+        return Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [parent, *page],
+                "has_more": bool(rest),
+                "response_metadata": {"next_cursor": f"next_ts:{rest[0]['ts']}" if rest else ""},
+            },
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    read: list[str] = []
+    cursor = ""
+    used_slack_cursor = False
+    while True:
+        messages, has_more, cursor = await slack.read_thread(
+            channel_id="C0001", message_ts=parent_ts, limit=3, cursor=cursor, max_chars=2_200
+        )
+        read.extend(m.ts for m in messages)
+        used_slack_cursor = used_slack_cursor or cursor.startswith("next_ts:")
+        if not has_more:
+            break
+
+    assert used_slack_cursor
+    assert read == [m["ts"] for m in thread]  # the parent exactly once, every reply exactly once
+
+
+def test_search_hit_carries_thread_ts_when_slack_provides_it():
+    reply = slack_client_module._search_hit(
+        {"ts": "1790000005.000100", "thread_ts": "1790000000.000100", "text": "a reply", "channel": {"id": "C0001"}}
+    )
+    top_level = slack_client_module._search_hit({"ts": "1790000005.000100", "text": "hi", "channel": {"id": "C0001"}})
+
+    assert reply.model_dump()["thread_ts"] == "1790000000.000100"
+    assert "thread_ts" not in top_level.model_dump()
+
+
+@pytest.mark.parametrize(
+    "cursor", ["ts:", "ts:abc", "ts:1790000001.000100:abc", "slack:", "slack:abc:xyz", "slack:1790000001.000100:"]
+)
+@pytest.mark.parametrize("model", [SlackReadRequest, SlackThreadReadRequest])
+def test_read_requests_reject_malformed_cursors(model, cursor):
+    with pytest.raises(ValidationError):
+        model(cursor=cursor)
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "",
+        "dXNlcjpVMDYxTkZUVDI=",
+        "ts:1790000001.000100",
+        "ts:1790000001.000100:1789000000.000000",
+        "slack:1789000000.000000:dXNlcjpVMDYxTkZUVDI=",
+    ],
+)
+def test_read_requests_accept_well_formed_cursors(cursor):
+    assert SlackReadRequest(cursor=cursor).cursor == cursor
+    assert SlackThreadReadRequest(cursor=cursor).cursor == cursor

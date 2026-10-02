@@ -214,7 +214,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.13.0" },
     { name = "prometheus-client", specifier = ">=0.23.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2.0" },
-    { name = "pydantic", specifier = ">=2.11" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "pydantic-settings", specifier = ">=2.14.1" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.0" },
     { name = "pyyaml", specifier = ">=6.0" },
