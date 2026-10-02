@@ -34,7 +34,13 @@ make -s -C "$ROOT/dev" controller > "$LOGS/example-controller.log" 2>&1 &
 controller=$!
 set +m
 stop() {
-  kill -TERM -- "-$api" "-$controller" 2>/dev/null || true
+  for group in "$api" "$controller"; do kill -TERM -- "-$group" 2>/dev/null || true; done
+  # `make` exits at once; the Python process under it takes a moment to shut down. Wait for each
+  # group to be empty, and kill what is left after ten seconds.
+  for group in "$api" "$controller"; do
+    for _ in $(seq 1 50); do kill -0 -- "-$group" 2>/dev/null || break; sleep 0.2; done
+    kill -KILL -- "-$group" 2>/dev/null || true
+  done
   wait "$api" "$controller" 2>/dev/null || true
   rm -rf "$COLLAB_HUB_CONFIG_DIR"
 }
