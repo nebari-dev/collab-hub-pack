@@ -476,6 +476,9 @@ def test_hung_forced_refresh_does_not_stall_cached_verification(jwks, clock):
 
     # Past PyJWT's own 30s refresh cooldown, so its forced refresh would run too.
     clock(auth.JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS + 1)
+    # Long enough that the hung fetch is still out whatever the scheduling
+    # delay; ``resume`` ends it, not the timeout.
+    _client(jwks.url).timeout = 30
     jwks.hang()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -487,7 +490,7 @@ def test_hung_forced_refresh_does_not_stall_cached_verification(jwks, clock):
 
         cached = pool.submit(_decode, known_good, jwks.url)
         try:
-            assert cached.result(timeout=2)["preferred_username"] == "signed-user"
+            assert cached.result(timeout=10)["preferred_username"] == "signed-user"
             assert not forced.done()
         finally:
             jwks.resume()
