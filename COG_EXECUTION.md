@@ -549,8 +549,8 @@ Where a worker runs is the second axis under the runner, chosen by configuration
 *Dev and CI* — `make op OP=echo LOCATION=local` at level 1 — no containers, the SQLite Track — runs the `echo` fake Cog as a real process, and without `LOCATION` the fake Cogs still answer in process; `make controller LOCATION=local` arrives with the controller itself, in Phase 10. The fake Cogs become packages: a `pixi.toml` with a `serve` task, its lock, and a `serve.py`. pixi joins level 1's prerequisites, marked as needed only for `LOCATION=local`. CI: `level-1` runs one fake Cog through the local executor on Linux and macOS (Windows is out of scope, decision 15) and asserts a killed controller leaves no worker behind; the location suite runs in `test-execution.yaml`. *Docs* — ADR-0002 gains **D12, agent location**, appended and never renumbered, and a sixth invariant: no lifecycle logic inside an executor, and `location` is the only switch; the glossary gains *Agent location*, *Local worker*, *Remote worker*; `runs.md` gains the location table.
 
 *Acceptance*
-- [ ] With `location: local`, an Op step runs in a child process of the controller and completes with a valid envelope, at dev level 1, on Linux and macOS.
-- [ ] Killing the controller with `SIGKILL` leaves no worker process running, on Linux and macOS.
+- [x] With `location: local`, an Op step runs in a child process of the controller and completes with a valid envelope, at dev level 1, on Linux and macOS.
+- [x] Killing the controller with `SIGKILL` leaves no worker process running, on Linux and macOS.
 - [x] `location` is the only switch; no caller imports an executor.
 - [x] `local` and the in-memory executor pass the location conformance suite.
 - [x] At level 1 with registry access disabled, the directory source finds and launches a package by name, and a name or path outside the configured roots is refused.
