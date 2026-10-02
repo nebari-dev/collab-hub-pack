@@ -241,14 +241,20 @@ api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on ever
 ## Level 1 — running Cogs and Ops
 # ---------------------------------------------------------------------------
 
-OP      ?= echo
-BACKEND ?= none
+OP       ?= echo
+BACKEND  ?= none
+LOCATION ?=
 
-# In process, no container: the fake Cogs under cogs/ answer in the same
-# process, over the SQLite Track in .local/. The execution package's own
-# environment runs it; PyYAML reads the Op.
-op: ## Run a fake Op in process and print its Track (OP=echo|needs-review|fails|slow|spender, BACKEND=none)
-	cd $(ROOT)/execution && uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
+# No container. Without a LOCATION the fake Cogs under cogs/ answer in the same
+# process. With LOCATION=local each step's worker is a real process: the Cog
+# package's `serve` task, run in its own pixi environment (pixi is needed for
+# that, and only for that), on a loopback port, killed when the step ends or
+# when this host dies. Either way the Track is the SQLite one in .local/. The
+# execution package's own environment runs it; PyYAML reads the Op.
+op: ## Run a fake Op and print its Track (OP=echo|needs-review|fails|slow|spender, LOCATION=local for real worker processes)
+	@if [ "$(LOCATION)" = local ] && ! command -v pixi >/dev/null; then \
+		echo "LOCATION=local runs each fake Cog in its own pixi environment: install pixi (https://pixi.sh), or run without LOCATION"; exit 1; fi
+	cd $(ROOT)/execution && LOCATION=$(LOCATION) uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
 		--backend $(BACKEND) --track $(LOCAL)/track.sqlite
 
 # ---------------------------------------------------------------------------

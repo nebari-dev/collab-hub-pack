@@ -1,11 +1,17 @@
-"""`make op OP=<name>`: run a fake Op at dev level 1, in process, and print its Track.
+"""`make op OP=<name>`: run a fake Op at dev level 1 and print its Track.
 
 The Op is `dev/ops/<name>.yaml`; each step names a fake Cog under `dev/cogs/`,
-whose `cog.py` answers in this process. The runner uses the durability backend
-`BACKEND` names (`none` by default, the only one built) over the SQLite Track in
-`dev/.local/track.sqlite`, and starts the way a host does: a run a previous
-`make op` left unfinished — stopped mid-step with Ctrl-C — is recorded
-`interrupted` before the new run starts. No container, no network.
+a Cog package whose `serve.py` holds its `handle` function. Without a location,
+`handle` answers in this process: no worker, no container, no network. With
+`LOCATION=local` each step's worker is a real process: the package's `serve`
+task, run in its own pixi environment through the local executor, listening on
+a loopback port, and gone when the step ends or when this host dies. Its output
+is under `dev/.local/runs/<run>/`.
+
+The runner uses the durability backend `BACKEND` names (`none` by default, the
+only one built) over the SQLite Track in `dev/.local/track.sqlite`, and starts
+the way a host does: a run a previous `make op` left unfinished — stopped
+mid-step with Ctrl-C — is recorded `interrupted` before the new run starts.
 
 One host at a time: the runner assumes it is the only one advancing the runs on
 its Track, and run pickup (Phase 10 of the plan) is what lets hosts share one.
@@ -28,11 +34,13 @@ from pathlib import Path
 import yaml
 
 from collab_hub_execution import (
+    AGENT_LOCATIONS,
     Gate,
     InMemoryCogExecutor,
     LifecycleRunner,
     OpDefinition,
     OpStep,
+    ResultEnvelope,
     RunBudget,
     SqliteTrackStore,
 )
@@ -41,16 +49,17 @@ DEV = Path(__file__).resolve().parent
 
 
 def _handler(cog: str):
-    path = DEV / "cogs" / cog / "cog.py"
+    path = DEV / "cogs" / cog / "serve.py"
     if not path.exists():
         raise SystemExit(f"no fake Cog {cog!r}: expected {path.relative_to(DEV.parent)}")
     spec = importlib.util.spec_from_file_location(f"dev_cog_{cog.replace('-', '_')}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.handle
+    # In process the envelope is checked the way the seam checks one that arrived as JSON.
+    return lambda entry_point, value, **feedback: ResultEnvelope.parse(module.handle(entry_point, value, **feedback))
 
 
-def _op(name: str, run_id: str) -> tuple[OpDefinition, RunBudget | None, dict]:
+def _op(name: str, run_id: str, in_process: bool) -> tuple[OpDefinition, RunBudget | None, dict]:
     path = DEV / "ops" / f"{name}.yaml"
     if not path.exists():
         known = sorted(p.stem for p in (DEV / "ops").glob("*.yaml"))
@@ -67,7 +76,7 @@ def _op(name: str, run_id: str) -> tuple[OpDefinition, RunBudget | None, dict]:
         seconds = budget.get("max_seconds")
         limits = RunBudget(max_tokens=budget.get("max_tokens"), max_cost=budget.get("max_cost"),
                            max_duration=timedelta(seconds=seconds) if seconds else None)
-    handlers = {step.cog: _handler(step.cog) for step in steps}
+    handlers = {step.cog: _handler(step.cog) for step in steps} if in_process else {}
     return OpDefinition(run_id, steps), limits, handlers
 
 
@@ -75,7 +84,8 @@ def _print_track(track, run_id: str) -> None:
     for event in track.replay(run_id):
         payload = event.payload
         detail = " ".join(
-            f"{key}={payload[key]}" for key in ("step", "attempt", "error", "reason", "dimension", "actor", "backend")
+            f"{key}={payload[key]}"
+            for key in ("step", "attempt", "error", "reason", "dimension", "actor", "backend", "location", "pid")
             if payload.get(key) not in (None, "")
         )
         print(f"  {event.sequence:>5}  {event.event_type:<20} {detail}".rstrip())
@@ -85,6 +95,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("op", help="the Op to run: a file under dev/ops/, without .yaml")
     parser.add_argument("--backend", default=os.environ.get("BACKEND", "none"))
+    parser.add_argument("--location", default=os.environ.get("LOCATION", ""), choices=("", *AGENT_LOCATIONS),
+                        help="where each step's worker runs; without one, the fake Cogs answer in this process")
     parser.add_argument("--track", default=str(DEV / ".local" / "track.sqlite"))
     args = parser.parse_args()
 
@@ -101,13 +113,18 @@ def main() -> int:
     track = SqliteTrackStore(track_path)
 
     run_id = f"{args.op}-{uuid.uuid4().hex[:8]}"
-    op, budget, handlers = _op(args.op, run_id)
-    runner = LifecycleRunner(executor=InMemoryCogExecutor(handlers), track=track, budget=budget,
-                             backend=args.backend)
+    op, budget, handlers = _op(args.op, run_id, in_process=not args.location)
+    if args.location:
+        where = {"location": args.location, "location_settings": {
+            "packages": [DEV / "cogs"], "work_dir": track_path.parent / "runs"}}
+    else:
+        where = {"executor": InMemoryCogExecutor(handlers)}
+    runner = LifecycleRunner(track=track, budget=budget, backend=args.backend, **where)
     for interrupted in runner.start():
         print(f"interrupted {interrupted}: a previous `make op` stopped before it ended", flush=True)
 
-    print(f"run {run_id} on the {runner.backend.name!r} backend", flush=True)
+    print(f"run {run_id} on the {runner.backend.name!r} backend, workers "
+          f"{'at ' + repr(args.location) if args.location else 'in process'}", flush=True)
     try:
         state = runner.submit(op)
     except KeyboardInterrupt:

@@ -131,7 +131,7 @@ Bare decision and invariant numbers are ADR-0001's.
 | #106 install by digest | D5 | Install runs `check` once; materialize happens per run. |
 | #107 worker SDK | ADR-0002 D5, invariant 4 | Optional for Cogs; the hub never imports it. |
 | #108 Hermes harness Cog | ADR-0002 D5 | The first harness Cog, built on the worker SDK. |
-| #109 agent location | ADR-0002 D1, D6 | `location`, `local` or `remote`, beside `backend`: a child process first, a pod (#6) behind the same switch. |
+| #109 agent location | ADR-0002 D12, invariant 6 | `location`, `local` or `remote`, beside `backend`: a process on the controller's host first, built; a pod (#6) behind the same switch. A worker's run token is minted here. |
 | #110 Temporal backend | ADR-0002 D1, D3 | The same conformance suites as the other backends. |
 | #125 the `collab-hub` CLI | ADR-0002 D4, D7 | A client over the REST API, authentication first; it imports no hub package. |
 | #126 CLI run commands | ADR-0002 D4, D7 | Every run API endpoint behind a command; later work adds its own commands, not another client. |

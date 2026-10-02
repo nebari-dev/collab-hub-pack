@@ -81,6 +81,19 @@ reader that never fetches payloads still knows what produced them.
 `reason`) and `teardown_failed` (`step`, `error`) are the worker machine's
 records. They leave the run's state where it is.
 
+A worker that is a process or a workload of its own has two more, written by
+the runner around the executor's calls:
+
+| Event | Payload |
+|---|---|
+| `worker_started` | `step`, `attempt`, `instance`, `location`, `run_token_sha256`, and where the worker is: at `local`, `package` (`name`, `digest`), `pid`, `pgid` and `logs`, the directory its stdout and stderr go to |
+| `worker_stopped` | `step`, `attempt`, `instance` — the worker was torn down, and its run token has expired |
+
+`run_token_sha256` is the hash of the worker's run token; the token itself is
+never recorded. A token is valid while its `worker_started` has no
+`worker_stopped` and the run has not ended or been interrupted
+([runs.md](runs.md#agent-locations)). An in-memory worker records neither.
+
 ## Reading a Track written before v1
 
 Events written before schema v1 carry `schema` 0 and are never rewritten.

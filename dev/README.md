@@ -27,6 +27,7 @@ one, and only matters once you reach level 3.
 | Docker with Compose v2 | levels 2–4 (**not** level 1) | `docker compose version` |
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
+| [pixi](https://pixi.sh) | `make op LOCATION=local` only | `pixi --version` |
 
 You do **not** need a local Python: `uv` provisions the interpreter pinned in
 `api/.python-version` (3.14, the one the image runs) on first run. The API
@@ -1126,12 +1127,13 @@ TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
 `cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
 runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 
-### Fake Ops, in process — `make op`
+### Fake Ops — `make op`
 
 Level 1, no container. `make op OP=<name>` runs the Op in `ops/<name>.yaml` on
 the lifecycle runner with the `none` durability backend, and prints its Track
-and its status. Each step names a fake Cog under `cogs/`, whose `cog.py`
-answers in the same process:
+and its status. Each step names a fake Cog under `cogs/`: a Cog package, with a
+`pixi.toml` that declares a `serve` task and a `serve.py` that holds the Cog's
+`handle` function. Without a location, `handle` answers in the same process:
 
 | Op | Fake Cog | Ends |
 |---|---|---|
@@ -1147,6 +1149,25 @@ make op OP=slow        # Ctrl-C during the step
 make op                # "interrupted slow-…: a previous `make op` stopped before it ended"
 ```
 
+**As real worker processes — `LOCATION=local`.** With `make op OP=<name>
+LOCATION=local`, each step's worker is a process: the local executor runs the
+package's `serve` task in the package's own pixi environment, on a loopback
+port it chose, waits for `/healthz`, calls `/invoke` with the worker's run
+token, and kills the worker's process group when the step ends. This is the
+`local` agent location ([runs.md](../docs/cog-execution/runs.md#agent-locations));
+it needs [pixi](https://pixi.sh), and nothing else here does. The first run of
+a Cog installs its environment (a Python, a few seconds); later runs reuse it.
+
+```sh
+make op OP=echo LOCATION=local    # worker_started … location=local pid=…, then worker_stopped
+make op OP=slow LOCATION=local &  # then kill -9 the `op.py` process: no worker is left behind
+```
+
+The Track gains `worker_started` and `worker_stopped` around each interaction.
+A worker's stdout and stderr are in `.local/runs/<run>/<step>_<attempt>/`.
+Stopping the host any way at all, `kill -9` included, leaves no worker: the
+launcher that holds each worker kills it when its pipe to the host closes.
+
 **What persists.** The Track is a SQLite file, `.local/track.sqlite`, kept
 across runs until `make clean`. Every `make op` starts the way a host does: a
 run a previous one left running or waiting at a Gate is recorded
@@ -1157,7 +1178,10 @@ still waiting at its Gate: nothing here decides it yet (the run API, #103, does)
 **One `make op` at a time.** The runner takes every unfinished run on its Track
 as its own when it starts, so `make op` holds a lock beside the Track, and a
 second one refuses to start while the first runs. `BACKEND=dbos` and
-`BACKEND=temporal` are refused until those backends are built.
+`BACKEND=temporal` are refused until those backends are built, and so is
+`LOCATION=remote` until Phase 20 puts the cluster executor behind the switch.
+The fake Cogs' pixi environments, `cogs/<name>/.pixi/`, are git-ignored and
+survive `make clean`; delete them to install afresh.
 
 ### The Cog catalog read API
 
@@ -1194,6 +1218,8 @@ list against Postgres.
 | `/web/signin` returns 404 | The web surface is not mounted without a Keycloak client id | Use `make api-full` |
 | `/health/db` says 200 but nothing persists | It answers 200 either way; the body says `not_configured` | Read the body, and use level 2 or above |
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
+| `make op LOCATION=local` says to install pixi | The `local` location runs each Cog in its own pixi environment | Install [pixi](https://pixi.sh), or drop `LOCATION` to run the fake Cogs in process |
+| `make op LOCATION=local` fails a step with `WorkerStartFailed` | The worker exited or never answered `/healthz`; the reason on the Track ends with its last lines of stderr | Read `.local/runs/<run>/<step>_<attempt>/stderr.log` |
 | `make op` says another `make op` is running | A previous one is still running on the same Track, possibly in another terminal | Let it finish or stop it; one host per Track until run pickup (#121) |
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
@@ -1241,7 +1267,7 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
 | 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
@@ -1297,6 +1323,7 @@ works as a set:
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
 | `OP` | `echo` | The Op `make op` runs: a file under `ops/`, without `.yaml` |
 | `BACKEND` | `none` | The durability backend `make op` runs on; only `none` is built |
+| `LOCATION` | *(empty)* | Where `make op` runs each step's worker: empty for in process, `local` for a real process per worker (needs pixi) |
 
 ## Files in this directory
 
@@ -1309,5 +1336,5 @@ works as a set:
 | `sql/bootstrap.sql` | Org + owner membership + operator grant, in one transaction |
 | `proxy/Caddyfile` | Host-routing front door for the desktop client |
 | `values/kind.yaml` | Helm values for the kind install |
-| `op.py`, `ops/`, `cogs/` | `make op`: the script, the fake Ops, and the fake Cogs they name |
-| `.local/` | Frame bodies, the `make op` Track, and scratch state (git-ignored, `make clean` removes it) |
+| `op.py`, `ops/`, `cogs/` | `make op`: the script, the fake Ops, and the fake Cog packages they name (`cogs/fake_worker.py` serves the seam for each) |
+| `.local/` | Frame bodies, the `make op` Track, the output of local workers (`runs/`), and scratch state (git-ignored, `make clean` removes it) |

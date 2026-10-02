@@ -387,6 +387,7 @@ _SUBMISSIONS = frozenset({"op_submitted", "submitted"})
 _FACTS = frozenset({
     "step_started", "materialized", "ready", "interaction_started", "interaction_usage",
     "idle", "teardown_started", "teardown_failed", "step_completed", "step_failed",
+    "worker_started", "worker_stopped",
 })
 
 # The payload fields that decide where a replayed event leads; a record and its replay must agree on them.

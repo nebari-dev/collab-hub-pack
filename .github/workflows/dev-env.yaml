@@ -125,7 +125,7 @@ jobs:
           [ "$(cli/.venv/bin/collab-hub cog list --json)" = "[]" ] \
             || { echo "collab-hub cog list did not report the empty catalog"; exit 1; }
 
-      # The runner on the `none` backend, in process: each fake Op ends where it
+      # The runner on the `none` backend, the fake Cogs answering in process: each fake Op ends where it
       # should, and a run stopped mid-step is recorded interrupted when the next
       # host starts, never resumed (ADR-0002 D2).
       - name: make op runs the fake Ops, and a stopped run is interrupted
@@ -149,6 +149,38 @@ jobs:
           make -s -C dev op OP=echo | tee /tmp/op-after.log
           grep -q "^interrupted $run:" /tmp/op-after.log \
             || { echo "the stopped run was not recorded interrupted"; exit 1; }
+
+      # The `local` agent location: the same fake Cog as a real process, its `serve` task run in the
+      # package's own pixi environment by the local executor. A host killed with SIGKILL runs no
+      # teardown, and still leaves no worker behind: the launcher that holds the worker sees its
+      # pipe to the host close, and kills the worker's process group (ADR-0002 D12).
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: make op LOCATION=local runs a fake Cog as a process, and a killed host leaves no worker
+        run: |
+          set -euo pipefail
+          workers() { pgrep -f 'dev/cogs/[a-z-]*/\.pixi/envs' || true; }
+          make -s -C dev op OP=echo LOCATION=local | tee /tmp/op-local.log
+          grep -q '^status: COMPLETED' /tmp/op-local.log
+          [ "$(grep -c ' worker_started .*location=local' /tmp/op-local.log)" = 2 ] \
+            || { echo "the steps did not run as local worker processes"; exit 1; }
+          [ "$(grep -c ' worker_stopped ' /tmp/op-local.log)" = 2 ]
+          [ -z "$(workers)" ] || { echo "a worker outlived its step"; exit 1; }
+
+          make -s -C dev op OP=slow LOCATION=local > /tmp/op-slow-local.log 2>&1 &
+          for _ in $(seq 1 120); do [ -n "$(workers)" ] && break; sleep 1; done
+          [ -n "$(workers)" ] || { echo "the slow Cog's worker never started"; cat /tmp/op-slow-local.log; exit 1; }
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/op-slow-local.log)
+          pkill -KILL -f "dev/op.py slow"
+          wait || true
+          for _ in $(seq 1 20); do [ -z "$(workers)" ] && break; sleep 1; done
+          [ -z "$(workers)" ] || { echo "a worker outlived its killed host:"; ps -p "$(workers)" -o pid,command; exit 1; }
+          make -s -C dev op OP=echo | tee /tmp/op-after-kill.log
+          grep -q "^interrupted $run:" /tmp/op-after-kill.log \
+            || { echo "the killed host's run was not recorded interrupted"; exit 1; }
 
       - name: make clean removes the scratch state
         run: |

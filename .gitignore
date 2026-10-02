@@ -40,3 +40,6 @@ CLAUDE.md
 
 # Local development scratch state (dev/Makefile)
 dev/.local/
+
+# The pixi environments of the fake Cog packages
+dev/cogs/*/.pixi/

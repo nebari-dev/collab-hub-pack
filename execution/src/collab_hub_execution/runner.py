@@ -40,6 +40,7 @@ from .backends import DurabilityBackend, select_backend
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
+from .locations import select_executor
 from .ops import (
     _NO_SIGNAL,
     CogExecutor,
@@ -202,6 +203,8 @@ class Attempt:
     outcome: tuple[str, Any] = ("broken", "Unknown")
     failure_reason: str | None = None
     teardown_error: str | None = None
+    started: bool = False
+    """A ``worker_started`` was recorded for the worker, so its teardown records ``worker_stopped``."""
     released: bool = False
     """Whoever tears the worker down has claimed it: the teardown step, or ``cancel()`` from another
     thread. Set under the runner's lock, so the worker is torn down once."""
@@ -281,14 +284,20 @@ class LifecycleRunner(WorkflowEngine):
     def __init__(
         self,
         *,
-        executor: CogExecutor,
+        executor: CogExecutor | None = None,
         track: TrackStore,
         budget: RunBudget | None = None,
         max_revisions: int | None = None,
         payload_inline_max_bytes: int = PAYLOAD_INLINE_MAX_BYTES,
         backend: str = "none",
+        location: str | None = None,
+        location_settings: Mapping[str, Any] | None = None,
     ) -> None:
-        self.executor = executor
+        if (executor is None) == (location is None):
+            raise ValueError("a runner takes a location, 'local' or 'remote', or an executor handed to it; not both")
+        # The configuration value is the only switch; a location not built yet is refused here.
+        self.executor: CogExecutor = executor if location is None else select_executor(
+            location, **(location_settings or {}))
         self.track = track
         self.budget = budget
         self.max_revisions = max_revisions
@@ -849,6 +858,13 @@ class LifecycleRunner(WorkflowEngine):
         step = attempt.step
         attempt.worker = self.executor.materialize(step.cog, op.run_id, attempt.instance)
         attempt.cog_worker = now.record(Worker.materialize(step.cog, step=step.name, digest=step.digest))
+        token_digest = getattr(attempt.worker, "run_token_digest", None)
+        if token_digest is not None:
+            # Where the worker is, and the hash of its run token: the token itself is never recorded.
+            now.append("worker_started", {
+                "step": step.name, "attempt": attempt.number, "instance": attempt.instance,
+                **getattr(attempt.worker, "details", {}), "run_token_sha256": token_digest})
+            attempt.started = True
         attempt.cog_worker = now.record(attempt.cog_worker.ready())
 
     @step_function
@@ -896,8 +912,16 @@ class LifecycleRunner(WorkflowEngine):
         what is left of it, and if that fails the run's `failed` record says so.
         ``TORN_DOWN`` is never recorded, so the runner does not move the worker there.
         A worker ``cancel()`` already tore down is not torn down again; its machine
-        records why it stopped.
+        records why it stopped. A worker whose start was recorded has its stop
+        recorded once it is gone, which is when its run token expires.
         """
+        error = self._tear_down(now, attempt)
+        if error is None and attempt.started:
+            now.append("worker_stopped", {"step": attempt.step.name, "attempt": attempt.number,
+                                          "instance": attempt.instance})
+        return error
+
+    def _tear_down(self, now: _Pass, attempt: Attempt) -> str | None:
         cog_worker = attempt.cog_worker
         with self._lock:
             by_cancel, attempt.released = attempt.released, True

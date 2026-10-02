@@ -51,6 +51,7 @@ from .lifecycle import (
     BudgetTracker,
     RunBudget,
 )
+from .locations import AGENT_LOCATIONS, LocationNotImplemented
 from .ops import InMemoryCogExecutor, OpDefinition, OpStep, WorkflowEngine
 from .runner import STEP_FUNCTIONS, LifecycleRunner, UsageUnavailable
 from .states import (
@@ -108,6 +109,8 @@ __all__ = [
     "derive_run_status",
     "ModelBinding",
     "ModelCog",
+    "AGENT_LOCATIONS",
+    "LocationNotImplemented",
     "DURABILITY_BACKENDS",
     "BackendNotImplemented",
     "DurabilityBackend",

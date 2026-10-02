@@ -2,9 +2,10 @@
 
 How a run advances, what its status means, and what survives when the process
 advancing it stops. The code is `collab_hub_execution.runner` (the lifecycle
-runner) and `collab_hub_execution.backends` (the durability backends); the
+runner), `collab_hub_execution.backends` (the durability backends) and
+`collab_hub_execution.locations` (the agent locations); the
 decisions behind them are [ADR-0002](../adr/0002-lifecycle-runner-durability-and-placement.md)
-D1–D3. The states and events each status comes from are
+D1–D3 and D12. The states and events each status comes from are
 [states.md](states.md); what the Track records is [track.md](track.md).
 
 ## Durability backends
@@ -27,6 +28,58 @@ The setting is the only switch: nothing imports a backend, and a runner
 configured with a backend that is not built yet refuses to start
 (`BackendNotImplemented`), so the configuration shape is fixed before the
 backends exist.
+
+## Agent locations
+
+Where a step's worker runs is the *agent location*, a second setting beside the
+backend. The runner drives every location the same way: it asks an executor to
+materialize a worker, speaks the seam to it (`GET /healthz`, `POST /invoke`),
+and asks the executor to tear it down. An executor holds no lifecycle logic.
+
+| Location | Setting | Built | A worker is | For |
+|---|---|---|---|---|
+| `local` | `location="local"` | yes | a process on the controller's host: the Cog package's `serve` task, in the package's own pixi environment, on a loopback port | development and the desktop |
+| `remote` | `location="remote"` | Phase 20 of the plan (#6) | a workload on a cluster, reached over the cluster's network | a Kubernetes hub, always |
+
+The setting is the only switch: nothing imports an executor, and a runner
+configured with a location that is not built yet refuses to start
+(`LocationNotImplemented`). The Kubernetes executor that exists today is what
+`remote` will select; until Phase 20 it is handed to a runner directly, as the
+in-memory executor of the tests is.
+
+**What a local worker is given.** Its environment, and nothing else of its
+controller: `PATH`, `HOME` and the few variables a process needs to run at all;
+`COLLAB_COG_HOST` (always `127.0.0.1`) and `COLLAB_COG_PORT`, where it must
+listen; `COLLAB_COG_ID` and `COLLAB_RUN_ID`; `COLLAB_RUN_TOKEN`; and whatever
+the binding delivers, which enters the child's environment only, never the
+Track and never a file. The controller's own configuration and credentials are
+not passed on. Its stdout and stderr go to a directory of its run,
+`<work_dir>/<run>/<step>_<attempt>/`, which the Track references.
+
+**What a local worker leaves.** Nothing. Teardown kills the worker's whole
+process group. A controller that dies without tearing down, killed with
+`SIGKILL` included, still leaves no worker: each worker is started through a
+launcher that holds a pipe from the controller, and kills the worker's process
+group when that pipe closes, for whatever reason. On Linux the worker is also
+killed by the kernel if the launcher itself dies.
+
+**Packages.** At `local` a Cog's name resolves through the *directory package
+source*: an allowlisted name under a configured root, refused when the name or
+a symbolic link leaves the root. The package is a directory with a `pixi.toml`
+that declares a `serve` task, identified on the Track by its name and the
+sha256 of its manifest and lock, so a development run is never mistaken for a
+published Cog. Resolving a published reference is Phase 21.
+
+**The run token.** One per worker, minted when it is materialized. The
+controller presents it as a bearer token on `/invoke`; the worker will present
+it to the hub endpoints it calls. `worker_started` records its sha256 on the
+run's Track, the store the API and the controller share, and
+`collab_hub_execution.run_tokens.verify` answers whether a token belongs to a
+worker of that run that is still up. It expires when the worker's
+`worker_stopped` is recorded, or when the run ends or is interrupted.
+
+`local` is not for a deployed hub: a local worker shares its controller's host
+and network identity, so the isolation a cluster gives a worker does not hold.
 
 ## Statuses
 
@@ -105,6 +158,9 @@ leaves it alone.
 
 At dev level 1, with no container: `make -C dev op OP=<name>` runs an Op from
 `dev/ops/` with the fake Cogs of `dev/cogs/` on `none`, over a SQLite Track in
-`dev/.local/`, and prints its Track and status. Stop `make op OP=slow` mid-step,
+`dev/.local/`, and prints its Track and status. The fake Cogs answer in the
+same process; add `LOCATION=local` (which needs pixi) and each step's worker is
+a real process, whose `worker_started` and `worker_stopped` appear on the
+Track and whose output is under `dev/.local/runs/`. Stop `make op OP=slow` mid-step,
 and the next `make op` reports the run `interrupted`. See
 [dev/README.md](../../dev/README.md#running-cogs-and-ops).

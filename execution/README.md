@@ -238,6 +238,31 @@ independent metering or hard per-request caps.
 
 ## Workers
 
+Where a worker runs is the runner's `location` setting, `local` or `remote`
+(ADR-0002 D12); only `local` is built behind the switch, and `remote` is
+refused until Phase 20:
+
+```python
+LifecycleRunner(track=track, location="local", location_settings={
+    "packages": ["dev/cogs"],      # directories Cog packages are found under
+    "allow": ["echo"],             # the names that may run; every package when omitted
+    "work_dir": "dev/.local/runs", # each worker's stdout and stderr, per run
+})
+```
+
+A local worker is the package's `serve` task (`pixi.toml`, `[tasks]`), run in
+the package's own pixi environment on a loopback port the executor chooses. It
+is told where to listen (`COLLAB_COG_HOST`, `COLLAB_COG_PORT`), which Cog and
+run it is (`COLLAB_COG_ID`, `COLLAB_RUN_ID`) and its run token
+(`COLLAB_RUN_TOKEN`), which the controller presents as a bearer token on
+`/invoke`. It inherits nothing else of the controller's environment, and it is
+killed with its whole process group at teardown, or when the controller dies.
+The Track records `worker_started` (where it ran, and the hash of its token)
+and `worker_stopped`. An executor may still be handed to the runner directly
+(`executor=`), which is how the in-memory executor of the tests and the
+Kubernetes executor are used today. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#agent-locations).
+
 A step that is sent back receives its original `input` and, separately, the
 findings as `signal`. The field is absent until a send back; an empty list of
 findings is still a signal. In-memory handlers that are sent back need a
@@ -258,3 +283,6 @@ request; an HTTP failure does not prove that a side effect did not occur.
 Run `uv run --group test pytest` from this directory. Set `TEST_POSTGRES_URL`
 to a disposable database to include the Postgres tests; they recreate Track
 tables. The kind workflow also exercises the worker transport and resume path.
+The location tests start real worker processes from the fake Cog packages of
+`dev/cogs/`, under the test interpreter; the one that runs a package in its
+pixi environment is skipped unless `pixi` is on `PATH`.

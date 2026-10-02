@@ -80,6 +80,14 @@ prompts, and receives streamed updates and permission requests. The worker
 SDK's first harness adapter speaks ACP, so any harness that implements it
 can be wrapped without new adapter code. (ADR-0002 D5.)
 
+**Agent location.** Where a Cog's worker runs, relative to the run
+controller: `local` (a process on the controller's host) or `remote` (a
+workload on a cluster). One configuration value; the lifecycle runner drives
+both through the same executor interface and the same seam, and one
+conformance suite holds them to the same behaviour. Not *locality*, which is
+where a satisfier runs, nor the *run target*, which is where Collab sends a
+run. (ADR-0002 D12.)
+
 **Binding record.** The output of resolution: which pinned model, which
 endpoint, which harness, which evidence — the identity that every result
 envelope and every Track entry carries. Credentials appear in a binding
@@ -116,6 +124,10 @@ while a run waits at a Gate, several replicas) with an outcome that depends
 on the backend: on `dbos` and `temporal` the run resumes and no step runs
 on two replicas at once; on `none` the run ends `interrupted` and is never
 resumed. Passing both is what makes a backend swappable. (ADR-0002 D1–D2.)
+A third, the *location suite*, is shared by every agent location instead:
+materialize, ready, an `/invoke` round trip, teardown, a cancel
+mid-interaction, two workers at once, and a controller killed with a worker
+in flight. (ADR-0002 D12.)
 
 **Contract check.** A Cog's own in-package validation of its declared
 contract (schema, grounding, citation, identity), self-reported in the
@@ -150,8 +162,9 @@ hosting environment. (Cog-execution README; seam note.)
 
 **Executor.** The component that materializes and tears down Cog workers
 on some substrate (Kubernetes is the default implementation). Pluggable;
-no raw cluster primitives leak past it into orchestration. (ADR-0001 D5,
-invariant 2.)
+no raw cluster primitives leak past it into orchestration. Which one a
+runner uses is its *agent location*; an executor holds no lifecycle logic.
+(ADR-0001 D5, invariant 2; ADR-0002 D12, invariant 6.)
 
 **Grant.** A user's standing, revocable permission for Cogs to use one
 connector, with given scopes, on that user's behalf when no request of
@@ -216,6 +229,13 @@ in-cluster, on-prem, or an external provider. A bind-time constraint that
 resolution enforces so data stays where policy allows; the sensitivity
 model generalizes it. (Sensitivity doc.)
 
+**Local worker.** A Cog worker at the `local` agent location: the Cog
+package's `serve` task, run as a process on the controller's host in the
+package's own pixi environment, listening on a loopback port the executor
+chose. It is given its environment and nothing else of its controller, and it
+cannot outlive it: its launcher kills its process group when the controller
+lets go of it or dies. For development and the desktop. (ADR-0002 D12.)
+
 **Materialize / worker.** To materialize a Cog is to bring up a running
 instance of its `serve` entry point where the hub can reach it — on
 Kubernetes, a pod behind a Service. That running instance is a **worker**.
@@ -226,6 +246,10 @@ cog-execution README.)
 **Nebi.** The package manager for Cogs: `nebi pull` installs a Cog's
 files, `nebi run` executes one of its entry points, and publishing goes
 through Nebi to an OCI registry the hub indexes. (ADR-0001 D6.)
+
+**Remote worker.** A Cog worker at the `remote` agent location: a workload
+on a cluster, reached over the cluster's network through the same seam as a
+local worker. What a Kubernetes hub always runs. (ADR-0002 D12.)
 
 **Result envelope.** The structured return of a usage entry point: `ok`,
 `payload`, `problems`, `binding`, plus usage and timing — exactly what
@@ -248,6 +272,12 @@ controller, and ends `interrupted` if the controller stops. `dbos` and
 user's machine. Both serve the same run API. Placement chooses the target,
 and a run bound to local-only resources never reaches the hub. (ADR-0002
 D6–D7.)
+
+**Run token.** The credential of one materialized worker: minted by the
+controller when it materializes the worker, delivered in the worker's
+environment, expired when the worker is torn down. The controller presents it
+to the worker's `/invoke`, and the worker presents it to the hub endpoints it
+calls. Only its hash is recorded, on the run's Track. (ADR-0002 D12.)
 
 **Satisfier / resolution.** A Cog declares what it `requires` (a model
 capability, a harness, a connector); a *satisfier* is something in the
