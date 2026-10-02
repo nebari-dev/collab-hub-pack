@@ -726,3 +726,8 @@ cogs:
     intervalSeconds: 300
     # -- Whether a sweep runs when the API starts, before the first interval.
     runOnStartup: true
+
+# Feature flags for work in progress that is on main but not yet exposed. Every
+# flag is off until it is listed here and set to true; each entry becomes
+# COLLAB_HUB_API__FEATURES__<NAME>. See docs/feature-flags.md.
+features: {}

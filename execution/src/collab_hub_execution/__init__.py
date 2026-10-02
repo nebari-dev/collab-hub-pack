@@ -5,27 +5,29 @@ subject to breaking changes. See execution/README.md for current limitations.
 
 Guarantees and non-goals
 ------------------------
-``DurableWorkflowEngine`` is a single-owner, at-least-once reference engine. Its
-durability is Track-based recovery, not distributed ownership:
+``LifecycleRunner`` runs Ops on the durability backend its configuration names.
+Only ``none`` is built, and it is single-owner, at-least-once, and not durable:
 
+- **Not durable.** Nothing survives the host. When a host starts, ``start()``
+  records every run a stopped host left running or waiting at a Gate as
+  ``interrupted``; none of them resumes. ``retry()`` continues an interrupted
+  run's attempt under its idempotency key, and runs a failed step as a new
+  attempt with a new key. Submitting a run again never resumes it.
 - **Single-owner.** It holds no cross-replica lease, so one run must be advanced
   by one owner at a time. The Postgres Track's one-submission-per-run index guards
   a duplicate *submission*, not two callers concurrently *advancing* the same run.
-- **At-least-once.** The engine keeps a stable idempotency key across a
-  crash-recovery resume and passes it to the worker, but the reference and
-  Kubernetes workers do not persist keys, so a replaced worker re-runs the side
-  effect. Terminal runs are immutable; failed runs can be retried explicitly.
-  Runs that exhausted a duration/token/cost budget require a new run id.
-- **Caller-driven recovery.** submit(), decide(), and retry() are synchronous.
-  After a process restart, a caller must resubmit the same incomplete Op. This
-  package provides no startup reconciliation or background recovery loop.
+- **At-least-once.** The reference and Kubernetes workers do not persist keys, so
+  a retried attempt re-runs its side effect until the keyed claim (#102) answers
+  for it. Terminal runs are immutable apart from ``retry()``; runs that exhausted a
+  duration/token/cost budget require a new run id.
 
-Do not use this engine for multi-replica production execution until the
-crash-safe engine backing tracked in collab-hub-pack #1 supplies ownership leases
-and durable keyed (exactly-once) claims. ``WorkflowEngine`` and the Track/executor
-interfaces separate these concerns, but their shapes are still experimental.
+Do not use it for multi-replica production execution until the ``dbos`` backend
+(#104), run pickup (#121) and the keyed claim (#102) land. ``WorkflowEngine`` and
+the Track, executor and backend interfaces separate these concerns, but their
+shapes are still experimental.
 """
 
+from .backends import DURABILITY_BACKENDS, BackendNotImplemented, DurabilityBackend
 from .binding import (
     BindingResolutionError,
     CapabilityRequirement,
@@ -49,15 +51,8 @@ from .lifecycle import (
     BudgetTracker,
     RunBudget,
 )
-from .orchestration import (
-    DurableWorkflowEngine,
-    InMemoryCogExecutor,
-    OpDefinition,
-    OpStep,
-    UsageUnavailable,
-    WorkflowEngine,
-)
-from .runner import STEP_FUNCTIONS, LifecycleRunner
+from .ops import InMemoryCogExecutor, OpDefinition, OpStep, WorkflowEngine
+from .runner import STEP_FUNCTIONS, LifecycleRunner, UsageUnavailable
 from .states import (
     CogInstall,
     InstallState,
@@ -113,7 +108,9 @@ __all__ = [
     "derive_run_status",
     "ModelBinding",
     "ModelCog",
-    "DurableWorkflowEngine",
+    "DURABILITY_BACKENDS",
+    "BackendNotImplemented",
+    "DurabilityBackend",
     "LifecycleRunner",
     "STEP_FUNCTIONS",
     "InMemoryCogExecutor",

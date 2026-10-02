@@ -11,6 +11,7 @@ from .frames.account_provisioning import DisabledServiceAccessGranter
 
 if TYPE_CHECKING:
     from .cogs.catalog import CogCatalogStore
+    from .config import FeaturesConfig
     from .frames.account_provisioning import ServiceAccessGranter
     from .frames.active_state import ActiveFrameStore
     from .frames.audit_log import AuditLog
@@ -101,3 +102,7 @@ def get_granted_service_groups(request: Request) -> Sequence[str]:
     """
 
     return getattr(request.app.state, "granted_service_groups", ())
+
+
+def get_features(request: Request) -> FeaturesConfig:
+    return request.app.state.features
