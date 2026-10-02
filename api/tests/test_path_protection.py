@@ -1,4 +1,4 @@
-"""Tests for the per-path protection map (issue #60)."""
+"""Tests for the per-path protection map."""
 
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def hardened() -> dict:
 
 async def test_an_unconfigured_server_keeps_its_previous_behavior(tmp_path, monkeypatch):
     # The upgrade case: protection is opted into, so a deployment that does not
-    # ask for it serves / and /metrics exactly as it did before issue #60.
+    # ask for it serves / and /metrics exactly as it did before the map existed.
     app, client = await make_client(tmp_path, monkeypatch)
     async with app.router.lifespan_context(app), client:
         assert Config.parse(base_values(tmp_path)).security.default_access == "public"
