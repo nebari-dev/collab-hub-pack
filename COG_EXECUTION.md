@@ -299,7 +299,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 6 | #125, in part | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | merged, #159 |
 | 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | merged, #162 |
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | merged, #163 |
-| 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | in review, #PRNUM |
+| 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | in review, #174 |
 | 10 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9 | M | not started |
 | 11 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10 | M | not started |
 | 12 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 9 | M | not started |
@@ -533,7 +533,7 @@ The runner, with the durability engine plugged in or absent — and `none`, the 
 - [x] A test proves all backends call the same step functions, by spying on `STEP_FUNCTIONS` under each, and none reimplements the driver.
 
 #### Phase 9 — Agent location: `local` first, `remote` behind the same switch
-**Issue** #109 · **Branch** `feat/cog-agent-location` · **Depends on** Phase 8 · **Size** M · **Status** in review, #PRNUM
+**Issue** #109 · **Branch** `feat/cog-agent-location` · **Depends on** Phase 8 · **Size** M · **Status** in review, #174
 
 Where a worker runs is the second axis under the runner, chosen by configuration exactly as the durability backend is — and the first value implemented is the one that needs no cluster.
 
