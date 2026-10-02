@@ -43,7 +43,7 @@ def select_executor(
     ``local`` takes ``packages``, the directories Cog packages are found under,
     ``allow``, the names that may be run from them (every package when omitted),
     and ``work_dir``, where each run's worker output goes. Further settings are
-    the executor's own (``environment``, ``pixi``, ``extra_environment``,
+    the executor's own (``environment``, ``pixi``, ``deliver``,
     ``ready_timeout``).
     """
     if location == "local":

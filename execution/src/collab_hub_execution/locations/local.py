@@ -16,6 +16,7 @@ the Track.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -51,8 +52,18 @@ class WorkerStartFailed(RuntimeError):
 
 
 def _segment(value: str) -> str:
-    """A run id or an instance as one path segment."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", value) or "_"
+    """A run id or an instance as one path segment: a readable prefix, and a digest of the whole id.
+
+    Ids are arbitrary, so the prefix alone would let two of them share a
+    directory (``a/b`` and ``a_b``) and a long one exceed a file name. The
+    digest keeps distinct ids apart, and the segment bounded.
+    """
+    prefix = re.sub(r"[^A-Za-z0-9._-]", "_", value)[:40].strip(".") or "_"
+    return f"{prefix}-{hashlib.sha256(value.encode()).hexdigest()[:16]}"
+
+
+Delivery = Callable[[str, str, str], Mapping[str, str]]
+"""What the binding delivers to one worker: called with the Cog, the run and the instance."""
 
 
 class _LocalWorker(_KubernetesWorker):
@@ -83,9 +94,11 @@ class LocalProcessCogExecutor:
     task's command directly, with nothing installed for it, and is for testing
     the executor itself where pixi is not available.
 
-    ``extra_environment`` is what the binding delivers to the worker — a model
-    endpoint, a key the controller resolved from an ``auth_ref``. It enters the
-    child's environment only: never the Track, never a file.
+    ``deliver`` is what the binding delivers to a worker — a model endpoint, a
+    key the controller resolved from an ``auth_ref``. It is called once per
+    materialization, with the Cog, the run and the instance, and what it
+    returns enters that one child's environment only: never another worker's,
+    never the Track, never a file. The executor keeps none of it.
     """
 
     location = "local"
@@ -97,7 +110,7 @@ class LocalProcessCogExecutor:
         work_dir: str | Path,
         environment: str = "pixi",
         pixi: str = "pixi",
-        extra_environment: Mapping[str, str] | None = None,
+        deliver: Delivery | None = None,
         ready_timeout: float = 120.0,
         poll_interval: float = 0.1,
         interaction_timeout: float | None = 60.0,
@@ -109,12 +122,14 @@ class LocalProcessCogExecutor:
         self.work_dir = Path(work_dir)
         self.environment = environment
         self.pixi = pixi
-        self.extra_environment = dict(extra_environment or {})
+        self.deliver = deliver
         self.ready_timeout = ready_timeout
         self.poll_interval = poll_interval
         self.grace = grace
-        self._http = httpx.Client(timeout=httpx.Timeout(connect=5.0, read=interaction_timeout,
-                                                        write=interaction_timeout, pool=5.0))
+        # trust_env=False: a proxy named in the controller's environment is never used to reach a
+        # worker on loopback, so the run token and the payload go to the worker and nowhere else.
+        self._http = httpx.Client(trust_env=False, timeout=httpx.Timeout(
+            connect=5.0, read=interaction_timeout, write=interaction_timeout, pool=5.0))
         self._lock = threading.Lock()
         self._lock_start = threading.Lock()  # a port is chosen and its launcher recorded as one move
         self._ports: dict[int, subprocess.Popen] = {}  # the ports handed out, and the launcher each went to
@@ -129,7 +144,9 @@ class LocalProcessCogExecutor:
             raise WorkerStartFailed(
                 f"pixi is not on PATH: the local location runs a Cog in its own pixi environment "
                 f"(https://pixi.sh); looked for {self.pixi!r}")
-        return [pixi, "run", "--manifest-path", str(package.manifest), "serve"]
+        # --locked: the environment is the one the lock describes, which is what the digest names;
+        # pixi refuses to run rather than resolve again when the lock no longer matches the manifest.
+        return [pixi, "run", "--locked", "--manifest-path", str(package.manifest), "serve"]
 
     def _port(self) -> int:
         """A free loopback port no worker of this executor was handed: chosen here, never by the Cog."""
@@ -143,9 +160,11 @@ class LocalProcessCogExecutor:
                     return port
         raise WorkerStartFailed("no free loopback port for a worker")
 
-    def _environment(self, package: CogPackage, run_id: str, port: int, token: str) -> dict[str, str]:
+    def _environment(self, package: CogPackage, run_id: str, instance: str, port: int,
+                     token: str) -> dict[str, str]:
         env = {name: os.environ[name] for name in INHERITED if name in os.environ}
-        env.update(self.extra_environment)
+        if self.deliver is not None:
+            env.update(self.deliver(package.name, run_id, instance))
         env.update({HOST_ENV: LOOPBACK, PORT_ENV: str(port), COG_ENV: package.name, RUN_ENV: run_id,
                     run_tokens.RUN_TOKEN_ENV: token})
         return env
@@ -158,20 +177,20 @@ class LocalProcessCogExecutor:
         token = run_tokens.mint()
         with self._lock_start:
             port = self._port()
-            launcher = self._launch(package, command, logs, run_id, port, token)
+            launcher = self._launch(package, command, logs, run_id, instance, port, token)
             with self._lock:
                 self._ports[port] = launcher
         return self._hand_over(cog, run_id, instance, package, logs, port, token, launcher)
 
-    def _launch(self, package: CogPackage, command: list[str], logs: Path, run_id: str, port: int,
-                token: str) -> subprocess.Popen:
+    def _launch(self, package: CogPackage, command: list[str], logs: Path, run_id: str, instance: str,
+                port: int, token: str) -> subprocess.Popen:
         with open(logs / "launcher.log", "ab") as launcher_log:
             return subprocess.Popen(  # noqa: S603 - this package's own launcher, with the Cog's serve command
                 [sys.executable, "-m", "collab_hub_execution.locations.launcher",
                  "--stdout", str(logs / "stdout.log"), "--stderr", str(logs / "stderr.log"),
                  "--cwd", str(package.directory), "--grace", str(self.grace), "--", *command],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=launcher_log,
-                env=self._environment(package, run_id, port, token), start_new_session=True,
+                env=self._environment(package, run_id, instance, port, token), start_new_session=True,
             )
 
     def _hand_over(self, cog: str, run_id: str, instance: str, package: CogPackage, logs: Path, port: int,

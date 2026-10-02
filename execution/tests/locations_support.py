@@ -38,7 +38,8 @@ def packages(tmp_path: Path) -> Path:
     shutil.copytree(DEV_COGS, root, ignore=shutil.ignore_patterns(".pixi", "__pycache__"))
     (root / "env").mkdir()
     (root / "env" / "serve.py").write_text(ENV_COG)
-    shutil.copy(root / "echo" / "pixi.toml", root / "env" / "pixi.toml")
+    for file in ("pixi.toml", "pixi.lock"):
+        shutil.copy(root / "echo" / file, root / "env" / file)
     for manifest in root.glob("*/pixi.toml"):
         manifest.write_text(re.sub(r'^serve = .*$', f'serve = "{sys.executable} serve.py"', manifest.read_text(),
                                    flags=re.M))

@@ -30,8 +30,13 @@ import time
 _PR_SET_PDEATHSIG = 1
 
 
-def _die_with_launcher() -> None:
-    """In the worker, before exec: on Linux, be killed when the launcher dies."""
+def _die_with_launcher(launcher: int) -> None:
+    """In the worker, before exec: on Linux, be killed when the launcher dies.
+
+    The request is not retroactive: a launcher that died between the fork and
+    the request left no signal to deliver. So the worker checks afterwards that
+    its parent is still the launcher, and ends itself if it is not.
+    """
     if not sys.platform.startswith("linux"):
         return
     try:
@@ -39,7 +44,9 @@ def _die_with_launcher() -> None:
 
         ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
     except Exception:  # noqa: BLE001 - a second line; the process group kill is the first
-        pass
+        return
+    if os.getppid() != launcher:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def _kill_group(pgid: int, child: subprocess.Popen, grace: float) -> None:
@@ -76,11 +83,12 @@ def main(argv: list[str] | None = None) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: stopping.append(True))
 
+    launcher = os.getpid()  # read before the fork, for the worker to compare its parent with
     with open(args.stdout, "ab") as out, open(args.stderr, "ab") as err:
         try:
             child = subprocess.Popen(  # noqa: S603 - the Cog package's own declared serve command
                 command, cwd=args.cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                start_new_session=True, preexec_fn=_die_with_launcher,
+                start_new_session=True, preexec_fn=lambda: _die_with_launcher(launcher),
             )
         except OSError as exc:
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), flush=True)

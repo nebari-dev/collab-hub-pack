@@ -1164,7 +1164,8 @@ make op OP=slow LOCATION=local &  # then kill -9 the `op.py` process: no worker 
 ```
 
 The Track gains `worker_started` and `worker_stopped` around each interaction.
-A worker's stdout and stderr are in `.local/runs/<run>/<step>_<attempt>/`.
+A worker's stdout and stderr are under `.local/runs/`, in the directory its
+`worker_started` names as `logs` (`<run>-<digest>/<step>_<attempt>-<digest>/`).
 Stopping the host any way at all, `kill -9` included, leaves no worker: the
 launcher that holds each worker kills it when its pipe to the host closes.
 
@@ -1219,7 +1220,7 @@ list against Postgres.
 | `/health/db` says 200 but nothing persists | It answers 200 either way; the body says `not_configured` | Read the body, and use level 2 or above |
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
 | `make op LOCATION=local` says to install pixi | The `local` location runs each Cog in its own pixi environment | Install [pixi](https://pixi.sh), or drop `LOCATION` to run the fake Cogs in process |
-| `make op LOCATION=local` fails a step with `WorkerStartFailed` | The worker exited or never answered `/healthz`; the reason on the Track ends with its last lines of stderr | Read `.local/runs/<run>/<step>_<attempt>/stderr.log` |
+| `make op LOCATION=local` fails a step with `WorkerStartFailed` | The worker exited or never answered `/healthz`; the reason on the Track ends with its last lines of stderr | Read `stderr.log` in the directory the run's `worker_started` names as `logs`, under `.local/runs/` |
 | `make op` says another `make op` is running | A previous one is still running on the same Track, possibly in another terminal | Let it finish or stop it; one host per Track until run pickup (#121) |
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |

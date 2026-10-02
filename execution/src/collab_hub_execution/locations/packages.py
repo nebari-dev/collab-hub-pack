@@ -6,8 +6,10 @@ refuses a name or a path that leaves the roots. It is not a registry source:
 it resolves no reference and pulls nothing.
 
 A package is a directory with a ``pixi.toml`` that declares a ``serve`` task,
-the command that serves the seam (``POST /invoke``, ``GET /healthz``). It is
-identified by its name and by the digest of its manifest and its lock, so a
+the command that serves the seam (``POST /invoke``, ``GET /healthz``), and the
+``pixi.lock`` that pins its environment. Both are files of the package itself:
+a symbolic link in their place is refused, so neither leads outside the roots.
+It is identified by its name and by the digest of its manifest and its lock, so a
 development run is recognisable on the Track and never mistaken for a published
 Cog, which is identified by its artifact's digest.
 
@@ -19,6 +21,7 @@ two things it needs here, the ``serve`` task and the digest, itself.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import tomllib
 from collections.abc import Iterable
@@ -97,8 +100,27 @@ class DirectoryPackageSource:
         raise PackageNotFound(f"no package {name!r} under {', '.join(str(root) for root in self.roots)}")
 
     @staticmethod
-    def _read(name: str, directory: Path) -> CogPackage:
-        manifest = (directory / MANIFEST).read_bytes()
+    def _own_file(name: str, directory: Path, file: str) -> bytes:
+        """A file of the package, read without following a link: the bytes are the package's own."""
+        try:
+            descriptor = os.open(directory / file, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            raise PackageRefused(
+                f"package {name!r} has no {file}: a runnable package carries its manifest and its lock") from None
+        except OSError as exc:  # ELOOP: the file is a symbolic link
+            raise PackageRefused(f"package {name!r} has a {file} that is a symbolic link or cannot be read: "
+                                 f"{exc.strerror}") from exc
+        with os.fdopen(descriptor, "rb") as handle:
+            if not os.path.isfile(handle.fileno()):
+                raise PackageRefused(f"package {name!r} has a {file} that is not a file")
+            return handle.read()
+
+    @classmethod
+    def _read(cls, name: str, directory: Path) -> CogPackage:
+        manifest = cls._own_file(name, directory, MANIFEST)
+        # The lock is part of what the package is: without it the environment that runs would be
+        # resolved at launch, and the digest would not name it.
+        lock = cls._own_file(name, directory, LOCK)
         try:
             document = tomllib.loads(manifest.decode())
         except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -109,8 +131,6 @@ class DirectoryPackageSource:
             raise PackageNotFound(f"package {name!r} declares no `{SERVE_TASK}` task in its {MANIFEST}")
         digest = hashlib.sha256()
         digest.update(manifest)
-        lock = directory / LOCK
-        if lock.is_file():
-            digest.update(b"\0")
-            digest.update(lock.read_bytes())
+        digest.update(b"\0")
+        digest.update(lock)
         return CogPackage(name=name, directory=directory, serve=command.strip(), digest=f"sha256:{digest.hexdigest()}")

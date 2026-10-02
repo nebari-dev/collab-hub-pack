@@ -51,10 +51,14 @@ in-memory executor of the tests is.
 controller: `PATH`, `HOME` and the few variables a process needs to run at all;
 `COLLAB_COG_HOST` (always `127.0.0.1`) and `COLLAB_COG_PORT`, where it must
 listen; `COLLAB_COG_ID` and `COLLAB_RUN_ID`; `COLLAB_RUN_TOKEN`; and whatever
-the binding delivers, which enters the child's environment only, never the
-Track and never a file. The controller's own configuration and credentials are
+the binding delivers. Delivery is asked once per worker, for that Cog, run and
+step, and enters that one child's environment only: never another worker's,
+never the Track, never a file. The controller's own configuration and credentials are
 not passed on. Its stdout and stderr go to a directory of its run,
-`<work_dir>/<run>/<step>_<attempt>/`, which the Track references.
+under `<work_dir>`, one level per run and one per step attempt, each named by a
+readable prefix of the id and a digest of all of it, so two ids never share a
+directory. `worker_started` gives the path as `logs`. The controller reaches a
+worker directly on loopback, ignoring any proxy its own environment names.
 
 **What a local worker leaves.** Nothing. Teardown kills the worker's whole
 process group. A controller that dies without tearing down, killed with
@@ -66,8 +70,10 @@ killed by the kernel if the launcher itself dies.
 **Packages.** At `local` a Cog's name resolves through the *directory package
 source*: an allowlisted name under a configured root, refused when the name or
 a symbolic link leaves the root. The package is a directory with a `pixi.toml`
-that declares a `serve` task, identified on the Track by its name and the
-sha256 of its manifest and lock, so a development run is never mistaken for a
+that declares a `serve` task and the `pixi.lock` that pins its environment,
+both files of the package itself: a package without its lock, or with a
+symbolic link in place of either, is refused, and pixi runs it `--locked`. It
+is identified on the Track by its name and the sha256 of its manifest and lock, so a development run is never mistaken for a
 published Cog. Resolving a published reference is Phase 21.
 
 **The run token.** One per worker, minted when it is materialized. The

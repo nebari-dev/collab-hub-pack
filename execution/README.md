@@ -255,7 +255,10 @@ the package's own pixi environment on a loopback port the executor chooses. It
 is told where to listen (`COLLAB_COG_HOST`, `COLLAB_COG_PORT`), which Cog and
 run it is (`COLLAB_COG_ID`, `COLLAB_RUN_ID`) and its run token
 (`COLLAB_RUN_TOKEN`), which the controller presents as a bearer token on
-`/invoke`. It inherits nothing else of the controller's environment, and it is
+`/invoke`. What a binding delivers is asked per worker (`deliver`, a function of
+the Cog, the run and the instance) and reaches that worker alone. A package
+needs its `pixi.lock`, and neither it nor the manifest may be a symbolic link.
+It inherits nothing else of the controller's environment, and it is
 killed with its whole process group at teardown, or when the controller dies.
 The Track records `worker_started` (where it ran, and the hash of its token)
 and `worker_stopped`. An executor may still be handed to the runner directly

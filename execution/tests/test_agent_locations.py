@@ -31,7 +31,8 @@ from collab_hub_execution import (
     RunState,
     run_tokens,
 )
-from collab_hub_execution.locations import select_executor
+from collab_hub_execution.locations import launcher, select_executor
+from collab_hub_execution.locations.local import _segment
 from collab_hub_execution.locations.packages import DirectoryPackageSource, PackageNotFound, PackageRefused
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "collab_hub_execution"
@@ -147,6 +148,28 @@ def test_the_source_refuses_what_is_not_allowlisted_or_leaves_its_root(tmp_path)
         DirectoryPackageSource([root]).resolve("linked")
 
 
+@pytest.mark.parametrize("file", ["pixi.toml", "pixi.lock"])
+def test_the_source_refuses_a_package_whose_manifest_or_lock_is_a_link(tmp_path, file):
+    # The directory is inside the root, and the file it would run from is not: the link is refused,
+    # so nothing outside the roots is read, or handed to pixi to execute.
+    root = packages(tmp_path)
+    outside = tmp_path / "outside" / file
+    outside.parent.mkdir()
+    shutil.copy(root / "slow" / file, outside)
+    (root / "echo" / file).unlink()
+    (root / "echo" / file).symlink_to(outside)
+    with pytest.raises(PackageRefused, match=f"{file} that is a symbolic link"):
+        DirectoryPackageSource([root]).resolve("echo")
+
+
+def test_the_source_refuses_a_package_without_its_lock(tmp_path):
+    # Without the lock the environment would be resolved at launch, and the digest would not name it.
+    root = packages(tmp_path)
+    (root / "echo" / "pixi.lock").unlink()
+    with pytest.raises(PackageRefused, match="has no pixi.lock"):
+        DirectoryPackageSource([root]).resolve("echo")
+
+
 def test_the_source_finds_no_package_without_a_serve_task(tmp_path):
     root = packages(tmp_path)
     with pytest.raises(PackageNotFound, match="no package 'absent'"):
@@ -221,7 +244,8 @@ def test_a_worker_answers_invoke_only_to_the_bearer_of_its_run_token(tmp_path):
 def test_a_worker_inherits_nothing_from_its_controller_but_what_it_is_delivered(tmp_path, monkeypatch):
     monkeypatch.setenv("COLLAB_HUB_API__DATABASE_URL", "postgresql://controller-only")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "controller-only")
-    executor = local_executor(tmp_path, extra_environment={"MODEL_API_KEY": "delivered-by-the-binding"})
+    executor = local_executor(
+        tmp_path, deliver=lambda cog, run, instance: {"MODEL_API_KEY": "delivered-by-the-binding"})
     track = InMemoryTrackStore()
     worker = executor.materialize("env", "r", "s:0")
     try:
@@ -243,13 +267,78 @@ def test_a_worker_inherits_nothing_from_its_controller_but_what_it_is_delivered(
     assert b"delivered-by-the-binding" not in written and env["COLLAB_RUN_TOKEN"].encode() not in written
 
 
+def test_what_the_binding_delivers_reaches_its_own_worker_and_no_other(tmp_path):
+    # Delivery is asked per materialization and kept nowhere: a key resolved for one Cog's worker
+    # is not in the environment of another Cog's, nor of the same Cog's worker in another run.
+    asked = []
+
+    def deliver(cog, run_id, instance):
+        asked.append((cog, run_id, instance))
+        return {"MODEL_API_KEY": f"key-of-{run_id}"} if cog == "env" else {}
+
+    executor = local_executor(tmp_path, deliver=deliver)
+    first, second = executor.materialize("env", "r1", "s:0"), executor.materialize("env", "r2", "s:0")
+    other = executor.materialize("echo", "r1", "t:0")
+    try:
+        assert first.interact("run").payload["env"]["MODEL_API_KEY"] == "key-of-r1"
+        assert second.interact("run").payload["env"]["MODEL_API_KEY"] == "key-of-r2"
+        with open(f"/proc/{other.details['pid']}/environ", "rb") as environ:
+            assert b"MODEL_API_KEY" not in environ.read()
+    except FileNotFoundError:
+        pytest.skip("no /proc to read another worker's environment from")
+    finally:
+        for worker in (first, second, other):
+            executor.teardown(worker)
+    assert asked == [("env", "r1", "s:0"), ("env", "r2", "s:0"), ("echo", "r1", "t:0")]
+    assert "key-of" not in repr(vars(executor))
+
+
+def test_a_proxy_in_the_controllers_environment_is_never_used_to_reach_a_worker(tmp_path, monkeypatch):
+    # A proxy would be sent the run token and the payload. Nothing listens on port 9: a client that
+    # honoured these would reach no worker at all.
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    executor = local_executor(tmp_path, ready_timeout=5.0)
+    worker = executor.materialize("echo", "r", "s:0")
+    try:
+        assert worker.interact("run", 1).payload == {"echo": 1}
+    finally:
+        executor.teardown(worker)
+
+
 def test_a_workers_output_goes_to_a_directory_of_its_run(tmp_path):
     executor = local_executor(tmp_path)
     worker = executor.materialize("echo", "team/run 1", "s:0")
     executor.teardown(worker)
     logs = Path(worker.details["logs"])
-    assert logs == tmp_path / "runs" / "team_run_1" / "s_0"  # one path segment each: no id leaves work_dir
+    # One path segment each, so no id leaves work_dir; the Track's `logs` is where to look.
+    assert logs.parent.parent == tmp_path / "runs" and logs.parent.name.startswith("team_run_1-")
+    assert logs.name.startswith("s_0-")
     assert "serving on 127.0.0.1" in (logs / "stdout.log").read_text()
+
+
+def test_distinct_ids_never_share_a_log_directory_and_a_long_one_still_fits():
+    assert _segment("a/b") != _segment("a_b")  # the readable prefix is the same; the digest is not
+    assert _segment("a/b") == _segment("a/b")
+    for value in ("", ".", "..", "../../etc", "x" * 5000, "run/with spaces"):
+        segment = _segment(value)
+        assert len(segment) <= 57 and "/" not in segment and segment not in (".", ".."), value
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux's")
+def test_a_worker_whose_launcher_died_before_it_asked_ends_itself():
+    # The request to die with the parent is not retroactive: a worker whose parent is already not
+    # the launcher it was forked by got no signal, and ends itself instead of running on.
+    for expected_parent, survives in ((os.getpid(), True), (1, False)):
+        child = os.fork()
+        if child == 0:
+            launcher._die_with_launcher(expected_parent)
+            os._exit(0)
+        _, status = os.waitpid(child, 0)
+        assert (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0) is survives
+        assert (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL) is not survives
 
 
 def test_a_worker_that_exits_before_it_is_ready_fails_the_step_and_says_why(tmp_path):
@@ -271,7 +360,8 @@ def test_a_worker_that_is_never_ready_is_killed_and_fails_the_step(tmp_path):
                                ready_timeout=1.0, grace=1.0)
     with pytest.raises(Exception, match="was not ready within 1 seconds"):
         executor.materialize("echo", "r", "s:0")
-    assert gone(int((tmp_path / "runs" / "r" / "s_0" / "stdout.log").read_text()))
+    [stdout] = (tmp_path / "runs").glob("r-*/s_0-*/stdout.log")
+    assert gone(int(stdout.read_text()))
 
 
 def test_a_command_that_cannot_be_started_fails_the_step(tmp_path):
