@@ -2,10 +2,16 @@
   "branches": ["main"],
   "tagFormat": "v${version}",
   "plugins": [
-    ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+    [
+      "@semantic-release/commit-analyzer",
+      {
+        "preset": "conventionalcommits",
+        "releaseRules": [{ "breaking": true, "release": "minor" }]
+      }
+    ],
     [
       "@semantic-release/exec",
-      { "publishCmd": "echo ${nextRelease.version} > .next-release" }
+      { "verifyReleaseCmd": "echo ${nextRelease.version} > .next-release" }
     ]
   ]
 }

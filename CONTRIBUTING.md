@@ -101,13 +101,13 @@ optional and names the area the change touches, such as `connectors`,
 | `feat` | minor (0.2.0 to 0.3.0) |
 | `fix`, `perf` | patch (0.2.0 to 0.2.1) |
 | `refactor`, `docs`, `test`, `build`, `ci`, `chore`, `style` | none |
-| `revert` | none, or patch when the description keeps git's `This reverts commit <sha>.` line |
+| `revert` | none, unless the title has no scope (`revert: ...`) and the description keeps git's `This reverts commit <sha>.` line, which is a patch |
 
 A `!` after the type or scope (`feat!: ...`), or a line in the PR description
-that starts with `BREAKING CHANGE:`, is a major release, which from 0.x goes
-straight to 1.0.0. Keep `BREAKING CHANGE:` out of a description unless that is
-the intent. A title the check would reject releases nothing, so a fix merged
-under one waits for the next releasing merge.
+that starts with `BREAKING CHANGE:`, marks a breaking change. Before 1.0 it is
+a minor release, so neither can move the pack to 1.0.0 by accident; that step
+is a deliberate change to `.releaserc.json`. A title the check would reject
+releases nothing, so a fix merged under one waits for the next releasing merge.
 
 Fix forward rather than reverting. GitHub's Revert button titles its PR
 `Revert "<original title>"`, which the check rejects.
