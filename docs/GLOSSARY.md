@@ -263,6 +263,11 @@ and reads its Track, and never calls the executor. On the user's machine,
 the local run host plays the same role. (ADR-0002 D4, D6; ADR-0001
 invariant 2; issue #6.)
 
+**Run intent.** What a client asked of a run, recorded on its Track by the
+API for the run controller to act on: `op_submitted`, and `cancel_requested`.
+The API writes intent and reads status; it never calls the controller.
+(ADR-0002 D4.)
+
 **Run pickup.** Under `none`, how exactly one run controller starts a
 submitted run: an atomic pickup record. The run then belongs to that
 controller, and ends `interrupted` if the controller stops. `dbos` and

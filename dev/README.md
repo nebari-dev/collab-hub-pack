@@ -27,7 +27,7 @@ one, and only matters once you reach level 3.
 | Docker with Compose v2 | levels 2–4 (**not** level 1) | `docker compose version` |
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
-| [pixi](https://pixi.sh) | `make op LOCATION=local` only | `pixi --version` |
+| [pixi](https://pixi.sh) | `make controller` and `make op LOCATION=local` only | `pixi --version` |
 
 You do **not** need a local Python: `uv` provisions the interpreter pinned in
 `api/.python-version` (3.14, the one the image runs) on first run. The API
@@ -1090,9 +1090,10 @@ Frames and the user directory work immediately. Three things do not:
 
 ## Running Cogs and Ops
 
-Nothing here runs a Cog through the hub yet: the API does not import the
-execution package (#35), and there is no run controller or run API to call.
-This section is where they arrive, one target at a time, under the rule
+A Cog runs through the hub at level 1: `make api` serves the run API
+(`/v1/runs`, behind the `cog_runs` feature flag, which this target sets),
+`make controller` advances the runs it accepts, and the `collab-hub` CLI
+launches them. This section is where the rest arrives, one target at a time, under the rule
 [ADR-0002](../docs/adr/0002-lifecycle-runner-durability-and-placement.md) D9
 sets for every Cog execution change. In the same PR, what a change adds is:
 
@@ -1126,6 +1127,34 @@ TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
 **The E2E script brings its own cluster.** It creates a kind cluster named
 `cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
 runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
+
+### A Cog launched from the CLI — `make api`, `make controller`
+
+Level 1, no container. Two processes over one SQLite Track,
+`.local/track.sqlite`:
+
+```sh
+make api          # terminal 1: the API, with /v1/runs on
+make controller   # terminal 2: starts each submitted run's worker as a local process (needs pixi)
+cd ../cli && uv run collab-hub --hub http://localhost:8000 cog launch hello --input '{"name": "Ada"}' --watch
+```
+
+The API records the submission and nothing else; the controller reads it from
+the Track, runs the Cog package's `serve` task in its own pixi environment, and
+records what happened; the CLI reads the run back through the API. `run list`,
+`run show` and `run terminate` are the other commands.
+[`examples/cog-local`](../examples/cog-local/README.md) is the walk-through,
+and `examples/cog-local/demo.sh` runs it end to end and checks it.
+
+Cog packages are found in `COGS`, a `:`-separated list that defaults to
+`dev/cogs` (the fake Cogs) and `examples/cog-local/cogs` (`hello`); both
+targets read it, so set it on both to add a directory of your own. A worker's
+output is under `.local/runs/`.
+
+**What persists.** The Track file, until `make clean`. The controller keeps
+nothing else: stop it mid-run and the next `make controller` records that run
+`interrupted`. **One controller at a time**, and not beside a `make op`: each
+holds the same lock next to the Track.
 
 ### Fake Ops — `make op`
 
@@ -1180,7 +1209,7 @@ still waiting at its Gate: nothing here decides it yet (the run API, #103, does)
 as its own when it starts, so `make op` holds a lock beside the Track, and a
 second one refuses to start while the first runs. `BACKEND=dbos` and
 `BACKEND=temporal` are refused until those backends are built, and so is
-`LOCATION=remote` until Phase 20 puts the cluster executor behind the switch.
+`LOCATION=remote` until Phase 21 puts the cluster executor behind the switch.
 The fake Cogs' pixi environments, `cogs/<name>/.pixi/`, are git-ignored and
 survive `make clean`; delete them to install afresh.
 
@@ -1221,6 +1250,9 @@ list against Postgres.
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
 | `make op LOCATION=local` says to install pixi | The `local` location runs each Cog in its own pixi environment | Install [pixi](https://pixi.sh), or drop `LOCATION` to run the fake Cogs in process |
 | `make op LOCATION=local` fails a step with `WorkerStartFailed` | The worker exited or never answered `/healthz`; the reason on the Track ends with its last lines of stderr | Read `stderr.log` in the directory the run's `worker_started` names as `logs`, under `.local/runs/` |
+| `collab-hub cog launch` answers 404 | The hub's run API is off: it is behind the `cog_runs` feature flag | Use `make api`, which sets it; another target needs `COLLAB_HUB_API__FEATURES__COG_RUNS=true` and `COLLAB_HUB_API__RUNS__TRACK_PATH` |
+| A launched run stays `SUBMITTED` | No controller is watching the Track | `make controller` in another terminal |
+| `make controller` says another controller, or `make op`, is running | One host at a time on a Track | Stop the other one |
 | `make op` says another `make op` is running | A previous one is still running on the same Track, possibly in another terminal | Let it finish or stop it; one host per Track until run pickup (#121) |
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
@@ -1268,7 +1300,7 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); `examples/cog-local/demo.sh` launches a Cog through the CLI, the API and the run controller, lists it, and terminates a second one with no worker left; every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
 | 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
@@ -1324,6 +1356,7 @@ works as a set:
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
 | `OP` | `echo` | The Op `make op` runs: a file under `ops/`, without `.yaml` |
 | `BACKEND` | `none` | The durability backend `make op` runs on; only `none` is built |
+| `COGS` | `dev/cogs:examples/cog-local/cogs` | The directories `make api` and `make controller` find Cog packages in, `:`-separated |
 | `LOCATION` | *(empty)* | Where `make op` runs each step's worker: empty for in process, `local` for a real process per worker (needs pixi) |
 
 ## Files in this directory

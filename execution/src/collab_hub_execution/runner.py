@@ -472,10 +472,10 @@ class LifecycleRunner(WorkflowEngine):
         recorded ``interrupted`` rather than left looking alive, and continues only
         when a person retries it (ADR-0002 D2). A run this host is advancing right
         now is left alone. Returns the runs it interrupted. A durable backend
-        resumes its runs instead, which Phases 25 and 31 build.
+        resumes its runs instead, which Phases 26 and 32 build.
 
         Every unfinished run on the Track is taken as this host's, the single
-        owner the runner assumes; run pickup by a controller (Phase 10) narrows
+        owner the runner assumes; run pickup by a controller (Phase 11) narrows
         this to the runs the starting controller picked up.
         """
         if self.backend.durable:

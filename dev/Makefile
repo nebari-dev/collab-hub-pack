@@ -124,6 +124,15 @@ DEV_AUTH_ENV := \
 LEVEL1_ENV := \
   COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory
 
+# Level 1 only: the run API (/v1/runs), behind its feature flag, over the SQLite
+# Track `make controller` watches. PACKAGES are the directories a Cog package
+# may be launched from, the same ones the controller is given.
+COGS ?= $(CURDIR)/cogs:$(ROOT)/examples/cog-local/cogs
+RUNS_ENV := \
+  COLLAB_HUB_API__FEATURES__COG_RUNS=true \
+  COLLAB_HUB_API__RUNS__TRACK_PATH=$(LOCAL)/track.sqlite \
+  COLLAB_HUB_API__RUNS__PACKAGES=$(COGS)
+
 # Real bearer verification against the local Keycloak realm.
 #
 # FRAMES_AUTH_IDENTITY_CLAIM=sub matches the production convention: the OIDC
@@ -231,11 +240,12 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 api: | $(LOCAL)/frames ## The API alone: no containers, dev auth, local-FS frames, in-memory stores
-	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) uv run python -m collab_hub_api
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) $(RUNS_ENV) \
+		uv run --group runs python -m collab_hub_api
 
 api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on every source change
-	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) \
-		uv run --with watchfiles watchfiles 'python -m collab_hub_api' src
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) $(RUNS_ENV) \
+		uv run --group runs --with watchfiles watchfiles 'python -m collab_hub_api' src
 
 # ---------------------------------------------------------------------------
 ## Level 1 — running Cogs and Ops
@@ -256,6 +266,16 @@ op: ## Run a fake Op and print its Track (OP=echo|needs-review|fails|slow|spende
 		echo "LOCATION=local runs each fake Cog in its own pixi environment: install pixi (https://pixi.sh), or run without LOCATION"; exit 1; fi
 	cd $(ROOT)/execution && LOCATION=$(LOCATION) uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
 		--backend $(BACKEND) --track $(LOCAL)/track.sqlite
+
+# The process that advances the runs `make api` accepts: it watches the same
+# SQLite Track, starts each submitted run's worker as a local process (the Cog
+# package's `serve` task in its own pixi environment), and delivers cancels.
+controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cogs launched through /v1/runs as local processes
+	@command -v pixi >/dev/null || { \
+		echo "the controller runs each Cog in its own pixi environment: install pixi (https://pixi.sh)"; exit 1; }
+	cd $(ROOT)/execution && uv run --quiet python -m collab_hub_execution.controller \
+		--track $(LOCAL)/track.sqlite $(foreach dir,$(subst :, ,$(COGS)),--packages $(dir)) \
+		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local
 
 # ---------------------------------------------------------------------------
 ## Level 2 — API with real datastores

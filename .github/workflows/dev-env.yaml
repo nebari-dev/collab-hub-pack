@@ -26,6 +26,8 @@ on:
       - "dev/**"
       - "cli/**"
       - "execution/**"
+      - "api/**"
+      - "examples/**"
       - "scripts/smoke_frames_common.sh"
       - "scripts/keycloak_login_browser.py"
       - "helm/**"
@@ -181,6 +183,16 @@ jobs:
           make -s -C dev op OP=echo | tee /tmp/op-after-kill.log
           grep -q "^interrupted $run:" /tmp/op-after-kill.log \
             || { echo "the killed host's run was not recorded interrupted"; exit 1; }
+
+      # The whole path a user takes, across three processes: the CLI launches a Cog through
+      # /v1/runs, the API records it, the run controller starts its worker as a local process,
+      # and the CLI lists the run and terminates another. The script checks each step itself.
+      - name: examples/cog-local launches, lists and terminates a Cog from the CLI
+        run: API_PORT=8017 examples/cog-local/demo.sh
+
+      - name: Example logs on failure
+        if: failure()
+        run: tail -40 dev/.local/example-api.log dev/.local/example-controller.log || true
 
       - name: make clean removes the scratch state
         run: |

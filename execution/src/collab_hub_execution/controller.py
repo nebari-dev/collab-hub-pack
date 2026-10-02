@@ -1,0 +1,165 @@
+"""The run controller: the process that advances runs, separate from the one that accepts them.
+
+    python -m collab_hub_execution.controller --track FILE --packages DIR [--packages DIR ...] --work-dir DIR
+
+ADR-0002 D4. The API writes intent to the Track (``intents.py``); the
+controller watches the Track and acts on it. A run submitted and not yet picked
+up is started on the lifecycle runner, and a request to cancel is delivered to
+the runner, which tears the run's worker down and ends it ``cancelled``.
+Nothing calls the controller, and it alone constructs an executor.
+
+This is the controller's first form, enough for one host: it polls the Track,
+and it assumes it is the only controller on it — it holds a lock beside a
+SQLite Track for as long as it runs, and a second one refuses to start. When it
+starts, every run a previous controller left unfinished is recorded
+``interrupted`` (``none`` keeps nothing across a restart). Pickup that two
+replicas can race for, reaping a survivor by its recorded pid, and health
+endpoints are the run controller's own phase of the plan.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import logging
+import signal
+import sys
+import threading
+from pathlib import Path
+
+from .intents import CANCEL_REQUESTED
+from .locations import AGENT_LOCATIONS
+from .runner import LifecycleRunner
+from .states import InvalidTransition, Run, RunState
+from .track import SqliteTrackStore, upgrade
+
+_log = logging.getLogger("collab_hub_execution.controller")
+
+
+class RunController:
+    """Watches a Track and advances what it finds there, on one lifecycle runner."""
+
+    def __init__(self, runner: LifecycleRunner, *, poll_interval: float = 0.25) -> None:
+        self.runner = runner
+        self.poll_interval = poll_interval
+        self._ended: set[str] = set()
+        self._advancing: dict[str, threading.Thread] = {}
+        self._cancelling: dict[str, threading.Thread] = {}
+
+    def start(self) -> tuple[str, ...]:
+        """What a controller does first: record every run a stopped one left unfinished as interrupted."""
+        interrupted = self.runner.start()
+        for run_id in interrupted:
+            _log.info("interrupted %s: a previous controller stopped before it ended", run_id)
+        return interrupted
+
+    def tick(self) -> None:
+        """One pass over the Track: start what was submitted, deliver what was asked."""
+        track = self.runner.track
+        for run_id in track.run_ids():
+            if run_id in self._ended:
+                continue
+            events = tuple(upgrade(event) for event in track.replay(run_id))
+            run = Run.replay(events)
+            if run is None:
+                continue
+            if run.state.ended:
+                self._ended.add(run_id)
+                continue
+            asked = next((e.payload.get("actor") for e in events if e.event_type == CANCEL_REQUESTED), None)
+            if asked is not None:
+                if not self._alive(self._cancelling, run_id):
+                    self._spawn(self._cancelling, run_id, self._cancel, run_id, asked)
+            elif run.state is RunState.SUBMITTED and not self._alive(self._advancing, run_id):
+                op = self.runner._submitted_definition(run_id, events)
+                self._spawn(self._advancing, run_id, self._advance, op)
+
+    @staticmethod
+    def _alive(threads: dict[str, threading.Thread], run_id: str) -> bool:
+        thread = threads.get(run_id)
+        return thread is not None and thread.is_alive()
+
+    @staticmethod
+    def _spawn(threads: dict[str, threading.Thread], run_id: str, target, *args) -> None:
+        threads[run_id] = threading.Thread(target=target, args=args, name=f"run-{run_id}", daemon=True)
+        threads[run_id].start()
+
+    def _advance(self, op) -> None:
+        _log.info("picked up %s", op.run_id)
+        try:
+            state = self.runner.submit(op)
+        except Exception:  # noqa: BLE001 - one run's failure never stops the controller
+            _log.exception("advancing %s failed", op.run_id)
+            return
+        _log.info("%s is %s", op.run_id, state.name)
+
+    def _cancel(self, run_id: str, actor: str) -> None:
+        try:
+            self.runner.cancel(run_id, actor=actor)
+        except InvalidTransition:
+            pass  # it ended on its own before the request was delivered
+        except Exception:  # noqa: BLE001 - one run's failure never stops the controller
+            _log.exception("cancelling %s failed", run_id)
+            return
+        _log.info("cancel of %s by %s delivered", run_id, actor)
+
+    def run(self, stop: threading.Event) -> None:
+        """Watch the Track until ``stop`` is set."""
+        while not stop.is_set():
+            try:
+                self.tick()
+            except Exception:  # noqa: BLE001 - a Track that cannot be read now is read again next pass
+                _log.exception("reading the Track failed")
+            stop.wait(self.poll_interval)
+
+    def idle(self) -> bool:
+        """Whether nothing is being advanced or cancelled right now."""
+        return not any(thread.is_alive() for thread in (*self._advancing.values(), *self._cancelling.values()))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="The run controller: advances the runs submitted to a Track.")
+    parser.add_argument("--track", required=True, help="the SQLite Track file the API writes submissions to")
+    parser.add_argument("--packages", action="append", required=True, metavar="DIR",
+                        help="a directory Cog packages are found under; repeat for several")
+    parser.add_argument("--allow", action="append", metavar="NAME",
+                        help="a package that may run; every package under --packages when omitted")
+    parser.add_argument("--work-dir", required=True, help="where each run's worker output goes")
+    parser.add_argument("--backend", default="none")
+    parser.add_argument("--location", default="local", choices=AGENT_LOCATIONS)
+    parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument("--environment", default="pixi", choices=("pixi", "host"),
+                        help="how a package's serve task is run: in its own pixi environment, or directly")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s controller %(message)s", datefmt="%H:%M:%S",
+                        stream=sys.stderr)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per /healthz poll is noise here
+
+    track_path = Path(args.track)
+    SqliteTrackStore.ensure_schema(track_path)
+    lock = open(track_path.with_suffix(".host.lock"), "w")  # noqa: SIM115 - held for as long as this controller runs
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"another controller, or `make op`, is running on {track_path}: one host at a time on a Track",
+              file=sys.stderr)
+        return 1
+
+    runner = LifecycleRunner(
+        track=SqliteTrackStore(track_path), backend=args.backend, location=args.location,
+        location_settings={"packages": args.packages, "allow": args.allow, "work_dir": args.work_dir,
+                           "environment": args.environment})
+    controller = RunController(runner, poll_interval=args.poll_interval)
+    controller.start()
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    _log.info("watching %s on the %r backend, workers at %r", track_path, runner.backend.name, args.location)
+    controller.run(stop)
+    # Stopping: runs still in flight are left as they are, and the next controller records them interrupted.
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
