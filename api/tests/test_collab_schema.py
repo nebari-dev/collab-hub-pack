@@ -56,6 +56,8 @@ COLLAB_TABLES = (
     "collab_platform_roles",
     "collab_audit_events",
     "collab_schema_migrations",
+    "collab_track_events",
+    "collab_track_payloads",
 )
 
 
@@ -308,7 +310,38 @@ def test_migration_creates_the_cog_catalog_schema():
         statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 11 for statement in statements
     )
     assert "collab_cog_artifacts" not in earlier
-    assert LATEST_COLLAB_SCHEMA_VERSION == 11
+
+
+def test_migration_creates_the_track_schema():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    (events,) = server.ddl_for("collab_track_events")
+    # A global sequence orders events across replicas; an event's shape is versioned.
+    assert "sequence bigint PRIMARY KEY DEFAULT nextval('collab_track_event_sequence')" in events
+    assert "event_id text NOT NULL UNIQUE" in events
+    assert "payload jsonb NOT NULL DEFAULT '{}'::jsonb" in events
+    assert "schema integer NOT NULL DEFAULT 0" in events
+    (payloads,) = server.ddl_for("collab_track_payloads")
+    assert "ref text PRIMARY KEY" in payloads and "payload jsonb NOT NULL" in payloads
+
+    created = " ".join(server.statements)
+    for statement in (
+        "CREATE SEQUENCE IF NOT EXISTS collab_track_event_sequence",
+        "CREATE INDEX IF NOT EXISTS collab_track_events_run_sequence ON collab_track_events (run_id, sequence)",
+        # One submission per run: two API replicas cannot both start it.
+        "CREATE UNIQUE INDEX IF NOT EXISTS collab_track_one_submission"
+        " ON collab_track_events (run_id) WHERE event_type = 'op_submitted'",
+        "CREATE INDEX IF NOT EXISTS collab_track_payloads_run ON collab_track_payloads (run_id)",
+    ):
+        assert statement in created, statement
+    # Appended as version 12; nothing earlier mentions the Track.
+    earlier = " ".join(
+        statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 12 for statement in statements
+    )
+    assert "collab_track" not in earlier
+    assert LATEST_COLLAB_SCHEMA_VERSION == 12
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -352,6 +385,7 @@ PINNED_CHECKSUMS = {
     9: "f3b9d518f4f6c116bcc5df4afeee9bd65d4f6e6bee2e03736ad0844d905af678",
     10: "cad0ef7844a3458f9aa0528f4edf5d418300cdd40b22a65fd4ecd1e6e0a29e6b",
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
+    12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
 }
 
 

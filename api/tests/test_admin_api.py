@@ -113,6 +113,25 @@ async def test_a_signed_in_non_operator_is_refused_as_json(tmp_path, idp: _StubI
 
 
 @pytest.mark.asyncio
+async def test_the_session_lists_the_feature_flags_that_are_on(tmp_path, idp: _StubIdp, monkeypatch):
+    """The panel gates unfinished screens on this list; it has no other view of server settings."""
+
+    from collab_hub_api import config as config_module
+    from collab_hub_api.config import FeaturesConfig
+
+    monkeypatch.setitem(config_module.FEATURE_FLAGS, "cogs_ui", "The Cogs screens (test flag).")
+    monkeypatch.setitem(config_module.FEATURE_FLAGS, "other_ui", "Another screen (test flag).")
+    app = build_app(tmp_path, idp)
+
+    async with app.router.lifespan_context(app), web_client(app) as client:
+        grant_operator(app, idp.sub)
+        await sign_in(client, idp, next_path="/web")
+        assert (await client.get(ADMIN_SESSION_PATH)).json()["features"] == []
+        app.state.features = FeaturesConfig.model_validate({"cogs_ui": True, "other_ui": False})
+        assert (await client.get(ADMIN_SESSION_PATH)).json()["features"] == ["cogs_ui"]
+
+
+@pytest.mark.asyncio
 async def test_an_operator_gets_their_identity_role_and_csrf_token(tmp_path, idp: _StubIdp):
     """The panel cannot read the CSRF secret itself: the cookie is HttpOnly."""
 

@@ -173,6 +173,9 @@ security:
     - path: /health/db
       match: exact
       access: public
+    - path: /v1/auth/cli
+      match: exact
+      access: public
     - path: /web
       match: prefix
       access: public
@@ -204,6 +207,11 @@ combination, but not restating the list is the better habit.)
   append an override rather than restate the map.
 - `defaultAccess` applies where no rule matches. Keep it `authenticated`: a
   route that ships without its own auth dependency then fails closed.
+- `/v1/auth/cli` is public because the `collab-hub` CLI asks it how to sign in
+  before it holds any credential. It names the bearer issuer, the realm client
+  the CLI signs in with and whether dev auth is on — nothing the realm's own
+  discovery document does not already publish. `GET /v1/me`, which the CLI's
+  `whoami` reads, stays behind the default like every other route.
 - The API routes under `/v1` need no entry: the default covers them, and each
   also carries its own auth dependency, so a `public` entry does not make
   frames or tasks anonymous. The one exception is the Cog catalog: a `public`
@@ -486,7 +494,13 @@ a chart test:
   panel's model access adds a third: a confidential service-account client
   that lists and changes model-group membership
   (`frames.model_access.keycloak.*`, see
-  [Configuring the admin panel](#configuring-the-admin-panel)).
+  [Configuring the admin panel](#configuring-the-admin-panel)). The
+  [`collab-hub` CLI](../cli/README.md) adds no client: it signs in with
+  `apollo-desktop` and the desktop's flow — authorization code with PKCE and a
+  `http://127.0.0.1` loopback redirect — so the client must keep allowing
+  `http://127.0.0.1:*/*` as a redirect URI. `GET /v1/auth/cli` names it to the
+  CLI; `frames.auth.cliClientId` overrides it for a realm whose desktop client
+  has another id.
 
 Any path marked `authenticated` needs a verifiable token: set
 `frames.auth.idToken.jwksUrl` (browsers) and `frames.auth.bearer.jwksUrl`

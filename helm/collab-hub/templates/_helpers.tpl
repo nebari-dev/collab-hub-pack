@@ -489,6 +489,10 @@ include with nindent.
 - name: FRAMES_BEARER_AUDIENCE
   value: {{ . | quote }}
 {{- end }}
+{{- with .Values.frames.auth.cliClientId }}
+- name: COLLAB_HUB_CLI_CLIENT_ID
+  value: {{ . | quote }}
+{{- end }}
 {{- with .Values.frames.auth.identityClaim }}
 - name: FRAMES_AUTH_IDENTITY_CLAIM
   value: {{ . | quote }}
@@ -683,6 +687,10 @@ include with nindent.
       key: {{ $webhook.secretKey | default "secret" | quote }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- range $name, $on := .Values.features }}
+- name: {{ printf "COLLAB_HUB_API__FEATURES__%s" ($name | upper) | quote }}
+  value: {{ $on | toString | quote }}
 {{- end }}
 {{- with .Values.api.deployment.extraEnv }}
 {{- toYaml . | nindent 0 }}

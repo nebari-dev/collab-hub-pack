@@ -96,7 +96,7 @@ idempotent — already-running containers are left alone. You never run
 all**. The API is a plain process on your machine at every level except 4;
 Docker only ever supplies the things around it.
 
-| Command | Postgres | MinIO | Keycloak | Fake providers | Front door |
+| Command | Postgres | S3 | Keycloak | Fake providers | Front door |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `make api` | – | – | – | – | – |
 | `make api-watch` | – | – | – | – | – |
@@ -108,8 +108,8 @@ Docker only ever supplies the things around it.
 | `make api-desktop` | ✅ | ✅ | ✅ | – | ✅ |
 | `make api-desktop-fakes` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-(MinIO tags along with Postgres because both come from `make services`; only
-`make api-full` actually stores frames in it.)
+(The S3 store tags along with Postgres because both come from `make services`;
+only `make api-full` actually stores frames in it.)
 
 Containers left running from a previous level are **not** wired in by a lower
 one: `make api-pg` then Ctrl-C then `make api` leaves Postgres up but running
@@ -190,7 +190,7 @@ flowchart LR
     proxy["<b>front door</b> :9080<br/><i>make hub-proxy</i><br/>routes by Host"]
     kc["<b>Keycloak</b> :8080<br/>realm 'nebari'"]
     pg[("<b>Postgres</b> :5432<br/>orgs · history · tasks")]
-    minio[("<b>MinIO</b> :9000<br/>S3 frame store")]
+    s3[("<b>SeaweedFS</b> :9000<br/>S3 frame store")]
     fg["fake Google :8081"]
     fs["fake Slack :8082"]
     fg2["fake GitHub :8083"]
@@ -201,7 +201,7 @@ flowchart LR
   api -->|"exchange bearer for<br/>the user's provider token"| kc
   api --> pg
   api --> frames
-  api -.->|"frames.storage.backend=s3"| minio
+  api -.->|"frames.storage.backend=s3"| s3
   api -->|"provider API calls"| fg
   api --> fs
   api --> fg2
@@ -256,11 +256,20 @@ tables at startup; the dev targets set it.
 make psql          # a psql shell on the dev database
 ```
 
-### MinIO — the S3 frame store
+### SeaweedFS — the S3 frame store
 
-Frame **bodies** default to the local filesystem (`dev/.local/frames`). MinIO
-is only needed to exercise the S3 code path, which `make api-full` does. The
-console is at <http://localhost:9001> (`minioadmin` / `minioadmin123`).
+Frame **bodies** default to the local filesystem (`dev/.local/frames`). The S3
+store is only needed to exercise the S3 code path, which `make api-full` does.
+Its keys are `devaccesskey` / `devsecretkey` (`dev/s3/s3.json`), the API is on
+<http://localhost:9000>, and the server's status page is at
+<http://localhost:9333>. `make services` creates the `frames` bucket with the
+AWS CLI, which speaks to any S3.
+
+This was MinIO until its images left Docker Hub (#114, #115) and then quay.io,
+which no account can pull; SeaweedFS is maintained, Apache-2.0, and serves the
+part of S3 the frame store uses, conditional writes included. Nothing outside
+`dev/` and `scripts/smoke_frames_s3.sh` knew which server it was: the API
+speaks S3 through boto3 either way.
 
 ### Keycloak
 
@@ -321,7 +330,7 @@ Level 4 builds `api/Dockerfile`, loads it into a kind cluster, and installs
 | | `make down` | `make destroy` | `make clean` |
 |---|:--:|:--:|:--:|
 | Postgres rows — frames, orgs, roles, audit | kept | **erased** | kept |
-| MinIO objects | kept | **erased** | kept |
+| S3 objects | kept | **erased** | kept |
 | Keycloak realm, identity providers, account links | kept | **erased** | kept |
 | Frame bodies on disk (`dev/.local/frames`) | kept | kept | **erased** |
 | The kind cluster | kept | kept | kept |
@@ -389,7 +398,7 @@ true` — on a routed host they are an authentication bypass. See
 ## Level 2 — with Postgres
 
 ```sh
-make api-pg      # starts Postgres + MinIO, then the API
+make api-pg      # starts Postgres + the S3 store, then the API
 ```
 
 Starts the two containers first (skipping any already up), waits for them to be
@@ -419,7 +428,7 @@ curl -s localhost:8000/v1/frame-groups
 ## Level 3 — with Keycloak
 
 ```sh
-make api-oidc    # starts Postgres, MinIO and Keycloak, then the API
+make api-oidc    # starts Postgres, the S3 store and Keycloak, then the API
 ```
 
 Three containers, started for you and waited on before the API launches. The
@@ -461,6 +470,37 @@ rows you seed by subject match nobody.
 ```sh
 make sub        # the OIDC subject for the same user
 ```
+
+### Signing in from the CLI
+
+The `collab-hub` CLI signs in the way the Collab desktop does: the realm's
+`apollo-desktop` client, the authorization code flow with PKCE, and a redirect
+back to a listener on `127.0.0.1`. `make cli` installs it into `cli/.venv`.
+
+```sh
+make cli
+../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login
+```
+
+`login` opens the realm's sign-in page in your browser. **Sign in as `dev`,
+password `dev`** — or `owner` / `owner`, the realm's second user (see
+[What is in the realm](#2-what-is-in-the-realm)). The page then sends the
+browser back to the CLI's listener, which says you can close the tab, and the
+CLI prints who the hub signed you in as. Leave `login` running until then: the
+listener lives only as long as the command, so a sign-in finished after it
+stopped lands on a closed port.
+
+```sh
+../cli/.venv/bin/collab-hub whoami           # dev, its organization, and when the token expires
+../cli/.venv/bin/collab-hub cog list         # the Cogs in the catalog
+../cli/.venv/bin/collab-hub logout           # ends the realm session, revokes the token, deletes it here
+```
+
+With no browser on this machine, take a token from `make token` instead:
+`make -s token | ../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login --with-token`.
+At level 1 there is no realm: `login` says the hub runs dev auth, and `whoami`
+says the session is unauthenticated. [`cli/README.md`](../cli/README.md) has
+the rest.
 
 Other level-3 targets:
 
@@ -602,6 +642,16 @@ leaving you guessing at a login screen.
 
 `apollo-desktop` carries an **audience mapper** so its access tokens contain
 `"aud": ["apollo-desktop", …]`, which is what `FRAMES_BEARER_AUDIENCE` checks.
+The `collab-hub` CLI signs in with the same client and the same flow as the
+desktop, so it needs no client of its own.
+
+| User | Password | Email | Used for |
+|---|---|---|---|
+| `dev` | `dev` | `dev@example.com` | Every sign-in in this guide: the desktop, `collab-hub login`, `make token` (`KC_USER`/`KC_PASS` default to it) |
+| `owner` | `owner` | `owner@example.com` | A second person, for sharing and membership: `make token KC_USER=owner KC_PASS=owner` |
+
+These are development credentials, imported with the realm and good only on
+this local Keycloak.
 
 Both clients keep the realm-default client scopes, **including `basic`**. That
 scope carries the `sub` mapper in Keycloak 25+; a client whose default scopes
@@ -1076,6 +1126,39 @@ TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
 `cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
 runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 
+### Fake Ops, in process — `make op`
+
+Level 1, no container. `make op OP=<name>` runs the Op in `ops/<name>.yaml` on
+the lifecycle runner with the `none` durability backend, and prints its Track
+and its status. Each step names a fake Cog under `cogs/`, whose `cog.py`
+answers in the same process:
+
+| Op | Fake Cog | Ends |
+|---|---|---|
+| `echo` (the default) | `echo` answers with its input | `COMPLETED`, two steps |
+| `needs-review` | `needs-review` answers with an `error` problem, so the step's default Gate escalates | `WAITING_AT_GATE` |
+| `fails` | `fails` answers `ok: false` | `FAILED`, with the code on `step_failed` |
+| `spender` | `spender` reports 100 tokens per step, under a 150-token budget | `BUDGET_EXCEEDED` after the second step |
+| `slow` | `slow` takes 30 seconds | stop it with Ctrl-C: the next `make op` reports it `interrupted` |
+
+```sh
+make op OP=needs-review
+make op OP=slow        # Ctrl-C during the step
+make op                # "interrupted slow-…: a previous `make op` stopped before it ended"
+```
+
+**What persists.** The Track is a SQLite file, `.local/track.sqlite`, kept
+across runs until `make clean`. Every `make op` starts the way a host does: a
+run a previous one left running or waiting at a Gate is recorded
+`interrupted`, since `none` keeps nothing across a restart
+([runs.md](../docs/cog-execution/runs.md)). That includes a `needs-review` run
+still waiting at its Gate: nothing here decides it yet (the run API, #103, does).
+
+**One `make op` at a time.** The runner takes every unfinished run on its Track
+as its own when it starts, so `make op` holds a lock beside the Track, and a
+second one refuses to start while the first runs. `BACKEND=dbos` and
+`BACKEND=temporal` are refused until those backends are built.
+
 ### The Cog catalog read API
 
 The read API (`/v1/cogs`, [docs/cog-registry.md](../docs/cog-registry.md#read-api))
@@ -1111,6 +1194,7 @@ list against Postgres.
 | `/web/signin` returns 404 | The web surface is not mounted without a Keycloak client id | Use `make api-full` |
 | `/health/db` says 200 but nothing persists | It answers 200 either way; the body says `not_configured` | Read the body, and use level 2 or above |
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
+| `make op` says another `make op` is running | A previous one is still running on the same Track, possibly in another terminal | Let it finish or stop it; one host per Track until run pickup (#121) |
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
@@ -1157,7 +1241,7 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`) |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next |
 | 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
@@ -1205,21 +1289,25 @@ works as a set:
 | `KC_USER` / `KC_PASS` | `dev` / `dev` | Whose token `make token` prints |
 | `PG_URL` | `postgresql://collab:collab@127.0.0.1:5432/collab` | Dev database |
 | `KC_ADMIN` / `KC_ADMIN_PW` | `admin` / `admin` | Admin console **and** `kcadm`; only seeded against an empty database |
-| `S3_ENDPOINT` | `http://127.0.0.1:9000` | MinIO, for the S3 frame store |
+| `S3_ENDPOINT` | `http://127.0.0.1:9000` | The S3 frame store |
 | `CLUSTER_NAME` | `collab-hub-dev` | kind cluster name |
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
 | `IMAGE` | `collab-hub-api:dev` | Image `make kind-image` builds and loads, and `make kind-up` deploys |
 | `FORWARD_PORT` | `18080` | Local port for `make kind-forward` |
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
+| `OP` | `echo` | The Op `make op` runs: a file under `ops/`, without `.yaml` |
+| `BACKEND` | `none` | The durability backend `make op` runs on; only `none` is built |
 
 ## Files in this directory
 
 | Path | What it is |
 |---|---|
 | `Makefile` | Every target described above |
-| `compose.yaml` | Postgres, MinIO, Keycloak, the two fake providers, and the desktop front door |
+| `compose.yaml` | Postgres, the S3 store, Keycloak, the two fake providers, and the desktop front door |
+| `s3/s3.json` | The dev credentials the S3 store reads |
 | `keycloak/realm-nebari.json` | The `nebari` realm: clients, mappers, users |
 | `sql/bootstrap.sql` | Org + owner membership + operator grant, in one transaction |
 | `proxy/Caddyfile` | Host-routing front door for the desktop client |
 | `values/kind.yaml` | Helm values for the kind install |
-| `.local/` | Frame bodies and scratch state (git-ignored, `make clean` removes it) |
+| `op.py`, `ops/`, `cogs/` | `make op`: the script, the fake Ops, and the fake Cogs they name |
+| `.local/` | Frame bodies, the `make op` Track, and scratch state (git-ignored, `make clean` removes it) |

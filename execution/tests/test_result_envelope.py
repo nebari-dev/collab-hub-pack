@@ -5,11 +5,11 @@ import pytest
 
 from collab_hub_execution import (
     ERROR_CODES,
-    DurableWorkflowEngine,
     EnvelopeError,
     EnvelopeInvalid,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     Problem,
@@ -108,7 +108,7 @@ def test_a_worker_that_builds_an_invalid_envelope_fails_durably_not_crashing_the
             return ResultEnvelope(ok=False)  # would have reached error.code with error None
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
+    assert LifecycleRunner(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
     failed = events(track, "env", "failed")[-1].payload
     assert failed["error"] == "EnvelopeInvalid" and "ok: false requires error" in failed["reason"]
 
@@ -132,19 +132,20 @@ def test_every_documented_code_has_a_status_and_every_status_a_code():
 # --- the engine's reading ----------------------------------------------------
 
 
-def test_ok_with_problems_completes_the_step_and_records_them():
-    problems = [Problem("grounding", "quote not verbatim", "error")]
+def test_ok_with_warnings_completes_the_step_and_records_them():
+    # Under the default Gate a `warn` problem passes with problems; an `error` one escalates (test_gates.py).
+    problems = [Problem("grounding", "quote not verbatim", "warn")]
     executor = InMemoryCogExecutor({
         "c": lambda e, v: ResultEnvelope.success(
             {"answer": v}, usage={"tokens": 1}, problems=problems, binding={"model": "m1"},
         ),
     })
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.COMPLETED
+    assert LifecycleRunner(executor=executor, track=track).submit(op()) is RunState.COMPLETED
     (completed,) = events(track, "env", "step_completed")
-    assert completed.payload["output"] == {"answer": "draft"}
+    assert completed.payload["payload"] == {"answer": "draft"}
     assert completed.payload["problems"] == [
-        {"check": "grounding", "detail": "quote not verbatim", "severity": "error"},
+        {"check": "grounding", "detail": "quote not verbatim", "severity": "warn"},
     ]
     assert completed.payload["binding"] == {"model": "m1"}
     assert not events(track, "env", "failed")
@@ -153,7 +154,7 @@ def test_ok_with_problems_completes_the_step_and_records_them():
 def test_a_clean_envelope_records_no_problems_key():
     track = InMemoryTrackStore()
     executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v)})
-    DurableWorkflowEngine(executor=executor, track=track).submit(op())
+    LifecycleRunner(executor=executor, track=track).submit(op())
     (completed,) = events(track, "env", "step_completed")
     assert "problems" not in completed.payload and "binding" not in completed.payload
 
@@ -170,7 +171,7 @@ def test_each_error_code_fails_the_step_and_keeps_the_code(code):
 
     executor = InMemoryCogExecutor({"c": handler})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=100))
+    engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=100))
     assert engine.submit(op()) is RunState.FAILED
     (failed,) = events(track, "env", "failed")
     assert failed.payload["error"] == code
@@ -179,7 +180,7 @@ def test_each_error_code_fails_the_step_and_keeps_the_code(code):
     # the failed call's spending is on the Track, and counts on retry
     assert events(track, "env", "interaction_usage")[-1].payload["usage"] == {"tokens": 7}
     assert engine.retry("env") is RunState.COMPLETED
-    assert engine._budget_tracker(track.replay("env")).tokens == 8
+    assert engine.budget_tracker(track.replay("env")).tokens == 8
 
 
 def test_an_error_envelope_with_problems_records_them_on_the_failure():
@@ -187,7 +188,7 @@ def test_an_error_envelope_with_problems_records_them_on_the_failure():
         "c": lambda e, v: ResultEnvelope.failure("invalid-input", "bad", problems=[Problem("input", "x")]),
     })
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(op()) is RunState.FAILED
+    assert LifecycleRunner(executor=executor, track=track).submit(op()) is RunState.FAILED
     (failed,) = events(track, "env", "failed")
     assert failed.payload["problems"] == [{"check": "input", "detail": "x", "severity": "error"}]
 
@@ -195,22 +196,23 @@ def test_an_error_envelope_with_problems_records_them_on_the_failure():
 def test_missing_usage_under_a_budget_fails_even_in_a_valid_envelope():
     executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v)})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=10))
+    engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=10))
     assert engine.submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == "UsageUnavailable"
 
 
 def test_in_memory_handler_may_return_an_envelope_shaped_mapping_or_a_raw_value():
     executor = InMemoryCogExecutor({
-        "c": lambda e, v: {"envelope": 1, "ok": True, "payload": v, "problems": [{"check": "schema", "detail": "d"}]},
+        "c": lambda e, v: {"envelope": 1, "ok": True, "payload": v,
+                           "problems": [{"check": "schema", "detail": "d", "severity": "warn"}]},
         "raw": lambda e, v: {"answer": v},  # no envelope key: a plain payload
     })
     track = InMemoryTrackStore()
     definition = OpDefinition("mix", (OpStep("a", "c", "run", "x"), OpStep("b", "raw", "run", "y")))
-    assert DurableWorkflowEngine(executor=executor, track=track).submit(definition) is RunState.COMPLETED
+    assert LifecycleRunner(executor=executor, track=track).submit(definition) is RunState.COMPLETED
     first, second = events(track, "mix", "step_completed")
-    assert first.payload["output"] == "x" and first.payload["problems"][0]["check"] == "schema"
-    assert second.payload["output"] == {"answer": "y"} and "problems" not in second.payload
+    assert first.payload["payload"] == "x" and first.payload["problems"][0]["check"] == "schema"
+    assert second.payload["payload"] == {"answer": "y"} and "problems" not in second.payload
 
 
 def test_a_worker_returning_something_else_fails_durably_as_envelope_invalid():
@@ -219,7 +221,7 @@ def test_a_worker_returning_something_else_fails_durably_as_envelope_invalid():
             return {"output": "done"}  # the pre-envelope shape
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
+    assert LifecycleRunner(executor=LocalExecutor(Worker()), track=track).submit(op()) is RunState.FAILED
     failed = events(track, "env", "failed")[-1].payload
     assert failed["error"] == "EnvelopeInvalid"
     assert failed["reason"] == "interact() must return a ResultEnvelope"
@@ -245,7 +247,7 @@ def test_http_200_envelope_is_parsed():
 def test_http_200_without_an_envelope_fails_the_step_as_envelope_invalid(body):
     worker = http_worker(lambda _: httpx.Response(200, json=body))
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
+    assert LifecycleRunner(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == "EnvelopeInvalid"
 
 
@@ -260,7 +262,7 @@ def test_http_error_statuses_carry_an_error_envelope_whose_code_is_kept(status, 
     envelope = worker.interact("run", "x")
     assert not envelope.ok and envelope.error.code == code and envelope.usage == {"tokens": 4}
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
+    assert LifecycleRunner(executor=LocalExecutor(worker), track=track).submit(op()) is RunState.FAILED
     assert events(track, "env", "failed")[-1].payload["error"] == code
 
 
@@ -290,11 +292,8 @@ def test_http_envelope_with_an_unknown_pause_field_is_an_envelope_not_a_pause():
     assert worker.interact("run", "x") == ResultEnvelope.success("p")
 
 
-def test_http_pause_answer_is_still_a_pause_until_gates_move_to_the_step():
-    from collab_hub_execution import PauseRequest
-
+def test_an_http_pause_answer_is_not_an_envelope_so_a_cog_cannot_pause_a_run():
     answer = {"pause": True, "reason": "review", "usage": {"tokens": 0}}
     worker = http_worker(lambda _: httpx.Response(200, json=answer))
-    with pytest.raises(PauseRequest) as caught:
+    with pytest.raises(EnvelopeInvalid):
         worker.interact("run", "x")
-    assert caught.value.usage == {"tokens": 0}
