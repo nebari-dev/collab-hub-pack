@@ -25,6 +25,7 @@ on:
     paths:
       - "dev/**"
       - "cli/**"
+      - "execution/**"
       - "scripts/smoke_frames_common.sh"
       - "scripts/keycloak_login_browser.py"
       - "helm/**"
@@ -123,6 +124,31 @@ jobs:
           print("whoami reports unauthenticated dev auth as", me["user"])'
           [ "$(cli/.venv/bin/collab-hub cog list --json)" = "[]" ] \
             || { echo "collab-hub cog list did not report the empty catalog"; exit 1; }
+
+      # The runner on the `none` backend, in process: each fake Op ends where it
+      # should, and a run stopped mid-step is recorded interrupted when the next
+      # host starts, never resumed (ADR-0002 D2).
+      - name: make op runs the fake Ops, and a stopped run is interrupted
+        run: |
+          set -euo pipefail
+          status() { make -s -C dev op OP="$1" | tee /tmp/op-"$1".log | sed -n 's/^status: //p'; }
+          [ "$(status echo)" = COMPLETED ]                || { cat /tmp/op-echo.log; exit 1; }
+          [ "$(status needs-review)" = WAITING_AT_GATE ]  || { cat /tmp/op-needs-review.log; exit 1; }
+          [ "$(status fails)" = FAILED ]                  || { cat /tmp/op-fails.log; exit 1; }
+          [ "$(status spender)" = BUDGET_EXCEEDED ]       || { cat /tmp/op-spender.log; exit 1; }
+
+          # Kill the host during a 30-second step, then start another host. SIGTERM, since a
+          # background job in a non-interactive shell starts with SIGINT ignored.
+          make -s -C dev op OP=slow > /tmp/op-slow.log 2>&1 &
+          for _ in $(seq 1 60); do grep -q '^run slow-' /tmp/op-slow.log && break; sleep 1; done
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/op-slow.log)
+          [ -n "$run" ] || { echo "the slow Op never started"; cat /tmp/op-slow.log; exit 1; }
+          sleep 2
+          pkill -TERM -f "dev/op.py slow"
+          wait || true
+          make -s -C dev op OP=echo | tee /tmp/op-after.log
+          grep -q "^interrupted $run:" /tmp/op-after.log \
+            || { echo "the stopped run was not recorded interrupted"; exit 1; }
 
       - name: make clean removes the scratch state
         run: |

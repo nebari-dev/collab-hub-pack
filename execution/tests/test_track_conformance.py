@@ -126,6 +126,18 @@ def test_a_stream_with_no_timeout_returns_what_is_there(store):
     assert [e.event_type for e in store.stream("r")] == ["op_submitted"]
 
 
+def test_the_runs_on_a_track_are_listed_in_the_order_they_were_submitted(store):
+    assert store.run_ids() == ()
+    store.append(_event("op_submitted", run_id="b"))
+    store.append(_event("op_submitted", run_id="a"))
+    store.append(_event("run_picked_up", run_id="b"))
+    store.append(_event("step_started", run_id="orphan"))  # never submitted: not a run
+    # Submitted before schema v1, where the event was `submitted`: listed too, once, in its place.
+    store.append(TrackEvent(run_id="old", event_type="submitted", payload={}, schema=0))
+    store.append(TrackEvent(run_id="old", event_type="step_started", payload={"step": "s"}, schema=0))
+    assert store.run_ids() == ("b", "a", "old")
+
+
 # --- status from the Track ----------------------------------------------------------------
 
 
@@ -160,10 +172,10 @@ def test_an_escalated_payload_s_digest_can_be_recomputed_from_the_kept_row(store
     # Postgres keeps the row as jsonb, which reorders keys: the digest is over canonical JSON.
     import hashlib
 
-    from collab_hub_execution import DurableWorkflowEngine, Gate, InMemoryCogExecutor, OpDefinition, OpStep
+    from collab_hub_execution import Gate, InMemoryCogExecutor, LifecycleRunner, OpDefinition, OpStep
 
     result = {"zeta": "x" * 200, "alpha": {"b": 1, "a": [2.5, None]}, "mid": "é"}
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=store,
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=store,
                                    payload_inline_max_bytes=100)
     engine.submit(OpDefinition("r", (OpStep("s", "c", "run", result, gate=Gate(escalate="always")),)))
     [escalated] = [e for e in store.replay("r") if e.event_type == "gate_escalated"]

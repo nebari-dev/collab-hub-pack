@@ -69,6 +69,17 @@ flowchart LR
   api --> dir[User directory<br/>Keycloak]
 ```
 
+## Known limitations
+
+- **The `none` durability backend does not survive a restart.** Cog execution
+  runs Ops on `none` today: nothing is checkpointed, so a run in flight — or
+  waiting at a Gate — when its host stops is recorded `interrupted` when a host
+  starts again, and continues only when someone retries it. `dbos` (#104) is
+  the backend that resumes runs; see
+  [`docs/cog-execution/runs.md`](docs/cog-execution/runs.md).
+- **One host per Track.** Until run pickup (#121), a host takes every
+  unfinished run on its Track as its own when it starts.
+
 ## Local development
 
 Everything is driven from [`dev/`](dev/), which runs the pack on your machine
