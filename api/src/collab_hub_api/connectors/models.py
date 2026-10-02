@@ -617,25 +617,29 @@ class GitHubProjectsListResponse(UntrustedConnectorResponse):
 
 
 class GitHubProjectReadRequest(BaseModel):
-    # The read auto-paginates server-side up to this cap (GitHub caps a GraphQL
-    # page at 100; the client walks multiple pages). Default returns a whole
-    # board up to the 500 ceiling in one call; boards larger than the cap report
-    # truncated=True so the caller never mistakes a subset for the whole board.
+    # Default returns one GraphQL page. `counts` carries exact board-wide totals
+    # and per-column breakdowns regardless of how many items come back, so most
+    # board questions don't need the full listing. Callers that do can raise
+    # max_items up to the 500 ceiling; truncated=True marks a partial listing.
+    # `query` is an optional ProjectV2 item filter (GitHub's board filter DSL,
+    # e.g. 'status:"In Progress"' or 'assignee:octocat') that narrows the items
+    # returned; `counts` stays board-wide either way.
     owner: str = Field(min_length=1, max_length=100)
-    max_items: int = Field(default=500, ge=1, le=500)
+    max_items: int = Field(default=50, ge=1, le=500)
+    query: str = Field(default="", max_length=256)
 
 
 class GitHubProjectReadResponse(UntrustedConnectorResponse):
     project: GitHubProject
     items: list[GitHubProjectItem]
-    # total_count is the board's full item count; truncated is set when it
-    # exceeds the items returned here, so a caller never mistakes a partial
-    # board for the whole thing.
+    # total_count is the number of items matching the request (the whole board
+    # when no query is given); truncated is set when it exceeds the items
+    # returned here, so a caller never mistakes a partial listing for the whole.
     total_count: int = 0
     truncated: bool = False
-    # Aggregate breakdowns (per status column, by type, open/closed). Accurate
-    # regardless of the item truncation above: computed by server-side count
-    # queries when available, otherwise sampled and flagged non-authoritative.
+    # Board-wide aggregate breakdowns (per status column, by type, open/closed),
+    # independent of max_items and query: computed by server-side count queries
+    # when available, otherwise sampled and flagged non-authoritative.
     counts: GitHubProjectCounts | None = None
 
 

@@ -1066,6 +1066,64 @@ async def test_github_read_project_auto_paginates(tmp_path, monkeypatch):
     assert body["truncated"] is False
 
 
+async def test_github_read_project_default_requests_small_page(tmp_path, monkeypatch):
+    # The default read asks GitHub for one small page, not a 100-item page
+    # walked up to five times.
+    seen_first: list[int] = []
+    node = _read_node()
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/graphql"):
+            payload = json.loads(request.content.decode("utf-8"))
+            if "ProjectRead" in payload.get("query", ""):
+                seen_first.append(payload["variables"]["first"])
+            return Response(200, json={"data": {"organization": node, "user": None}})
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        await client.post(
+            "/v1/connectors/github/projects/1/read", headers=_auth_header(), json={"owner": "openteams-ai"}
+        )
+    assert seen_first and seen_first[0] == 50
+
+
+async def test_github_read_project_forwards_item_query(tmp_path, monkeypatch):
+    seen_query: list[str | None] = []
+    node = _read_node()
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/graphql"):
+            payload = json.loads(request.content.decode("utf-8"))
+            if "ProjectRead" in payload.get("query", ""):
+                seen_query.append(payload["variables"].get("query"))
+            return Response(200, json={"data": {"organization": node, "user": None}})
+        return Response(404, json={"message": "Not Found"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": 'status:"In Progress"'},
+        )
+    assert seen_query[0] == 'status:"In Progress"'
+
+
+async def test_github_read_project_rejects_oversized_query(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _graphql_handler(org=_read_node(), user=None))
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/github/projects/1/read",
+            headers=_auth_header(),
+            json={"owner": "openteams-ai", "query": "x" * 257},
+        )
+    assert response.status_code == 422
+
+
 async def test_github_project_owner_not_found(tmp_path, monkeypatch):
     _install_mock_client(monkeypatch, _graphql_handler(org=None, user=None))
     app = make_app(_config(tmp_path))

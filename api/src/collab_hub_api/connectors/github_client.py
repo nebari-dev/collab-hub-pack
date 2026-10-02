@@ -93,19 +93,20 @@ query ProjectsList($login: String!, $first: Int!) {{
 
 _PROJECT_READ_BODY = f"""projectV2(number: $number) {{
       number title shortDescription closed
-      items(first: $first, after: $after) {{ {_PROJECT_ITEM_FIELDS} }}
+      items(first: $first, after: $after, query: $query) {{ {_PROJECT_ITEM_FIELDS} }}
     }}"""
 
 _PROJECT_READ_QUERY = f"""
-query ProjectRead($login: String!, $number: Int!, $first: Int!, $after: String) {{
+query ProjectRead($login: String!, $number: Int!, $first: Int!, $after: String, $query: String) {{
   organization(login: $login) {{ {_PROJECT_READ_BODY} }}
   user(login: $login) {{ {_PROJECT_READ_BODY} }}
 }}
 """
 
 # Project reads auto-paginate server-side: GitHub's GraphQL caps a page at 100,
-# so we walk up to MAX_PROJECT_PAGES pages (a bounded whole-board read) and set
-# truncated=True only for boards larger than that ceiling.
+# so we walk up to _MAX_PROJECT_PAGES pages and set truncated=True when the
+# matching items exceed what we returned. The default request asks for far
+# fewer (see GitHubProjectReadRequest.max_items).
 _PROJECT_PAGE_SIZE = 100
 _MAX_PROJECT_ITEMS = 500
 _MAX_PROJECT_PAGES = _MAX_PROJECT_ITEMS // _PROJECT_PAGE_SIZE
@@ -536,20 +537,24 @@ class GitHubClient:
         owner: str,
         number: int,
         max_items: int,
+        query: str = "",
     ) -> tuple[GitHubProject, list[GitHubProjectItem]]:
         """Read a board's items, auto-paginating server-side up to a bounded cap
-        so the caller gets the whole board in one call (GitHub caps a GraphQL
-        page at 100). project.items_count is the board's real size; the router
-        marks the response truncated when we returned fewer (board > cap)."""
+        (GitHub caps a GraphQL page at 100). With a query, only matching items
+        are walked and project.items_count is the matching count; the router
+        marks the response truncated when we returned fewer than that."""
         cap = min(max(max_items, 1), _MAX_PROJECT_ITEMS)
         login = owner.strip()
+        filter_query = query.strip() or None
         project: dict | None = None
         collected: list[GitHubProjectItem] = []
         cursor: str | None = None
         for _page in range(_MAX_PROJECT_PAGES):
+            # Don't fetch a full 100-item page when the caller wants fewer.
+            first = min(_PROJECT_PAGE_SIZE, cap - len(collected))
             data = await self._graphql(
                 _PROJECT_READ_QUERY,
-                {"login": login, "number": number, "first": _PROJECT_PAGE_SIZE, "after": cursor},
+                {"login": login, "number": number, "first": first, "after": cursor, "query": filter_query},
                 operation="project read",
             )
             project = _owner_project(
@@ -569,49 +574,67 @@ class GitHubClient:
         return _project(project or {}), collected[:cap]
 
     async def read_project_with_counts(
-        self, *, owner: str, number: int, max_items: int
+        self, *, owner: str, number: int, max_items: int, query: str = ""
     ) -> tuple[GitHubProject, list[GitHubProjectItem], GitHubProjectCounts]:
-        """Read a board and compute its aggregate counts concurrently.
+        """Read a board and compute its board-wide aggregate counts concurrently.
 
-        The exact server-side count queries don't depend on the item
-        enumeration, so they run alongside read_project instead of strictly
-        after it -- overlapping the two count round-trips with the 1-5
-        enumeration pages rather than paying them in series.
-
-        Counts never break the read: on any count failure (rejected filter DSL,
-        non-reconciling self-check, upstream/network error, or a coding bug) we
-        fall back to bucketing the enumerated items, flagged non-authoritative.
-        A read_project failure, by contrast, propagates -- it's the caller's
-        error to map -- after the counts task is cancelled so it can't leak."""
+        Counts never break the read: on any count failure we fall back to
+        bucketing an unfiltered enumeration, flagged non-authoritative when that
+        enumeration doesn't cover the whole board. A read_project failure
+        propagates after the counts task is cancelled so it can't leak."""
         counts_task = asyncio.ensure_future(
             self._authoritative_counts(login=owner.strip(), number=number)
         )
         try:
-            project, items = await self.read_project(owner=owner, number=number, max_items=max_items)
+            project, items = await self.read_project(
+                owner=owner, number=number, max_items=max_items, query=query
+            )
         except BaseException:
             counts_task.cancel()
             with contextlib.suppress(BaseException):
                 await counts_task
             raise
-        total = project.items_count
         try:
             counts = await counts_task
         except (GitHubUpstreamError, httpx.HTTPError):
-            # Expected degrade: upstream/network failure, a rejected filter DSL,
-            # or a self-check that refused to stamp non-reconciling counts
-            # authoritative (see _authoritative_counts). Sample at WARNING.
             logger.warning("github_project_counts_fallback", exc_info=True)
-            counts = _sampled_counts(total=total, items=items)
+            counts = await self._fallback_counts(
+                owner=owner, number=number, project=project, items=items, query=query
+            )
         except Exception:
-            # Unexpected: a coding bug (bad query edit, upstream shape change,
-            # TypeError in parsing) would otherwise become permanent silent
-            # degradation -- and a small fully-enumerated board still returns
-            # authoritative=True from the fallback, masking it. Log at ERROR so a
-            # shipped regression is loud, but still honor "must not break the
-            # read" (asyncio.CancelledError is a BaseException and still surfaces).
             logger.error("github_project_counts_unexpected_error", exc_info=True)
-            counts = _sampled_counts(total=total, items=items)
+            counts = await self._fallback_counts(
+                owner=owner, number=number, project=project, items=items, query=query
+            )
         return project, items, counts
+
+    async def _fallback_counts(
+        self,
+        *,
+        owner: str,
+        number: int,
+        project: GitHubProject,
+        items: list[GitHubProjectItem],
+        query: str,
+    ) -> GitHubProjectCounts:
+        """Sample counts from an unfiltered enumeration. Reuses the returned
+        items when they already are the whole board; otherwise walks the board
+        (up to the 500 ceiling) for counting only, so the smaller default
+        max_items doesn't degrade the fallback's accuracy."""
+        if not query.strip() and len(items) >= project.items_count:
+            return _sampled_counts(total=project.items_count, items=items)
+        try:
+            board, all_items = await self.read_project(
+                owner=owner, number=number, max_items=_MAX_PROJECT_ITEMS
+            )
+        except (GitHubUpstreamError, httpx.HTTPError):
+            logger.warning("github_project_counts_sample_failed", exc_info=True)
+            if query.strip():
+                # Filtered items can't stand in for the board; report nothing
+                # rather than a misleading partial breakdown.
+                return GitHubProjectCounts(authoritative=False, counted_items=0)
+            return _sampled_counts(total=project.items_count, items=items)
+        return _sampled_counts(total=board.items_count, items=all_items)
 
     async def _authoritative_counts(self, *, login: str, number: int) -> GitHubProjectCounts:
         data = await self._graphql(
