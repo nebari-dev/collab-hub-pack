@@ -4,19 +4,45 @@ This package is a reference implementation for local integration and discovery.
 Python interfaces, the `/invoke` protocol, and Track event schemas may change
 without backward compatibility guarantees.
 
-## Execution and recovery
+## Running, stopping, and what a restart does
 
-`submit()`, `decide()`, and `retry()` run synchronously until the run completes,
-fails, or waits at a Gate, and return the run's state. The Track stores recovery
-state. After a process restart, a caller must resubmit the same incomplete Op;
-there is no background recovery loop. A run `WAITING_AT_GATE` waits for
-`decide()`; once a decision is recorded the run is `RUNNING` again, so a crash
-before the run advances resumes on the next submit.
+`LifecycleRunner` runs Ops on the durability backend its `backend` setting
+names — `none`, `dbos` or `temporal`; only `none` is built, and the other two
+are refused when the runner is constructed. `submit()`, `decide()` and
+`retry()` run synchronously until the run completes, fails, waits at a Gate or
+is cancelled, and return the run's state.
 
-Only one caller may advance a run at a time. The submission index does not
-serialize advancement. Idempotency keys survive engine recovery, but the
-reference worker does not persist results across pod replacement, so completed
-side effects may repeat.
+**`none` keeps nothing across a restart.** When a host starts, it calls
+`start()`, which records every run the Track shows running or waiting at a
+Gate — one a stopped host left behind — as `INTERRUPTED`, and returns their
+ids. Such a run is never resumed: submitting it again returns its state, and it
+continues only through `retry()`, which continues the attempt that was in
+flight under its idempotency key. A run waiting at a Gate cannot survive a
+restart either (decision 3 of the plan): once interrupted, its retry runs the
+escalated step again. Submitting a run that was submitted and never picked up
+starts it. See [`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md).
+
+**`cancel(run_id, actor=...)`** ends a run `CANCELLED` and records the actor. A
+run this host is advancing is cancelled at its next step boundary: its live
+worker is torn down at once, a worker still being brought up is torn down
+before it is invoked, and the call advancing it records `cancelled` without
+keeping the result of an interaction that was in flight. A run that is
+submitted, running or waiting at a Gate and not advancing here is cancelled at
+once; an ended run cannot be, even one that ends while the request is on its
+way. A worker the cancel could not tear down is tried again, and recorded as a
+`step_failed` with `TeardownFailed` beside `cancelled` if that fails too.
+
+Every call that moves a run claims it first, so two calls in one host never
+move one run at once: a second `submit` waits for the first to write the
+submission, is refused if its Op differs, and otherwise returns the status; a
+second `retry` or `decide` is refused; and `start()` leaves a claimed run alone. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#one-run-one-call-at-a-time).
+
+Only one host may advance the runs on a Track at a time: `start()` takes every
+unfinished run as its own, and run pickup by a controller (#121) is what lets
+hosts share a Track. The reference worker does not persist results by key, so
+a retried attempt may repeat a completed side effect until the keyed claim
+(#102) answers for it.
 
 `retry()` starts a new attempt for a failed run. Completed runs and runs that
 exhausted their duration, token, or cost budget cannot be retried; start a new
@@ -39,14 +65,19 @@ the step's Gate, which leads to `complete` or `escalate`. Outside an attempt,
 `stop_for_budget` stops a run at a boundary its budget has passed. Each step function moves the state machines below by their
 transitions and writes the records they return; none assigns a state itself.
 
-`DurableWorkflowEngine` is the `WorkflowEngine` contract in front of it, and
-makes no lifecycle decision of its own: every method delegates to its runner.
-The step functions are sequenced by the runner's driver (`_advance`), which is
-lifecycle logic too: it picks the run up and completes it, skips completed
-steps, completes an approved escalation, checks and consumes the budget at step
-boundaries, and maps a failure to the attempt's outcome. A durability backend
-(ADR-0002 D1) will reuse that one driver and schedule the step functions it
-calls, never copying it; until then the engine runs it in process. The Op and the seam's types —
+`LifecycleRunner` implements the `WorkflowEngine` contract (`submit`, `decide`,
+`retry`, `cancel`, `observe`, `open_escalation`) itself; `DurableWorkflowEngine`,
+which recovered runs by replaying the Track on a resubmit, is gone with that
+recovery. The step functions are sequenced by the runner's driver (`_advance`),
+which is lifecycle logic too: it picks the run up and completes it, skips
+completed steps, completes an approved escalation, checks and consumes the
+budget at step boundaries, maps a failure to the attempt's outcome, and ends a
+run cancelled at a step boundary. Every durability backend (ADR-0002 D1,
+`collab_hub_execution.backends`) shares that one driver: the driver hands each
+step function to `DurabilityBackend.run_step`, and the backend decides only how
+it is scheduled and whether its result is checkpointed. `none` calls it in
+process. Callers never import a backend; the `backend` setting is the only
+switch. The Op and the seam's types —
 `OpDefinition`, `OpStep`, `CogWorker`, `CogExecutor`, `InMemoryCogExecutor` —
 are in `collab_hub_execution.ops`.
 

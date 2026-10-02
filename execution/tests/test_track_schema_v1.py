@@ -2,10 +2,10 @@
 
 from collab_hub_execution import (
     SCHEMA_VERSION,
-    DurableWorkflowEngine,
     Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     Problem,
@@ -30,7 +30,7 @@ def test_step_completed_names_the_cog_the_binding_the_problems_the_usage_and_the
     track = InMemoryTrackStore()
     envelope = ResultEnvelope.success({"answer": 42}, usage={"tokens": 3}, binding={"model": "m1"},
                                       problems=[Problem("style", "long", "warn")])
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: envelope}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: envelope}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run", "in", digest="sha256:abc"),))) \
         is RunState.COMPLETED
     [completed] = _events(track, "r", "step_completed")
@@ -46,7 +46,7 @@ def test_step_completed_names_the_cog_the_binding_the_problems_the_usage_and_the
 def test_a_large_payload_is_kept_by_reference_and_a_small_one_inline():
     track = InMemoryTrackStore()
     big = {"text": "x" * 200}
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
                                    payload_inline_max_bytes=100)
     op = OpDefinition("r", (OpStep("small", "c", "run", {"n": 1}), OpStep("large", "c", "run", big)))
     assert engine.submit(op) is RunState.COMPLETED
@@ -60,7 +60,7 @@ def test_a_large_payload_is_kept_by_reference_and_a_small_one_inline():
 
 def test_an_approved_result_is_completed_with_the_same_record_shape():
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage={"tokens": 1})}), track=track,
     )
     op = OpDefinition("r", (OpStep("s", "c", "run", "draft", gate=Gate(escalate="always")),))
@@ -84,7 +84,7 @@ def test_a_broken_interaction_records_the_step_s_failure_with_its_key_worker_and
         raise RuntimeError("the model host returned nothing usable " + "!" * 2000)
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": boom}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": boom}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run", digest="sha256:abc"),))) is RunState.FAILED
     [failed_step] = _events(track, "r", "step_failed")
     assert failed_step.payload["step"] == "s" and failed_step.payload["attempt"] == 0
@@ -101,7 +101,7 @@ def test_an_error_envelope_records_its_code_detail_and_problems_on_the_step_s_fa
     answer = ResultEnvelope.failure("model-call-failed", "upstream 502 " + "x" * 2000,
                                     problems=[Problem("input", "too long")], binding={"model": "m1"})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
     [failed_step] = _events(track, "r", "step_failed")
     assert failed_step.payload["error"] == "model-call-failed"
@@ -115,7 +115,7 @@ def test_a_usage_failure_records_its_reason_on_the_step_s_failure():
     from collab_hub_execution import RunBudget
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v)}),
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v)}),
                                    track=track, budget=RunBudget(max_tokens=10))
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
     [failed_step] = _events(track, "r", "step_failed")
@@ -138,7 +138,7 @@ def test_a_worker_that_cannot_be_torn_down_records_the_step_s_failure_too():
             raise RuntimeError("delete failed")
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=Executor(), track=track).submit(
+    assert LifecycleRunner(executor=Executor(), track=track).submit(
         OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
     [failed_step] = _events(track, "r", "step_failed")
     assert failed_step.payload["error"] == "TeardownFailed"
@@ -160,7 +160,7 @@ def test_the_engine_reads_a_pre_v1_track_and_drives_it_on():
         calls.append(signal)
         return ResultEnvelope.success(value)
 
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": cog}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": cog}), track=track)
     assert engine.observe("old") is RunState.WAITING_AT_GATE
     assert engine.open_escalation("old")["escalation"] is None
     assert engine.decide("old", escalation=None, actor="alice", outcome="send_back", findings=["again"]) \
@@ -180,7 +180,7 @@ def test_status_and_decisions_survive_a_restart_over_a_sqlite_track(tmp_path):
     op = OpDefinition("r", (OpStep("s", "c", "run", "draft", gate=Gate(escalate="always")),))
 
     def engine():  # a new process: a new store object, a new engine, the same file
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=SqliteTrackStore(path))
+        return LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=SqliteTrackStore(path))
 
     assert engine().submit(op) is RunState.WAITING_AT_GATE
     assert engine().observe("r") is RunState.WAITING_AT_GATE
@@ -216,7 +216,7 @@ class _CountingPayloads(InMemoryTrackStore):
 def test_an_escalated_large_result_is_kept_once_by_reference_and_approved_from_there():
     track = _CountingPayloads()
     big = {"text": "x" * 500}
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
                                    payload_inline_max_bytes=100)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run", big, gate=Gate(escalate="always")),))) \
         is RunState.WAITING_AT_GATE
@@ -238,7 +238,7 @@ def test_two_large_results_differing_only_in_their_payload_have_different_digest
 
     def escalate(value):
         track = InMemoryTrackStore()
-        engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
+        engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
                                        payload_inline_max_bytes=10)
         engine.submit(OpDefinition("r", (OpStep("s", "c", "run", value, gate=Gate(escalate="always")),)))
         return envelope_digest(engine.open_escalation("r")["envelope"])
@@ -260,14 +260,16 @@ def test_a_recovered_attempt_rewrites_its_payload_instead_of_leaving_another_one
     op = OpDefinition("r", (OpStep("s", "c", "run", {"text": "x" * 500}),))
 
     def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
+        return LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: v}), track=track,
                                      payload_inline_max_bytes=100)
 
     try:
         engine().submit(op)
     except SystemExit:
         pass
-    assert engine().submit(op) is RunState.COMPLETED
+    host = engine()  # the host starts again: the run is interrupted, and its retry continues the attempt
+    assert host.start() == ("r",)
+    assert host.retry("r") is RunState.COMPLETED
     assert [ref for _, ref, _ in track.puts] == ["r:s:0", "r:s:0"]  # the same row, rewritten
     assert list(track._payloads) == ["r:s:0"]
 
@@ -276,7 +278,7 @@ def test_a_payload_that_is_not_json_fails_the_step_durably():
     from datetime import datetime
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success({"at": datetime(2026, 1, 1)})}),
         track=track,
     )
@@ -291,7 +293,7 @@ def test_a_payload_that_is_not_json_still_counts_the_usage_the_worker_reported()
 
     answer = ResultEnvelope.success({"at": datetime(2026, 1, 1)}, usage={"tokens": 7, "cost": 0.5})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
     assert engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
     [spent] = _events(track, "r", "interaction_usage")  # once, with what was reported
     assert spent.payload["usage"] == {"tokens": 7, "cost": 0.5}
@@ -314,7 +316,7 @@ def test_a_failed_teardown_keeps_the_step_s_own_failure():
             raise ConnectionError("delete failed")
 
     track = InMemoryTrackStore()
-    assert DurableWorkflowEngine(executor=Executor(), track=track).submit(
+    assert LifecycleRunner(executor=Executor(), track=track).submit(
         OpDefinition("r", (OpStep("s", "c", "run"),))) is RunState.FAILED
     [failed_step] = _events(track, "r", "step_failed")
     assert failed_step.payload["error"] == "RuntimeError"
@@ -341,7 +343,7 @@ def test_a_failed_teardown_after_an_error_envelope_keeps_its_code_and_problems()
             raise RuntimeError("delete failed")
 
     track = InMemoryTrackStore()
-    DurableWorkflowEngine(executor=Executor(), track=track).submit(OpDefinition("r", (OpStep("s", "c", "run"),)))
+    LifecycleRunner(executor=Executor(), track=track).submit(OpDefinition("r", (OpStep("s", "c", "run"),)))
     [failed_step] = _events(track, "r", "step_failed")
     assert failed_step.payload["error"] == "model-call-failed" and failed_step.payload["message"] == "upstream 502"
     assert failed_step.payload["problems"] == [{"check": "input", "detail": "too long", "severity": "error"}]
@@ -351,7 +353,7 @@ def test_a_failed_teardown_after_an_error_envelope_keeps_its_code_and_problems()
 def test_the_run_s_failure_reason_is_bounded_like_the_step_s():
     answer = ResultEnvelope.failure("model-call-failed", "y" * 200_000)
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
+    engine = LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda e, v: answer}), track=track)
     engine.submit(OpDefinition("r", (OpStep("s", "c", "run"),)))
     [failed] = _events(track, "r", "failed")
     assert len(failed.payload["reason"]) == MESSAGE_MAX_CHARS

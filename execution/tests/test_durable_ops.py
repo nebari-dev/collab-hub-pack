@@ -1,8 +1,8 @@
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     RunState,
@@ -18,7 +18,7 @@ def test_multi_step_op_interacts_with_each_cog_and_completes():
         }
     )
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track)
+    engine = LifecycleRunner(executor=executor, track=track)
     op = OpDefinition(
         "run-1",
         (OpStep("first-step", "first", "run", "a"), OpStep("second-step", "second", "run", "b")),
@@ -35,7 +35,7 @@ def test_a_run_waiting_at_a_gate_is_approved_by_another_engine_after_a_restart()
     op = OpDefinition("run-2", (OpStep("draft", "writer", "write", "work", gate=Gate(escalate="always")),))
 
     def engine():
-        return DurableWorkflowEngine(executor=InMemoryCogExecutor({"writer": lambda e, v: calls.append(v) or v}),
+        return LifecycleRunner(executor=InMemoryCogExecutor({"writer": lambda e, v: calls.append(v) or v}),
                                      track=track)
 
     assert engine().submit(op) is RunState.WAITING_AT_GATE
@@ -48,7 +48,7 @@ def test_a_run_waiting_at_a_gate_is_approved_by_another_engine_after_a_restart()
 def test_engine_failure_is_recorded_and_worker_is_torn_down():
     executor = InMemoryCogExecutor({"broken": lambda _entry, _value: 1 / 0})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track)
+    engine = LifecycleRunner(executor=executor, track=track)
 
     assert engine.submit(OpDefinition("run-3", (OpStep("broken", "broken", "run"),))) is RunState.FAILED
     assert executor.torn_down == ["broken"]
