@@ -575,8 +575,8 @@ The whole path a user takes, demonstrable now: launch a Cog from `collab-hub`, s
 *Dev and CI* — `make controller` at level 1, and `make api` now serves the run API there, both over `dev/.local/track.sqlite` and both finding packages in `COGS` (`dev/cogs` and `examples/cog-local/cogs`). CI: `level-1` runs `examples/cog-local/demo.sh` on Linux and macOS — a Cog launched from the CLI completes and its answer is printed, a second is listed while running and terminated, and no worker is left; the controller and intents are tested in `test-execution.yaml`, the routes in `test.yaml`, the commands in `test-cli.yaml`. *Docs* — `runs.md` gains *The run controller and the run API*; `track.md` gains `cancel_requested` and `submitted_by`; the glossary gains *Run intent*; `feature-flags.md` lists `cog_runs`; `cli/README.md` gains the launch and run commands and the exit codes; `dev/README.md` gains `make controller` and the example; the root `README.md` points to the example.
 
 *Acceptance*
-- [ ] At dev level 1, `collab-hub cog launch hello --watch` runs the example Cog as a local process and prints what it answered, on Linux and macOS.
-- [ ] `collab-hub run list` shows a run in flight, and `collab-hub run terminate` ends it `cancelled` with its actor on the Track and no worker left.
+- [x] At dev level 1, `collab-hub cog launch hello --watch` runs the example Cog as a local process and prints what it answered, on Linux and macOS.
+- [x] `collab-hub run list` shows a run in flight, and `collab-hub run terminate` ends it `cancelled` with its actor on the Track and no worker left.
 - [x] The API constructs no executor, and reaches the execution package from the run router only, enforced by a test.
 - [x] A Cog the hub cannot launch is refused at submit with 422, naming those it can, and the CLI reports them.
 - [x] A member of another organization can neither see nor cancel a run.
