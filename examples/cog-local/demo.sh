@@ -25,12 +25,16 @@ hub() { uv run --quiet --project "$ROOT/cli" collab-hub "$@"; }
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 mkdir -p "$LOGS"
+# Job control gives each of the two its own process group, so stopping one stops `make`, `uv`
+# and the Python process under it together, whichever of them forwards a signal and whichever does not.
+set -m
 make -s -C "$ROOT/dev" api API_PORT="$PORT" > "$LOGS/example-api.log" 2>&1 &
 api=$!
 make -s -C "$ROOT/dev" controller > "$LOGS/example-controller.log" 2>&1 &
 controller=$!
+set +m
 stop() {
-  kill "$api" "$controller" 2>/dev/null || true
+  kill -TERM -- "-$api" "-$controller" 2>/dev/null || true
   wait "$api" "$controller" 2>/dev/null || true
   rm -rf "$COLLAB_HUB_CONFIG_DIR"
 }
@@ -74,4 +78,10 @@ if pgrep -f 'examples/cog-local/cogs/hello/\.pixi/envs' >/dev/null; then
   echo "a hello worker is still running after its run was terminated"; exit 1
 fi
 
-say "Done: one run completed, one terminated, and no worker left behind."
+trap - EXIT
+stop
+if curl -sf -m 2 "$COLLAB_HUB_URL/health" >/dev/null; then
+  echo "the API is still answering after it was stopped"; exit 1
+fi
+
+say "Done: one run completed, one terminated, and nothing left running."
