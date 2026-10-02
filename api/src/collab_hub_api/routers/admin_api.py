@@ -169,6 +169,7 @@ def make_router() -> APIRouter:
             "role": resolve_platform_role(request, session.user),
             "csrf_token": session.csrf,
             "version": _running_version(),
+            "features": request.app.state.features.enabled_names,
         }
 
     @router.get("/invitations")

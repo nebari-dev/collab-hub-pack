@@ -302,6 +302,11 @@ security:
     - path: /health/db
       match: exact
       access: public
+    # How the collab-hub CLI signs in: asked before the client holds a token,
+    # and naming only what the realm's discovery document already publishes.
+    - path: /v1/auth/cli
+      match: exact
+      access: public
     - path: /web
       match: prefix
       access: public
@@ -370,6 +375,13 @@ frames:
     # only within one issuer, so frames.auth.bearer.issuer / idToken.issuer must
     # be set and agree (the API refuses to start otherwise).
     identityClaim: ""
+    # -- The public realm client the collab-hub CLI signs in with, which
+    # GET /v1/auth/cli hands to the CLI beside the bearer issuer. Empty means
+    # "apollo-desktop": the CLI reuses the desktop's client and its flow,
+    # authorization code with PKCE on a http://127.0.0.1 loopback redirect, so
+    # its tokens carry the audience frames.auth.bearer.audience already checks.
+    # Set it only for a realm whose desktop client has another id.
+    cliClientId: ""
     # -- Where a caller's organization comes from: "" (same as "claims"),
     # "membership", or "single".
     #
@@ -714,3 +726,8 @@ cogs:
     intervalSeconds: 300
     # -- Whether a sweep runs when the API starts, before the first interval.
     runOnStartup: true
+
+# Feature flags for work in progress that is on main but not yet exposed. Every
+# flag is off until it is listed here and set to true; each entry becomes
+# COLLAB_HUB_API__FEATURES__<NAME>. See docs/feature-flags.md.
+features: {}

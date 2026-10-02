@@ -69,6 +69,17 @@ flowchart LR
   api --> dir[User directory<br/>Keycloak]
 ```
 
+## Known limitations
+
+- **The `none` durability backend does not survive a restart.** Cog execution
+  runs Ops on `none` today: nothing is checkpointed, so a run in flight — or
+  waiting at a Gate — when its host stops is recorded `interrupted` when a host
+  starts again, and continues only when someone retries it. `dbos` (#104) is
+  the backend that resumes runs; see
+  [`docs/cog-execution/runs.md`](docs/cog-execution/runs.md).
+- **One host per Track.** Until run pickup (#121), a host takes every
+  unfinished run on its Track as its own when it starts.
+
 ## Local development
 
 Everything is driven from [`dev/`](dev/), which runs the pack on your machine
@@ -106,12 +117,16 @@ production build.
 ## Documentation
 
 Setup and reference docs — connector setup, Frames, operations, the
-[Cog registry](docs/cog-registry.md) — live in [`docs/`](docs/).
+[Cog registry](docs/cog-registry.md), [feature flags](docs/feature-flags.md) — live in [`docs/`](docs/).
 
 The basis for Cog and Op execution — vocabulary, the Op–Cog seam, the
 result envelope, the sensitivity model — is in
 [`docs/cog-execution/`](docs/cog-execution/); the decisions behind it are
 recorded in [`docs/adr/`](docs/adr/).
+
+The [`collab-hub` CLI](cli/README.md) is a terminal client for the hub's REST
+API: it signs in the way the Collab desktop does, and lists the Cogs the hub
+offers.
 
 ## Contributing
 

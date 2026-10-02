@@ -2,7 +2,7 @@
 #
 # Started through dev/Makefile, never by hand:
 #
-#   make services   postgres + minio            (no profile)
+#   make services   postgres + s3               (no profile)
 #   make keycloak   + keycloak                  (profile: auth)
 #   make fakes      + fake Google/Slack         (profile: fakes)
 #   make up         all of the above
@@ -35,36 +35,48 @@ services:
 
   # S3-compatible frame content store. The default frame store is the local
   # filesystem; this is only needed to exercise the S3 code path.
-  # quay.io, not Docker Hub: Docker Hub no longer serves minio/minio or minio/mc.
-  minio:
-    image: quay.io/minio/minio:RELEASE.2024-03-30T09-41-56Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin123
+  #
+  # SeaweedFS, not MinIO: MinIO's images left Docker Hub (#114, #115) and have
+  # now left quay.io too, so `make services` could not pull them at all. This one
+  # is maintained, Apache-2.0, pullable without an account, and speaks the part of
+  # S3 the frame store uses — conditional writes (`If-Match`) included.
+  s3:
+    image: chrislusf/seaweedfs:4.47
+    # One process serves the master, a volume server, the filer and the S3 API.
+    # `-volume.max` has to leave room for the volumes the filer grows on first
+    # write; too low and a PUT fails with "no writable volumes".
+    command: >
+      server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
+      -master.volumeSizeLimitMB=64 -volume.max=10
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:9000:9000"   # the S3 API
+      - "127.0.0.1:9333:9333"   # the master's status page
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9333/cluster/healthz"]
       interval: 3s
       timeout: 3s
       retries: 20
     volumes:
-      - minio-data:/data
+      - ./s3/s3.json:/etc/seaweedfs/s3.json:ro
+      - s3-data:/data
 
-  # One-shot: create the bucket the API expects, then exit.
-  minio-init:
-    image: quay.io/minio/mc:RELEASE.2024-03-30T15-29-52Z
+  # One-shot: create the bucket the API expects, then exit. The AWS CLI speaks to
+  # any S3, so nothing here is tied to the server that serves it.
+  s3-init:
+    image: amazon/aws-cli:2.37.3
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: devaccesskey
+      AWS_SECRET_ACCESS_KEY: devsecretkey
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint:
       - sh
       - -c
       - |
-        mc alias set local http://minio:9000 minioadmin minioadmin123
-        mc mb --ignore-existing local/frames
+        aws --endpoint-url http://s3:9000 s3api create-bucket --bucket frames >/dev/null 2>&1 ||
+          aws --endpoint-url http://s3:9000 s3api head-bucket --bucket frames
         echo "bucket 'frames' ready"
     restart: "no"
 
@@ -172,5 +184,5 @@ services:
 
 volumes:
   postgres-data:
-  minio-data:
+  s3-data:
   keycloak-data:

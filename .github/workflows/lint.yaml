@@ -19,6 +19,10 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v5
+        with:
+          # Pinned: when the latest-release lookup fails the action falls back to
+          # Helm 3, whose schema errors the negative render tests do not expect.
+          version: v4.3.0
 
       - name: helm lint
         run: helm lint helm/collab-hub
