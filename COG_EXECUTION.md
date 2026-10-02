@@ -301,7 +301,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | merged, #162 |
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | merged, #163 |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | merged, #174 |
-| 10 | #177 | Launch a Cog from the `collab-hub` CLI on a local dev hub: an end-to-end example | `feat/cog-local-example` | 6, 9 | M | in review, #PRNUM |
+| 10 | #177 | Launch a Cog from the `collab-hub` CLI on a local dev hub: an end-to-end example | `feat/cog-local-example` | 6, 9 | M | in review, #178 |
 | 11 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9, 10 | M | not started |
 | 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | not started |
 | 13 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 9 | M | not started |
@@ -558,7 +558,7 @@ Where a worker runs is the second axis under the runner, chosen by configuration
 - [x] At level 1 with registry access disabled, the directory source finds and launches a package by name, and a name or path outside the configured roots is refused.
 
 #### Phase 10 — A Cog launched from the CLI on the local dev hub: the example
-**Issue** #177 · **Branch** `feat/cog-local-example` · **Depends on** Phases 6, 9 · **Size** M · **Status** in review, #PRNUM
+**Issue** #177 · **Branch** `feat/cog-local-example` · **Depends on** Phases 6, 9 · **Size** M · **Status** in review, #178
 
 The whole path a user takes, demonstrable now: launch a Cog from `collab-hub`, see it running, stop it, on a hub that is two plain processes on one machine. It is a walking skeleton, the thinnest slice of three later phases, built first so there is something to show and to point a newcomer at; Phases 11, 12 and 15 then build each part out, and the example keeps running through all of them.
 
