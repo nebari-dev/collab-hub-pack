@@ -7,8 +7,8 @@ import httpx
 import pytest
 
 from collab_hub_execution import (
+    EnvelopeInvalid,
     KubernetesCogExecutor,
-    PauseRequest,
     ResultEnvelope,
     cog_slug,
     label_value,
@@ -201,9 +201,10 @@ class PausingWorkerHttp:
         return FakeResponse(200, {"pause": True, "reason": "needs approval"})
 
 
-def test_runner_pause_response_becomes_a_pause_request():
+def test_a_worker_asking_to_pause_is_not_answering_with_an_envelope():
+    # A Cog cannot pause a run; only its step's Gate can escalate one.
     worker = _executor(FakeK8sApi(), PausingWorkerHttp()).materialize("openteams/gated", "run-6")
-    with pytest.raises(PauseRequest):
+    with pytest.raises(EnvelopeInvalid):
         worker.interact("review", {"draft": "v1"})
 
 

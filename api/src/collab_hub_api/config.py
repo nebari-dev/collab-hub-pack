@@ -5,7 +5,17 @@ from collections.abc import Mapping
 from typing import Any, Literal, Self
 
 import l2sl
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from .cogs.catalog import (
@@ -177,12 +187,16 @@ def recommended_path_rules() -> list[PathRule]:
 
     ``/health`` and ``/health/db`` stay public because kubelet probes and
     uptime checks carry no credentials: a hardened map that drops them stops
-    the pod passing its own probes.
+    the pod passing its own probes. ``/v1/auth/cli`` stays public because a
+    command-line client asks it how to sign in before it holds any credential;
+    it names only what the realm's own discovery document publishes.
     """
 
     return [
         PathRule(path="/health", match="exact", access="public"),
         PathRule(path="/health/db", match="exact", access="public"),
+        # Where the collab-hub CLI learns how to sign in, asked before it holds a token.
+        PathRule(path="/v1/auth/cli", match="exact", access="public"),
         PathRule(path="/", match="exact", access="authenticated"),
         PathRule(path="/metrics", match="exact", access="authenticated"),
     ]
@@ -976,6 +990,116 @@ class CogsConfig(BaseModel):
         return self
 
 
+FEATURE_FLAGS: dict[str, str] = {}
+"""Every feature flag this hub knows: name to one line on what it exposes.
+
+Adding a flag starts here. A name that is not listed is refused wherever it
+appears: set in the environment or the chart, it stops startup; passed to
+:meth:`FeaturesConfig.enabled`, it raises. So a misspelled flag fails loudly
+instead of silently reading as off.
+"""
+
+RETIRED_FEATURE_FLAGS: frozenset[str] = frozenset()
+"""Flags that have been removed but that deployments may still set.
+
+When a flag's feature ships, move its name here from :data:`FEATURE_FLAGS`.
+A retired name is ignored, and the app logs a warning naming it, instead of
+stopping startup, so the chart
+that drops a flag can roll out before every deployment's values drop it.
+"""
+
+FEATURE_FLAG_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+"""A flag name: lowercase snake_case, the form environment keys arrive in.
+
+The same pattern as ``features.propertyNames`` in the chart's
+values.schema.json, so a name the registry accepts is one the chart accepts.
+"""
+
+
+def check_feature_flag_registry(flags: Mapping[str, str], retired: frozenset[str]) -> None:
+    """Refuse a registry whose names could never be set, or that is both live and retired."""
+    bad = sorted(name for name in (*flags, *retired) if not FEATURE_FLAG_NAME.fullmatch(name))
+    if bad:
+        raise ValueError(f"feature flag names must be lowercase snake_case: {', '.join(bad)}")
+    both = sorted(set(flags) & retired)
+    if both:
+        raise ValueError(f"feature flags both registered and retired: {', '.join(both)}")
+
+
+check_feature_flag_registry(FEATURE_FLAGS, RETIRED_FEATURE_FLAGS)
+
+_FLAG_VALUE = TypeAdapter(bool)
+
+
+class FeaturesConfig(BaseModel):
+    """Per-deployment switches for features that are on ``main`` but not yet exposed.
+
+    The mechanism is always on. Each flag is declared once in
+    :data:`FEATURE_FLAGS` and is off until a deployment sets it to true,
+    either in the chart's ``features`` values or as the environment variable
+    ``COLLAB_HUB_API__FEATURES__<NAME>``, following pydantic-settings' nested
+    variables:
+    https://docs.pydantic.dev/latest/concepts/pydantic_settings/#parsing-environment-variable-values
+
+    Values are parsed with pydantic's boolean rules, so ``true``, ``1``,
+    ``yes`` and ``on`` (any case) turn a flag on, and a value those rules
+    cannot parse stops startup instead of reading as off:
+    https://docs.pydantic.dev/latest/api/standard_library_types/#booleans
+
+    Code reads flags only through :meth:`enabled`: routes through the
+    ``get_features`` dependency, the admin UI through the ``features`` list in
+    its session payload. Flags are for work in progress and are removed once
+    the feature ships; a permanent operational switch belongs in its own
+    section as a documented ``bool`` field.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    _retired: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _parse_flags(cls, data: Any, handler: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return handler(data)
+        flags: dict[str, bool] = {}
+        retired: list[str] = []
+        for name in data:
+            # pydantic-settings lowercases environment keys; the chart's
+            # schema admits only lowercase names. Anything else is a typo.
+            flag = str(name)
+            if flag in RETIRED_FEATURE_FLAGS:
+                retired.append(flag)
+                continue
+            if flag not in FEATURE_FLAGS:
+                known = ", ".join(sorted(FEATURE_FLAGS)) or "none"
+                raise ValueError(f"unknown feature flag {name!r}; registered flags: {known}")
+            try:
+                flags[flag] = _FLAG_VALUE.validate_python(data[name])
+            except ValidationError:
+                # Name only the flag: Config hides input values in errors.
+                raise ValueError(f"feature flag {name!r} must be a boolean") from None
+        features = handler(flags)
+        features._retired = sorted(retired)
+        return features
+
+    def enabled(self, name: str) -> bool:
+        """Whether the named flag is on for this deployment. An unregistered name raises ``KeyError``."""
+        if name not in FEATURE_FLAGS:
+            raise KeyError(f"feature flag {name!r} is not registered in FEATURE_FLAGS")
+        return bool((self.__pydantic_extra__ or {}).get(name, False))
+
+    @property
+    def retired_names(self) -> list[str]:
+        """The retired flags this deployment still sets, sorted. The app factory logs them."""
+        return list(self._retired)
+
+    @property
+    def enabled_names(self) -> list[str]:
+        """The flags that are on for this deployment, sorted."""
+        return sorted(name for name, on in (self.__pydantic_extra__ or {}).items() if on)
+
+
 class BaseConfig(BaseSettings):
     server: ServerConfig = Field(default_factory=ServerConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
@@ -987,6 +1111,7 @@ class BaseConfig(BaseSettings):
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     cogs: CogsConfig = Field(default_factory=CogsConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
 
 
 class Config(BaseConfig):

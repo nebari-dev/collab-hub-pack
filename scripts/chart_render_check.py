@@ -75,6 +75,7 @@ class Rendered:
 
 def case_default(r: Rendered) -> None:
     assert r.cogs_env == ["COLLAB_HUB_API__COGS__INDEX__ENABLED"], r.cogs_env
+    assert not [n for n in r.env if n.startswith("COLLAB_HUB_API__FEATURES__")], "flag vars rendered with no flags set"
     assert r.value("COLLAB_HUB_API__COGS__INDEX__ENABLED") == "false"
     assert "cogs-ca-bundle" not in r.mounts and "cogs-ca-bundle" not in r.volumes
 
@@ -136,7 +137,16 @@ def case_reordered(r: Rendered) -> None:
     r.no_source_vars_for("mid.one")
 
 
+def case_features(r: Rendered) -> None:
+    flags = {n: r.value(n) for n in r.env if n.startswith("COLLAB_HUB_API__FEATURES__")}
+    assert flags == {
+        "COLLAB_HUB_API__FEATURES__COGS_UI": "true",
+        "COLLAB_HUB_API__FEATURES__NEW_THING": "false",
+    }, flags
+
+
 CASES = {
+    "features": case_features,
     "default": case_default,
     "fixture": case_fixture,
     "static-only": case_static_only,

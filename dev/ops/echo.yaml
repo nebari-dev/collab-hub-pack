@@ -1,0 +1,4 @@
+# Two steps that always complete.
+steps:
+  - {name: first, cog: echo, entry_point: run, input: {text: hello}}
+  - {name: second, cog: echo, entry_point: run, input: {text: again}}
