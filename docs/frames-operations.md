@@ -381,6 +381,14 @@ shared `frames.postgres.url`, migrated by the same
   never authorization principals. Indexed on `org_id` for member listing.
 - There is **no workspaces table**: `workspace_id` is the literal constant
   `"default"`.
+- `collab_track_events` and `collab_track_payloads` (version 12) — the Track
+  of every Cog run ([track](cog-execution/track.md)): the append-only events,
+  with a global `sequence` for replay order and a `schema` version per event,
+  and the step payloads too large to keep inline. The execution package's
+  `PostgresTrackStore` reads and writes them; on the hub they are created here
+  and never by that store's own `ensure_schema`, which serves the standalone
+  package and local use. A partial unique index admits one `op_submitted` per
+  run, so two replicas cannot both start it.
 
 Unlike the `frames_server_` tables, these are created by a single **versioned,
 lock-guarded runner**. One transaction takes
@@ -1722,7 +1730,7 @@ matter for Frames:
 
 - `scripts/smoke_frames_http.py` validates REST, MCP, metrics, and optional active state.
 - `scripts/smoke_frames_observability.sh` checks metrics plus structured request/audit logs.
-- `scripts/smoke_frames_minio_s3.sh` installs MinIO and validates S3-backed Frame content.
+- `scripts/smoke_frames_s3.sh` installs an S3 store (SeaweedFS) and validates S3-backed Frame content.
 - `scripts/smoke_frames_postgres_active_state.sh` installs Postgres and validates stored active-frame state.
 
 ## Identity Inventory Dry Run (Read-Only)

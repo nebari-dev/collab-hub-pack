@@ -1,0 +1,3 @@
+# A step whose worker answers ok: false: the run fails, and its step_failed keeps the code.
+steps:
+  - {name: attempt, cog: fails, entry_point: run}

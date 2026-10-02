@@ -73,6 +73,7 @@ from .routers import (
     connectors,
     frame_groups,
     frames,
+    identity,
     invitations,
     invite,
     org_invitations,
@@ -312,6 +313,10 @@ def make_app(config: BaseConfig) -> FastAPI:
                 "member_sources": sorted(single_org.member_sources),
             },
         )
+    # Logged here rather than during config validation, which runs before
+    # logging is configured.
+    for flag in config.features.retired_names:
+        logger.warning("feature_flag_retired_ignored", extra={"flag": flag})
     mcp = create_mcp_server(frames_store, active_store=active_frame_store)
     mcp_app = mcp.streamable_http_app()
     # MCP traffic authenticates through the same get_auth_context, which
@@ -349,6 +354,7 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.org_store = org_store
             app.state.mcp_server = mcp
             app.state.connectors_config = config.connectors
+            app.state.features = config.features
             # Process-wide bound on concurrent generic GitHub reads (api_get).
             # Created once here, where the sizing config is in hand and we're
             # already inside the event loop — so the route needs no lazy
@@ -732,6 +738,9 @@ def make_app(config: BaseConfig) -> FastAPI:
     # The Cog catalog read API (#85). /v1 only: it post-dates the unprefixed
     # legacy mounts, so there is no old client to keep answering.
     app.include_router(cogs.router, prefix="/v1")
+    # Who is calling, and how the collab-hub CLI signs in. /auth/cli is public:
+    # the hardened map lists it, since a client asks it before it holds a token.
+    app.include_router(identity.router, prefix="/v1")
 
     if config.web.enabled:
         # The browser surface (issue #88): session sign-in and the page

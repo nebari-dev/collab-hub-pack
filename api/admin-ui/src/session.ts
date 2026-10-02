@@ -23,6 +23,8 @@ export interface AdminSession {
   csrf_token: string;
   /** The build actually running, read from the package's own metadata. */
   version: string;
+  /** Feature flags that are on for this deployment, for gating unfinished screens. */
+  features: string[];
 }
 
 /**

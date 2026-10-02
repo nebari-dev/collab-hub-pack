@@ -1,0 +1,36 @@
+[project]
+name = "collab-hub-cli"
+version = "0.0.0.dev0"
+description = "collab-hub: a command-line client for the Collab Hub's REST API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.0",
+    "typer>=0.15.0",
+]
+
+[project.scripts]
+collab-hub = "collab_hub_cli.main:run"
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+test = [
+    "pytest>=8.3.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I001",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
