@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import httpx
 import pytest
@@ -499,4 +500,88 @@ def test_read_requests_reject_malformed_cursors(model, cursor):
 )
 def test_read_requests_accept_well_formed_cursors(cursor):
     assert SlackReadRequest(cursor=cursor).cursor == cursor
-    assert SlackThreadReadRequest(cursor=cursor).cursor == cursor
+    if not cursor.startswith("slack:") and cursor.count(":") < 2:
+        # Windowed cursors come only from channel reads (see the channel-only test).
+        assert SlackThreadReadRequest(cursor=cursor).cursor == cursor
+
+
+async def test_a_window_starting_before_2001_still_pages_with_valid_cursors(monkeypatch):
+    # since_date before 2001-09-09 gives a 9-digit timestamp; the read must still hand out
+    # cursors that the next request accepts, across both our cursor and Slack's.
+    request = SlackReadRequest(since_date=date(2000, 1, 1))
+    assert request.oldest == "946684800.000000"
+    sizes = [500, 500, 500, 500, 500, 500, 1_000, 1_000, 2_000]
+    history = [{"ts": f"17900000{i:02d}.000100", "user": "U0001", "text": "x" * size} for i, size in enumerate(sizes)]
+    seen_params: list[dict] = []
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        params = dict(request.url.params)
+        seen_params.append(params)
+        latest = params.get("latest")
+        resume = params.get("cursor", "").removeprefix("next_ts:")
+        pool = [
+            m
+            for m in reversed(history)
+            if (not latest or float(m["ts"]) <= float(latest)) and (not resume or float(m["ts"]) <= float(resume))
+        ]
+        page, rest = pool[:2], pool[2:]
+        return Response(
+            200,
+            json={
+                "ok": True,
+                "messages": page,
+                "has_more": bool(rest),
+                "response_metadata": {"next_cursor": f"next_ts:{rest[0]['ts']}" if rest else ""},
+            },
+        )
+
+    _install_mock_client(monkeypatch, handler)
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    read: list[str] = []
+    cursors: list[str] = []
+    messages, has_more, cursor = await slack.read_conversation(
+        channel_id="C0001", limit=2, oldest=request.oldest, max_chars=2_500
+    )
+    read.extend(m.ts for m in messages)
+    while has_more:
+        cursors.append(cursor)
+        next_request = SlackReadRequest(cursor=cursor)  # the next request must accept it
+        messages, has_more, cursor = await slack.read_conversation(
+            channel_id="C0001", limit=2, cursor=next_request.cursor, max_chars=2_500
+        )
+        read.extend(m.ts for m in messages)
+
+    assert read == [m["ts"] for m in reversed(history)]
+    assert any(c.startswith("ts:") for c in cursors) and any(c.startswith("slack:") for c in cursors)
+    assert not any(c.startswith("slack:") and ":ts:" in c for c in cursors)  # never wrapped twice
+    assert all(params["oldest"] == request.oldest for params in seen_params)
+
+
+def test_a_window_before_1970_is_clamped_to_the_epoch():
+    assert SlackReadRequest(since_date=date(1, 1, 1)).oldest == "0.000000"
+    assert SlackReadRequest(until_date=date(1, 1, 1)).latest == "0.000000"
+
+
+@pytest.mark.parametrize("cursor", ["slack:1789000000.000000:abc", "ts:1790000001.000100:1789000000.000000"])
+def test_thread_reads_reject_channel_only_cursors(cursor):
+    # These come only from channel reads; a thread read can't use them.
+    assert SlackReadRequest(cursor=cursor).cursor == cursor
+    with pytest.raises(ValidationError):
+        SlackThreadReadRequest(cursor=cursor)
+
+
+def test_search_hit_takes_thread_ts_from_the_permalink_when_slack_omits_the_field():
+    reply = slack_client_module._search_hit(
+        {
+            "ts": "1790000005.000100",
+            "text": "a reply",
+            "channel": {"id": "C0001"},
+            "permalink": "https://x.slack.com/archives/C0001/p1790000005000100?thread_ts=1790000000.000100&cid=C0001",
+        }
+    )
+    payload = reply.model_dump()
+    assert payload["thread_ts"] == "1790000000.000100"
+    assert "permalink" not in payload  # still never sent to the model

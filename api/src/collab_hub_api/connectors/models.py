@@ -341,19 +341,35 @@ class SlackMessage(BaseModel):
     reply_count: int = _omit_when_default(0)
 
 
+# A Slack message timestamp ("1790000000.000100"), and a time-window bound. A
+# bound can be shorter than a message ts: a since_date before 2001-09-09 has a
+# 9-digit epoch, and dates before 1970 are clamped to "0.000000".
 _SLACK_TS_PATTERN = r"\d{10,}\.\d{3,}"
+_SLACK_BOUND_PATTERN = r"\d+\.\d+"
 # The cursors the Slack reads hand out themselves: "ts:<ts>[:<oldest>]" after a
-# max_chars stop, and "slack:<oldest>:<Slack cursor>" for a time-windowed read.
-_SLACK_BUDGET_CURSOR = re.compile(rf"ts:{_SLACK_TS_PATTERN}(:{_SLACK_TS_PATTERN})?")
-_SLACK_WINDOWED_CURSOR = re.compile(rf"slack:{_SLACK_TS_PATTERN}:.+")
+# max_chars stop, and "slack:<oldest>:<Slack cursor>" for a time-windowed channel
+# read. A thread read only ever hands out "ts:<ts>".
+_SLACK_BUDGET_CURSOR = re.compile(rf"ts:{_SLACK_TS_PATTERN}(:{_SLACK_BOUND_PATTERN})?")
+_SLACK_WINDOWED_CURSOR = re.compile(rf"slack:{_SLACK_BOUND_PATTERN}:.+")
+_SLACK_THREAD_BUDGET_CURSOR = re.compile(rf"ts:{_SLACK_TS_PATTERN}")
+_INVALID_CURSOR = "cursor must be a next_cursor value returned by an earlier read"
 
 
 def _check_slack_read_cursor(cursor: str) -> str:
     """Reject a malformed ``ts:``/``slack:`` cursor with a 422; Slack's own cursors pass."""
     if cursor.startswith("ts:") and not _SLACK_BUDGET_CURSOR.fullmatch(cursor):
-        raise ValueError("cursor must be a next_cursor value returned by an earlier read")
+        raise ValueError(_INVALID_CURSOR)
     if cursor.startswith("slack:") and not _SLACK_WINDOWED_CURSOR.fullmatch(cursor):
-        raise ValueError("cursor must be a next_cursor value returned by an earlier read")
+        raise ValueError(_INVALID_CURSOR)
+    return cursor
+
+
+def _check_slack_thread_cursor(cursor: str) -> str:
+    """Like ``_check_slack_read_cursor``, but threads never use windowed cursors."""
+    if cursor.startswith("ts:") and not _SLACK_THREAD_BUDGET_CURSOR.fullmatch(cursor):
+        raise ValueError(_INVALID_CURSOR)
+    if cursor.startswith("slack:"):
+        raise ValueError(_INVALID_CURSOR)
     return cursor
 
 
@@ -433,7 +449,9 @@ class SlackReadRequest(BaseModel):
                     tzinfo=timezone.utc,
                 )
             if start is not None:
-                self.oldest = f"{start.timestamp():.6f}"
+                # Clamp to the epoch: Slack has nothing older, and a negative
+                # value would not be a valid bound.
+                self.oldest = f"{max(start.timestamp(), 0.0):.6f}"
 
         if not self.latest and self.until_date is not None:
             end = datetime(
@@ -446,7 +464,7 @@ class SlackReadRequest(BaseModel):
                 999999,
                 tzinfo=timezone.utc,
             )
-            self.latest = f"{end.timestamp():.6f}"
+            self.latest = f"{max(end.timestamp(), 0.0):.6f}"
 
         return self
 
@@ -466,7 +484,7 @@ class SlackThreadReadRequest(BaseModel):
     # Stop adding messages once their text would go over this many characters.
     max_chars: int = Field(default=12_000, ge=1, le=50_000)
 
-    _check_cursor = field_validator("cursor")(lambda cls, value: _check_slack_read_cursor(value))
+    _check_cursor = field_validator("cursor")(lambda cls, value: _check_slack_thread_cursor(value))
 
 
 class SlackThreadReadResponse(UntrustedConnectorResponse):

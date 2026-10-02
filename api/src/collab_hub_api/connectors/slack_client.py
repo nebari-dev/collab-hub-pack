@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -31,10 +32,13 @@ _BUDGET_CURSOR_PREFIX = "ts:"
 # "slack:<oldest>:<slack cursor>" so the bound survives that page too.
 _WINDOWED_SLACK_CURSOR_PREFIX = "slack:"
 
-# A Slack message timestamp ("1790000000.000100"). Our own cursors are only
-# recognised when every timestamp in them has this shape; anything else goes to
-# Slack unchanged, which rejects it, instead of crashing or restarting the read.
+# A Slack message timestamp ("1790000000.000100"), and a time-window bound, which
+# can be shorter (a pre-2001 date) or "0.000000". Our own cursors are only
+# recognised when they have these shapes. The request models reject anything else
+# with a 422; a direct client call sends it to Slack unchanged, which rejects it,
+# instead of crashing or restarting the read.
 _SLACK_TS = re.compile(r"\d{10,}\.\d{3,}")
+_SLACK_BOUND = re.compile(r"\d+\.\d+")
 
 # ``auth.test`` errors that mean the brokered token is not a usable Slack Web API
 # user token -- e.g. Keycloak brokered an OpenID sign-in/identity token instead of an
@@ -195,7 +199,7 @@ class SlackClient:
         messages, has_more, next_cursor = _messages_page(payload)
         window = params.get("oldest", "")
         messages, has_more, next_cursor = _apply_read_budget(messages, has_more, next_cursor, max_chars, oldest=window)
-        if window and next_cursor and _decode_budget_cursor(next_cursor) is None:
+        if window and next_cursor and not next_cursor.startswith(_BUDGET_CURSOR_PREFIX):
             # Slack's cursor would lose the window, so carry it along.
             next_cursor = _encode_windowed_slack_cursor(next_cursor, window)
         return messages, has_more, next_cursor
@@ -398,7 +402,7 @@ def _decode_budget_cursor(cursor: str) -> tuple[str, str] | None:
     if not cursor.startswith(_BUDGET_CURSOR_PREFIX):
         return None
     ts, _, oldest = cursor[len(_BUDGET_CURSOR_PREFIX) :].partition(":")
-    if not _SLACK_TS.fullmatch(ts) or (oldest and not _SLACK_TS.fullmatch(oldest)):
+    if not _SLACK_TS.fullmatch(ts) or (oldest and not _SLACK_BOUND.fullmatch(oldest)):
         return None
     return ts, oldest
 
@@ -412,7 +416,7 @@ def _decode_windowed_slack_cursor(cursor: str) -> tuple[str, str] | None:
     if not cursor.startswith(_WINDOWED_SLACK_CURSOR_PREFIX):
         return None
     oldest, _, slack_cursor = cursor[len(_WINDOWED_SLACK_CURSOR_PREFIX) :].partition(":")
-    if not _SLACK_TS.fullmatch(oldest) or not slack_cursor:
+    if not _SLACK_BOUND.fullmatch(oldest) or not slack_cursor:
         return None
     return slack_cursor, oldest
 
@@ -479,8 +483,15 @@ def _search_hit(item: dict) -> SlackSearchHit:
         author_name=str(item.get("username", "") or ""),
         text=text,
         truncated=truncated,
-        thread_ts=str(item.get("thread_ts", "") or ""),
+        thread_ts=str(item.get("thread_ts", "") or "") or _permalink_thread_ts(item),
     )
+
+
+def _permalink_thread_ts(item: dict) -> str:
+    """Slack search matches may only carry a reply's thread in its permalink."""
+    # The permalink itself is never sent to the model (see SlackSearchHit).
+    thread_ts = parse_qs(urlsplit(str(item.get("permalink", "") or "")).query).get("thread_ts", [""])[0]
+    return thread_ts if _SLACK_TS.fullmatch(thread_ts) else ""
 
 
 def _raise_for_slack_status(response: httpx.Response, *, operation: str) -> None:

@@ -70,16 +70,17 @@ Payloads are kept small for the model (#139):
 - Search hits carry at most the first 500 characters of each message and set
   `truncated: true` when the text was cut. Read the message by its `ts` for the
   full text: for a thread reply (the hit has `thread_ts`), use the thread read
-  with that `ts`, since the channel read only returns replies that were also
-  posted to the channel; otherwise use the channel read with
-  `oldest` = `latest` = `ts`.
+  with the hit's `thread_ts` as `message_ts` (a long thread may take a few
+  pages), since the channel read only returns replies that were also posted to
+  the channel; otherwise use the channel read with `oldest` = `latest` = `ts`.
 - The read endpoints accept `max_chars` (default 12,000, max 50,000). A page
   stops before the message that would go over it, never cutting a message, and
   returns `has_more: true` with a `next_cursor` that resumes exactly there
   (`ts:<ts>`, or `ts:<ts>:<oldest>` for a time-windowed read). A read's time
   window (`oldest`, `days_back` or `since_date`) is carried in `next_cursor`,
   so later pages stay inside it; Slack's own cursor is wrapped as
-  `slack:<oldest>:<cursor>` for that. If a request also sends its own `oldest`,
+  `slack:<oldest>:<cursor>` for that. These windowed cursors come only from the
+  channel read; a thread read only hands out `ts:<ts>`. If a request also sends its own `oldest`,
   that one is used. Treat `next_cursor` as opaque and send it back unchanged; a
   malformed `ts:` or `slack:` cursor is rejected with a 422.
 - Messages in a read don't repeat `channel_id`; it is set once on the response.
