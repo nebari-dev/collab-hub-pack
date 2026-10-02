@@ -16,6 +16,7 @@ import pytest
 from locations_support import gone, packages
 
 from collab_hub_execution import (
+    Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
     LifecycleRunner,
@@ -111,6 +112,86 @@ def test_a_request_to_cancel_is_delivered_to_the_run_in_flight():
     assert [e.payload for e in track.replay("r") if e.event_type == "cancelled"] == [{"actor": "bob"}]
     with pytest.raises(intents.RunEnded, match="has ended CANCELLED"):
         intents.request_cancel(track, "r", actor="bob")
+
+
+def test_racing_cancel_requests_are_recorded_once_and_none_lands_on_a_run_that_ended():
+    track = InMemoryTrackStore()
+    intents.submit(track, OpDefinition("r", (OpStep("a", "echo", "run"),)), by=BY)
+    start = threading.Barrier(8)
+
+    def ask(n):
+        start.wait()
+        intents.request_cancel(track, "r", actor=f"actor-{n}")
+
+    threads = [threading.Thread(target=ask, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert _types(track, "r").count("cancel_requested") == 1
+
+    # A run that ended on its own: the request is refused, and nothing is written after its end.
+    intents.submit(track, OpDefinition("done", (OpStep("a", "echo", "run"),)), by=BY)
+    _settle(_controller(track, {"echo": lambda entry, value: value}))
+    before = _types(track, "done")
+    with pytest.raises(intents.RunEnded, match="has ended COMPLETED"):
+        intents.request_cancel(track, "done", actor="bob")
+    assert _types(track, "done") == before and before[-1] == "completed"
+
+
+def test_a_cancel_request_a_run_outlived_does_not_cancel_its_retry():
+    # Asked for, but the run failed on its own before the controller delivered it. Retried, the
+    # run is a new attempt nobody asked to cancel.
+    track, fail = InMemoryTrackStore(), [True]
+
+    def flaky(entry, value):
+        return ResultEnvelope.failure("model-call-failed", "no") if fail.pop() else ResultEnvelope.success(value)
+
+    op = OpDefinition("r", (OpStep("a", "c", "run", 1),))
+    intents.submit(track, op, by=BY)
+    runner = LifecycleRunner(executor=InMemoryCogExecutor({"c": flaky}), track=track)
+    # The request lands while the run is still advancing, and the run fails before it is delivered.
+    real_materialize = runner.executor.materialize
+
+    def materialize(cog, run_id, instance=""):
+        intents.request_cancel(track, "r", actor="bob")
+        return real_materialize(cog, run_id, instance)
+
+    runner.executor.materialize = materialize
+    assert runner.submit(op) is RunState.FAILED
+    runner.executor.materialize = real_materialize
+    assert intents.describe(track, "r").cancel_requested_by == "bob"
+    fail.append(False)
+    controller = RunController(runner, poll_interval=0.01)
+    retried = threading.Thread(target=runner.retry, args=("r",))
+    retried.start()
+    retried.join()
+    _settle(controller)
+    view = intents.describe(track, "r")
+    assert view.state is RunState.COMPLETED and view.cancel_requested_by is None
+    assert "cancelled" not in _types(track, "r")
+
+
+@pytest.mark.parametrize(("end", "state"), [("cancel", "cancelled"), ("reject", "rejected"),
+                                             ("interrupt", "interrupted")])
+def test_a_step_waiting_at_its_gate_when_the_run_ends_ends_with_it(end, state):
+    track = InMemoryTrackStore()
+    op = OpDefinition("r", (OpStep("draft", "echo", "run", gate=Gate(escalate="always")), OpStep("b", "echo", "run")))
+    intents.submit(track, op, by=BY)
+    controller = _controller(track, {"echo": lambda entry, value: value})
+    _settle(controller)
+    assert [step.state for step in intents.describe(track, "r").steps] == ["waiting_at_gate", "pending"]
+    if end == "cancel":
+        intents.request_cancel(track, "r", actor="bob")
+        _settle(controller)
+    elif end == "reject":
+        runner = controller.runner
+        runner.decide("r", escalation=runner.open_escalation("r")["escalation"], actor="alice", outcome="reject")
+    else:
+        assert _controller(track, {}).start() == ("r",)
+    view = intents.describe(track, "r")
+    assert view.status == state.upper()
+    assert [step.state for step in view.steps] == [state, "pending"]
 
 
 def test_a_run_cancelled_before_pickup_never_starts_and_an_unknown_run_is_not_cancelled():

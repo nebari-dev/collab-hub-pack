@@ -9,7 +9,7 @@ and acts on it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -38,21 +38,44 @@ def submit(track: TrackStore, op: OpDefinition, *, by: Mapping[str, Any]) -> Non
         _append(track, op.run_id, record.event_type, record.payload)
 
 
+def cancel_request(events: Iterable[TrackEvent]) -> str | None:
+    """Who asked for the run to be cancelled, as it stands now; ``None`` when nobody has.
+
+    A request belongs to the attempt it was made of: one that a run outlived,
+    because it ended on its own first and was then retried, does not cancel the
+    retry.
+    """
+    actor = None
+    for event in events:
+        if event.event_type == CANCEL_REQUESTED:
+            actor = actor or event.payload.get("actor")
+        elif event.event_type == "retry_requested":
+            actor = None
+    return actor
+
+
 def request_cancel(track: TrackStore, run_id: str, *, actor: str) -> RunView:
     """Record that ``actor`` asked for a run to be cancelled; the controller tears it down and ends it.
 
     ``LookupError`` for a run never submitted, :class:`RunEnded` for one that
-    has ended. Asking twice records the request once.
+    has ended. Asking twice records the request once. The request is appended
+    only if, as it lands, the run has not ended and holds no request yet: the
+    check and the append are one step on the Track, so a run that ends, or a
+    second request that arrives, in between is seen.
     """
+    def still_wanted(events: tuple[TrackEvent, ...]) -> bool:
+        events = tuple(upgrade(event) for event in events)
+        run = Run.replay(events)
+        return run is not None and not run.state.ended and cancel_request(events) is None
+
+    request = TrackEvent(run_id=run_id, event_type=CANCEL_REQUESTED, payload={"actor": actor}, schema=SCHEMA_VERSION)
+    recorded = track.append_if(request, still_wanted)
     view = describe(track, run_id)
     if view is None:
         raise LookupError(f"no run {run_id!r} on the Track")
-    if view.state.ended:
+    if recorded is None and view.state.ended:
         raise RunEnded(view.state, CANCEL_REQUESTED, f"the run has ended {view.status}")
-    if view.cancel_requested_by is None:
-        _append(track, run_id, CANCEL_REQUESTED, {"actor": actor})
-        return describe(track, run_id)
-    return view
+    return view  # recorded now, or a request already stood
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,14 +121,13 @@ def describe(track: TrackStore, run_id: str) -> RunView | None:
     submission = next(event for event in events if event.event_type == "op_submitted")
     op = _deserialize_op(submission.payload["op"])
     steps: dict[str, dict[str, Any]] = {step.name: {"state": "pending"} for step in op.steps}
-    cancel_requested_by = error = reason = None
-    in_flight: set[str] = set()
+    error = reason = None
+    cancel_requested_by = cancel_request(events)
+    open_steps: set[str] = set()  # started, and neither completed nor failed: running, or waiting at a Gate
     for event in events:
         payload = event.payload
         step = steps.get(payload.get("step")) if isinstance(payload.get("step"), str) else None
-        if event.event_type == CANCEL_REQUESTED:
-            cancel_requested_by = cancel_requested_by or payload.get("actor")
-        elif event.event_type in ("failed", "budget_exceeded"):
+        if event.event_type in ("failed", "budget_exceeded"):
             error, reason = payload.get("error") or event.event_type, payload.get("reason")
         elif event.event_type == "retry_requested":
             error = reason = None
@@ -113,20 +135,20 @@ def describe(track: TrackStore, run_id: str) -> RunView | None:
             continue
         if event.event_type == "step_started":
             step.update(state="running", attempt=payload.get("attempt"), error=None)
-            in_flight.add(payload["step"])
-            continue
-        if event.event_type == "step_completed":
-            step.update(state="completed", output=payload.get("payload"), output_ref=payload.get("payload_ref"))
-        elif event.event_type == "step_failed":
-            step.update(state="failed", error=payload.get("error"))
+            open_steps.add(payload["step"])
         elif event.event_type == "gate_escalated":
             step.update(state="waiting_at_gate")
-        else:
-            continue
-        in_flight.discard(payload["step"])
+            open_steps.add(payload["step"])
+        elif event.event_type == "step_completed":
+            step.update(state="completed", output=payload.get("payload"), output_ref=payload.get("payload_ref"))
+            open_steps.discard(payload["step"])
+        elif event.event_type == "step_failed":
+            step.update(state="failed", error=payload.get("error"))
+            open_steps.discard(payload["step"])
     if run.state.ended:
-        # A step still in flight when its run ended did not finish: it ended with the run.
-        for name in in_flight:
+        # A step that was running, or waiting at its Gate, when its run ended did not finish: it
+        # ended with the run, cancelled, rejected or interrupted as the run was.
+        for name in open_steps:
             steps[name]["state"] = run.state.value
     return RunView(
         run_id=run_id, state=run.state, op=op,

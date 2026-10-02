@@ -170,6 +170,22 @@ def test_the_source_refuses_a_package_without_its_lock(tmp_path):
         DirectoryPackageSource([root]).resolve("echo")
 
 
+def test_the_source_names_only_the_packages_it_would_resolve(tmp_path):
+    # A directory with a manifest is listed only if it could run: with its lock, both files its
+    # own, and a `serve` task.
+    root = packages(tmp_path)
+    (root / "slow" / "pixi.lock").unlink()
+    (root / "fails" / "pixi.toml").write_text('[workspace]\nname = "fails"\n')
+    outside = tmp_path / "outside.lock"
+    shutil.copy(root / "spender" / "pixi.lock", outside)
+    (root / "spender" / "pixi.lock").unlink()
+    (root / "spender" / "pixi.lock").symlink_to(outside)
+    source = DirectoryPackageSource([root])
+    assert source.names() == ("echo", "env", "needs-review")
+    for name in source.names():
+        assert source.resolve(name).name == name
+
+
 def test_the_source_finds_no_package_without_a_serve_task(tmp_path):
     root = packages(tmp_path)
     with pytest.raises(PackageNotFound, match="no package 'absent'"):

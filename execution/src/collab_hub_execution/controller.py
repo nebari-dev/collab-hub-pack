@@ -27,7 +27,7 @@ import sys
 import threading
 from pathlib import Path
 
-from .intents import CANCEL_REQUESTED
+from .intents import cancel_request
 from .locations import AGENT_LOCATIONS
 from .runner import LifecycleRunner
 from .states import InvalidTransition, Run, RunState
@@ -66,7 +66,7 @@ class RunController:
             if run.state.ended:
                 self._ended.add(run_id)
                 continue
-            asked = next((e.payload.get("actor") for e in events if e.event_type == CANCEL_REQUESTED), None)
+            asked = cancel_request(events)
             if asked is not None:
                 if not self._alive(self._cancelling, run_id):
                     self._spawn(self._cancelling, run_id, self._cancel, run_id, asked)

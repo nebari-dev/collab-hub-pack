@@ -104,11 +104,12 @@ The process that accepts runs is not the one that advances them (ADR-0002 D4).
 | `POST /v1/runs` | Submit an Op: `steps`, each with `name`, `cog`, `entry_point`, `input` and `gate`. Records `op_submitted` with who submitted it, and answers 201 with the run, `SUBMITTED`. A `cog` that is not a package the controller can launch is a 422 naming the packages it can |
 | `GET /v1/runs` | The caller's organization's runs, newest first; `status`, `limit` and `offset` |
 | `GET /v1/runs/{id}` | One run: its status, each step's state, and each completed step's `output` |
-| `POST /v1/runs/{id}/cancel` | Records `cancel_requested` with the caller, and answers 202. A run that has ended is a 409 naming its status |
+| `POST /v1/runs/{id}/cancel` | Records `cancel_requested` with the caller, once, and answers 202. A run that has ended is a 409 naming its status, checked as the request is written |
 
 Every answer names the `backend` and the `location` the run is advanced with,
 so a client never assumes a run survives a restart or that its worker is
-isolated. A run belongs to the organization that submitted it; to any other it
+isolated. A step that was running, or waiting at its Gate, when its run ended
+is reported in the state the run ended in. A run belongs to the organization that submitted it; to any other it
 is a 404. The routes are authenticated, like every route the protection map
 does not open.
 

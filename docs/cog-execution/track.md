@@ -47,7 +47,12 @@ when a client submitted the run through the run API, which is what scopes the
 run to its organization. `cancel_requested` (`actor`) is what the API records
 when a client asks for a run to be cancelled: it leaves the run's state where
 it is, and the controller that reads it ends the run, which `cancelled`
-records.
+records. It is written with the store's conditional append (`append_if`), which
+checks the run's Track and appends in one step: the request is recorded only
+if the run has not ended and holds no request yet, so none is ever written
+after a run's end and two racing requests leave one. A request belongs to the
+attempt it was made of: one a run outlived, by ending on its own and being
+retried, does not cancel the retry.
 
 ### Step facts
 

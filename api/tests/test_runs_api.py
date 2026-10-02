@@ -33,6 +33,9 @@ def package(root, name):
 def runs_config(tmp_path) -> Config:
     for name in ("echo", "slow", "hidden"):
         package(tmp_path / "cogs", name)
+    # A directory that is allowlisted and has a manifest, and still cannot run: it has no lock.
+    package(tmp_path / "cogs", "unlocked")
+    (tmp_path / "cogs" / "unlocked" / "pixi.lock").unlink()
     return Config.parse({
         "storage": {"frames_path": str(tmp_path / "frames")},
         "frames": {"active_state": {"backend": "memory"}, "history": {"backend": "memory"},
@@ -40,7 +43,7 @@ def runs_config(tmp_path) -> Config:
         "tasks": {"backend": "memory"},
         "features": {"cog_runs": True},
         "runs": {"track_path": str(tmp_path / "track.sqlite"), "packages": [str(tmp_path / "cogs")],
-                 "allow": ["echo", "slow"]},
+                 "allow": ["echo", "slow", "unlocked"]},
     })
 
 
@@ -162,6 +165,7 @@ async def test_a_run_cancelled_before_any_controller_picked_it_up_never_starts(r
 
 
 @pytest.mark.parametrize(("cog", "why"), [("hidden", "not allowlisted"), ("absent", "not allowlisted"),
+                                          ("unlocked", "has no pixi.lock"),
                                           ("../echo", "not a package name")])
 async def test_a_step_naming_a_cog_the_hub_cannot_launch_is_refused_naming_those_it_can(runs_client, cog, why):
     body = {"steps": [{"name": "s", "cog": cog, "entry_point": "run"}]}
