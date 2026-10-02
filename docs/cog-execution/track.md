@@ -6,7 +6,7 @@ It is the only source of a run's status (ADR-0002 D3), and it is the
 accountability record — a Gate signature is worth something because the Track
 can say what was signed. This page is the reference for what the Track holds.
 The code is `collab_hub_execution.track` and the lifecycle runner that writes
-it, `collab_hub_execution.runner`, which `DurableWorkflowEngine` delegates to.
+it, `collab_hub_execution.runner`.
 
 ## Events
 
@@ -60,7 +60,7 @@ is reserved on step events for sensitivity labels (#13) and is not written yet.
 `payload_inline_max_bytes` (64 KiB by default) is kept beside the Track, and
 the event carries `payload_ref` instead of `payload`;
 `TrackStore.get_payload(ref)` returns it. The reference is the attempt's
-idempotency key, so recovering an attempt rewrites the same row instead of
+idempotency key, so retrying an interrupted attempt rewrites the same row instead of
 leaving another one, and at most one is ever kept per attempt. The result is
 rendered as JSON once, and that is what is measured and kept; a payload that
 is not JSON fails the step as `EnvelopeInvalid`, and the usage the worker

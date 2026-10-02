@@ -238,6 +238,20 @@ api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on ever
 		uv run --with watchfiles watchfiles 'python -m collab_hub_api' src
 
 # ---------------------------------------------------------------------------
+## Level 1 — running Cogs and Ops
+# ---------------------------------------------------------------------------
+
+OP      ?= echo
+BACKEND ?= none
+
+# In process, no container: the fake Cogs under cogs/ answer in the same
+# process, over the SQLite Track in .local/. The execution package's own
+# environment runs it; PyYAML reads the Op.
+op: ## Run a fake Op in process and print its Track (OP=echo|needs-review|fails|slow|spender, BACKEND=none)
+	cd $(ROOT)/execution && uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
+		--backend $(BACKEND) --track $(LOCAL)/track.sqlite
+
+# ---------------------------------------------------------------------------
 ## Level 2 — API with real datastores
 # ---------------------------------------------------------------------------
 

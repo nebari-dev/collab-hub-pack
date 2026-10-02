@@ -1,0 +1,6 @@
+# Two steps of 100 tokens under a budget of 150. Usage is known only after an interaction, so the
+# second step overspends, and the run stops at the next boundary, its end, instead of completing.
+budget: {max_tokens: 150}
+steps:
+  - {name: first, cog: spender, entry_point: run, input: {tokens: 100}}
+  - {name: second, cog: spender, entry_point: run, input: {tokens: 100}}

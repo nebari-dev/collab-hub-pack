@@ -4,9 +4,9 @@ import httpx
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     Problem,
@@ -53,7 +53,7 @@ def test_second_executor_and_http_stop_ten_step_run_at_fifteen_tokens(transport)
         worker = Worker() if transport == "local" else _KubernetesWorker("c", "w", "http://worker", client)
         executor = LocalExecutor(worker)
         track = InMemoryTrackStore()
-        engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
+        engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=15))
         assert engine.submit(op()) is RunState.BUDGET_EXCEEDED
         assert len(calls) == executor.torn_down == 2
         assert sum(e.payload["usage"]["tokens"] for e in track.replay("accounting")
@@ -67,14 +67,14 @@ def test_second_executor_and_http_stop_ten_step_run_at_fifteen_tokens(transport)
 def test_missing_or_invalid_tokens_fail_durably_without_starting_next_step(usage):
     executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)})
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
+    engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=15))
     assert engine.submit(op()) is RunState.FAILED
     events = track.replay("accounting")
     assert events[-1].payload["error"] == "UsageUnavailable"
     assert events[-1].payload["reason"]
     assert len(executor.materialized) == len(executor.torn_down) == 1
     # A restart cannot turn the unknown spending into a fresh zero balance.
-    restarted = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
+    restarted = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=15))
     assert restarted.retry("accounting") is RunState.FAILED
     assert len(executor.materialized) == 1
 
@@ -85,7 +85,7 @@ def test_missing_or_invalid_tokens_fail_durably_without_starting_next_step(usage
 ])
 def test_cost_budget_requires_a_valid_cost_report(usage):
     executor = InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)})
-    engine = DurableWorkflowEngine(executor=executor, track=InMemoryTrackStore(), budget=RunBudget(max_cost=1))
+    engine = LifecycleRunner(executor=executor, track=InMemoryTrackStore(), budget=RunBudget(max_cost=1))
     assert engine.submit(op()) is RunState.FAILED
     assert len(executor.materialized) == 1
 
@@ -98,7 +98,7 @@ def test_cost_budget_requires_a_valid_cost_report(usage):
     (None, RunBudget()),
 ])
 def test_explicit_zero_and_unbudgeted_unknown_usage_are_supported(usage, budget):
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(v, usage=usage)}),
         track=InMemoryTrackStore(), budget=budget,
     )
@@ -118,7 +118,7 @@ def test_explicit_zero_and_unbudgeted_unknown_usage_are_supported(usage, budget)
 def test_wrong_http_shape_or_misplaced_usage_cannot_disable_budget(body):
     with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body))) as client:
         executor = LocalExecutor(_KubernetesWorker("c", "w", "http://worker", client))
-        engine = DurableWorkflowEngine(executor=executor, track=InMemoryTrackStore(), budget=RunBudget(max_tokens=15))
+        engine = LifecycleRunner(executor=executor, track=InMemoryTrackStore(), budget=RunBudget(max_tokens=15))
         assert engine.submit(op()) is RunState.FAILED
         assert executor.torn_down == 1
 
@@ -126,7 +126,7 @@ def test_wrong_http_shape_or_misplaced_usage_cannot_disable_budget(body):
 def test_usage_inside_the_payload_is_output_not_accounting():
     payload = {"usage": {"tokens": 1000}, "answer": "unrelated field"}
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda e, v: ResultEnvelope.success(payload, usage={"tokens": 1})}),
         track=track, budget=RunBudget(max_tokens=15),
     )
@@ -142,7 +142,7 @@ def test_worker_must_return_declared_result_type():
             return {"output": "done", "usage": {"tokens": 1}}
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=LocalExecutor(Worker()), track=track)
+    engine = LifecycleRunner(executor=LocalExecutor(Worker()), track=track)
     assert engine.submit(op()) is RunState.FAILED
     failed = track.replay("accounting")[-1].payload
     assert failed["error"] == "EnvelopeInvalid"
@@ -159,7 +159,7 @@ def test_escalated_usage_and_completed_usage_survive_restart_without_double_coun
     track = InMemoryTrackStore()
 
     def engine():
-        return DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_tokens=15))
+        return LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_tokens=15))
 
     assert engine().submit(op(count=2)) is RunState.WAITING_AT_GATE
     escalation = engine().open_escalation("accounting")["escalation"]
@@ -167,7 +167,7 @@ def test_escalated_usage_and_completed_usage_survive_restart_without_double_coun
     # and that result is not discarded: its escalation is recorded and waits.
     assert engine().decide("accounting", escalation=escalation, actor="alice", outcome="send_back",
                            findings=["go"]) is RunState.WAITING_AT_GATE
-    assert engine()._budget_tracker(track.replay("accounting")).tokens == 18
+    assert engine().budget_tracker(track.replay("accounting")).tokens == 18
     assert len(executor.materialized) == 3
     # Approving that result spends nothing, keeps the work, and the run stops on its budget.
     second = engine().open_escalation("accounting")["escalation"]
@@ -182,7 +182,7 @@ def test_a_result_that_would_escalate_without_usage_fails_when_spending_is_bound
     def handler(entry, value):
         return ResultEnvelope.success(value, problems=[Problem("review", "needs another look")])
 
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": handler}), track=InMemoryTrackStore(), budget=RunBudget(max_tokens=15),
     )
     assert engine.submit(op()) is RunState.FAILED
@@ -196,7 +196,7 @@ def test_failed_interaction_does_not_reset_unknown_usage_on_retry():
         raise httpx.ReadTimeout("response lost")
 
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": handler}), track=track, budget=RunBudget(max_tokens=15),
     )
     assert engine.submit(op()) is RunState.FAILED
@@ -218,7 +218,7 @@ def test_accounting_survives_teardown_failure_and_retry():
 
     executor = Executor(Worker())
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=RunBudget(max_cost=1))
+    engine = LifecycleRunner(executor=executor, track=track, budget=RunBudget(max_cost=1))
     assert engine.submit(op()) is RunState.FAILED
     assert engine.retry("accounting") is RunState.BUDGET_EXCEEDED
     assert executor.torn_down == 2

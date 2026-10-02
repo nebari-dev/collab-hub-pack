@@ -43,6 +43,7 @@ The first thing that runs end to end is the primary goal: **the hub launches Her
 - **#134** — Phase 4: every Op step has a Gate, evaluated over the step's envelope, and a Cog can no longer pause a run — `PauseRequest` and `signal()` are gone. An escalation is recorded with its attempt, envelope and approvers under an id minted over both; `decide()` answers it as an actor, approve completing the step with the envelope its approver saw, reject ending the run `REJECTED`, send back re-running the step with the findings, and a decision on a closed escalation refused. The dev S3 frame store moved off MinIO on the way, whose images left quay.io as they had left Docker Hub (#114, #115), to SeaweedFS with the AWS CLI creating its bucket.
 - **#158** — Phase 5: Track event schema v1, versioned on every event. `step_completed` names the Cog, its digest, the binding, the problems, the usage and the Frames behind a result, inline or by reference above a threshold; `step_failed` carries the key, the worker, the code and a bounded message; `gate_escalated` and `gate_decided` carry the escalation id, the actor and the digest of the result decided on. A Track written before v1 reads through `track.upgrade`. A SQLite store joins the in-memory and Postgres ones under one conformance suite, and the hub's tables come from migration 12, which CI asserts. [`docs/cog-execution/track.md`](docs/cog-execution/track.md) is the reference.
 - **#159** — Phase 6: the `collab-hub` CLI under `cli/`, on Typer. `login` signs in the way the desktop does — the realm's `apollo-desktop` client, authorization code with PKCE and a `127.0.0.1` loopback redirect, with `--port` for an SSH forward and `--with-token` for scripts — and `logout` ends the realm session and revokes its refresh token. The session is stored `0600`, sent only to its own hub, renewed before it expires, kept through a realm outage, and ended at the realm when a new sign-in replaces it. `whoami` reads the new `GET /v1/me`; the public `GET /v1/auth/cli` names the issuer and client, so the hub's URL is all a user types. `cog list` and `cog show` read the catalog. CI signs in against the real dev realm at level 3. #125, which asked for a device flow, stays open.
+- **#162** — Phase 7: the lifecycle lives in `LifecycleRunner`, as step functions registered in `STEP_FUNCTIONS` — resolve, materialize, interact, read the envelope, teardown, evaluate the Gate, then complete, escalate or fail — and the one driver that sequences them. Every Track write the suite makes stayed identical, and no existing test changed. The Op and the seam's types moved to `ops.py`.
 - **#81, #82, #83** — the Cog bundle reader, the OCI client and the registry sources (PRs #89, #88, #90).
 - **#23** — superseded; #20 was closed in favour of #2–#5.
 
@@ -295,8 +296,8 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 4 | #99 | Declare Gates on Op steps, and take pausing away from Cogs | `feat/cog-step-gates` | 2, 3 | M | merged, #134 |
 | 5 | #5 | Record a durable, replayable Track of every run | `feat/cog-track-record-5` | 2, 3, 4 | M | merged, #158 |
 | 6 | #125, in part | The `collab-hub` CLI: sign in, and list the Cogs the hub offers | `feat/cli-auth` | — | M | merged, #159 |
-| 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | in review, #162 |
-| 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | not started |
+| 7 | #100 | Extract a lifecycle runner from the execution engine, with no behaviour change | `enh/cog-lifecycle-runner` | 3, 5 | M | merged, #162 |
+| 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | in review, #163 |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | not started |
 | 10 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9 | M | not started |
 | 11 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10 | M | not started |
@@ -491,7 +492,7 @@ A terminal client for the hub, and the thing every later command needs first: a 
 Where the two configuration axes are born, each with its first value: `none` for durability, `local` for location. By the end of it the hub's controller runs a fake Cog as a child process, picks runs up from the Track, and answers honestly when it is killed.
 
 #### Phase 7 — Extract the lifecycle runner, no behaviour change
-**Issue** #100 · **Branch** `enh/cog-lifecycle-runner` · **Depends on** Phases 3, 5 · **Size** M · **Status** in review, #162
+**Issue** #100 · **Branch** `enh/cog-lifecycle-runner` · **Depends on** Phases 3, 5 · **Size** M · **Status** merged as #162
 
 A pure refactor, so the phase that changes behaviour is reviewed against a known baseline rather than inside a move.
 
@@ -508,7 +509,7 @@ A pure refactor, so the phase that changes behaviour is reviewed against a known
 - [x] `DurableWorkflowEngine` makes no lifecycle decision itself.
 
 #### Phase 8 — The durability seam and the `none` backend
-**Issue** #101 · **Branch** `feat/cog-durability-none` · **Depends on** Phase 7 · **Size** L
+**Issue** #101 · **Branch** `feat/cog-durability-none` · **Depends on** Phase 7 · **Size** L · **Status** in review, #163
 
 The runner, with the durability engine plugged in or absent — and `none`, the absent case, ships first.
 
@@ -525,10 +526,10 @@ The runner, with the durability engine plugged in or absent — and `none`, the 
 *Dev and CI* — `make op OP=<name>` at level 1 runs a fake Op in process and prints its Track; Op definitions live in `dev/ops/<name>.yaml`, fake Cogs under `dev/cogs/` (`echo`, `needs-review`, `fails`, `slow`, `spender`); both suites run in `test-execution.yaml`. *Docs* — a new `docs/cog-execution/runs.md` opening with the backends table; the root `README.md` gains *Known limitations*, starting with "`none` does not survive a restart".
 
 *Acceptance*
-- [ ] A multi-step Op with a Gate completes on `none` through the runner.
-- [ ] After a restart, every run `none` had in flight is `interrupted` on the Track, and none of them resumes.
-- [ ] No caller imports a concrete backend; the configuration value is the only switch.
-- [ ] A test proves all backends call the same step functions, by spying on `STEP_FUNCTIONS` under each, and none reimplements the driver.
+- [x] A multi-step Op with a Gate completes on `none` through the runner.
+- [x] After a restart, every run `none` had in flight is `interrupted` on the Track, and none of them resumes.
+- [x] No caller imports a concrete backend; the configuration value is the only switch.
+- [x] A test proves all backends call the same step functions, by spying on `STEP_FUNCTIONS` under each, and none reimplements the driver.
 
 #### Phase 9 — Agent location: `local` first, `remote` behind the same switch
 **Issue** #109 · **Branch** `feat/cog-agent-location` · **Depends on** Phase 8 · **Size** M

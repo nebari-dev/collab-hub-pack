@@ -1,16 +1,15 @@
-"""The lifecycle runner: the lifecycle lives in its step functions, and the engine only delegates to it."""
+"""The lifecycle runner: the lifecycle lives in its step functions and the one driver that runs them."""
 
 from __future__ import annotations
 
 import ast
-import inspect
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
+    STEP_FUNCTIONS,
     Gate,
     InMemoryCogExecutor,
     InMemoryTrackStore,
@@ -20,7 +19,7 @@ from collab_hub_execution import (
     RunBudget,
     RunState,
 )
-from collab_hub_execution.orchestration import STEP_FUNCTIONS, LifecycleRunner
+from collab_hub_execution.runner import LifecycleRunner
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "collab_hub_execution"
 
@@ -33,8 +32,7 @@ def test_the_step_functions_are_registered():
     assert all(getattr(LifecycleRunner, name) is function for name, function in STEP_FUNCTIONS.items())
 
 
-def _spied(engine: DurableWorkflowEngine, calls: list[str]) -> DurableWorkflowEngine:
-    runner = engine.runner
+def _spied(runner: LifecycleRunner, calls: list[str]) -> LifecycleRunner:
     for name in STEP_FUNCTIONS:
         bound = getattr(runner, name)
 
@@ -43,11 +41,11 @@ def _spied(engine: DurableWorkflowEngine, calls: list[str]) -> DurableWorkflowEn
             return _bound(*args, **kwargs)
 
         setattr(runner, name, spy)
-    return engine
+    return runner
 
 
-def _engine(handlers, calls, **kwargs) -> DurableWorkflowEngine:
-    return _spied(DurableWorkflowEngine(executor=InMemoryCogExecutor(handlers), track=InMemoryTrackStore(),
+def _engine(handlers, calls, **kwargs) -> LifecycleRunner:
+    return _spied(LifecycleRunner(executor=InMemoryCogExecutor(handlers), track=InMemoryTrackStore(),
                                         **kwargs), calls)
 
 
@@ -58,7 +56,7 @@ def test_a_completed_step_goes_through_the_runner_s_step_functions():
     assert calls == ["resolve", "materialize", "interact", "read_envelope", "teardown", "evaluate_gate", "complete"]
 
 
-def test_every_step_function_is_reached_through_the_engine():
+def test_every_step_function_is_reached_through_the_runner():
     calls: list[str] = []
     # An escalation, then its approval.
     engine = _engine({"c": lambda entry, value: value}, calls)
@@ -82,19 +80,6 @@ def test_every_step_function_is_reached_through_the_engine():
     assert set(calls) == set(STEP_FUNCTIONS)
 
 
-@pytest.mark.parametrize("method", ["submit", "retry", "decide", "observe", "open_escalation", "_budget_tracker"])
-def test_the_engine_makes_no_lifecycle_decision_it_only_delegates(method):
-    # Each engine method is one return of the runner's method of the same name.
-    tree = ast.parse(inspect.getsource(getattr(DurableWorkflowEngine, method)).strip())
-    [function] = tree.body
-    body = [node for node in function.body if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))]
-    assert len(body) == 1 and isinstance(body[0], ast.Return), ast.dump(function)
-    call = body[0].value
-    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-    assert ast.unparse(call.func.value) == "self.runner"
-    assert call.func.attr == method.lstrip("_")
-
-
 def test_no_step_function_assigns_a_state_itself():
     # States move only through the machines' transitions, whose records the runner writes.
     tree = ast.parse((SOURCE / "runner.py").read_text())
@@ -115,8 +100,7 @@ def test_every_write_while_a_run_advances_reaches_the_pass_history():
 
     bypassed: list[str] = []
 
-    def watched(engine: DurableWorkflowEngine) -> DurableWorkflowEngine:
-        runner = engine.runner
+    def watched(runner: LifecycleRunner) -> LifecycleRunner:
         real = runner._append
 
         def append(run_id, event_type, payload, into=None):
@@ -125,15 +109,15 @@ def test_every_write_while_a_run_advances_reaches_the_pass_history():
             return real(run_id, event_type, payload, into)
 
         runner._append = append
-        return engine
+        return runner
 
     spender = {"c": lambda entry, value: ResultEnvelope.success(value, usage={"tokens": 10})}
-    watched(DurableWorkflowEngine(executor=InMemoryCogExecutor(spender), track=InMemoryTrackStore(),
+    watched(LifecycleRunner(executor=InMemoryCogExecutor(spender), track=InMemoryTrackStore(),
                                   budget=RunBudget(max_tokens=5))).submit(
         OpDefinition("spent", (OpStep("a", "c", "run"), OpStep("b", "c", "run"))))
-    watched(DurableWorkflowEngine(executor=FailingTeardown({"c": lambda entry, value: value}),
+    watched(LifecycleRunner(executor=FailingTeardown({"c": lambda entry, value: value}),
                                   track=InMemoryTrackStore())).submit(OpDefinition("leak", (OpStep("s", "c", "run"),)))
-    gated = watched(DurableWorkflowEngine(executor=InMemoryCogExecutor({"c": lambda entry, value: value}),
+    gated = watched(LifecycleRunner(executor=InMemoryCogExecutor({"c": lambda entry, value: value}),
                                           track=InMemoryTrackStore()))
     gated.submit(OpDefinition("gated", (OpStep("s", "c", "run", gate=Gate(escalate="always")),)))
     gated.decide("gated", escalation=gated.open_escalation("gated")["escalation"], actor="alice", outcome="approve")
