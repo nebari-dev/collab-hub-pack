@@ -1139,6 +1139,46 @@ async def test_slack_read_reports_upstream_error_detail(tmp_path, monkeypatch):
     assert "slack-token-alice" not in response.text
 
 
+async def test_slack_read_routes_pass_max_chars_to_the_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+    messages = [{"ts": f"17900000{i:02d}.000100", "user": "U0001", "text": "x" * 1_000} for i in range(3)]
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        return Response(200, json={"ok": True, "messages": messages, "has_more": False})
+
+    original_async_client = httpx.AsyncClient
+
+    def mock_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
+    app = make_app(slack_connector_config(tmp_path))
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            read = await client.post(
+                "/v1/connectors/slack/channels/C0001/read",
+                headers=auth_header(),
+                json={"limit": 10, "max_chars": 1_500},
+            )
+            thread = await client.post(
+                "/v1/connectors/slack/channels/C0001/threads/1790000000.000100/read",
+                headers=auth_header(),
+                json={"limit": 10, "max_chars": 1_500},
+            )
+
+    for response in (read, thread):
+        assert response.status_code == 200
+        assert len(response.json()["messages"]) == 1
+        assert response.json()["has_more"] is True
+        assert response.json()["next_cursor"] == "ts:1790000001.000100"
+
+
 async def test_slack_search_endpoint_rejected_when_not_connected(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")

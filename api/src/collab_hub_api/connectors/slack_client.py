@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import httpx
@@ -29,6 +30,11 @@ _BUDGET_CURSOR_PREFIX = "ts:"
 # read has a lower time bound, its Slack cursor is wrapped as
 # "slack:<oldest>:<slack cursor>" so the bound survives that page too.
 _WINDOWED_SLACK_CURSOR_PREFIX = "slack:"
+
+# A Slack message timestamp ("1790000000.000100"). Our own cursors are only
+# recognised when every timestamp in them has this shape; anything else goes to
+# Slack unchanged, which rejects it, instead of crashing or restarting the read.
+_SLACK_TS = re.compile(r"\d{10,}\.\d{3,}")
 
 # ``auth.test`` errors that mean the brokered token is not a usable Slack Web API
 # user token -- e.g. Keycloak brokered an OpenID sign-in/identity token instead of an
@@ -173,8 +179,9 @@ class SlackClient:
         if budget is not None:
             budget_ts, window_oldest = budget
             # A budget cursor picks up where the last page's budget stopped:
-            # everything at or before that ts, i.e. the next (older) page.
-            params["latest"] = budget_ts
+            # everything at or before that ts, i.e. the next (older) page. If the
+            # caller also sent its own latest, keep whichever is older.
+            params["latest"] = min(budget_ts, latest, key=float) if latest else budget_ts
         elif windowed is not None:
             slack_cursor, window_oldest = windowed
             params["cursor"] = slack_cursor
@@ -387,6 +394,8 @@ def _decode_budget_cursor(cursor: str) -> tuple[str, str] | None:
     if not cursor.startswith(_BUDGET_CURSOR_PREFIX):
         return None
     ts, _, oldest = cursor[len(_BUDGET_CURSOR_PREFIX) :].partition(":")
+    if not _SLACK_TS.fullmatch(ts) or (oldest and not _SLACK_TS.fullmatch(oldest)):
+        return None
     return ts, oldest
 
 
@@ -399,6 +408,8 @@ def _decode_windowed_slack_cursor(cursor: str) -> tuple[str, str] | None:
     if not cursor.startswith(_WINDOWED_SLACK_CURSOR_PREFIX):
         return None
     oldest, _, slack_cursor = cursor[len(_WINDOWED_SLACK_CURSOR_PREFIX) :].partition(":")
+    if not _SLACK_TS.fullmatch(oldest) or not slack_cursor:
+        return None
     return slack_cursor, oldest
 
 

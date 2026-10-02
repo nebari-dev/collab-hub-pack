@@ -384,3 +384,31 @@ async def test_time_window_survives_a_switch_from_the_budget_cursor_to_slacks_cu
     assert read == [m["ts"] for m in reversed(history[2:])]  # every message in the window, none older
     assert any("cursor" in params for params in seen_params)  # Slack's own cursor was used along the way
     assert all(params["oldest"] == window_start for params in seen_params)
+
+
+@pytest.mark.parametrize(
+    "cursor", ["ts:", "ts:abc", "ts:1790000001.000100:abc", "slack:", "slack:abc:xyz", "slack:1790000001.000100:"]
+)
+async def test_malformed_cursors_go_to_slack_unchanged_instead_of_crashing(monkeypatch, cursor):
+    seen_params: list[dict] = []
+    _install_mock_client(monkeypatch, _history_handler(_messages(3, 10), seen_params))
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    await slack.read_conversation(channel_id="C0001", limit=10, cursor=cursor)
+    await slack.read_thread(channel_id="C0001", message_ts="1790000000.000100", limit=10, cursor=cursor)
+
+    # Not recognised as one of our cursors, so Slack sees it as-is and can reject it.
+    assert all(params.get("cursor") == cursor for params in seen_params)
+    assert all("latest" not in params and "oldest" not in params for params in seen_params)
+
+
+async def test_budget_cursor_never_reads_past_the_callers_own_latest(monkeypatch):
+    seen_params: list[dict] = []
+    _install_mock_client(monkeypatch, _history_handler(_messages(5, 10), seen_params))
+    slack = SlackClient(access_token="token", api_base_url="https://slack.test/api")
+
+    await slack.read_conversation(
+        channel_id="C0001", limit=10, latest="1790000001.000100", cursor="ts:1790000003.000100"
+    )
+
+    assert seen_params[0]["latest"] == "1790000001.000100"
