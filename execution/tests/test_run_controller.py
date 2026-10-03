@@ -395,6 +395,7 @@ def test_one_run_that_cannot_be_read_hides_no_other_run():
                             schema=SCHEMA_VERSION))
     intents.submit(track, OpDefinition("good", (OpStep("a", "echo", "run", 1),)), by=BY)
     controller = _controller(track, {"echo": lambda entry, value: value})
+    assert controller.start() == ()  # a host starts, passing over the run it cannot read
     _settle(controller)
     assert intents.describe(track, "good").state is RunState.COMPLETED  # picked up, despite the broken run
     assert [view.run_id for view in intents.list_runs(track)] == ["good"]  # listed, the broken one left out
@@ -488,3 +489,21 @@ def test_run_views_read_only_what_each_track_gained():
     track.read.clear()
     assert views.view("r1").cancel_requested_by == "bob" and track.read == [1]  # only the new event
     assert views.views(org_id="other") == () and views.views(status="SUBMITTED")[0].run_id in ("r0", "r1", "r2")
+
+
+def test_run_views_keep_nothing_for_unknown_ids_and_let_an_ended_runs_events_go():
+    track = InMemoryTrackStore()
+    views = intents.RunViews(track)
+    for n in range(1000):  # ids nobody submitted, as any client can ask for
+        assert views.view(f"run-{n:012d}") is None
+    assert views._kept == {}
+    intents.submit(track, OpDefinition("r", (OpStep("a", "c", "run"),)), by=BY)
+    turn = intents.request_turn(track, "r", text="hello", actor="alice")
+    intents.request_cancel(track, "r", actor="bob")
+    _settle(_controller(track, {"c": lambda entry, value: value}))
+    view = views.view("r")
+    assert view.state is RunState.CANCELLED and views._kept["r"].events is None  # ended: events let go
+    assert views.turns("r")[turn.turn].state == "failed"  # its turns are still told
+    assert [event.event_type for event in views.events("r")][-1] == "cancelled"  # read again when asked
+    views.forget("r")
+    assert views._kept == {}

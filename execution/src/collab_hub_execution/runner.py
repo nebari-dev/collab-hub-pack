@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -52,8 +53,10 @@ from .ops import (
     _deserialize_op,
     _serialize_op,
 )
-from .states import RUN, Run, RunState, Transition, Worker
+from .states import RUN, InvalidTransition, Run, RunState, Transition, Worker
 from .track import PAYLOAD_INLINE_MAX_BYTES, SCHEMA_VERSION, TrackEvent, TrackStore, upgrade
+
+_log = logging.getLogger(__name__)
 
 # A failure's message on the Track is bounded, so a stack trace or a model's
 # answer cannot turn the accountability record into a log.
@@ -492,6 +495,10 @@ class LifecycleRunner(WorkflowEngine):
                         interrupted.append(run_id)
             except RunBusy:
                 continue
+            except InvalidTransition as exc:
+                # A Track the machine cannot replay is passed over, as a controller's pass passes over
+                # it: one such run never keeps a host from starting, and nothing is written to it.
+                _log.warning("run %s cannot be read, and is left as it is: %s", run_id, exc)
         return tuple(interrupted)
 
     def live_worker(self, run_id: str) -> CogWorker | None:

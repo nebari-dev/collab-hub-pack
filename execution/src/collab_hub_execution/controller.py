@@ -83,6 +83,7 @@ class RunController:
             return
         if view.state.ended:
             self._ended.add(run_id)
+            self.views.forget(run_id)  # never read again here: keep nothing of it
             return
         if view.cancel_requested_by is not None:
             if not self._alive(self._cancelling, run_id):
