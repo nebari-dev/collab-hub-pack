@@ -59,6 +59,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from starlette.concurrency import run_in_threadpool
 
@@ -75,6 +76,9 @@ from .oci import (
 )
 from .registry import RegistrySource, is_repository_path
 from .registry_credentials import RegistryCredentialStore
+
+if TYPE_CHECKING:
+    from .publishing import CogPublisher
 
 logger = logging.getLogger("frames_server.cogs.serving")
 
@@ -320,5 +324,7 @@ class CogRegistryServing:
     credential_ttl_seconds: int
     token_ttl_seconds: int
     max_blob_seconds: float
+    publisher: CogPublisher | None = None
+    """Pushes through the Hub (issue #180); ``None`` unless a source is marked ``publish: true``."""
     max_metadata_seconds: float = 30.0
     """Deadline on every read that is not a blob body: manifests, tags, and ``HEAD`` of a blob."""

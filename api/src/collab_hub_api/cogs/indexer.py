@@ -267,9 +267,14 @@ class CogIndexer:
         max_bytes_per_file: int = DEFAULT_MAX_BUNDLE_FILE_BYTES,
         drain_deadline_seconds: float = DRAIN_DEADLINE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        published_repositories: Callable[[str], Sequence[str]] | None = None,
     ) -> None:
         self._store = store
         self._sources = list(sources)
+        # Repositories published through the Hub into a source (issue #180):
+        # enumerated along with whatever the source itself lists, so the
+        # publish target needs no configured repository list.
+        self._published_repositories = published_repositories
         self._max_artifacts = max_artifacts_per_repository
         self._drain_deadline = drain_deadline_seconds
         self._max_new_fetches = max_new_fetches_per_sweep
@@ -554,6 +559,16 @@ class CogIndexer:
         return summary
 
     async def _sweep_source(self, source: RegistrySource, summary: SweepSummary) -> None:
+        # With publishing through the Hub, rows are also written outside the
+        # sweep, at any moment. What the catalog held before this source was
+        # enumerated is remembered, so that a row which appears while the
+        # sweep runs -- published after the registry was listed -- is not
+        # declared gone by a listing that predates it (see the removal below).
+        held_before: set[tuple[str, str]] | None = None
+        if self._published_repositories is not None:
+            held_before = {
+                (row.repository, row.digest) for row in await self._on_thread(self._store.known, source.id)
+            }
         enumeration = await self._enumerate(source)
         if enumeration.errors:
             summary.sources_failed += 1
@@ -601,6 +616,12 @@ class CogIndexer:
         # reconciled. Deferred fetches do NOT skip removal: those artifacts
         # were enumerated and stand in the present set.
         present = {repo: [artifact.digest for artifact in artifacts] for repo, artifacts in enumeration.present.items()}
+        if held_before is not None:
+            for row in await self._on_thread(self._store.known, source.id):
+                if (row.repository, row.digest) not in held_before and not row.removed:
+                    # Written since this sweep began: the next sweep, whose
+                    # listing can include it, is the one to judge it.
+                    present.setdefault(row.repository, []).append(row.digest)
         removed = await self._on_thread(
             self._store.mark_removed, source.id, present, excluding=enumeration.failed_repositories
         )
@@ -683,6 +704,11 @@ class CogIndexer:
             result.complete = False
             result.errors.append(f"list_repositories: {_describe(exc)}")
             return result
+        if self._published_repositories is not None:
+            # A store read, outside the guard above on purpose: like every
+            # other store error, a database outage here aborts the sweep.
+            published = await self._on_thread(self._published_repositories, source.id)
+            repositories = sorted(set(repositories) | set(published))
         for repository in repositories:
             try:
                 artifacts = await source.list_artifacts(repository)
@@ -784,6 +810,21 @@ class CogIndexer:
         source = self._source(source_id)
         ref = ArtifactRef(digest=digest, tags=tuple(sorted(set(tags))), pushed_at=pushed_at)
         row = await self._read_artifact(source, repository, ref)
+        return await self._store_row(row, targeted=True)
+
+    async def inspect(self, source: RegistrySource, repository: str, artifact: ArtifactRef) -> CogArtifact:
+        """Read one artifact into the row a sweep would store, **without storing it**.
+
+        The reader a publish is validated with before its manifest is
+        accepted (issue #180): the same code path as a sweep, so "would it
+        index" has one answer. Never raises except for cancellation.
+        """
+
+        return await self._read_artifact(source, repository, artifact)
+
+    async def record(self, row: CogArtifact) -> CogArtifact:
+        """Store a row obtained from :meth:`inspect`, on the lock-less targeted path :meth:`reindex` uses."""
+
         return await self._store_row(row, targeted=True)
 
     async def mark_removed(self, source_id: str, repository: str, digest: str) -> bool:

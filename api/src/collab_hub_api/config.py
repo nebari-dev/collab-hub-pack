@@ -27,6 +27,13 @@ from .cogs.catalog import (
 )
 from .cogs.indexer import CogIndexer
 from .cogs.oci import install_log_redaction
+from .cogs.publish_store import (
+    InMemoryPublishStore,
+    PostgresPublishStore,
+    PublishStore,
+    UnavailablePublishStore,
+)
+from .cogs.publishing import CogPublisher, PublishPolicy
 from .cogs.registry import CogRegistrySourceConfig, build_registry_sources, registry_host
 from .cogs.registry_credentials import (
     InMemoryRegistryCredentialStore,
@@ -940,6 +947,34 @@ class CogServeConfig(BaseModel):
         return origin_authority(self.public_url)
 
 
+class CogPublishConfig(BaseModel):
+    """Who may publish Cogs through the Hub (issue #180). Nobody, by default.
+
+    Publishing is switched on by marking one registry source ``publish:
+    true``; this block only says who holds the permission. Pull rights never
+    imply it.
+
+    ``allowed_roles`` grants it by role: ``operator`` (the platform role),
+    ``owner`` and ``member`` (the caller's role in their organization). Roles
+    exist only where the Hub resolves organizations from membership; under
+    claims-sourced auth nobody has one, and ``allowed_users`` -- a list of
+    user ids, as the Hub's ACL principal -- is the only way to grant it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed_roles: list[Literal["operator", "owner", "member"]] = Field(default_factory=list)
+    allowed_users: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_users")
+    @classmethod
+    def _check_users(cls, value: list[str]) -> list[str]:
+        cleaned = [user.strip() for user in value]
+        if any(not user for user in cleaned):
+            raise ValueError("cogs.publish.allowed_users entries must not be blank")
+        return cleaned
+
+
 COGS_SOURCE_SECRET_ENV_FIELDS: tuple[tuple[str, str, bool], ...] = (
     ("username_env", "username", False),
     ("password_env", "password", True),
@@ -1073,6 +1108,7 @@ class CogsConfig(BaseModel):
     index: CogIndexConfig = Field(default_factory=CogIndexConfig)
     catalog: CogCatalogConfig = Field(default_factory=CogCatalogConfig)
     serve: CogServeConfig = Field(default_factory=CogServeConfig)
+    publish: CogPublishConfig = Field(default_factory=CogPublishConfig)
 
     @field_validator("registry_sources", mode="before")
     @classmethod
@@ -1102,6 +1138,17 @@ class CogsConfig(BaseModel):
             raise ValueError(
                 "cogs.serve.enabled is true but cogs.registry_sources is empty: a registry endpoint with "
                 "no source behind it can serve nothing. Add a source or set enabled=false."
+            )
+        publishing = [source.id for source in self.registry_sources if source.publish]
+        if len(publishing) > 1:
+            raise ValueError(
+                f"cogs.registry_sources marks {len(publishing)} sources publish: true ({', '.join(publishing)}): "
+                "pushes through the Hub are written to exactly one source"
+            )
+        if publishing and not self.serve.enabled:
+            raise ValueError(
+                f"cogs.registry_sources source {publishing[0]!r} is publish: true but cogs.serve.enabled is false: "
+                "pushes arrive on the Hub's /v2/ surface, which serving mounts"
             )
         if self.serve.enabled and not self.serve.public_url:
             raise ValueError(
@@ -1392,7 +1439,26 @@ class CogIndexing:
         self.run_on_startup = run_on_startup
 
 
-def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexing | None:
+def build_cog_publish_store(config: BaseConfig, pools: PostgresPools) -> PublishStore:
+    """Where repository ownership and upload sessions live (issue #180); follows the catalog's backend."""
+
+    if config.cogs.catalog.backend == "memory":
+        return InMemoryPublishStore()
+    url = config.frames.postgres.url
+    if url:
+        return PostgresPublishStore(pools.database(url))
+    return UnavailablePublishStore()
+
+
+def publish_source_id(config: BaseConfig) -> str | None:
+    """The id of the source pushes are written to, or ``None`` when publishing is off."""
+
+    return next((source.id for source in config.cogs.registry_sources if source.publish), None)
+
+
+def build_cog_indexing(
+    config: BaseConfig, store: CogCatalogStore, publish_store: PublishStore | None = None
+) -> CogIndexing | None:
     """The reconciliation indexer (issue #84) when ``cogs.index.enabled``, else ``None``.
 
     Reads the ``cogs`` block (issue #87): ``cogs.registry_sources`` and
@@ -1436,7 +1502,17 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
     # should not index as healthy.
     sources = build_registry_sources(list(cogs.registry_sources), restrict_redirects=cogs.serve.enabled)
     return CogIndexing(
-        CogIndexer(store, sources),
+        # With a publish source, the repositories published through the Hub
+        # are enumerated too: that source needs no configured list.
+        CogIndexer(
+            store,
+            sources,
+            published_repositories=(
+                publish_store.published_repositories
+                if publish_store is not None and publish_source_id(config) is not None
+                else None
+            ),
+        ),
         interval_seconds=float(index.interval_seconds),
         run_on_startup=index.run_on_startup,
     )
@@ -1460,7 +1536,7 @@ def build_cog_registry_credential_store(config: BaseConfig, pools: PostgresPools
 
 
 def build_cog_registry_serving(
-    config: BaseConfig, store: CogCatalogStore, pools: PostgresPools
+    config: BaseConfig, store: CogCatalogStore, pools: PostgresPools, publish_store: PublishStore | None = None
 ) -> CogRegistryServing | None:
     """The Hub's own registry surface when ``cogs.serve.enabled``, else ``None`` (issue #179).
 
@@ -1494,12 +1570,28 @@ def build_cog_registry_serving(
     # storage URLs out of the HTTP libraries' own logs. Process-wide, and
     # only here -- with serving off (indexing on or not) logging is untouched.
     install_log_redaction()
-    return CogRegistryServing(
-        front=CogRegistryFront(
-            store,
-            build_registry_sources(list(cogs.registry_sources), restrict_redirects=True),
+    sources = build_registry_sources(list(cogs.registry_sources), restrict_redirects=True)
+    publisher = None
+    target = publish_source_id(config)
+    if target is not None:
+        # Publishing (issue #180): pushes are written through to the one
+        # source marked publish, with that source's own client. The indexer
+        # here never sweeps; it is the reader a manifest is validated with
+        # and the lock-less targeted write that lists it.
+        publisher = CogPublisher(
+            catalog=store,
+            store=publish_store if publish_store is not None else build_cog_publish_store(config, pools),
+            source=next(source for source in sources if source.id == target),
+            indexer=CogIndexer(store, sources),
+            policy=PublishPolicy(
+                allowed_roles=frozenset(cogs.publish.allowed_roles),
+                allowed_users=frozenset(cogs.publish.allowed_users),
+            ),
             max_blob_bytes=serve.max_blob_bytes,
-        ),
+        )
+    return CogRegistryServing(
+        front=CogRegistryFront(store, sources, max_blob_bytes=serve.max_blob_bytes),
+        publisher=publisher,
         credentials=build_cog_registry_credential_store(config, pools),
         host=serve.host,
         token_url=f"{public_url}/v2/token",

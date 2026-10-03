@@ -500,6 +500,51 @@ def test_serving_round_trips_through_the_environment_as_the_chart_renders_it(mon
     assert serve.max_blob_bytes == 5 * 1024**3 and serve.credential_ttl_seconds == 600
 
 
+# --- cogs.publish and the publish source (issue #180) --------------------------
+
+
+def test_nobody_may_publish_by_default_and_no_source_is_the_publish_source():
+    cogs = parse_cogs(registry_sources=[static_source()]).cogs
+
+    assert cogs.publish.allowed_roles == [] and cogs.publish.allowed_users == []
+    assert [source.publish for source in cogs.registry_sources] == [False]
+
+
+def test_a_publish_source_needs_serving_and_may_be_a_static_source_with_nothing_to_enumerate():
+    bare = {"id": "pub", "kind": "static", "url": "https://registry.example.com", "publish": True}
+    serve = {"enabled": True, "public_url": "https://hub.example.com"}
+
+    cogs = parse_cogs(
+        registry_sources=[bare, static_source()],
+        serve=serve,
+        publish={"allowed_roles": ["owner"], "allowed_users": [" user-1 ", "user-2"]},
+    ).cogs
+    assert [source.publish for source in cogs.registry_sources] == [True, False]
+    assert cogs.publish.allowed_roles == ["owner"] and cogs.publish.allowed_users == ["user-1", "user-2"]
+
+    with pytest.raises(ValidationError, match="is publish: true but cogs.serve.enabled is false"):
+        parse_cogs(registry_sources=[bare])
+    with pytest.raises(ValidationError, match="marks 2 sources publish: true"):
+        parse_cogs(registry_sources=[bare, {**bare, "id": "pub-2"}], serve=serve)
+    # Without publish, a static source still needs something to enumerate.
+    with pytest.raises(ValidationError, match="requires repositories and/or index_url"):
+        parse_cogs(registry_sources=[{**bare, "publish": False}], serve=serve)
+
+
+def test_publish_settings_round_trip_through_the_environment_as_the_chart_renders_them(monkeypatch):
+    source = {"id": "pub", "kind": "static", "url": "https://registry.example.com", "publish": True}
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__REGISTRY_SOURCES", json.dumps([source]))
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__SERVE__ENABLED", "true")
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__SERVE__PUBLIC_URL", "https://hub.example.com")
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_ROLES", '["owner","operator"]')
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_USERS", '["user-1"]')
+
+    cogs = Config().cogs
+
+    assert cogs.publish.allowed_roles == ["owner", "operator"] and cogs.publish.allowed_users == ["user-1"]
+    assert cogs.registry_sources[0].publish is True
+
+
 # --- Parity with the chart: the same refusals, from one fixture ---------------
 
 

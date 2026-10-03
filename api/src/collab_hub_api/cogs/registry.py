@@ -293,6 +293,12 @@ class CogRegistrySourceConfig(BaseModel):
     credentials: CogRegistryCredentials = Field(default_factory=CogRegistryCredentials)
     webhook_secret: SecretStr = SecretStr("")
     request_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    publish: bool = False
+    """Whether pushes through the Hub are written to this source (issue #180). At most one source.
+
+    Such a source also enumerates the repositories published through the
+    Hub, so a ``static`` one needs neither ``repositories`` nor ``index_url``.
+    """
     blob_redirect_hosts: list[str] = Field(default_factory=list)
     """Hosts a blob redirect from this registry may point at; empty means no allowlist.
 
@@ -392,8 +398,11 @@ class CogRegistrySourceConfig(BaseModel):
                 if getattr(self, name):
                     raise ValueError(f"{label} does not read {name}; that field belongs to kind 'static'")
         elif self.kind == "static":
-            if not self.repositories and not self.index_url:
-                raise ValueError(f"{label} requires repositories and/or index_url: it has no listing API to ask")
+            if not self.repositories and not self.index_url and not self.publish:
+                raise ValueError(
+                    f"{label} requires repositories and/or index_url (or publish: true, whose repositories "
+                    "are the ones published through the Hub): it has no listing API to ask"
+                )
             for name in ("projects", "api_url"):
                 if getattr(self, name):
                     raise ValueError(f"{label} does not read {name}; that field belongs to kind 'harbor'")

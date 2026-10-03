@@ -82,6 +82,7 @@ from ..cogs.models import (
 )
 from ..cogs.registry_credentials import (
     CREDENTIAL_ID_PATTERN,
+    SCOPE_PUBLISH,
     RegistryCredentialsUnavailableError,
     new_credential_id,
     new_credential_secret,
@@ -186,22 +187,44 @@ def get_listing_caller(request: Request) -> AuthContext | None:
     return caller
 
 
+def _merged(first: dict | None, second: dict | None) -> dict | None:
+    """Two ``model_dump(exclude=...)`` specs as one."""
+
+    if not first or not second:
+        return first or second
+    merged = dict(first)
+    for key, value in second.items():
+        mine = merged.get(key)
+        merged[key] = _merged(mine, value) if isinstance(mine, dict) and isinstance(value, dict) else value
+    return merged
+
+
 @dataclass(frozen=True)
 class Redaction:
     """What the caller may see; the one place a response is cut down for it.
 
     Each response model declares its anonymous cut as ``ANONYMOUS_EXCLUDE``
-    (see :mod:`..cogs.models`); an authenticated caller gets the model whole.
+    (see :mod:`..cogs.models`); an authenticated caller gets the model whole
+    -- except for who published a version through the Hub
+    (``PUBLICATION_EXCLUDE``), which is shown only on a Hub that accepts
+    publishes, and never to an anonymous caller. On a Hub that does not, the
+    keys are absent, so its answers are what they were before they existed.
     """
 
     anonymous: bool
+    publication: bool = False
 
     @classmethod
-    def for_caller(cls, caller: AuthContext | None) -> Redaction:
-        return cls(anonymous=caller is None)
+    def for_caller(cls, caller: AuthContext | None, request: Request | None = None) -> Redaction:
+        serving = get_cog_registry_serving(request) if request is not None else None
+        publishing = serving is not None and serving.publisher is not None
+        return cls(anonymous=caller is None, publication=publishing and caller is not None)
 
     def respond(self, model: BaseModel) -> JSONResponse:
-        exclude = type(model).ANONYMOUS_EXCLUDE if self.anonymous else None
+        kind = type(model)
+        exclude = kind.ANONYMOUS_EXCLUDE if self.anonymous else None
+        if not self.publication:
+            exclude = _merged(exclude, getattr(kind, "PUBLICATION_EXCLUDE", None))
         return JSONResponse(model.model_dump(mode="json", exclude=exclude))
 
 
@@ -261,6 +284,14 @@ class CogVersionNotFoundError(LookupError):
     """This digest is not indexed as a version of this Cog."""
 
 
+class CogPublishingNotEnabledError(LookupError):
+    """This Hub accepts no publishes (no registry source is marked ``publish: true``)."""
+
+
+class CogPublishForbiddenError(PermissionError):
+    """The caller does not hold the publish permission."""
+
+
 class CogRegistryCredentialNotFoundError(LookupError):
     """No live registry credential with this id belongs to the caller."""
 
@@ -289,6 +320,7 @@ def _version_locations(store: CogCatalogStore, cog_id: str, digest: str) -> list
     summary="List current Cogs",
 )
 def list_cogs(
+    request: Request,
     _auth: ListingAuthDep,
     store: CatalogDep,
     registry_host: RegistryHostDep,
@@ -343,7 +375,7 @@ def list_cogs(
         offset=offset,
         next_offset=offset + limit if len(rows) > limit else None,
     )
-    return Redaction.for_caller(_auth).respond(page)
+    return Redaction.for_caller(_auth, request).respond(page)
 
 
 @router.get(
@@ -403,9 +435,21 @@ def create_registry_credential(
     404 `cog_registry_not_served` when this Hub does not serve pulls
     (`cogs.serve.enabled` is off): pull from the `reference` the catalog
     gives, with whatever credential that registry takes.
+
+    `{"scope": "publish"}` asks for a credential that may also push
+    (`nebi publish`, `oras push`). 404 `cog_publishing_not_enabled` when
+    this Hub accepts no publishes, and 403 `cog_publish_forbidden` when the
+    caller does not hold the publish permission. Holding the credential is
+    not the permission: it is checked again, with the repository's
+    ownership, on every push.
     """
 
     scope = (body or RegistryCredentialRequest()).scope
+    if scope == SCOPE_PUBLISH:
+        if serving.publisher is None:
+            raise CogPublishingNotEnabledError()
+        if not serving.publisher.policy.permits(auth.user, auth.org_role, auth.platform_role):
+            raise CogPublishForbiddenError()
     secret = new_credential_secret()
     credential = serving.credentials.create_credential(
         credential_id=new_credential_id(),
@@ -414,6 +458,9 @@ def create_registry_credential(
         scope=scope,
         session_id=session_id_of(request),
         ttl_seconds=serving.credential_ttl_seconds,
+        # The organization a publish is attributed to where there is no
+        # membership table to re-read; None for an operator with none.
+        org_id=auth.home_org_id,
     )
     return RegistryCredentialResponse(
         id=credential.id,
@@ -538,6 +585,7 @@ def get_cog_reference(
     summary="Card of one version",
 )
 def get_cog_version(
+    request: Request,
     _auth: AuthDep, store: CatalogDep, registry_host: RegistryHostDep, cog_id: CogIdPath, digest: DigestPath
 ) -> JSONResponse:
     """The exact card indexed for this digest -- what an install pins -- in full.
@@ -546,7 +594,7 @@ def get_cog_version(
     """
 
     entry = CogEntry.of(_version_locations(store, cog_id, digest)[0], registry_host)
-    return Redaction.for_caller(_auth).respond(entry)
+    return Redaction.for_caller(_auth, request).respond(entry)
 
 
 @router.get(
@@ -555,7 +603,9 @@ def get_cog_version(
     responses={**NOT_FOUND, **UNAVAILABLE},
     summary="A Cog and its versions",
 )
-def get_cog(_auth: AuthDep, store: CatalogDep, registry_host: RegistryHostDep, cog_id: CogIdPath) -> JSONResponse:
+def get_cog(
+    request: Request, _auth: AuthDep, store: CatalogDep, registry_host: RegistryHostDep, cog_id: CogIdPath
+) -> JSONResponse:
     """The Cog's current full card (its newest present version) and every indexed version, newest first.
 
     404 when no version is present, even if removed ones are indexed: those
@@ -570,7 +620,7 @@ def get_cog(_auth: AuthDep, store: CatalogDep, registry_host: RegistryHostDep, c
         **CogEntry.of(current, registry_host).model_dump(),
         versions=[CogVersion.of(row, registry_host) for row in versions],
     )
-    return Redaction.for_caller(_auth).respond(detail)
+    return Redaction.for_caller(_auth, request).respond(detail)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -586,6 +636,18 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def cog_registry_not_served_handler(_request: Request, _exc: CogRegistryNotServedError):
         return error_response(
             status.HTTP_404_NOT_FOUND, "cog_registry_not_served", "This Hub does not serve Cog pulls itself"
+        )
+
+    @app.exception_handler(CogPublishingNotEnabledError)
+    async def cog_publishing_not_enabled_handler(_request: Request, _exc: CogPublishingNotEnabledError):
+        return error_response(
+            status.HTTP_404_NOT_FOUND, "cog_publishing_not_enabled", "This Hub does not accept Cog publishes"
+        )
+
+    @app.exception_handler(CogPublishForbiddenError)
+    async def cog_publish_forbidden_handler(_request: Request, _exc: CogPublishForbiddenError):
+        return error_response(
+            status.HTTP_403_FORBIDDEN, "cog_publish_forbidden", "This account may not publish Cogs"
         )
 
     @app.exception_handler(CogRegistryCredentialNotFoundError)

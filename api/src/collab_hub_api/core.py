@@ -21,6 +21,7 @@ from .config import (
     build_audit_log,
     build_cog_catalog_store,
     build_cog_indexing,
+    build_cog_publish_store,
     build_cog_registry_serving,
     build_connector_store,
     build_frames_store,
@@ -280,11 +281,16 @@ def make_app(config: BaseConfig) -> FastAPI:
     # this replica sweeps registries. The indexer -- and the registry
     # sources it owns -- exist only when cogs.index.enabled (issue #87).
     cog_catalog_store = build_cog_catalog_store(config, postgres_pools)
-    cog_indexing = build_cog_indexing(config, cog_catalog_store)
+    # Repository ownership and upload sessions (issue #180): read by the
+    # indexer (published repositories are enumerated) and written by pushes.
+    cog_publish_store = build_cog_publish_store(config, postgres_pools)
+    cog_indexing = build_cog_indexing(config, cog_catalog_store, cog_publish_store)
     # Pulls through the Hub (issue #179), when cogs.serve.enabled: the /v2/
     # surface and the registry sources it reads from, built on every replica
     # that serves it and independent of whether this process indexes.
-    cog_registry_serving = build_cog_registry_serving(config, cog_catalog_store, postgres_pools)
+    cog_registry_serving = build_cog_registry_serving(
+        config, cog_catalog_store, postgres_pools, cog_publish_store
+    )
     if org_source_resolves_membership():
         # Third membership precondition (the env-only ones are checked above):
         # the organization store must have a real backend. Membership is an
@@ -463,6 +469,8 @@ def make_app(config: BaseConfig) -> FastAPI:
                         with suppress(Exception):
                             await source.aclose()
                 if cog_registry_serving is not None:
+                    if cog_registry_serving.publisher is not None:
+                        cog_registry_serving.publisher.close()
                     for source in cog_registry_serving.front.sources:
                         with suppress(Exception):
                             await source.aclose()

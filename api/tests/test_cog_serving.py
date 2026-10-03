@@ -59,8 +59,9 @@ UPSTREAM_USER = "robot$hub"
 UPSTREAM_PASSWORD = "upstream-robot-password-9f3"
 UPSTREAM_TOKEN = "upstream-bearer-token-71c"
 STORAGE_SIGNATURE = "presigned-signature-4be"
+UPLOAD_STATE = "upstream-upload-state-5d2"
 
-SECRETS = (UPSTREAM_PASSWORD, UPSTREAM_TOKEN, STORAGE_SIGNATURE)
+SECRETS = (UPSTREAM_PASSWORD, UPSTREAM_TOKEN, STORAGE_SIGNATURE, UPLOAD_STATE)
 """Nothing here may appear in a response or in a log line."""
 BACKING_NAMES = (BACKING_HOST, STORAGE_HOST)
 """Nothing here may appear in a response to a client."""
@@ -123,6 +124,10 @@ class FakeRegistry:
         self.blob_delay = 0.0
         self.stream_delay = 0.0
         self.storage_scheme = "https"
+        # The push half: upload sessions by id, and switches for the failures a registry can answer with.
+        self.uploads: dict[str, bytearray] = {}
+        self.upload_delay = 0.0
+        self.refuse_writes: httpx.Response | None = None
         self.storage_saw_authorization = False
 
     def publish(self, repo: str, bundle: Bundle, *tags: str) -> None:
@@ -135,6 +140,65 @@ class FakeRegistry:
         for ref in (digest, *tags):
             self.manifests[(repo, ref)] = (media_type, body)
         return digest
+
+    def writes(self) -> list[str]:
+        """``METHOD path`` of every write the registry was sent with its credential (the 401 dance excluded)."""
+
+        return [
+            f"{request.method} {request.url.path}"
+            for request in self.requests
+            if request.method in ("POST", "PATCH", "PUT", "DELETE")
+            and request.headers.get("authorization") == f"Bearer {UPSTREAM_TOKEN}"
+        ]
+
+    async def _write(self, request: httpx.Request, rest: str) -> httpx.Response:
+        """The push half of the distribution API, as a registry answers it (absolute, stateful upload URLs)."""
+
+        if request.method == "HEAD":
+            digest = rest.rpartition("/blobs/")[2]
+            if digest in self.blobs:
+                return httpx.Response(200, headers={"Content-Length": str(len(self.blobs[digest]))})
+            return httpx.Response(404)
+        if self.refuse_writes is not None:
+            return self.refuse_writes
+        body = await request.aread()
+        if "/blobs/uploads" in rest:
+            repo, _, upload = rest.partition("/blobs/uploads")
+            upload = upload.strip("/")
+            location = f"{BACKING_URL}/v2/{repo}/blobs/uploads/{{}}?_state={UPLOAD_STATE}"
+            if request.method == "POST":
+                upload = f"upstream-{len(self.uploads) + 1}"
+                self.uploads[upload] = bytearray()
+                return httpx.Response(202, headers={"Location": location.format(upload), "Range": "0-0"})
+            if upload not in self.uploads or request.url.params.get("_state") != UPLOAD_STATE:
+                return httpx.Response(404, text=f"{BACKING_HOST}: unknown upload")
+            received = self.uploads[upload]
+            if request.method == "GET":
+                return httpx.Response(204, headers={"Location": location.format(upload)})
+            if request.method == "DELETE":
+                del self.uploads[upload]
+                return httpx.Response(204)
+            if self.upload_delay:
+                await asyncio.sleep(self.upload_delay)
+            content_range = request.headers.get("content-range")
+            if content_range is not None and int(content_range.split("-")[0]) != len(received):
+                return httpx.Response(416, text=f"{BACKING_HOST}: out of order")
+            received.extend(body)
+            if request.method == "PATCH":
+                return httpx.Response(202, headers={"Location": location.format(upload)})
+            digest = request.url.params.get("digest")
+            if sha256(bytes(received)) != digest:
+                return httpx.Response(400, text=f"digest invalid at {BACKING_HOST} for {UPSTREAM_USER}")
+            self.blobs[digest] = bytes(received)
+            del self.uploads[upload]
+            return httpx.Response(201, headers={"Location": f"{BACKING_URL}/v2/{repo}/blobs/{digest}"})
+        if request.method == "PUT" and "/manifests/" in rest:
+            repo, _, ref = rest.rpartition("/manifests/")
+            media_type = request.headers.get("content-type", MEDIA_TYPE_OCI_MANIFEST)
+            for name in {ref, sha256(body)}:
+                self.manifests[(repo, name)] = (media_type, body)
+            return httpx.Response(201, headers={"Location": f"{BACKING_URL}/v2/{repo}/manifests/{sha256(body)}"})
+        return httpx.Response(405, text=f"{BACKING_HOST}: unsupported")
 
     async def _slowly(self, body: bytes):
         for offset in range(0, len(body), 8):
@@ -179,6 +243,8 @@ class FakeRegistry:
         if path in self.fail:
             return self.fail[path]
         _v2, _, rest = path.partition("/v2/")
+        if request.method != "GET" or "/blobs/uploads/" in rest:
+            return await self._write(request, rest)
         if rest.endswith("/tags/list"):
             repo = rest[: -len("/tags/list")]
             tags = sorted(ref for (name, ref) in self.manifests if name == repo and not ref.startswith("sha256:"))
@@ -232,7 +298,9 @@ def catalog_row(repo: str, digest: str, *, tags=("latest",), source_id="backing"
     )
 
 
-def settings(tmp_path, *, serve: dict | None = None, security: dict | None = None) -> dict:
+def settings(
+    tmp_path, *, serve: dict | None = None, security: dict | None = None, publish: dict | None = None
+) -> dict:
     result: dict = {
         "storage": {"frames_path": str(tmp_path / "frames")},
         "frames": {"mcp_session_manager_enabled": False},
@@ -253,6 +321,10 @@ def settings(tmp_path, *, serve: dict | None = None, security: dict | None = Non
     }
     if security is not None:
         result["security"] = security
+    if publish is not None:
+        # Publishing on: pushes are written through to the one source, and this is who may push.
+        result["cogs"]["registry_sources"][0]["publish"] = True
+        result["cogs"]["publish"] = publish
     return result
 
 
@@ -381,10 +453,13 @@ async def test_exchange_answers_the_documented_contract(hub: Hub):
 
 
 async def test_exchange_refuses_unknown_scopes_and_requires_a_hub_session(hub: Hub):
-    for body in ({"scope": "publish"}, {"scope": "pull", "extra": 1}):
+    for body in ({"scope": "admin"}, {"scope": "pull", "extra": 1}):
         refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json=body)
         assert refused.status_code == 422, body
         assert refused.json()["error"]["code"] == "validation_error"
+    # A known scope this Hub does not offer: it accepts no publishes.
+    off = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json={"scope": "publish"})
+    assert off.status_code == 404 and off.json()["error"]["code"] == "cog_publishing_not_enabled"
     anonymous = await hub.request("POST", "/v1/cogs/registry-credentials")
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "unauthorized"
@@ -454,22 +529,25 @@ async def test_a_token_is_scoped_to_the_repositories_it_was_minted_for(hub: Hub)
     assert (await hub.get(f"/v2/{REPO}/tags/list", headers=bare)).status_code == 401
 
 
-def test_only_pull_on_a_repository_is_ever_granted():
-    assert requested_repositories(
-        [
-            "repository:cogs/a:pull",
-            "repository:cogs/b:pull,push repository:cogs/c:push",
-            "repository:cogs/a:pull",
-            "registry:catalog:*",
-            "repository:Not/Valid:pull",
-            "repository::pull",
-            "garbage",
-        ]
-    ) == ["cogs/a", "cogs/b"]
+def test_only_repository_pull_and_push_scopes_name_anything():
+    scopes = [
+        "repository:cogs/a:pull",
+        "repository:cogs/b:pull,push repository:cogs/c:push",
+        "repository:cogs/a:pull",
+        "repository:cogs/d:delete",
+        "registry:catalog:*",
+        "repository:Not/Valid:pull",
+        "repository::pull",
+        "garbage",
+    ]
+    assert requested_repositories(scopes) == ["cogs/a", "cogs/b", "cogs/c"]
+    # Whether push was asked for is reported separately; whether it is granted is the credential's to decide.
+    assert registry_router.requested_scope(scopes) == (["cogs/a", "cogs/b", "cogs/c"], True)
+    assert registry_router.requested_scope(["repository:cogs/a:pull"]) == (["cogs/a"], False)
     many = [f"repository:cogs/r{i}:pull" for i in range(40)]
     assert len(requested_repositories(many)) == registry_router.MAX_TOKEN_SCOPES
     # The input is bounded before it is parsed: a huge scope list is not walked to its end.
-    flood = ["repository:cogs/a:push " * 100_000 + "repository:cogs/z:pull"]
+    flood = ["repository:cogs/a:delete " * 100_000 + "repository:cogs/z:pull"]
     assert requested_repositories(flood) == []
     assert requested_repositories(["garbage"] * 10_000 + ["repository:cogs/z:pull"]) == []
     assert requested_repositories(["x " * 70 + "repository:cogs/z:pull"]) == []
