@@ -15,6 +15,11 @@ here so the layer-selection helper can name what it selects.
 Public interface (stable for the adapters and the indexer):
 
 - :class:`OCIClient` — one registry, optionally pre-authenticated.
+- :meth:`OCIClient.fetch_manifest` / :meth:`OCIClient.open_blob` — the two
+  reads the Hub's own ``/v2/`` surface serves pulls with: a verified manifest
+  exactly as stored (an index is *not* followed), and a blob as a
+  :class:`BlobStream` whose bytes are hashed as they pass instead of being
+  buffered.
 - :class:`Descriptor` / :class:`Manifest` — the parsed content descriptors.
 - :func:`select_bundle_layers` / :func:`fetch_bundle_files` — pick and fetch
   exactly the small layers the bundle reader needs.
@@ -50,11 +55,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
+import logging
 import re
 import ssl
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -148,6 +155,85 @@ _TokenKey = tuple[str, str, str]
 """(token endpoint, service, scope): what makes one bearer token interchangeable with another."""
 
 
+class _RequestLogFilter(logging.Filter):
+    """Drop the query string and userinfo from httpx's own per-request log line.
+
+    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request, and
+    a blob redirect to object storage is a pre-signed URL: its query string
+    *is* the credential. The path stays (it says which blob), the rest goes.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(_scrubbed_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args)
+        return True
+
+
+def _scrubbed_url(url: httpx.URL) -> httpx.URL:
+    if not url.query and not url.userinfo:
+        return url
+    return url.copy_with(query=None, userinfo=b"")
+
+
+_TRACE_HEADERS = re.compile(r"^(?P<event>\S*headers\S*)(?:\s|$)")
+_TRACE_STATUS = re.compile(r"return_value=\((?:b'[^']*',\s*)?(?P<status>[1-5][0-9]{2}),")
+_URL_USERINFO = re.compile(r"(?P<scheme>https?://)[^/\s'\"@]*@")
+_URL_QUERY = re.compile(r"(?P<url>https?://[^\s'\"?]*)\?[^\s'\"]*")
+
+
+class _TransportTraceFilter(logging.Filter):
+    """Keep header values out of httpcore's DEBUG trace.
+
+    Below httpx, the transport traces every step of a request at DEBUG, and
+    one of those lines is the response's whole header list: a redirect's
+    ``Location`` with its signature, ``Set-Cookie``, ``WWW-Authenticate``.
+    Any line about headers is cut down to its event name and the status
+    code; every other line has URL userinfo and query strings removed. The
+    trace message arrives preformatted, so this works on the text.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        headers = _TRACE_HEADERS.match(message)
+        if headers is not None:
+            found = _TRACE_STATUS.search(message)
+            status = f" status={found.group('status')}" if found else ""
+            message = f"{headers.group('event')}{status} [header values redacted]"
+        else:
+            message = _URL_USERINFO.sub(r"\g<scheme>", message)
+            message = _URL_QUERY.sub(r"\g<url>", message)
+        record.msg, record.args = message, None
+        return True
+
+
+_REQUEST_LOGGER = "httpx"
+_TRANSPORT_LOGGERS = (
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+def install_log_redaction() -> None:
+    """Install the two filters above. **Process-wide**, idempotent, and never undone.
+
+    Called when a deployment turns Cog *serving* on, and not otherwise, so a
+    Hub that does not serve pulls logs exactly as it did -- including one
+    that only indexes, whose DEBUG transport trace is unfiltered as it has
+    always been. Once installed the filters apply to every httpx client in
+    the process, not only the registry's: logging filters attach to loggers,
+    and the HTTP libraries share theirs.
+    """
+
+    targets = [(_REQUEST_LOGGER, _RequestLogFilter)] + [(name, _TransportTraceFilter) for name in _TRANSPORT_LOGGERS]
+    for name, kind in targets:
+        target = logging.getLogger(name)
+        if not any(isinstance(existing, kind) for existing in target.filters):
+            target.addFilter(kind())
+
+
 def _monotonic() -> float:
     """Clock behind the token cache; a module-level indirection so tests can advance it."""
     return time.monotonic()
@@ -185,6 +271,19 @@ class OCITransportError(OCIError):
     artifact as broken. The message names the httpx error class only; URLs
     and headers are never echoed.
     """
+
+
+class OCIRejected(OCIError):
+    """The registry refused a write for a reason that is the pusher's to fix (a 4xx other than 401/403).
+
+    ``status`` is the registry's status code -- 400 for a digest that does
+    not match the bytes, 404 for an upload session it no longer knows, 416
+    for a chunk out of order. The registry's response body is never kept.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class OCIInvalidReference(OCIProtocolError, ValueError):
@@ -295,6 +394,8 @@ class OCIClient:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
+        redirect_hosts: Sequence[str] = (),
+        restrict_redirects: bool = False,
     ) -> None:
         try:
             origin = httpx.URL(base_url.rstrip("/"))
@@ -309,6 +410,12 @@ class OCIClient:
         self._base_url = str(origin)
         self._origin = origin
         self._credentials = credentials
+        self._redirect_hosts = tuple(host.lower() for host in redirect_hosts)
+        # The redirect policy is an opt-in of whoever builds the client: on
+        # when asked for (the Hub serving pulls), or when the source names
+        # the hosts its redirects may reach. Otherwise redirects are followed
+        # as they always were, with the credential dropped off-origin.
+        self._restrict_redirects = bool(restrict_redirects or self._redirect_hosts)
         self._token_url = token_url
         self._max_manifest_bytes = max_manifest_bytes
         self._tokens: dict[_TokenKey, _CachedToken] = {}
@@ -384,6 +491,237 @@ class OCIClient:
         body = await _read_bounded(response, max_bytes, what=f"blob {digest}")
         _verify_digest(body, digest, what=f"blob {digest}")
         return body
+
+    async def fetch_manifest(self, repo: str, ref: str) -> Manifest:
+        """Fetch a manifest exactly as the registry stores it, verified, without following an index.
+
+        What a pull through the Hub needs: a client that asked for an index
+        must get the index. ``Manifest.raw`` is the body, ``Manifest.digest``
+        its verified sha256 (see the module docstring for what a tag is
+        verified against).
+        """
+        _validate_repo(repo)
+        _validate_ref(ref)
+        return await self._fetch_manifest(repo, ref)
+
+    async def open_blob(self, repo: str, digest: str) -> BlobStream:
+        """Open a blob for streaming: redirects followed here, nothing read yet.
+
+        The caller drains :meth:`BlobStream.iter_verified` (or closes the
+        stream). Redirects to object storage are followed by this client, one
+        hop at a time and without the registry credential once a hop leaves
+        the registry origin, so the caller never sees a ``Location``.
+        """
+        _validate_repo(repo)
+        _validate_digest(digest)
+        response = await self._send(
+            f"/v2/{repo}/blobs/{digest}",
+            headers={},
+            scope_hint=_pull_scope(repo),
+            allow_redirects=True,
+        )
+        return BlobStream(response, digest)
+
+    # -- writes (publishing through the Hub, issue #180) ----------------------
+    #
+    # The push half of the distribution API, with the same rules as the reads:
+    # the registry's credential is this client's alone, nothing the registry
+    # says in a body is kept, and redirects are not followed at all -- a
+    # write goes to the registry's own origin or nowhere.
+
+    async def blob_size(self, repo: str, digest: str) -> int | None:
+        """The size of a blob the repository already holds, or ``None`` if it does not (or will not say)."""
+
+        _validate_repo(repo)
+        _validate_digest(digest)
+        response = await self._exchange(
+            "HEAD", self._origin.join(f"/v2/{repo}/blobs/{digest}"), scope_hint=_pull_scope(repo), what="blob check"
+        )
+        try:
+            if response.status_code != 200:
+                return None
+            declared = response.headers.get("content-length", "")
+            return int(declared) if declared.isascii() and declared.isdigit() else None
+        finally:
+            await response.aclose()
+
+    async def start_upload(self, repo: str) -> str:
+        """Open a blob upload session and return its URL at the registry (never to be shown to a client)."""
+
+        _validate_repo(repo)
+        url = self._origin.join(f"/v2/{repo}/blobs/uploads/")
+        response = await self._exchange("POST", url, scope_hint=_push_scope(repo), what="upload start")
+        try:
+            _expect(response, (202,), what="upload start")
+            return self._upload_location(url, response, what="upload start")
+        finally:
+            await response.aclose()
+
+    async def upload_chunk(
+        self, repo: str, location: str, content: AsyncIterable[bytes], *, offset: int, length: int | None
+    ) -> str:
+        """Send the next bytes of an upload, streamed, and return the session's (possibly new) URL."""
+
+        _validate_repo(repo)
+        url = self._session_url(location)
+        headers = {"Content-Type": "application/octet-stream"}
+        if length is not None:
+            headers["Content-Length"] = str(length)
+            if length > 0:
+                headers["Content-Range"] = f"{offset}-{offset + length - 1}"
+        await self._authorize_stream(url, _push_scope(repo))
+        response = await self._exchange(
+            "PATCH", url, scope_hint=_push_scope(repo), headers=headers, content=content, what="upload chunk"
+        )
+        try:
+            _expect(response, (202,), what="upload chunk")
+            return self._upload_location(url, response, what="upload chunk")
+        finally:
+            await response.aclose()
+
+    async def finish_upload(
+        self,
+        repo: str,
+        location: str,
+        digest: str,
+        content: AsyncIterable[bytes] | None = None,
+        *,
+        length: int | None = None,
+    ) -> None:
+        """Close an upload as ``digest``, optionally sending its last (or only) bytes. The registry verifies them."""
+
+        _validate_repo(repo)
+        _validate_digest(digest)
+        url = self._session_url(location).copy_merge_params({"digest": digest})
+        headers = {"Content-Type": "application/octet-stream"}
+        if content is None:
+            headers["Content-Length"] = "0"
+        else:
+            if length is not None:
+                headers["Content-Length"] = str(length)
+            await self._authorize_stream(url, _push_scope(repo))
+        response = await self._exchange(
+            "PUT", url, scope_hint=_push_scope(repo), headers=headers, content=content, what="upload finish"
+        )
+        try:
+            _expect(response, (201, 204), what="upload finish")
+        finally:
+            await response.aclose()
+
+    async def cancel_upload(self, repo: str, location: str) -> None:
+        """Ask the registry to drop an upload session. Best effort: a registry that will not is not an error."""
+
+        _validate_repo(repo)
+        try:
+            response = await self._exchange(
+                "DELETE", self._session_url(location), scope_hint=_push_scope(repo), what="upload cancel"
+            )
+        except OCIError:
+            return
+        await response.aclose()
+
+    async def put_manifest(self, repo: str, ref: str, body: bytes, media_type: str) -> None:
+        """Store a manifest under a tag or its digest."""
+
+        _validate_repo(repo)
+        _validate_ref(ref)
+        response = await self._exchange(
+            "PUT",
+            self._origin.join(f"/v2/{repo}/manifests/{ref}"),
+            scope_hint=_push_scope(repo),
+            headers={"Content-Type": media_type},
+            content=body,
+            what="manifest put",
+        )
+        try:
+            _expect(response, (201, 200, 204), what="manifest put")
+        finally:
+            await response.aclose()
+
+    def _session_url(self, location: str) -> httpx.URL:
+        url = _parse_url(location, what="upload session")
+        if not _same_origin(url, self._origin):
+            raise OCIProtocolError("upload session is not on the registry's origin")
+        return url
+
+    def _upload_location(self, url: httpx.URL, response: httpx.Response, *, what: str) -> str:
+        location = response.headers.get("location")
+        if not location:
+            raise OCIProtocolError(f"{what}: the registry named no upload location")
+        target = _join_url(url, location, what=f"{what} location")
+        if not _same_origin(target, self._origin):
+            # The registry credential is attached to every request to the
+            # session: it goes to the registry's own origin or not at all.
+            raise OCIProtocolError(f"{what}: the registry named an upload location off its own origin")
+        return str(target)
+
+    async def _authorize_stream(self, url: httpx.URL, scope_hint: str) -> None:
+        """Make sure a credential is in hand before a body that cannot be replayed is sent.
+
+        A streamed body is gone once a 401 has been answered, so the
+        challenge is taken first on a bodiless request to the same session
+        (its upload status) whenever no usable token is cached.
+        """
+
+        if self._proactive_auth(scope_hint) is not None:
+            return
+        response = await self._exchange("GET", url, scope_hint=scope_hint, what="upload status")
+        await response.aclose()
+
+    async def _exchange(
+        self,
+        method: str,
+        url: httpx.URL,
+        *,
+        scope_hint: str,
+        what: str,
+        headers: Mapping[str, str] | None = None,
+        content: bytes | AsyncIterable[bytes] | None = None,
+    ) -> httpx.Response:
+        """One non-GET request to the registry's origin, answering one 401 challenge when the body allows it.
+
+        Returns a streaming response the caller closes. A 401 after a
+        credential was presented, or to a streamed body that cannot be
+        resent, is :class:`OCIAuthError`; a 403 is too (the registry knows
+        the Hub and will not let it write). Redirects are never followed.
+        """
+
+        replayable = content is None or isinstance(content, bytes)
+        request_headers = dict(headers or {})
+        presented = self._proactive_auth(scope_hint)
+        if presented:
+            request_headers["Authorization"] = presented
+        response = await self._write(method, url, request_headers, content, what=what)
+        if response.status_code == 401 and replayable:
+            challenges = _parse_challenges(response.headers.get_list("www-authenticate"))
+            await response.aclose()
+            request_headers["Authorization"] = await self._answer_challenge(challenges, scope_hint, presented)
+            response = await self._write(method, url, request_headers, content, what=what)
+        if response.status_code in (401, 403):
+            await response.aclose()
+            raise OCIAuthError(f"{what}: the registry refused the Hub's credential")
+        if response.status_code in _REDIRECT_STATUSES:
+            await response.aclose()
+            raise OCIProtocolError(f"{what}: the registry answered a write with a redirect")
+        return response
+
+    async def _write(
+        self,
+        method: str,
+        url: httpx.URL,
+        headers: Mapping[str, str],
+        content: bytes | AsyncIterable[bytes] | None,
+        *,
+        what: str,
+    ) -> httpx.Response:
+        try:
+            request = self._http.build_request(method, url, headers=dict(headers), content=content)
+        except (UnicodeError, ValueError, TypeError) as exc:
+            raise OCIProtocolError(f"{what}: request could not be constructed: {type(exc).__name__}") from exc
+        try:
+            return await self._http.send(request, stream=True, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            raise OCITransportError(f"{what}: {type(exc).__name__}") from exc
 
     async def list_tags(self, repo: str) -> list[str]:
         """List a repository's tags, following ``Link: rel="next"`` pagination.
@@ -544,6 +882,8 @@ class OCIClient:
             if not location:
                 raise OCIProtocolError(f"{what}: redirect without a Location header")
             target = _join_url(url, location, what=f"{what} redirect")
+            if self._restrict_redirects:
+                self._check_redirect(url, target, what=what)
             hop_headers = dict(headers)
             if not _same_origin(target, self._origin):
                 # Object storage must never see the registry credential. Every
@@ -559,6 +899,49 @@ class OCIClient:
             await response.aclose()
             raise OCIProtocolError(f"{what}: more than {MAX_BLOB_REDIRECTS} redirects")
         return response
+
+    def _check_redirect(self, previous: httpx.URL, target: httpx.URL, *, what: str) -> None:
+        """Refuse a redirect a client built with the redirect policy must not follow. Messages never quote the target.
+
+        Applied only when the client was constructed with
+        ``restrict_redirects`` or a ``redirect_hosts`` allowlist.
+
+        The registry is configured by the operator and trusted with a
+        credential, so this is defence in depth against a registry that is
+        compromised or misconfigured into pointing the Hub at something else:
+
+        - ``https`` never downgrades to ``http``, on any hop, including one
+          that returns to the registry;
+        - otherwise a hop that stays on the registry's own origin is allowed;
+        - a loopback, link-local or unspecified address is never a
+          destination (that covers the cloud metadata address and its IPv6
+          and IPv4-mapped forms), and neither is a host written as a bare
+          number or a short or hex/octal dotted form, which a resolver would
+          read as an address (see :func:`_redirect_host_kind`). Private
+          (RFC 1918) addresses are allowed: in-cluster object storage is
+          normal;
+        - with ``redirect_hosts`` configured, the host must be on it: an
+          exact name, or a ``.suffix`` any subdomain of which matches.
+
+        A hostname that *resolves* to a refused address is not caught here;
+        the allowlist is what closes that.
+        """
+
+        if previous.scheme == "https" and target.scheme != "https":
+            # Before the same-origin exemption: a chain that leaves an http
+            # registry for https storage may not be led back down to http,
+            # where the registry credential would be attached again.
+            raise OCIProtocolError(f"{what}: refusing a redirect from https to http")
+        if _same_origin(target, self._origin):
+            return
+        host = target.host.lower().rstrip(".")
+        kind = _redirect_host_kind(host)
+        if kind == "forbidden":
+            raise OCIProtocolError(f"{what}: refusing a redirect to a loopback or link-local address")
+        if kind == "ambiguous":
+            raise OCIProtocolError(f"{what}: refusing a redirect to a host that is neither an IP address nor a name")
+        if self._redirect_hosts and not any(_host_allowed(host, allowed) for allowed in self._redirect_hosts):
+            raise OCIProtocolError(f"{what}: refusing a redirect to a host that is not in blob_redirect_hosts")
 
     def _proactive_auth(self, scope_hint: str) -> str | None:
         if self._use_basic and self._credentials is not None:
@@ -674,6 +1057,101 @@ class OCIClient:
         _bound(self._tokens)
 
 
+class BlobStream:
+    """One open blob response, read as a verified stream.
+
+    Nothing is buffered beyond one chunk. :meth:`iter_verified` hashes the
+    bytes as they pass and **holds the last chunk back until the digest and
+    the size have been checked**: a body that does not hash to the digest it
+    was requested by ends in :class:`OCIDigestMismatch` *before* its final
+    bytes are released, so a consumer relaying the chunks to its own client
+    leaves that client with a short body rather than a complete wrong one.
+    """
+
+    def __init__(self, response: httpx.Response, digest: str) -> None:
+        self._response = response
+        self.digest = digest
+        self._closed = False
+
+    @property
+    def content_length(self) -> int | None:
+        """The size the registry (or its object storage) declared, when it declared a usable one."""
+
+        declared = self._response.headers.get("content-length")
+        if declared is None or not declared.isdigit():
+            return None
+        return int(declared)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._response.aclose()
+
+    async def iter_verified(self, *, max_bytes: int, expected_size: int | None = None):
+        """Yield the body's chunks; raise instead of releasing the last one if the blob is wrong.
+
+        ``max_bytes`` is the cap (:class:`OCITooLarge` once exceeded);
+        ``expected_size`` is the size a manifest descriptor promised, and a
+        body of any other length is :class:`OCIDigestMismatch`. Encoded
+        bodies are refused, as everywhere in this module. The response is
+        closed when the iteration ends, however it ends.
+        """
+
+        what = f"blob {self.digest}"
+        hasher = hashlib.sha256()
+        total = 0
+        held: bytes | None = None
+        try:
+            encoding = self._response.headers.get("content-encoding", "identity").strip().lower()
+            if encoding not in ("", "identity"):
+                raise OCIProtocolError(f"{what}: registry sent a Content-Encoding this client does not accept")
+            try:
+                async for chunk in self._response.aiter_bytes(_STREAM_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise OCITooLarge(f"{what} exceeds the {max_bytes}-byte cap")
+                    if expected_size is not None and total > expected_size:
+                        raise OCIDigestMismatch(f"{what}: body is longer than the {expected_size} bytes declared")
+                    hasher.update(chunk)
+                    if held is not None:
+                        yield held
+                    held = chunk
+            except httpx.HTTPError as exc:
+                raise OCITransportError(f"{what}: {type(exc).__name__} while reading") from exc
+        finally:
+            await self.aclose()
+        if expected_size is not None and total != expected_size:
+            raise OCIDigestMismatch(f"{what}: body is {total} bytes, {expected_size} declared")
+        actual = "sha256:" + hasher.hexdigest()
+        if actual != self.digest:
+            raise OCIDigestMismatch(f"{what}: body hashes to {actual}")
+        if held is not None:
+            yield held
+
+
+def is_index_manifest(manifest: Manifest) -> bool:
+    """Whether ``manifest`` is a multi-platform index rather than an image manifest."""
+
+    return _is_index(manifest.media_type, manifest.raw)
+
+
+def index_children(manifest: Manifest) -> list[Descriptor]:
+    """The child descriptors of an index manifest (``[]`` for an image manifest)."""
+
+    if not is_index_manifest(manifest):
+        return []
+    children = _parse_json_object(manifest.raw, what="index").get("manifests")
+    if not isinstance(children, list):
+        raise OCIProtocolError("index has no 'manifests' list")
+    return [_parse_descriptor(entry, what="index entry") for entry in children]
+
+
 def select_bundle_layers(
     manifest: Manifest,
     *,
@@ -739,6 +1217,33 @@ def _pull_scope(repo: str) -> str:
     return f"repository:{repo}:pull"
 
 
+def _push_scope(repo: str) -> str:
+    return f"repository:{repo}:pull,push"
+
+
+def _expect(response: httpx.Response, statuses: tuple[int, ...], *, what: str) -> None:
+    """Raise unless the registry answered a write with one of ``statuses``. The body is not read."""
+
+    status = response.status_code
+    if status in statuses:
+        return
+    if 400 <= status < 500:
+        raise OCIRejected(f"{what}: the registry answered HTTP {status}", status)
+    raise OCIProtocolError(f"{what}: the registry answered HTTP {status}")
+
+
+def is_tag(value: object) -> bool:
+    """Whether ``value`` is a tag by the distribution grammar."""
+
+    return isinstance(value, str) and _TAG_RE.fullmatch(value) is not None
+
+
+def is_sha256_digest(value: object) -> bool:
+    """Whether ``value`` is ``sha256:`` + 64 lowercase hex digits, the one digest form this module verifies."""
+
+    return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
+
+
 def _validate_repo(repo: object) -> None:
     if not isinstance(repo, str) or len(repo) > _MAX_REPO_LENGTH or not _REPO_RE.fullmatch(repo):
         raise OCIInvalidReference(f"invalid repository name {repo!r}")
@@ -774,6 +1279,49 @@ def _join_url(base: httpx.URL, target: str, *, what: str) -> httpx.URL:
 def _same_origin(a: httpx.URL, b: httpx.URL) -> bool:
     # httpx drops default ports, so https://h and https://h:443 compare equal.
     return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
+
+
+_NUMERIC_LABEL = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)")
+
+
+def _redirect_host_kind(host: str) -> str:
+    """Classify a redirect host (lowercase, no trailing dot): ``"ok"``, ``"forbidden"`` or ``"ambiguous"``.
+
+    - A **canonical IP literal** (what :mod:`ipaddress` parses strictly:
+      dotted-quad IPv4 without leading zeros, or IPv6) is range-checked:
+      loopback, link-local and unspecified addresses, and their IPv4-mapped
+      IPv6 forms, are forbidden.
+    - Anything else must be a **name with at least one label that is not a
+      number**. ``2130706433``, ``127.1``, ``0x7f000001`` and ``0177.0.0.1``
+      are not names: the resolver reads them as addresses (here, loopback),
+      and they parse as no canonical literal, so they are ambiguous and
+      refused rather than interpreted.
+    - ``localhost`` and names under it are forbidden: by convention they are
+      loopback, whatever a resolver says.
+    """
+
+    if not host:
+        return "ambiguous"
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        if host == "localhost" or host.endswith(".localhost"):
+            return "forbidden"
+        if ":" in host or all(_NUMERIC_LABEL.fullmatch(label) for label in host.split(".")):
+            return "ambiguous"
+        return "ok"
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    if address.is_loopback or address.is_link_local or address.is_unspecified:
+        return "forbidden"
+    return "ok"
+
+
+def _host_allowed(host: str, allowed: str) -> bool:
+    if allowed.startswith("."):
+        return host.endswith(allowed)
+    return host == allowed
 
 
 def _bound(mapping: dict) -> None:

@@ -1060,6 +1060,21 @@ def _credential_claims(request: Request) -> tuple[dict, str] | None:
     return None
 
 
+def session_id_of(request: Request) -> str | None:
+    """The ``sid`` of the session behind this request's credential, when its token carries one.
+
+    Recorded with things exchanged from a session (a Cog registry credential)
+    so they can be traced back to it. ``None`` for the dev shortcut and for a
+    token without the claim; never an authentication decision.
+    """
+
+    credential = _credential_claims(request)
+    if credential is None:
+        return None
+    sid = credential[0].get("sid")
+    return sid if isinstance(sid, str) and sid else None
+
+
 def _dev_auth_user() -> str | None:
     """The local/dev shortcut's subject, or ``None`` when it is not enabled."""
 
