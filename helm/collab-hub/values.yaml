@@ -691,6 +691,10 @@ cogs:
     #   indexUrl: catalog.v1.json URL listing repositories (static)
     #   caBundlePath: per-source CA bundle path; defaults to cogs.caBundle when that is set
     #   requestTimeoutSeconds: HTTP timeout, default 10
+    #   blobRedirectHosts: hosts a blob redirect from this registry may point at
+    #         (its object storage): exact names or leading-dot suffixes such as
+    #         ".s3.amazonaws.com". Empty means no allowlist; loopback and
+    #         link-local addresses are refused either way.
     #   credentials:
     #     existingSecret: Secret holding the robot/service credential (required if the block is present)
     #     usernameKey: key in that Secret, default "username"
@@ -735,7 +739,8 @@ cogs:
     # what clients released before this pull from. On, references name the
     # Hub. Needs at least one source. See docs/cog-registry.md.
     enabled: false
-    # -- The Hub's external origin: `https://host[:port]`, no path. This is
+    # -- The Hub's external origin: `https://host[:port]`, no path and no
+    # trailing slash. This is
     # the origin of the Hub API itself, not a separate registry hostname:
     # `/v2/` is served on the same host as `/v1`, and clients accept a
     # registry credential only for the exact origin they exchanged it at.

@@ -289,6 +289,7 @@ toJson sorts keys, so the rendering is deterministic.
 {{- with .repositories }}{{ $_ := set $source "repositories" . }}{{ end -}}
 {{- with .indexUrl }}{{ $_ := set $source "index_url" . }}{{ end -}}
 {{- with (default $caBundlePath .caBundlePath) }}{{ $_ := set $source "ca_bundle_path" . }}{{ end -}}
+{{- with .blobRedirectHosts }}{{ $_ := set $source "blob_redirect_hosts" . }}{{ end -}}
 {{- if hasKey . "requestTimeoutSeconds" }}{{ $_ := set $source "request_timeout_seconds" .requestTimeoutSeconds }}{{ end -}}
 {{- $credentials := .credentials | default dict -}}
 {{- if $credentials.existingSecret -}}

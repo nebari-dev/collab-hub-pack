@@ -397,6 +397,62 @@ cases:
       serve: {enabled: true, public_url: 'oci://hub.example.com'}
     app_error: 'must be an http\(s\) origin with a host'
 
+  - name: serve public URL with an out-of-range port
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        serve: {enabled: true, publicUrl: 'https://hub.example.com:99999'}
+    chart_error: 'publicUrl.*(pattern|match)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      serve: {enabled: true, public_url: 'https://hub.example.com:99999'}
+    app_error: 'has an invalid port'
+
+  - name: serve public URL with a trailing slash
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        serve: {enabled: true, publicUrl: 'https://hub.example.com/'}
+    chart_error: 'publicUrl.*(pattern|match)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+      serve: {enabled: true, public_url: 'https://hub.example.com/'}
+    app_error: 'must be a bare origin'
+
+  - name: blob redirect host with a scheme
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blobRedirectHosts: ['https://storage.example.com']}
+    chart_error: 'blobRedirectHosts.*(pattern|match)'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blob_redirect_hosts: ['https://storage.example.com']}
+    app_error: 'is not a hostname or a leading-dot suffix'
+
+  - name: duplicate blob redirect hosts
+    layers: [schema]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blobRedirectHosts: [storage.example.com, storage.example.com]}
+    chart_error: 'blobRedirectHosts.*are equal'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blob_redirect_hosts: [storage.example.com, storage.example.com]}
+    app_error: 'blob_redirect_hosts lists .* twice'
+
   - name: registry credential lifetime below the floor
     layers: [schema]
     values:
@@ -969,7 +1025,7 @@ accepted:
       cogs:
         registry:
           sources:
-            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+            - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blobRedirectHosts: [storage.example.com, .s3.amazonaws.com, 10.0.0.7]}
         serve:
           enabled: true
           publicUrl: 'https://hub.example.com:8443'
@@ -979,7 +1035,7 @@ accepted:
           maxBlobSeconds: 21600
     settings:
       registry_sources:
-        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha]}
+        - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blob_redirect_hosts: [storage.example.com, .s3.amazonaws.com, 10.0.0.7]}
       serve:
         enabled: true
         public_url: 'https://hub.example.com:8443'
