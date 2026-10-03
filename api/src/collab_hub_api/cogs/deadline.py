@@ -51,6 +51,14 @@ class BudgetedConnection:
     spent by earlier statements, is therefore never granted again.
     """
 
+    # One residual, stated rather than engineered around: the ``set_config``
+    # round trip that installs the timeout is itself a trivial statement with
+    # no timeout of its own. If *it* stalls (a dead server or network, not a
+    # lock: it touches no table), it is bounded by the pool's connection
+    # settings -- TCP keepalive and the pool's liveness handling -- and not by
+    # the request budget. The deadline is re-checked when it returns, so the
+    # application statement never starts late.
+
     def __init__(self, conn, deadline: float) -> None:
         self._conn = conn
         self._deadline = deadline
@@ -63,6 +71,10 @@ class BudgetedConnection:
             "SELECT set_config('statement_timeout', %s, true)",
             (str(max(1, int(remaining * 1000))),),
         )
+        # The setup round trip took time too: if it used up what was left,
+        # the statement is not sent at all rather than started late.
+        if self._deadline - time.monotonic() <= 0:
+            raise BudgetExhausted("the request's time budget is spent")
         return self._conn.execute(sql, params)
 
 

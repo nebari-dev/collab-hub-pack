@@ -634,3 +634,121 @@ async def test_a_malformed_page_number_is_a_400_not_a_500(hub: Hub):
     for good, count in (("1", 1), ("999999999", 1), ("0", 0), ("0001", 1)):
         response = await hub.get(f"/v2/{REPO}/tags/list", params={"n": good}, headers=headers)
         assert response.status_code == 200 and len(response.json()["tags"]) == count, good
+
+
+def test_first_sign_in_provisioning_spends_from_the_request_budget_inside_a_registry_request():
+    """A single-org first sign-in can be admitted at the token endpoint; that write is bounded there, and only there."""
+
+    from contextlib import contextmanager
+
+    import psycopg
+
+    from collab_hub_api.cogs import deadline
+    from collab_hub_api.frames.orgs import PostgresOrgStore
+
+    seen: list = []
+
+    class ConflictingInsertHeldElsewhere:
+        def execute(self, sql, params=None):
+            if "set_config('statement_timeout'" in sql:
+                seen.append(("timeout", int(params[0])))
+                return self
+            seen.append(("sql", " ".join(sql.split())[:30]))
+            raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            seen.append(("checkout", timeout))
+            yield ConflictingInsertHeldElsewhere()
+
+    store = PostgresOrgStore(Database())
+    # Outside a registry request: the ordinary checkout, no timeout, the statement sent as it always was.
+    with pytest.raises(psycopg.errors.QueryCanceled):
+        store.provision_member("sub-1", "org-1", "Org One")
+    assert seen[0] == ("checkout", None) and seen[1][0] == "sql" and len(seen) == 2
+
+    seen.clear()
+    token = deadline.request_deadline.set(deadline.time.monotonic() + 0.4)
+    try:
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            store.provision_member("sub-1", "org-1", "Org One")
+    finally:
+        deadline.request_deadline.reset(token)
+    checkout, timeout, statement = seen
+    assert checkout[0] == "checkout" and 0 < checkout[1] <= 0.4
+    assert timeout[0] == "timeout" and 1 <= timeout[1] <= 400 and statement[0] == "sql"
+
+
+def test_a_statement_is_not_sent_when_installing_its_timeout_used_up_the_budget(monkeypatch):
+    from contextlib import contextmanager
+
+    from collab_hub_api.cogs import deadline
+
+    clock = [50.0]
+    monkeypatch.setattr(deadline.time, "monotonic", lambda: clock[0])
+    sent: list[str] = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            sent.append(sql.split("(")[0].strip())
+            if sql.startswith("SELECT set_config"):
+                clock[0] += 2.0  # the setup round trip alone takes two seconds
+            return self
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            yield Connection()
+
+    token = deadline.request_deadline.set(clock[0] + 1.0)
+    try:
+        with pytest.raises(deadline.BudgetExhausted):
+            with deadline.bounded_connection(Database()) as conn:
+                conn.execute("SELECT application_query()")
+    finally:
+        deadline.request_deadline.reset(token)
+    assert sent == ["SELECT set_config"], "the application statement never started after the deadline"
+
+
+async def test_token_and_version_endpoints_do_not_wait_for_a_worker_past_their_budget(hub: Hub):
+    """Every threadpool slot is busy: the budget covers the wait for one, not only the store calls."""
+
+    import threading
+    import time
+
+    import anyio.to_thread
+
+    credential = await hub.exchange()
+    headers = {"Authorization": f"Bearer {await hub.token(credential, REPO)}"}
+    serving = hub.serving
+    fields = {name: getattr(serving, name) for name in serving.__dataclass_fields__}
+    hub.app.state.cog_registry_serving = type(serving)(**{**fields, "max_metadata_seconds": 0.05})
+
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    original = limiter.total_tokens
+    release = threading.Event()
+    limiter.total_tokens = 1
+    occupied = asyncio.create_task(anyio.to_thread.run_sync(release.wait))
+    try:
+        await asyncio.sleep(0.05)
+        assert limiter.borrowed_tokens == 1, "the only worker slot is taken"
+        for path, auth in (
+            ("/v2/token", basic(credential["username"], credential["secret"])),
+            ("/v2/", headers),
+            (f"/v2/{REPO}/manifests/latest", headers),
+        ):
+            started = time.monotonic()
+            response = await hub.request("GET", path, headers=auth)
+            elapsed = time.monotonic() - started
+            assert response.status_code == 503, (path, response.status_code)
+            assert response.json()["errors"][0]["code"] == "UNAVAILABLE"
+            assert elapsed < 1.0, f"{path} answered after {elapsed:.2f}s against a 0.05s budget"
+            assert not release.is_set()
+    finally:
+        release.set()
+        await occupied
+        limiter.total_tokens = original
+    # With a worker free again the same requests succeed.
+    hub.app.state.cog_registry_serving = serving
+    assert (await hub.get("/v2/", headers=headers)).status_code == 200

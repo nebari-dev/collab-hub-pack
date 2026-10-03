@@ -562,9 +562,18 @@ the same budget on the database's side: the pool wait is capped at what is
 left, and before each statement a transaction-local `statement_timeout` is
 set to what is left at that moment, so Postgres cancels a statement that
 would outlive the request and no later statement gets the time an earlier
-one used. Once the budget is spent no further SQL is sent. The membership
-lookup is bounded this way only inside a registry request; every other
-caller of the organization store is unchanged.
+one used. Once the budget is spent no further SQL is sent, including when
+installing the timeout itself used up what was left. The membership lookup,
+and the first-sign-in membership write a single-organization deployment may
+make at the token endpoint, are bounded this way only inside a registry
+request; every other caller of the organization store is unchanged. The
+token endpoint and the version check run under the same aggregate timeout
+as the read routes, which also covers waiting for a worker thread.
+
+One residual: the round trip that installs a statement's timeout is a
+trivial statement with no timeout of its own. If that round trip itself
+stalls (a dead server or network; it takes no lock), it is bounded by the
+pool's connection settings and TCP keepalive, not by the request budget.
 
 **Streaming.** Blobs are relayed in 64 KiB chunks and never buffered whole.
 Each is hashed as it passes and its last chunk is held until the hash and

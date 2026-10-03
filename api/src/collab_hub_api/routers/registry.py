@@ -181,6 +181,26 @@ def _start_budget(seconds: float) -> None:
     request_deadline.set(time.monotonic() + seconds)
 
 
+async def _within_budget(request: Request, operation) -> Response:
+    """Run a metadata operation under the aggregate deadline, in the registry's error format.
+
+    The coroutine timeout covers what the database-side budget cannot:
+    waiting for a threadpool slot before any store call has even begun.
+    """
+
+    budget = _serving(request).max_metadata_seconds
+    _start_budget(budget)
+    try:
+        async with asyncio.timeout(budget):
+            return await operation()
+    except RegistryError as exc:
+        return error_response(exc)
+    except TimeoutError:
+        return error_response(_unavailable())
+    except _storage_errors():
+        return error_response(_unavailable())
+
+
 def _storage_errors() -> tuple[type[Exception], ...]:
     return (
         RegistryCredentialsUnavailableError,
@@ -351,15 +371,9 @@ def _mint(request: Request) -> JSONResponse:
 
 @router.get(REGISTRY_PATH_PREFIX + "/token")
 async def token(request: Request) -> Response:
-    _start_budget(_serving(request).max_metadata_seconds)
-    try:
-        # One threadpool hop for the whole mint: the credential lookup, the
-        # membership re-check and the insert are all blocking store calls.
-        return await run_in_threadpool(_mint, request)
-    except RegistryError as exc:
-        return error_response(exc)
-    except _storage_errors():
-        return error_response(_unavailable())
+    # One threadpool hop for the whole mint: the credential lookup, the
+    # membership re-check and the insert are all blocking store calls.
+    return await _within_budget(request, lambda: run_in_threadpool(_mint, request))
 
 
 # -- the read API ---------------------------------------------------------------
@@ -534,14 +548,11 @@ async def _answer(request: Request, rest: str) -> Response:
 async def base(request: Request) -> Response:
     """The version check: ``200 {}`` with a pull token, the bearer challenge without one."""
 
-    _start_budget(_serving(request).max_metadata_seconds)
-    try:
+    async def check() -> Response:
         await _grant(request, None)
-    except RegistryError as exc:
-        return error_response(exc)
-    except _storage_errors():
-        return error_response(_unavailable())
-    return JSONResponse({}, headers=API_VERSION_HEADERS)
+        return JSONResponse({}, headers=API_VERSION_HEADERS)
+
+    return await _within_budget(request, check)
 
 
 @router.api_route(REGISTRY_PATH_PREFIX + "/{rest:path}", methods=["GET", "HEAD"])

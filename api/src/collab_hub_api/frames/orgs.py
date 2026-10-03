@@ -452,7 +452,11 @@ class PostgresOrgStore(OrgStore):
         # org.rename and a config value must not silently perform one on every
         # provision.
         try:
-            with self._db.connection() as conn:
+            # request_connection: bounded by the request budget inside a
+            # registry (/v2) request, where a first sign-in can be admitted at
+            # the token endpoint; the ordinary checkout, and the same single
+            # transaction, everywhere else (issue #179).
+            with request_connection(self._db) as conn:
                 conn.execute(
                     """
                     INSERT INTO collab_orgs (id, name, created_by)
