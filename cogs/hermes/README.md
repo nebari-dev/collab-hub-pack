@@ -6,7 +6,7 @@
 |---|---|
 | `serve.py` | The worker the run controller starts. Standard library only |
 | `hermes_acp.py` | How the worker starts Hermes: `hermes acp`, with no tools |
-| `pixi.toml` | The package: Python 3.12 and `hermes-agent[acp]`, and the `serve` task |
+| `pixi.toml` | The package: Python 3.12 and `hermes-agent[acp,anthropic]`, and the `serve` task |
 | `pixi.lock` | That environment, pinned for Linux and macOS |
 
 ## What the worker does
@@ -26,16 +26,17 @@ The controller delivers the model in the worker's environment, to this Cog and n
 
 | Variable | What |
 |---|---|
-| `COLLAB_MODEL_BASE_URL` | An OpenAI-compatible endpoint. Without it, the step fails `model-unavailable` |
-| `COLLAB_MODEL_NAME` | The model's id at that endpoint |
-| `COLLAB_MODEL_API_KEY` | Its key, if it needs one |
+| `COLLAB_MODEL_PROVIDER` | `openai-compatible` (the default), or `anthropic` for Claude through Hermes's own Anthropic provider, which uses the Anthropic SDK |
+| `COLLAB_MODEL_BASE_URL` | The OpenAI-compatible endpoint. Not used with `anthropic` |
+| `COLLAB_MODEL_NAME` | The model's id. With `anthropic`, `claude-opus-5-5` when unset |
+| `COLLAB_MODEL_API_KEY` | Its key. Required with `anthropic` |
 
-`make -C dev controller` delivers them, with [`dev/fake-model`](../../dev/fake-model/fake_model.py) as the default: an endpoint that answers `The fake model heard: ...` with no account and no network. Model bindings resolved by the hub replace this in a later phase of the plan.
+A model the worker cannot use fails the step `model-unavailable`, saying why. `make -C dev controller` delivers them, with [`dev/fake-model`](../../dev/fake-model/fake_model.py) as the default: an endpoint that answers `The fake model heard: ...` with no account and no network. [`examples/cog-local`](../../examples/cog-local/README.md) switches to Claude when `ANTHROPIC_API_KEY` is set. Model bindings resolved by the hub replace this in a later phase of the plan.
 
 ## What Hermes sees
 
-- **A home of its own.** Each session gets a temporary workspace, and `HERMES_HOME` inside it holds only a `config.yaml` naming the delivered model. Nothing of the machine's own `~/.hermes` is read or changed.
-- **Not the hub's secrets.** The run token and the model key are removed from Hermes's environment; the key reaches Hermes only through its config file, which is readable by its owner alone.
+- **A home of its own.** Each session gets a temporary workspace, which is also Hermes's `HOME`, and `HERMES_HOME` inside it holds only a `config.yaml` naming the delivered model. Nothing of the machine's own `~/.hermes` is read or changed, and Hermes finds no credentials of its own: its Anthropic provider would otherwise prefer Claude Code's sign-in to any key. The workspace is removed when the session ends or the worker is stopped.
+- **Only its model's key.** Hermes's environment is an allowlist (`PATH`, `LANG` and the like), so the run token, and any provider key the worker's environment happens to hold, never reach it: Hermes picks up whatever key it finds. Its model's key reaches it in its config file, readable by its owner alone, or, for Claude, as `ANTHROPIC_API_KEY`, the only way Hermes 0.19's Anthropic provider takes one.
 - **No tools.** The first Hermes run is prompt in, answer out (decision 14 of the plan): no command, no file, no browser, no web. Hermes 0.19's ACP adapter enables its whole toolset for every session and reads no setting that narrows it, so the worker starts Hermes through [`hermes_acp.py`](hermes_acp.py), which gives each session no toolsets at all. Its model is then offered no tools, and a tool call it makes anyway fails with `Tool '...' does not exist`; a test checks it with a model that orders a shell command. Should Hermes ask its client's permission for anything, the worker refuses.
 
 ## Running it

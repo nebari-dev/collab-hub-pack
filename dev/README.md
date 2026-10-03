@@ -1159,7 +1159,8 @@ Cog) and `examples/cog-local/cogs` (`hello`); both targets read it, so set it
 on both to add a directory of your own.
 
 **The Hermes Cog's model.** `make controller` hands the Hermes Cog's workers,
-and no other's, the model in `COLLAB_MODEL_BASE_URL`, `COLLAB_MODEL_NAME` and
+and no other's, the model in `COLLAB_MODEL_PROVIDER` (`openai-compatible`, or
+`anthropic` for Claude), `COLLAB_MODEL_BASE_URL`, `COLLAB_MODEL_NAME` and
 `COLLAB_MODEL_API_KEY`. By default it is `make fake-model`, an OpenAI-compatible
 endpoint on port 8090 that answers `The fake model heard: ...` with no account
 and no network ([`fake-model/fake_model.py`](fake-model/fake_model.py)). Set

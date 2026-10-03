@@ -8,6 +8,7 @@ itself against the fake model, where the Cog's pixi environment is installed.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -80,10 +81,42 @@ def test_hermes_gets_the_delivered_model_in_a_home_of_its_own_and_never_the_secr
     seen = json.loads(_answer(controller, track, "r", "env"))
     assert seen["model"] == {"provider": "custom", "base_url": "http://127.0.0.1:9/v1", "default": "a-model",
                              "api_key": "the-key"}
-    assert seen["run_token"] is False and seen["api_key_env"] is False
+    assert seen["run_token"] is False and seen["api_key_env"] is False and seen["anthropic_key"] is None
     assert Path(seen["cwd"]).name.startswith("hermes-r-")  # a workspace of the run's, not the package
+    assert seen["home"] == seen["cwd"]  # so no credentials of the machine's own are found under HOME
     intents.request_cancel(track, "r", actor="alice")
     _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+    # Terminated, the worker removes the session's workspace: its config names the model and its key.
+    deadline = time.monotonic() + 10
+    while Path(seen["cwd"]).exists():
+        assert time.monotonic() < deadline, "the session's workspace outlived the run"
+        time.sleep(0.05)
+
+
+def test_with_claude_hermes_uses_its_anthropic_provider_and_gets_only_that_key(tmp_path):
+    # A provider key the worker happens to have, here Gemini's, never reaches Hermes: it would use it.
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, {"COLLAB_MODEL_PROVIDER": "anthropic", "COLLAB_MODEL_API_KEY": "sk-key",
+                                               "GEMINI_API_KEY": "not-for-hermes"})
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    seen = json.loads(_answer(controller, track, "r", "env"))
+    assert seen["model"] == {"provider": "anthropic", "default": "claude-opus-5-5"}  # no key written to disk
+    assert seen["anthropic_key"] == "sk-key" and seen["gemini_key"] is False
+    intents.request_cancel(track, "r", actor="alice")
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+
+
+@pytest.mark.parametrize(("environment", "why"), [
+    ({"COLLAB_MODEL_PROVIDER": "anthropic"}, "needs COLLAB_MODEL_API_KEY"),
+    ({"COLLAB_MODEL_PROVIDER": "gemini", "COLLAB_MODEL_BASE_URL": "http://x/v1"}, "unknown COLLAB_MODEL_PROVIDER"),
+])
+def test_a_model_the_worker_cannot_use_fails_the_step_and_says_why(tmp_path, environment, why):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, environment)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    _until(controller, lambda: intents.describe(track, "r").state.ended, "the run did not end")
+    view = intents.describe(track, "r")
+    assert view.state is RunState.FAILED and view.error == "model-unavailable" and why in view.reason
 
 
 def test_a_tool_hermes_asks_permission_for_is_refused(tmp_path):
@@ -174,3 +207,22 @@ def test_hermes_runs_no_command_even_when_its_model_orders_one(tmp_path):
     assert not marker.exists(), "Hermes ran the command its model ordered"
     assert "Tool 'terminal' does not exist" in answer
     assert "offered: []" in (tmp_path / "model.log").read_text()  # no tool was even offered to the model
+
+
+@NEEDS_HERMES
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("COLLAB_TEST_CLAUDE") != "1",
+                    reason="spends a few Claude tokens: set COLLAB_TEST_CLAUDE=1 and ANTHROPIC_API_KEY to run it")
+def test_hermes_chats_with_claude_for_real(tmp_path):
+    track = InMemoryTrackStore()
+    key = os.environ["ANTHROPIC_API_KEY"]
+    runner = LifecycleRunner(track=track, location="local", location_settings={
+        "packages": [REPOSITORY / "cogs"], "allow": ["hermes"], "work_dir": tmp_path / "runs",
+        "interaction_timeout": None,
+        "deliver": lambda cog, run_id, instance: {"COLLAB_MODEL_PROVIDER": "anthropic", "COLLAB_MODEL_API_KEY": key}})
+    controller = RunController(runner, poll_interval=0.05)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    try:
+        assert "391" in _answer(controller, track, "r", "What is 17 times 23? Answer with the number only.")
+    finally:
+        intents.request_cancel(track, "r", actor="alice")
+        _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")

@@ -39,17 +39,28 @@ Or all three in the background with `make start` (logs in `.local/`, stopped wit
 
 ### Which model
 
-By default Hermes talks to a fake model, an OpenAI-compatible endpoint on port 8090 that answers every prompt with `The fake model heard: ...`. It needs no account and no network, which is what lets CI run this example.
+The steps decide it once, from your environment:
 
-To use a real model, set these in your environment before `make controller` (or `make start`), and skip `make model`:
+| If | Hermes chats with | `make model` |
+|---|---|---|
+| `ANTHROPIC_API_KEY` is set | **Claude**, for real: `claude-opus-5-5`, through Hermes's own Anthropic provider | not needed |
+| `COLLAB_MODEL_BASE_URL` is set | your OpenAI-compatible endpoint, with `COLLAB_MODEL_NAME` and `COLLAB_MODEL_API_KEY` | not needed |
+| neither | a fake model on port 8090 that answers every prompt with `The fake model heard: ...`, with no account and no network | needed, or `make start` |
+
+To chat with Claude:
 
 ```sh
-export COLLAB_MODEL_BASE_URL=https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint
-export COLLAB_MODEL_NAME=anthropic/claude-sonnet-4.5
-export COLLAB_MODEL_API_KEY=...                             # read from your environment, never from make's command line
+export ANTHROPIC_API_KEY=...   # from https://platform.claude.com; read from your environment, never from make's command line
+make claude                    # checks the key with Anthropic, and confirms Hermes will use Claude
 ```
 
-The controller hands these to the Hermes Cog's worker, and to no other Cog.
+```text
+  ANTHROPIC_API_KEY is set, and Anthropic accepts it: Claude Opus 5.5 (claude-opus-5-5) is available.
+  Hermes will chat with Claude for real: start (or restart) the controller from here,
+  with make controller or make start, and launch Hermes.
+```
+
+The model is the controller's to hand out, so set the key before starting it. `CLAUDE_MODEL=...` picks another Claude model. The controller hands the model to the Hermes Cog's worker and to no other Cog, and Hermes sees only that model's key: none of the other provider keys in your environment, and none of your own Claude Code or Hermes sign-ins. `make demo` always uses the fake model, so it costs nothing and runs anywhere.
 
 ## 2. Sign in with the CLI
 
@@ -96,10 +107,10 @@ run-d30f9866404b  hermes  RUNNING  0s   Dev User
 ## 5. Talk to Hermes from Toad
 
 ```sh
-make connect       # toad acp "collab-hub run connect RUN"
+make toad       # toad acp "collab-hub run connect RUN"
 ```
 
-Toad opens with the running Hermes as its agent. Ask it a few things: `hello`, `what can you do?`, anything you would ask an assistant. With the fake model each answer is `The fake model heard: ...`; with a real one, it is Hermes answering. Leave Toad with `ctrl+q`; Hermes keeps running.
+Toad opens with the running Hermes as its agent. Ask it a few things: `hello`, `what can you do?`, anything you would ask an assistant. With Claude or another real model, it is Hermes answering; with the fake model each answer is `The fake model heard: ...`. Leave Toad with `ctrl+q`; Hermes keeps running.
 
 The same from the CLI, one turn at a time:
 
@@ -145,7 +156,7 @@ Every step above in order, with the fake model, `login-token` for the sign-in, a
 ```text
 make login     ──▶ Keycloak (dev / dev) ──token──▶ collab-hub
 make launch    ──▶ POST /v1/runs ──▶ API ──writes──▶ Track ◀──watches── controller ──starts──▶ Hermes Cog ──▶ hermes acp
-make connect   ──▶ Toad ──ACP──▶ collab-hub run connect ──POST /v1/runs/{id}/turns──▶ API ──▶ Track
+make toad   ──▶ Toad ──ACP──▶ collab-hub run connect ──POST /v1/runs/{id}/turns──▶ API ──▶ Track
                        controller ──POST /turn──▶ Hermes Cog ──ACP──▶ Hermes ──▶ model
 make stop      ──▶ POST /v1/runs/{id}/cancel ──▶ API ──▶ Track ──▶ controller stops the Cog and Hermes
 ```
@@ -164,7 +175,7 @@ This directory also has [`cogs/hello`](cogs/hello), the smallest Cog that holds 
 | Hermes answers `API call failed ... Connection error` | Nothing listens at the model's address | `make model`, or check `COLLAB_MODEL_BASE_URL` |
 | The run fails with `model-unavailable` | The controller had no model to hand Hermes | Start the controller from this directory, or set the three variables above |
 | The first launch takes minutes | pixi is installing Hermes's environment | `make env` installs it ahead of time |
-| `make connect` or `make say` says the run takes no turns | The run has ended | `make launch` again |
+| `make toad` or `make say` says the run takes no turns | The run has ended | `make launch` again |
 | `toad: command not found` | Toad was installed into `~/.local/bin` | Add it to `PATH`, or open a new shell |
 
 The Cog's own output, Hermes's included, is under `../../dev/.local/runs/`, and the processes' in `.local/` when `make start` started them.

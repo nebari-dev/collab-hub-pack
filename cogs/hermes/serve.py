@@ -20,8 +20,10 @@ Entry points:
   run is terminated and this process with it.
 - `ask` answers one prompt, `input.prompt`, and returns.
 
-The model comes from the controller, in the environment: `COLLAB_MODEL_BASE_URL`
-(an OpenAI-compatible endpoint), `COLLAB_MODEL_NAME` and `COLLAB_MODEL_API_KEY`.
+The model comes from the controller, in the environment: `COLLAB_MODEL_PROVIDER`
+(`openai-compatible`, the default, or `anthropic` for Claude through Hermes's
+Anthropic provider), `COLLAB_MODEL_BASE_URL` (the OpenAI-compatible endpoint),
+`COLLAB_MODEL_NAME` and `COLLAB_MODEL_API_KEY`.
 Hermes gets a home of its own for the run, so nothing of the machine's own
 Hermes setup is read or changed. Should Hermes ask permission for anything, the
 worker refuses, since nobody is there to answer it.
@@ -31,6 +33,8 @@ import hmac
 import json
 import os
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +43,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 COG = os.environ.get("COLLAB_COG_ID", "hermes")
+DEFAULT_CLAUDE = "claude-opus-5-5"
+# What Hermes's process inherits from the worker's: enough to run, and no credential.
+HERMES_INHERITS = ("PATH", "LANG", "LC_ALL", "TZ", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
 RUN = os.environ.get("COLLAB_RUN_ID", "")
 TOKEN = os.environ.get("COLLAB_RUN_TOKEN", "")
 # Overridable so the worker can be tested against a stand-in agent; Hermes itself by default.
@@ -54,12 +61,22 @@ def hermes_home(root):
     """A Hermes home for this run: the model the controller delivered, and nothing else."""
     home = Path(root) / "hermes-home"
     home.mkdir(parents=True, exist_ok=True)
-    base_url = os.environ.get("COLLAB_MODEL_BASE_URL", "")
-    if not base_url:
-        raise RuntimeError("no model: the controller delivers COLLAB_MODEL_BASE_URL to this Cog")
-    model = {"provider": "custom", "base_url": base_url,
-             "default": os.environ.get("COLLAB_MODEL_NAME", ""),
-             "api_key": os.environ.get("COLLAB_MODEL_API_KEY", "") or "none"}
+    provider = os.environ.get("COLLAB_MODEL_PROVIDER", "") or "openai-compatible"
+    name, key = os.environ.get("COLLAB_MODEL_NAME", ""), os.environ.get("COLLAB_MODEL_API_KEY", "")
+    if provider == "anthropic":
+        # Claude, through Hermes's own Anthropic provider (the Anthropic SDK), with the delivered key.
+        if not key:
+            raise RuntimeError("no model: the anthropic provider needs COLLAB_MODEL_API_KEY")
+        # Hermes 0.19 reads an Anthropic key from its environment only: Agent passes it there.
+        model = {"provider": "anthropic", "default": name or DEFAULT_CLAUDE}
+    elif provider == "openai-compatible":
+        base_url = os.environ.get("COLLAB_MODEL_BASE_URL", "")
+        if not base_url:
+            raise RuntimeError("no model: the controller delivers COLLAB_MODEL_BASE_URL, or "
+                               "COLLAB_MODEL_PROVIDER=anthropic, to this Cog")
+        model = {"provider": "custom", "base_url": base_url, "default": name, "api_key": key or "none"}
+    else:
+        raise RuntimeError(f"unknown COLLAB_MODEL_PROVIDER {provider!r}: it is openai-compatible or anthropic")
     # JSON is YAML: Hermes reads this file as its config.yaml.
     (home / "config.yaml").write_text(json.dumps({"model": model}, indent=2))
     (home / "config.yaml").chmod(0o600)
@@ -71,9 +88,21 @@ class Agent:
 
     def __init__(self):
         self.workspace = Path(tempfile.mkdtemp(prefix=f"hermes-{RUN or 'run'}-"))
-        env = {**os.environ, "HERMES_HOME": str(hermes_home(self.workspace))}
-        for name in ("COLLAB_RUN_TOKEN", "COLLAB_MODEL_API_KEY"):
-            env.pop(name, None)  # Hermes reads the key from its config; it never needs the run token
+        self.process = None
+        try:
+            self._start()
+        except BaseException:
+            self.close()  # a session that could not open leaves nothing behind either
+            raise
+
+    def _start(self):
+        # Hermes picks up any provider's key it finds in its environment, and credentials of its own
+        # under HOME (Claude Code's among them): it gets neither, only what it needs to run, a HOME
+        # of its own, and its config, which names the model it was delivered.
+        env = {name: os.environ[name] for name in HERMES_INHERITS if name in os.environ}
+        env.update(HERMES_HOME=str(hermes_home(self.workspace)), HOME=str(self.workspace))
+        if os.environ.get("COLLAB_MODEL_PROVIDER") == "anthropic":
+            env["ANTHROPIC_API_KEY"] = os.environ["COLLAB_MODEL_API_KEY"]
         self.process = subprocess.Popen(AGENT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
                                         text=True, env=env, cwd=self.workspace)
         self.lock = threading.Lock()
@@ -127,12 +156,14 @@ class Agent:
         return said.strip() or "(Hermes said nothing)"
 
     def close(self):
-        if self.process.poll() is None:
+        """Stop Hermes, and remove the session's workspace: its config names the model, and its key."""
+        if self.process is not None and self.process.poll() is None:
             self.process.stdin.close()
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+        shutil.rmtree(self.workspace, ignore_errors=True)
 
 
 session = None
@@ -219,7 +250,15 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def stop(*_):
+    """The controller stops a worker with SIGTERM first: leave nothing of the session behind."""
+    if session is not None:
+        session.close()
+    os._exit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, stop)
     host, port = os.environ.get("COLLAB_COG_HOST", "127.0.0.1"), int(os.environ["COLLAB_COG_PORT"])
     log(f"serving run {RUN} on {host}:{port}")
     ThreadingHTTPServer((host, port), Handler).serve_forever()

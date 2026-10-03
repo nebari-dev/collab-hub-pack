@@ -278,11 +278,13 @@ controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cog
 	cd $(ROOT)/execution && uv run --quiet python -m collab_hub_execution.controller \
 		--track $(LOCAL)/track.sqlite $(foreach dir,$(subst :, ,$(COGS)),--packages $(dir)) \
 		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local --interaction-timeout 0 \
-		--deliver hermes:COLLAB_MODEL_BASE_URL --deliver hermes:COLLAB_MODEL_NAME --deliver hermes:COLLAB_MODEL_API_KEY
+		--deliver hermes:COLLAB_MODEL_PROVIDER --deliver hermes:COLLAB_MODEL_BASE_URL \
+		--deliver hermes:COLLAB_MODEL_NAME --deliver hermes:COLLAB_MODEL_API_KEY
 
 # The model the Hermes Cog calls: `make fake-model` by default. Point it at a real
-# OpenAI-compatible endpoint by setting these before `make controller`; the key is
-# read from your environment, never from the make command line.
+# OpenAI-compatible endpoint by setting these before `make controller`, or at
+# Claude with COLLAB_MODEL_PROVIDER=anthropic; the key is read from your
+# environment, never from the make command line.
 export COLLAB_MODEL_BASE_URL ?= http://127.0.0.1:$(FAKE_MODEL_PORT)/v1
 export COLLAB_MODEL_NAME ?= fake-model
 FAKE_MODEL_PORT ?= 8090

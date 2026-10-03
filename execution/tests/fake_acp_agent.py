@@ -35,9 +35,11 @@ for line in sys.stdin:
         elif text == "env":
             home = Path(os.environ["HERMES_HOME"])
             config = json.loads((home / "config.yaml").read_text())
-            say("s-1", json.dumps({"model": config["model"], "cwd": os.getcwd(),
+            say("s-1", json.dumps({"model": config["model"], "cwd": os.getcwd(), "home": os.environ.get("HOME"),
                                    "run_token": "COLLAB_RUN_TOKEN" in os.environ,
-                                   "api_key_env": "COLLAB_MODEL_API_KEY" in os.environ}))
+                                   "api_key_env": "COLLAB_MODEL_API_KEY" in os.environ,
+                                   "anthropic_key": os.environ.get("ANTHROPIC_API_KEY"),
+                                   "gemini_key": "GEMINI_API_KEY" in os.environ}))
         else:
             say("s-1", "agent heard: ")
             say("s-1", text)
