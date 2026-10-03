@@ -11,6 +11,8 @@ on:
       - "execution/**"
       - "docs/cog-execution/states.md"
       - "dev/cogs/**"
+      - "cogs/**"
+      - "dev/fake-model/**"
       - ".github/workflows/test-execution.yaml"
   pull_request: {}   # runs on every PR so it can be a required status check
 

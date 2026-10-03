@@ -47,6 +47,14 @@ INHERITED = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TZ", "PIXI_HOME", "PIX
 ENVIRONMENTS = ("pixi", "host")
 
 
+class TurnRefused(RuntimeError):
+    """A turn the worker did not answer: it holds no session, refused it, or answered something else."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class WorkerStartFailed(RuntimeError):
     """A local worker that did not come up: it could not be started, exited, or never became ready."""
 
@@ -83,6 +91,22 @@ class _LocalWorker(_KubernetesWorker):
         # The worker answered /healthz before it was handed over, so it is listening: one request,
         # and a worker that has gone since fails the step at once.
         return self.http.post(url, json=payload, headers={"Authorization": f"Bearer {self._run_token}"})
+
+    def turn(self, turn: str, text: str) -> str:
+        """One turn of a session the worker holds: ``POST /turn``, answered with ``{"text": ...}``."""
+        response = self.http.post(f"{self.url}/turn", json={"turn": turn, "text": text},
+                                  headers={"Authorization": f"Bearer {self._run_token}"})
+        if response.status_code != 200:
+            raise TurnRefused(f"the worker answered HTTP {response.status_code}"
+                              + (": it holds no session" if response.status_code == 404 else ""),
+                              status=response.status_code)
+        try:
+            answer = response.json()["text"]
+        except (ValueError, KeyError, TypeError):
+            answer = None
+        if not isinstance(answer, str):
+            raise TurnRefused("the worker's answer to a turn is not {\"text\": ...}")
+        return answer
 
 
 class LocalProcessCogExecutor:
