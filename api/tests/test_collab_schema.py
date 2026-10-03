@@ -50,6 +50,8 @@ COLLAB_TABLES = (
     "collab_cog_registry_tokens",
     "collab_cog_registry_credentials",
     "collab_cog_manifest_blobs",
+    "collab_cog_repositories",
+    "collab_cog_upload_sessions",
     "collab_cog_artifacts",
     "collab_service_access_grants",
     "collab_provisioned_accounts",
@@ -397,7 +399,39 @@ def test_migration_creates_the_cog_registry_credential_schema():
     )
     assert "collab_cog_registry" not in earlier and "collab_cog_artifacts_repository_idx" not in earlier
     assert "collab_cog_manifest_blobs" not in earlier
-    assert LATEST_COLLAB_SCHEMA_VERSION == 13
+
+
+def test_migration_creates_the_cog_publishing_schema():
+    server = FakeServer()
+
+    run_collab_schema_migrations(FakeDatabase(server))
+
+    created = " ".join(server.statements)
+    # Additive on the two existing tables: nothing a version-13 database holds is rewritten.
+    for statement in (
+        "ALTER TABLE collab_cog_registry_credentials ADD COLUMN IF NOT EXISTS org_id text",
+        "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_by text",
+        "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
+        "CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx ON collab_cog_repositories (source_id)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_expiry_idx ON collab_cog_upload_sessions (expires_at)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_user_idx ON collab_cog_upload_sessions (user_id)",
+    ):
+        assert statement in created, statement
+    (repositories,) = server.ddl_for("collab_cog_repositories")
+    # One owner per repository path, whatever source it was written through.
+    assert "repository text PRIMARY KEY" in repositories and "owner_org_id text," in repositories
+    assert "created_by text NOT NULL" in repositories and "source_id text NOT NULL" in repositories
+    (uploads,) = server.ddl_for("collab_cog_upload_sessions")
+    assert "id text PRIMARY KEY" in uploads and "upstream_location text NOT NULL" in uploads
+    assert "received bigint NOT NULL DEFAULT 0 CHECK (received >= 0)" in uploads
+    assert "expires_at timestamptz NOT NULL" in uploads
+    # Appended as version 14; nothing earlier mentions any of it.
+    earlier = " ".join(
+        statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 14 for statement in statements
+    )
+    for name in ("collab_cog_repositories", "collab_cog_upload_sessions", "published_by", "org_id text"):
+        assert name not in earlier, name
+    assert LATEST_COLLAB_SCHEMA_VERSION == 14
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -443,6 +477,7 @@ PINNED_CHECKSUMS = {
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
     13: "0fdba92b5b894fa4358da5ebada5a33ce23a527e181dce411268df650a71935d",
+    14: "79bfe91c3174013b679c762d5e6945eca8455d7d9d205243169720f4cf926969",
 }
 
 

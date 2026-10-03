@@ -408,6 +408,8 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.list_current(),
         lambda: store.list_repositories(),
         lambda: store.list_versions("x"),
+        lambda: store.record_publication(SOURCE, "cogs/a", digest("a"), user_id="u", org_id=None),
+        lambda: store.repository_known("cogs/a"),
         lambda: store.find_pullable("cogs/a", (SOURCE,), digest=digest("a")),
         lambda: store.has_pullable("cogs/a", (SOURCE,)),
         lambda: store.list_pullable_tags("cogs/a", (SOURCE,)),
@@ -876,6 +878,51 @@ def _exercise_blobs(store) -> None:
     # Back in the registry and reindexed: pullable again, from what was recorded before.
     store.upsert(artifact("1", repository="cogs/a", pushed_at=T0 + timedelta(days=1)))
     assert where("cogs/a", blob_y) == [(SOURCE, digest("1"), 20)]
+
+
+def _exercise_publication(store) -> None:
+    """Who published a version through the Hub (#180): written once, and left alone by everything else."""
+
+    store.upsert(artifact("1", repository="cogs/a", tags=("v1",)))
+    assert store.get(digest("1")).published_by is None, "an out-of-band artifact has no publisher"
+    assert store.record_publication(SOURCE, "cogs/a", digest("1"), user_id="alice", org_id="org-a") is True
+    assert store.record_publication(SOURCE, "cogs/a", digest("9"), user_id="alice", org_id="org-a") is False
+    row = store.get(digest("1"))
+    assert (row.published_by, row.published_org) == ("alice", "org-a")
+    # A sweep that rewrites the row, retags it, removes it and brings it back leaves the publisher alone.
+    store.upsert(artifact("1", repository="cogs/a", tags=("v1", "latest"), document=card(version="2.0.0")))
+    store.update_tags(SOURCE, "cogs/a", digest("1"), ("v2",))
+    store.mark_removed_one(SOURCE, "cogs/a", digest("1"))
+    store.upsert(artifact("1", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
+    store.upsert(artifact("1", repository="cogs/a", tags=("v3",)))
+    row = store.get(digest("1"))
+    assert (row.published_by, row.published_org, row.tags) == ("alice", "org-a", ("v3",))
+    for listed in (store.list_current()[0], store.list_versions("example/cog-a")[0], store.locations(digest("1"))[0]):
+        assert (listed.published_by, listed.published_org) == ("alice", "org-a")
+    # An upsert cannot set it either: only record_publication does.
+    forged = replace(artifact("2", repository="cogs/a"), published_by="mallory", published_org="org-m")
+    store.upsert(forged)
+    assert store.get(digest("2")).published_by is None
+    # An operator with no organization.
+    store.record_publication(SOURCE, "cogs/a", digest("2"), user_id="op", org_id=None)
+    assert (store.get(digest("2")).published_by, store.get(digest("2")).published_org) == ("op", None)
+
+    # "Known" means the path has ever held a row, in any source and any state.
+    assert store.repository_known("cogs/a") and not store.repository_known("cogs") and not store.repository_known("x/y")
+    store.upsert(artifact("3", repository="img/nginx", status=STATUS_NON_COG))
+    store.upsert(artifact("4", source_id="mirror", repository="cogs/gone"))
+    store.mark_removed_one("mirror", "cogs/gone", digest("4"))
+    assert store.repository_known("img/nginx") and store.repository_known("cogs/gone")
+
+
+def test_publication_in_memory(store):
+    _exercise_publication(store)
+
+
+@live_postgres
+def test_live_publication(live_store):
+    store, _ = live_store
+    _exercise_publication(store)
 
 
 def test_pullable_lookups_in_memory(store):
@@ -1450,6 +1497,41 @@ def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order()
 
 
 PULLABLE_SQL = "removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL"
+
+
+def test_record_publication_updates_two_columns_and_nothing_else():
+    store, conn = _fake_store([[{"digest": DIGEST_A}], []])
+    assert store.record_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice", org_id="org-a") is True
+    sql, params = conn.queries[0]
+    assert sql.startswith("UPDATE collab_cog_artifacts SET published_by = %s, published_org = %s WHERE")
+    assert params == ("alice", "org-a", SOURCE, "cogs/a", DIGEST_A)
+    assert store.record_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice", org_id=None) is False
+
+
+def test_the_upsert_never_names_the_publication_columns():
+    """What keeps a sweep from clobbering the publisher on Postgres: the columns are not in its statement."""
+
+    store, conn = _fake_store()
+    store.upsert(replace(_artifact_for_upsert(), published_by="mallory", published_org="org-m"))
+    sql, params = conn.queries[0]
+    assert "published_by" not in sql and "published_org" not in sql
+    assert "mallory" not in params and "org-m" not in params
+
+
+def _artifact_for_upsert() -> CogArtifact:
+    return artifact("a", repository="cogs/a")
+
+
+def test_repository_known_asks_for_any_row_at_all():
+    store, conn = _fake_store([[{"found": 1}], []])
+    assert store.repository_known("cogs/a") is True and store.repository_known("cogs/b") is False
+    assert conn.queries[0] == ("SELECT 1 AS found FROM collab_cog_artifacts WHERE repository = %s LIMIT 1", ("cogs/a",))
+
+
+def test_rows_read_back_carry_the_publication():
+    store, _conn = _fake_store([[_row(published_by="alice", published_org="org-a")], [_row()]])
+    assert store.get(DIGEST_A).published_by == "alice"
+    assert store.get(DIGEST_A).published_by is None, "a row mapping without the columns reads as unpublished"
 
 
 def test_find_pullable_is_an_exact_lookup_scoped_to_the_given_sources():

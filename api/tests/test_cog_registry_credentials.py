@@ -252,6 +252,41 @@ def test_a_token_expires_on_its_own_and_a_direct_one_has_no_credential(backend):
     assert refused is None
 
 
+def test_push_is_granted_only_to_tokens_of_a_publish_credential(backend):
+    store, _clock = backend
+    pull = _credential(store)
+    publish = store.create_credential(
+        credential_id=new_credential_id(),
+        user_id="alice",
+        secret_hash=secret_digest("s3cret"),
+        scope="publish",
+        session_id=None,
+        ttl_seconds=900,
+        org_id="org-a",
+    )
+    assert publish.org_id == "org-a" and pull.org_id is None
+    assert store.find_credential(publish.id, secret_digest("s3cret")).org_id == "org-a"
+
+    def mint(credential, push):
+        token = new_pull_token()
+        grant = store.create_token(
+            token_hash=secret_digest(token),
+            user_id="alice",
+            credential_id=credential.id if credential else None,
+            repositories=("cogs/a",),
+            ttl_seconds=300,
+            push=push,
+        )
+        assert store.find_token(secret_digest(token)) == grant
+        return grant
+
+    assert mint(publish, True).allows_push("cogs/a") and mint(publish, True).org_id == "org-a"
+    assert not mint(publish, False).allows_push("cogs/a"), "not asked for, not given"
+    assert not mint(pull, True).allows_push("cogs/a"), "a pull credential never pushes"
+    assert not mint(None, True).allows_push("cogs/a"), "nor does a token minted from a Hub session"
+    assert mint(pull, True).allows_pull("cogs/a") and mint(None, True).org_id is None
+
+
 def test_exchanging_past_the_cap_drops_the_oldest(backend):
     store, clock = backend
     created = []
@@ -389,6 +424,7 @@ CREDENTIAL_ROW = {
     "user_id": "alice",
     "scope": "pull",
     "session_id": "sid-1",
+    "org_id": "org-a",
     "created_at": T0,
     "expires_at": T0 + timedelta(minutes=15),
 }
@@ -396,6 +432,8 @@ TOKEN_ROW = {
     "user_id": "alice",
     "credential_id": "crc-1",
     "repositories": ["cogs/a"],
+    "actions": "pull",
+    "org_id": "org-a",
     "created_at": T0,
     "expires_at": T0 + timedelta(minutes=5),
 }
@@ -404,13 +442,20 @@ TOKEN_ROW = {
 def test_postgres_create_credential_sweeps_inserts_and_caps():
     store, conn = _fake({"INSERT INTO collab_cog_registry_credentials": [CREDENTIAL_ROW]})
     created = store.create_credential(
-        credential_id="crc-1", user_id="alice", secret_hash="hash", scope="pull", session_id="sid-1", ttl_seconds=900
+        credential_id="crc-1",
+        user_id="alice",
+        secret_hash="hash",
+        scope="pull",
+        session_id="sid-1",
+        ttl_seconds=900,
+        org_id="org-a",
     )
     assert created == RegistryCredential(
         id="crc-1",
         user_id="alice",
         scope="pull",
         session_id="sid-1",
+        org_id="org-a",
         created_at=T0,
         expires_at=T0 + timedelta(minutes=15),
     )
@@ -420,7 +465,7 @@ def test_postgres_create_credential_sweeps_inserts_and_caps():
     assert sweep_credentials[0] == "DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()"
     assert sweep_tokens[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
     assert "now() + make_interval(secs => %s)" in insert[0]
-    assert insert[1] == ("crc-1", "alice", "hash", "pull", "sid-1", 900)
+    assert insert[1] == ("crc-1", "alice", "hash", "pull", "sid-1", "org-a", 900)
     assert "ORDER BY created_at DESC, id DESC LIMIT %s" in cap[0]
     assert cap[1] == ("alice", "alice", MAX_CREDENTIALS_PER_USER)
 
@@ -462,12 +507,23 @@ def test_postgres_create_token_is_one_statement_with_the_liveness_check():
         repositories=("cogs/a",),
         issued_at=T0,
         expires_at=T0 + timedelta(minutes=5),
+        actions="pull",
+        org_id="org-a",
     )
+    assert not grant.allows_push("cogs/a")
     sweep, insert = conn.calls
     assert sweep[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
     assert "LEAST(now() + make_interval(secs => %s), c.expires_at)" in insert[0]
     assert "WHERE c.id = %s AND c.user_id = %s AND c.expires_at > now()" in insert[0]
-    assert insert[1] == ("thash", ["cogs/a"], 300, "crc-1", "alice")
+    assert insert[1] == ("thash", ["cogs/a"], False, 300, "crc-1", "alice")
+    # Push is decided where the credential is read: asked for, and granted only to a publish credential.
+    assert "CASE WHEN %s AND c.scope = 'publish' THEN 'pull,push' ELSE 'pull' END" in insert[0]
+    pushing, conn = _fake({"INSERT INTO collab_cog_registry_tokens": [{**TOKEN_ROW, "actions": "pull,push"}]})
+    granted = pushing.create_token(
+        token_hash="t", user_id="alice", credential_id="crc-1", repositories=("cogs/a",), ttl_seconds=300, push=True
+    )
+    assert conn.calls[-1][1][2] is True
+    assert granted.allows_push("cogs/a") and granted.allows_pull("cogs/a") and not granted.allows_push("cogs/b")
     # The credential went away between the caller's check and the insert.
     gone, _ = _fake()
     assert (
@@ -477,14 +533,15 @@ def test_postgres_create_token_is_one_statement_with_the_liveness_check():
 
 
 def test_postgres_create_token_without_a_credential():
-    row = {**TOKEN_ROW, "credential_id": None, "repositories": None}
+    row = {**TOKEN_ROW, "credential_id": None, "repositories": None, "org_id": None}
     store, conn = _fake({"INSERT INTO collab_cog_registry_tokens": [row]})
     grant = store.create_token(
-        token_hash="thash", user_id="alice", credential_id=None, repositories=iter(()), ttl_seconds=300
+        token_hash="thash", user_id="alice", credential_id=None, repositories=iter(()), ttl_seconds=300, push=True
     )
-    assert grant.credential_id is None and grant.repositories == ()
+    assert grant.credential_id is None and grant.repositories == () and grant.org_id is None
     _sweep, insert = conn.calls
-    assert "VALUES (%s, %s, NULL, %s, now() + make_interval(secs => %s))" in insert[0]
+    # A token minted straight from a Hub session is pull-only, whatever was asked.
+    assert "VALUES (%s, %s, NULL, %s, 'pull', now() + make_interval(secs => %s))" in insert[0]
     assert insert[1] == ("thash", "alice", [], 300)
 
 

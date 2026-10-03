@@ -122,6 +122,14 @@ class CogArtifact:
     manifest_schema: str | None = None
     read_errors: tuple[str, ...] = ()
     removed_at: datetime | None = None
+    published_by: str | None = None
+    """The Hub user who published this artifact *through the Hub* (issue #180); ``None`` for an out-of-band push.
+
+    Authenticated, unlike the card's self-declared ``publisher``. Written
+    only by :meth:`CogCatalogStore.record_publication`: an upsert never sets
+    or clears it, so a sweep that rewrites the row keeps it.
+    """
+    published_org: str | None = None
 
     @property
     def reference(self) -> str:
@@ -375,6 +383,31 @@ class CogCatalogStore(ABC):
 
         raise NotImplementedError
 
+    # -- what publishing through the Hub needs (issue #180) --------------------
+
+    @abstractmethod
+    def record_publication(
+        self, source_id: str, repository: str, digest: str, *, user_id: str, org_id: str | None
+    ) -> bool:
+        """Record who published this artifact through the Hub. Returns whether the row exists.
+
+        The only writer of ``published_by``/``published_org``; called right
+        after the targeted reindex that follows an accepted manifest.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def repository_known(self, repository: str) -> bool:
+        """Whether the catalog has ever held a row for this repository path, in any source, in any state.
+
+        What makes a repository "already exists, and was not published
+        through the Hub" when it has no ownership record: removed, failed and
+        non-Cog rows count, because the path is taken either way.
+        """
+
+        raise NotImplementedError
+
     # -- what pulls through the Hub need (issue #179) -------------------------
     #
     # "Pullable" is one rule, applied by every method below and nowhere else:
@@ -449,6 +482,14 @@ class CogCatalogStore(ABC):
         """
 
         raise NotImplementedError
+
+
+def _keep_publication(new: CogArtifact, old: CogArtifact | None) -> CogArtifact:
+    """An upsert replaces a row whole, except for who published it through the Hub."""
+
+    if old is None:
+        return replace(new, published_by=None, published_org=None)
+    return replace(new, published_by=old.published_by, published_org=old.published_org)
 
 
 def _one_of(digest: str | None, tag: str | None) -> None:
@@ -640,6 +681,12 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         raise self._refuse()
 
+    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
+        raise self._refuse()
+
+    def repository_known(self, repository) -> bool:
+        raise self._refuse()
+
     def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
         raise self._refuse()
 
@@ -707,7 +754,20 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             removed_at=None,
         )
         with self._lock:
-            self._rows[self._key(stored)] = stored
+            # Parity with Postgres, whose upsert does not name these columns.
+            self._rows[self._key(stored)] = _keep_publication(stored, self._rows.get(self._key(stored)))
+
+    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
+        with self._lock:
+            row = self._rows.get((source_id, repository, digest))
+            if row is None:
+                return False
+            self._rows[(source_id, repository, digest)] = replace(row, published_by=user_id, published_org=org_id)
+            return True
+
+    def repository_known(self, repository) -> bool:
+        with self._lock:
+            return any(row.repository == repository for row in self._rows.values())
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
         require_aware(pushed_at, "pushed_at")
@@ -875,7 +935,8 @@ class InMemoryCogCatalogStore(CogCatalogStore):
 
 _COLUMNS = (
     "source_id, host, repository, digest, tags, pushed_at, indexed_at, manifest_media_type, status, card, "
-    "cog_id, name, version, kind, publisher, manifest_schema, read_errors, removed_at"
+    "cog_id, name, version, kind, publisher, manifest_schema, read_errors, removed_at, "
+    "published_by, published_org"
 )
 
 
@@ -906,6 +967,10 @@ def _row_to_artifact(row: Mapping[str, Any]) -> CogArtifact:
         manifest_schema=row["manifest_schema"],
         read_errors=tuple(errors) if isinstance(errors, list) else (),
         removed_at=row["removed_at"],
+        # .get: a row mapping built before these columns existed (a test
+        # double, a query that selects a subset) has no publication.
+        published_by=row.get("published_by"),
+        published_org=row.get("published_org"),
     )
 
 
@@ -1250,6 +1315,26 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 (cog_id, include_removed),
             ).fetchall()
         return [_row_to_artifact(row) for row in rows]
+
+    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
+        with bounded_connection(self._db) as conn:
+            row = conn.execute(
+                """
+                UPDATE collab_cog_artifacts SET published_by = %s, published_org = %s
+                WHERE source_id = %s AND repository = %s AND digest = %s
+                RETURNING digest
+                """,
+                (user_id, org_id, source_id, repository, digest),
+            ).fetchone()
+        return row is not None
+
+    def repository_known(self, repository) -> bool:
+        with bounded_connection(self._db) as conn:
+            row = conn.execute(
+                "SELECT 1 AS found FROM collab_cog_artifacts WHERE repository = %s LIMIT 1",
+                (repository,),
+            ).fetchone()
+        return row is not None
 
     def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
         _one_of(digest, tag)

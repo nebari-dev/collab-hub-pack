@@ -844,6 +844,71 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             """,
         ),
     ),
+    (
+        14,
+        (
+            # Publishing through the Hub (issue #180): pushes arrive on the
+            # Hub's /v2/ surface and are written through to one source.
+            #
+            # The organization a registry credential's owner acted in when it
+            # was exchanged. On a membership-resolving deployment the owner's
+            # organization is re-read on every push; this is what a publish
+            # is attributed to where there is no membership table to re-read.
+            "ALTER TABLE collab_cog_registry_credentials ADD COLUMN IF NOT EXISTS org_id text",
+            # Who published an artifact *through the Hub*: the authenticated
+            # Hub user and their organization, as opposed to the `publisher`
+            # the bundle declares about itself. NULL for anything the indexer
+            # found that was pushed to the registry directly. Not in the
+            # indexer's upsert column list, so a sweep that rewrites the row
+            # leaves both as they are.
+            "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_by text",
+            "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
+            # A repository first published through the Hub belongs to the
+            # publisher's organization: later pushes need membership of it.
+            # One row per repository path, created by the first accepted
+            # manifest and never by an upload alone. `source_id` is the source
+            # it was written through, whose enumeration these rows extend, so
+            # a source needs no configured repository list. `owner_org_id` is
+            # NULL when a platform operator with no organization published it.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_repositories (
+                repository   text PRIMARY KEY,
+                source_id    text NOT NULL,
+                owner_org_id text,
+                created_by   text NOT NULL,
+                created_at   timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx
+            ON collab_cog_repositories (source_id)
+            """,
+            # An upload in progress. The client only ever sees `id`; the
+            # backing registry's own session URL stays here, so any replica
+            # can continue an upload and no response names the backing host.
+            # `received` is the number of bytes forwarded so far.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_upload_sessions (
+                id                text PRIMARY KEY,
+                user_id           text NOT NULL,
+                repository        text NOT NULL,
+                source_id         text NOT NULL,
+                upstream_location text NOT NULL,
+                received          bigint NOT NULL DEFAULT 0 CHECK (received >= 0),
+                created_at        timestamptz NOT NULL DEFAULT now(),
+                expires_at        timestamptz NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_expiry_idx
+            ON collab_cog_upload_sessions (expires_at)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_user_idx
+            ON collab_cog_upload_sessions (user_id)
+            """,
+        ),
+    ),
 )
 
 

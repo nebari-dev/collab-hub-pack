@@ -32,6 +32,18 @@ class BudgetExhausted(TimeoutError):
     """The request's budget was already spent before a store call could start."""
 
 
+def renew(seconds: float = DEFAULT_BUDGET_SECONDS) -> None:
+    """Give the store calls that follow a fresh budget of ``seconds``.
+
+    For a request whose own budget is long because it carries a blob: the
+    store calls made *after* the bytes have been forwarded must not find the
+    budget already spent by the transfer, and must not inherit minutes
+    either. The request's aggregate timeout still bounds the whole.
+    """
+
+    request_deadline.set(time.monotonic() + seconds)
+
+
 def remaining_seconds() -> float:
     """What is left of the current request's budget; the default budget when there is no request."""
 
