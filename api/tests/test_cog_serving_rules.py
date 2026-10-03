@@ -477,3 +477,160 @@ def test_live_postgres_ends_a_statement_at_the_request_budget():
     finally:
         deadline.request_deadline.reset(token)
         database.close()
+
+
+async def test_a_blocked_membership_lookup_is_bounded_like_every_other_store_call(membership_hubs):
+    """The owner's standing is re-read on every request; that query spends from the same budget, in the database."""
+
+    import threading
+    import time
+    from contextlib import contextmanager
+
+    import psycopg
+
+    from collab_hub_api.frames.orgs import PostgresOrgStore
+
+    first, _second = membership_hubs
+    first.seed(REPO, ALPHA, "latest")
+    credential = await first.exchange(MEMBER_TOKEN)
+    headers = {"Authorization": f"Bearer {await first.token(credential, REPO)}"}
+    state = {"timeouts": [], "acquire": [], "checked_out": 0, "plain": 0}
+    released = threading.Event()
+
+    class LockedTable:
+        def execute(self, sql, params=None):
+            if "set_config('statement_timeout'" in sql:
+                state["timeouts"].append(int(params[0]))
+                return self
+            assert "collab_org_members" in sql
+            time.sleep(state["timeouts"][-1] / 1000)  # waits on the lock until the server cancels it
+            raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            state["acquire"].append(timeout)
+            state["checked_out"] += 1
+            try:
+                yield LockedTable()
+            finally:
+                state["checked_out"] -= 1
+                released.set()
+
+    first.app.state.org_store = PostgresOrgStore(Database())
+    serving = first.serving
+    fields = {name: getattr(serving, name) for name in serving.__dataclass_fields__}
+    first.app.state.cog_registry_serving = type(serving)(**{**fields, "max_metadata_seconds": 0.4})
+
+    requests = [
+        ("GET", "/v2/", headers),
+        ("GET", f"/v2/{REPO}/manifests/latest", headers),
+        ("HEAD", f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers),
+        ("GET", f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers),
+        # The token endpoint re-reads the owner too, on both of its paths.
+        ("GET", "/v2/token", basic(credential["username"], credential["secret"])),
+    ]
+    for method, path, auth in requests:
+        released.clear()
+        started = time.monotonic()
+        response = await first.request(method, path, headers=auth)
+        assert response.status_code == 503, (method, path, response.status_code)
+        assert time.monotonic() - started < 2.0, (method, path)
+        assert await asyncio.to_thread(released.wait, 2.0), "the membership query kept its connection"
+        assert state["checked_out"] == 0
+        assert 1 <= state["timeouts"][-1] <= 400 and 0 < state["acquire"][-1] <= 0.4, (method, path)
+    assert len(state["timeouts"]) == len(requests)
+
+
+def test_the_membership_lookup_is_unchanged_outside_a_registry_request():
+    from contextlib import contextmanager
+
+    from collab_hub_api.frames.orgs import PostgresOrgStore
+
+    seen: list = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            seen.append(" ".join(sql.split())[:40])
+            return self
+
+        def fetchone(self):
+            return None
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            seen.append(("checkout", timeout))
+            yield Connection()
+
+    principal = PostgresOrgStore(Database()).resolve_principal("someone")
+    assert principal.membership is None and principal.platform_role is None
+    # The ordinary checkout and exactly one statement: no timeout, no preamble.
+    assert seen[0] == ("checkout", None) and len(seen) == 2 and seen[1].startswith("SELECT m.user_id")
+
+
+async def test_falling_back_to_another_source_is_not_a_way_past_the_blob_size_limit():
+    """Two sources hold a blob under descriptors that disagree about its size; the cap holds for both."""
+
+    from collab_hub_api.cogs.catalog import BlobDescriptor, InMemoryCogCatalogStore
+    from collab_hub_api.cogs.serving import BlobTooLarge, BlobUnknown, ServedBlob
+
+    body = b"0123456789"
+    blob = sha256(body)
+    asked: list[str] = []
+
+    def registry(name: str, has_blob: bool):
+        def handler(request: httpx.Request) -> httpx.Response:
+            asked.append(name)
+            return httpx.Response(200, content=body) if has_blob else httpx.Response(404)
+
+        client = OCIClient(f"https://{name}.example", transport=httpx.MockTransport(handler))
+        return type("Source", (), {"id": name, "host": f"{name}.example", "oci": lambda self: client})()
+
+    store = InMemoryCogCatalogStore()
+    # The newer manifest (source a) understates the size and its registry has lost the blob;
+    # the older one (source b) records the true ten bytes and still has it.
+    store.upsert(catalog_row(REPO, "sha256:" + "a" * 64, source_id="a", pushed_at=T0))
+    store.upsert(catalog_row(REPO, "sha256:" + "b" * 64, source_id="b", pushed_at=T0 - timedelta(days=1)))
+    store.record_manifest_blobs("a", REPO, "sha256:" + "a" * 64, [BlobDescriptor(blob, 5)])
+    store.record_manifest_blobs("b", REPO, "sha256:" + "b" * 64, [BlobDescriptor(blob, 10)])
+    sources = [registry("a", False), registry("b", True)]
+
+    capped = CogRegistryFront(store, sources, max_blob_bytes=5)
+    assert await capped.blob_size(REPO, blob) == 5
+    with pytest.raises(BlobUnknown):
+        await capped.blob(REPO, blob)
+    assert asked == ["a"], "the over-limit candidate in source b was never opened"
+
+    # With no candidate inside the limit, it is refused outright, before any registry is asked.
+    asked.clear()
+    with pytest.raises(BlobTooLarge, match="over this registry's 4-byte limit"):
+        await CogRegistryFront(store, sources, max_blob_bytes=4).blob(REPO, blob)
+    assert asked == []
+
+    # Under a limit that admits both, the fallback serves the real ten bytes.
+    roomy = await CogRegistryFront(store, sources, max_blob_bytes=10).blob(REPO, blob)
+    assert roomy.size == 10 and b"".join([chunk async for chunk in roomy.chunks]) == body
+
+    # And the cap is enforced on the bytes themselves, whatever a descriptor claimed.
+    stream = await sources[1].oci().open_blob(REPO, blob)
+    lying = ServedBlob(stream, 10, max_bytes=5)
+    received = bytearray()
+    with pytest.raises(Exception, match="exceeds the 5-byte cap"):
+        async for chunk in lying.chunks:
+            received.extend(chunk)
+    assert len(received) <= 5 and lying.closed
+
+
+async def test_a_malformed_page_number_is_a_400_not_a_500(hub: Hub):
+    hub.seed(REPO, ALPHA, "latest")
+    headers = await hub.pull_token(REPO)
+    for bad in ("²", "٣", "9" * 4301, "1" * 10, "-1", "1.5", " 1", "", "1e3"):
+        response = await hub.get(f"/v2/{REPO}/tags/list", params={"n": bad}, headers=headers)
+        if bad == "":
+            assert response.status_code == 400, "an empty n is not a number either"
+        assert response.status_code == 400, repr(bad[:12])
+        assert response.json()["errors"][0]["code"] == "PAGINATION_NUMBER_INVALID"
+    for good, count in (("1", 1), ("999999999", 1), ("0", 0), ("0001", 1)):
+        response = await hub.get(f"/v2/{REPO}/tags/list", params={"n": good}, headers=headers)
+        assert response.status_code == 200 and len(response.json()["tags"]) == count, good

@@ -1245,7 +1245,7 @@ async def test_a_response_that_fails_before_its_first_chunk_still_closes_the_ups
     client = OCIClient(BACKING_URL, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)))
 
     async def respond(send) -> ServedBlob:
-        blob = ServedBlob(await client.open_blob(REPO, sha256(body)), len(body))
+        blob = ServedBlob(await client.open_blob(REPO, sha256(body)), len(body), max_bytes=1 << 20)
         response = _BlobResponse(
             blob, deadline=asyncio.get_running_loop().time() + 5, what="x", headers={"Content-Length": str(len(body))}
         )

@@ -35,6 +35,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ..cogs.deadline import request_connection
+
 orgs_logger = logging.getLogger("frames_server.orgs")
 
 MEMBERSHIP_ACTIVE = "active"
@@ -394,8 +396,13 @@ class PostgresOrgStore(OrgStore):
         # revoked grant must resolve to "no role" with no code path in between
         # that could forget to check. Membership status is NOT filtered — the
         # caller decides what a removed row means, exactly as get_membership.
+        #
+        # request_connection: inside a registry (/v2) request, which re-reads
+        # the token owner's standing under an aggregate deadline, the checkout
+        # and the statement are bounded by what is left of it (issue #179).
+        # Every other caller gets the ordinary checkout, unchanged.
         try:
-            with self._db.connection() as conn:
+            with request_connection(self._db) as conn:
                 row = conn.execute(
                     """
                     SELECT m.user_id AS member_user_id, m.org_id, m.role, m.status,

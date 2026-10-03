@@ -530,7 +530,13 @@ pullable rule:
   blobs unpullable at once, unless another pullable manifest of the
   repository references them;
 - the descriptor's `size` is how a response declares its length, and how an
-  oversized blob is refused, before the registry is asked.
+  oversized blob is refused, before the registry is asked. `maxBlobBytes`
+  applies to every candidate source, not only the first, and again to the
+  bytes as they are counted, whatever a descriptor said. A descriptor is a
+  publisher's claim: if two manifests record different sizes for one digest,
+  one of them is wrong, the disagreement is logged, and each candidate is
+  held to its own recorded size and to the digest as it streams, so the
+  wrong one fails verification rather than being served.
 
 The record is written on the manifest read, which every OCI client makes
 before it asks for a blob, and it lives in the shared database, so the blob
@@ -551,12 +557,14 @@ dropped connection. The response owns the open connection to the source and
 closes it however the exchange ends, including when the deadline passes
 while it is blocked sending to a client that has stopped reading (that
 client's own connection is then the server's and the gateway's to reap).
-The catalog and credential queries a request makes get the same budget from
-the database's side: the pool wait is capped at what is left, and a
-transaction-local `statement_timeout` has Postgres cancel a statement that
-outlives it, so a slow database cannot hold a worker and a connection after
-the request has answered. (The membership lookup uses the organization
-store's ordinary connection and is bounded by the pool's own timeout.)
+The catalog, credential and membership queries a request makes spend from
+the same budget on the database's side: the pool wait is capped at what is
+left, and before each statement a transaction-local `statement_timeout` is
+set to what is left at that moment, so Postgres cancels a statement that
+would outlive the request and no later statement gets the time an earlier
+one used. Once the budget is spent no further SQL is sent. The membership
+lookup is bounded this way only inside a registry request; every other
+caller of the organization store is unchanged.
 
 **Streaming.** Blobs are relayed in 64 KiB chunks and never buffered whole.
 Each is hashed as it passes and its last chunk is held until the hash and

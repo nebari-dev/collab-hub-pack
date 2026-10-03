@@ -119,11 +119,14 @@ class ServedBlob:
     exactly when that matters.
     """
 
-    def __init__(self, stream: BlobStream, size: int) -> None:
+    def __init__(self, stream: BlobStream, size: int, *, max_bytes: int) -> None:
         self._stream = stream
         self.digest = stream.digest
         self.size = size
-        self.chunks: AsyncGenerator[bytes] = stream.iter_verified(max_bytes=size, expected_size=size)
+        # The configured cap is enforced on the bytes themselves, whatever a
+        # descriptor said: ``size`` is a publisher's claim until the stream
+        # has been counted and hashed.
+        self.chunks: AsyncGenerator[bytes] = stream.iter_verified(max_bytes=min(size, max_bytes), expected_size=size)
 
     @property
     def closed(self) -> bool:
@@ -253,7 +256,7 @@ class CogRegistryFront:
                 )
                 unavailable = True
                 continue
-            return ServedBlob(stream, located.size)
+            return ServedBlob(stream, located.size, max_bytes=self._max_blob_bytes)
         if unavailable:
             raise UpstreamUnavailable(f"blob {digest} of {repository} is temporarily unavailable")
         raise BlobUnknown(f"blob {digest} is not known to {repository}")
@@ -278,12 +281,21 @@ class CogRegistryFront:
         if not located:
             await self._require_repository(repository)
             raise unknown
-        if located[0].size > self._max_blob_bytes:
+        if len({candidate.size for candidate in located}) > 1:
+            # One digest is one content and one size, so manifests that
+            # disagree mean a descriptor is wrong. Nothing is decided here:
+            # each candidate is held to its own recorded size and to the
+            # digest as its bytes are counted, and a wrong one fails there.
+            logger.warning("cog_serve_blob_size_disagreement", extra={"repository": repository, "digest": digest})
+        # The limit applies to every candidate, not only the first: falling
+        # back to another source must not be a way past it.
+        within = [candidate for candidate in located if candidate.size <= self._max_blob_bytes]
+        if not within:
             raise BlobTooLarge(
-                f"blob {digest} of {repository} is {located[0].size} bytes, "
+                f"blob {digest} of {repository} is {min(candidate.size for candidate in located)} bytes, "
                 f"over this registry's {self._max_blob_bytes}-byte limit"
             )
-        return located
+        return within
 
     def _log_upstream(self, source_id: str, repository: str, exc: OCIError) -> None:
         # The class and the source id only. OCIError messages carry request

@@ -56,6 +56,7 @@ import asyncio
 import base64
 import binascii
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC
@@ -99,6 +100,7 @@ REGISTRY_PATH_PREFIX = "/v2"
 API_VERSION_HEADERS = {"Docker-Distribution-API-Version": "registry/2.0"}
 MAX_TOKEN_SCOPES = 16
 """Repositories one pull token may name; a client asks for one, a multi-repository tool for a few."""
+_PAGE_NUMBER = re.compile(r"[0-9]{1,9}")
 MAX_SCOPE_ENTRIES = 64
 MAX_SCOPE_LENGTH = 8192
 """How much of a token request's ``scope`` input is looked at at all: entries, and characters per parameter."""
@@ -167,6 +169,16 @@ def _unauthorized(serving: CogRegistryServing, repository: str | None, *, insuff
 
 def _unavailable() -> RegistryError:
     return RegistryError(status.HTTP_503_SERVICE_UNAVAILABLE, "UNAVAILABLE", "the registry is temporarily unavailable")
+
+
+def _start_budget(seconds: float) -> None:
+    """Start this request's budget for blocking store calls: catalog, credentials, and the membership re-check.
+
+    A context variable, so the threadpool hop carries it and the stores read
+    it without being handed it; see :mod:`..cogs.deadline`.
+    """
+
+    request_deadline.set(time.monotonic() + seconds)
 
 
 def _storage_errors() -> tuple[type[Exception], ...]:
@@ -339,6 +351,7 @@ def _mint(request: Request) -> JSONResponse:
 
 @router.get(REGISTRY_PATH_PREFIX + "/token")
 async def token(request: Request) -> Response:
+    _start_budget(_serving(request).max_metadata_seconds)
     try:
         # One threadpool hop for the whole mint: the credential lookup, the
         # membership re-check and the insert are all blocking store calls.
@@ -437,7 +450,7 @@ async def _serve(request: Request, rest: str) -> Response:
     deadline = now + budget
     # The same budget for the blocking store calls, which a cancelled
     # coroutine cannot stop: the database is told when to give up instead.
-    request_deadline.set(time.monotonic() + min(budget, serving.max_metadata_seconds))
+    _start_budget(min(budget, serving.max_metadata_seconds))
     blob: ServedBlob | None = None
     try:
         async with asyncio.timeout_at(deadline):
@@ -480,7 +493,8 @@ async def _tags_response(request: Request, serving: CogRegistryServing, name: st
     """One page of tags: ``n`` of them (a bounded default without ``n``) after ``last``, and a ``Link`` to the next."""
 
     raw_n = request.query_params.get("n")
-    if raw_n is not None and not raw_n.isdigit():
+    # ASCII decimal, and short: str.isdigit() also accepts "²", and int() refuses a number of thousands of digits.
+    if raw_n is not None and not _PAGE_NUMBER.fullmatch(raw_n):
         raise RegistryError(status.HTTP_400_BAD_REQUEST, "PAGINATION_NUMBER_INVALID", "n must be a number")
     n = min(int(raw_n), MAX_TAGS_PAGE) if raw_n is not None else DEFAULT_TAGS_PAGE
     last = request.query_params.get("last") or None
@@ -520,6 +534,7 @@ async def _answer(request: Request, rest: str) -> Response:
 async def base(request: Request) -> Response:
     """The version check: ``200 {}`` with a pull token, the bearer challenge without one."""
 
+    _start_budget(_serving(request).max_metadata_seconds)
     try:
         await _grant(request, None)
     except RegistryError as exc:

@@ -471,8 +471,9 @@ def test_postgres_calls_are_bounded_by_the_request_budget():
     )
     for call in calls:
         call()
-    # Outside a request: the default budget, for the pool wait and for every statement.
-    assert conn.budgets == [int(deadline.DEFAULT_BUDGET_SECONDS * 1000)] * len(calls)
+    # Outside a request: the default budget, for the pool wait and before every single statement.
+    default_ms = int(deadline.DEFAULT_BUDGET_SECONDS * 1000)
+    assert len(conn.budgets) == len(conn.calls) and all(default_ms - 1000 < ms <= default_ms for ms in conn.budgets)
     assert store._db.acquire_timeouts == [deadline.DEFAULT_BUDGET_SECONDS] * len(calls)
 
     token = deadline.request_deadline.set(deadline.time.monotonic() + 0.5)
@@ -486,6 +487,63 @@ def test_postgres_calls_are_bounded_by_the_request_budget():
         assert len(store._db.acquire_timeouts) == before, "a spent budget does not even take a connection"
     finally:
         deadline.request_deadline.reset(token)
+
+
+def test_the_budget_is_spent_once_across_the_pool_wait_and_every_statement(monkeypatch):
+    """Waiting for a connection and running earlier statements both use up what later statements get."""
+
+    from collab_hub_api.cogs import deadline
+
+    clock = [100.0]
+    monkeypatch.setattr(deadline.time, "monotonic", lambda: clock[0])
+    statements: list[tuple[str, tuple]] = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            statements.append((sql, tuple(params or ())))
+            if not sql.startswith("SELECT set_config"):
+                clock[0] += 4.0  # each statement takes four seconds
+            return self
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            assert timeout == 30.0
+            clock[0] += 29.0  # the pool made us wait for nearly all of it
+            yield Connection()
+
+    token = deadline.request_deadline.set(clock[0] + 30.0)
+    try:
+        with pytest.raises(deadline.BudgetExhausted):
+            with deadline.bounded_connection(Database()) as conn:
+                conn.execute("SELECT 1")
+                conn.execute("SELECT 2")
+    finally:
+        deadline.request_deadline.reset(token)
+    # One second was left after the checkout, not a fresh thirty; the second statement was never sent.
+    assert statements == [
+        ("SELECT set_config('statement_timeout', %s, true)", ("1000",)),
+        ("SELECT 1", ()),
+    ]
+
+
+def test_request_connection_is_the_ordinary_checkout_outside_a_request():
+    from collab_hub_api.cogs import deadline
+
+    conn = _FakeConnection()
+    db = _FakeDb(conn)
+    with deadline.request_connection(db) as plain:
+        plain.execute("SELECT 1")
+    assert plain is conn and conn.budgets == [] and db.acquire_timeouts == [None]
+
+    token = deadline.request_deadline.set(deadline.time.monotonic() + 0.5)
+    try:
+        with deadline.request_connection(db) as bounded:
+            bounded.execute("SELECT 1")
+    finally:
+        deadline.request_deadline.reset(token)
+    assert isinstance(bounded, deadline.BudgetedConnection)
+    assert 0 < db.acquire_timeouts[-1] <= 0.5 and 1 <= conn.budgets[-1] <= 500
 
 
 def test_postgres_find_token_requires_a_live_credential_when_it_has_one():

@@ -41,23 +41,58 @@ def remaining_seconds() -> float:
     return deadline - time.monotonic()
 
 
+class BudgetedConnection:
+    """A pooled connection that spends from one deadline, statement by statement.
+
+    Before **each** statement the remaining budget is recomputed: none left
+    raises :class:`BudgetExhausted` without sending anything, and otherwise
+    the statement runs under a transaction-local ``statement_timeout`` of
+    exactly what is left. Time spent waiting for the connection, and time
+    spent by earlier statements, is therefore never granted again.
+    """
+
+    def __init__(self, conn, deadline: float) -> None:
+        self._conn = conn
+        self._deadline = deadline
+
+    def execute(self, sql, params=None):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise BudgetExhausted("the request's time budget is spent")
+        self._conn.execute(
+            "SELECT set_config('statement_timeout', %s, true)",
+            (str(max(1, int(remaining * 1000))),),
+        )
+        return self._conn.execute(sql, params)
+
+
 @contextmanager
 def bounded_connection(db):
     """A pooled connection whose acquisition and statements cannot outlive the request budget.
 
     Raises :class:`BudgetExhausted` without touching the pool when nothing is
     left. Otherwise the checkout waits at most the remaining budget (psycopg's
-    ``PoolTimeout`` past it), and every statement in the transaction is
-    bounded by a transaction-local ``statement_timeout`` (``QueryCanceled``
-    past it) -- local, so the connection returns to the pool unaltered.
+    ``PoolTimeout`` past it) and yields a :class:`BudgetedConnection`, whose
+    every statement is bounded by what is left *at that moment*
+    (``QueryCanceled`` past it). The timeout is transaction-local, so the
+    connection returns to the pool unaltered.
     """
 
     remaining = remaining_seconds()
     if remaining <= 0:
         raise BudgetExhausted("the request's time budget is spent")
+    deadline = time.monotonic() + remaining
     with db.connection(timeout=remaining) as conn:
-        conn.execute(
-            "SELECT set_config('statement_timeout', %s, true)",
-            (str(max(1, int(remaining * 1000))),),
-        )
-        yield conn
+        yield BudgetedConnection(conn, deadline)
+
+
+def request_connection(db):
+    """:func:`bounded_connection` inside a request that carries a deadline; the ordinary checkout otherwise.
+
+    For stores with callers on both sides: the lookup behaves exactly as it
+    always has unless a ``/v2/`` request has set :data:`request_deadline`.
+    """
+
+    if request_deadline.get() is None:
+        return db.connection()
+    return bounded_connection(db)
