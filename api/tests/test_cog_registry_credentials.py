@@ -19,6 +19,7 @@ import pytest
 
 from collab_hub_api.cogs.registry_credentials import (
     CREDENTIAL_ID_PREFIX,
+    CREDENTIAL_ISSUE_LOCK_CLASS,
     CREDENTIAL_SECRET_PREFIX,
     MAX_CREDENTIALS_PER_USER,
     PULL_TOKEN_PREFIX,
@@ -285,6 +286,51 @@ def test_expired_rows_are_swept_by_the_next_write(backend):
         assert (credentials, tokens) == (1, 1)
 
 
+def test_live_concurrent_exchanges_never_leave_a_user_over_the_cap():
+    """Many exchanges at once for one user: the cap holds, and another user is not held up or pruned."""
+
+    if not POSTGRES_URL:
+        pytest.skip("set COLLAB_HUB_TEST_POSTGRES_URL to a disposable database to run the live-Postgres tests")
+    from concurrent.futures import ThreadPoolExecutor
+
+    from test_collab_schema import COLLAB_TABLES
+
+    from collab_hub_api.frames.db import PostgresDatabase
+
+    database = PostgresDatabase(POSTGRES_URL, min_size=0, max_size=12, timeout_seconds=30.0)
+
+    def drop_all() -> None:
+        with database.connection() as conn:
+            for table in COLLAB_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+    try:
+        drop_all()
+        run_collab_schema_migrations(database)
+        store = PostgresRegistryCredentialStore(database)
+        for _ in range(MAX_CREDENTIALS_PER_USER - 2):
+            _credential(store)
+        _credential(store, user="bob")
+
+        def exchange(index: int) -> str:
+            return _credential(store, user="alice" if index % 5 else "carol").id
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            issued = list(pool.map(exchange, range(60)))
+        assert len(set(issued)) == 60
+        with database.connection() as conn:
+            counts = {
+                row["user_id"]: row["n"]
+                for row in conn.execute(
+                    "SELECT user_id, count(*) AS n FROM collab_cog_registry_credentials GROUP BY user_id"
+                ).fetchall()
+            }
+        assert counts == {"alice": MAX_CREDENTIALS_PER_USER, "bob": 1, "carol": 12}
+    finally:
+        drop_all()
+        database.close()
+
+
 # ---------------------------------------------------------------------------
 # The Postgres store against a fake connection.
 # ---------------------------------------------------------------------------
@@ -368,7 +414,9 @@ def test_postgres_create_credential_sweeps_inserts_and_caps():
         created_at=T0,
         expires_at=T0 + timedelta(minutes=15),
     )
-    sweep_credentials, sweep_tokens, insert, cap = conn.calls
+    lock, sweep_credentials, sweep_tokens, insert, cap = conn.calls
+    # First, before anything is read or written: one user's issuance and pruning are serialized.
+    assert lock == ("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (CREDENTIAL_ISSUE_LOCK_CLASS, "alice"))
     assert sweep_credentials[0] == "DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()"
     assert sweep_tokens[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
     assert "now() + make_interval(secs => %s)" in insert[0]

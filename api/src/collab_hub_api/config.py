@@ -1430,9 +1430,6 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
             f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
             "connection for the whole sweep while everything else needs another."
         )
-    # This process is about to follow registry redirects: keep signed
-    # storage URLs out of the HTTP libraries' own logs (process-wide).
-    install_log_redaction()
     sources = build_registry_sources(list(cogs.registry_sources))
     return CogIndexing(
         CogIndexer(store, sources),
@@ -1489,6 +1486,9 @@ def build_cog_registry_serving(
             "cogs.serve.public_url and web.public_base_url name different hosts: the Hub serves /v2/ on the "
             "same origin as its API, and clients accept a registry credential only for that origin."
         )
+    # Serving follows registry redirects on clients' behalf: keep signed
+    # storage URLs out of the HTTP libraries' own logs. Process-wide, and
+    # only here -- with serving off (indexing on or not) logging is untouched.
     install_log_redaction()
     return CogRegistryServing(
         front=CogRegistryFront(

@@ -59,6 +59,14 @@ the id goes into ``DELETE /v1/cogs/registry-credentials/{id}`` unescaped."""
 SWEEP_INTERVAL_SECONDS = 300.0
 """How often a read may sweep expired rows; see ``PostgresRegistryCredentialStore._sweep_if_due``."""
 
+CREDENTIAL_ISSUE_LOCK_CLASS = int.from_bytes(b"crc1", "big")
+"""First key of the two-key advisory lock that serializes one user's credential issuance.
+
+The second key is ``hashtext(user_id)``. The two-``int4`` form keeps these
+locks in a key space of their own, apart from the single-``bigint`` keys the
+schema migration and the index sweep take.
+"""
+
 MAX_CREDENTIALS_PER_USER = 20
 """Live credentials one user may hold; exchanging past it drops the oldest.
 
@@ -367,6 +375,15 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
 
     def create_credential(self, *, credential_id, user_id, secret_hash, scope, session_id, ttl_seconds):
         with bounded_connection(self._db) as conn:
+            # Issuance and pruning for one user are serialized: without this,
+            # two concurrent exchanges each prune before the other commits and
+            # the user ends up over the cap. Transaction-level, so it is
+            # released at commit or rollback; the wait for it is a statement
+            # like any other and is bounded by the request budget.
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (CREDENTIAL_ISSUE_LOCK_CLASS, user_id),
+            )
             # Housekeeping rides the write that makes it necessary: expired
             # rows go (their tokens cascade), and so do expired tokens that
             # never had a credential.

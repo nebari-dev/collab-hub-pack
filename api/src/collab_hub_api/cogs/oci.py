@@ -219,12 +219,12 @@ _TRANSPORT_LOGGERS = (
 def install_log_redaction() -> None:
     """Install the two filters above. **Process-wide**, idempotent, and never undone.
 
-    Called when a deployment turns Cog indexing or serving on -- the two
-    things that make this process follow registry redirects -- and not
-    otherwise, so a Hub that does neither logs exactly as it did. Once
-    installed the filters apply to every httpx client in the process, not
-    only the registry's: logging filters attach to loggers, and the HTTP
-    libraries share theirs.
+    Called when a deployment turns Cog *serving* on, and not otherwise, so a
+    Hub that does not serve pulls logs exactly as it did -- including one
+    that only indexes, whose DEBUG transport trace is unfiltered as it has
+    always been. Once installed the filters apply to every httpx client in
+    the process, not only the registry's: logging filters attach to loggers,
+    and the HTTP libraries share theirs.
     """
 
     targets = [(_REQUEST_LOGGER, _RequestLogFilter)] + [(name, _TransportTraceFilter) for name in _TRANSPORT_LOGGERS]

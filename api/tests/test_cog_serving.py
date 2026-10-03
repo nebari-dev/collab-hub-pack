@@ -1275,22 +1275,49 @@ async def test_a_response_that_fails_before_its_first_chunk_still_closes_the_ups
     await client.aclose()
 
 
-def test_log_redaction_is_installed_only_by_a_hub_that_indexes_or_serves(tmp_path, monkeypatch):
+def test_log_redaction_is_installed_only_by_a_hub_that_serves(tmp_path, monkeypatch):
+    """With serving off, logging is exactly what it was -- whether or not this process indexes."""
+
     installed: list[int] = []
     monkeypatch.setattr(config_module, "install_log_redaction", lambda: installed.append(1))
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
 
-    plain = settings(tmp_path, serve={})
-    make_app(Config.parse(plain))
-    assert installed == [], "sources alone, with neither indexing nor serving, change no logging"
-
-    make_app(Config.parse(settings(tmp_path)))
-    assert installed == [1]
+    make_app(Config.parse(settings(tmp_path, serve={})))
+    assert installed == [], "sources alone change no logging"
 
     indexing = settings(tmp_path, serve={})
     indexing["cogs"]["index"] = {"enabled": True}
     make_app(Config.parse(indexing))
-    assert installed == [1, 1]
+    assert installed == [], "indexing on with serving off installs nothing"
+
+    make_app(Config.parse(settings(tmp_path)))
+    assert installed == [1]
+
+    both = settings(tmp_path)
+    both["cogs"]["index"] = {"enabled": True}
+    make_app(Config.parse(both))
+    assert installed == [1, 1], "once per serving app, not once more for the indexer"
+
+
+def test_an_index_only_hub_really_has_no_filters():
+    import subprocess
+    import sys
+
+    probe = (
+        "import logging;"
+        "from collab_hub_api.config import Config;"
+        "from collab_hub_api.core import make_app;"
+        "import tempfile;"
+        "d = tempfile.mkdtemp();"
+        "source = {'id': 's', 'kind': 'static', 'url': 'https://registry.example', 'repositories': ['cogs/a']};"
+        "cogs = {'catalog': {'backend': 'memory'}, 'registry_sources': [source], 'index': {'enabled': True}};"
+        "make_app(Config.parse({'storage': {'frames_path': d}, 'tasks': {'backend': 'memory'}, 'cogs': cogs,"
+        " 'frames': {'mcp_session_manager_enabled': False}}));"
+        "names = ['httpx', 'httpcore.http11', 'httpcore.http2', 'httpcore.connection'];"
+        "print([len(logging.getLogger(n).filters) for n in names])"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert result.stdout.strip().splitlines()[-1] == "[0, 0, 0, 0]"
 
 
 def test_importing_the_oci_client_installs_no_log_filter():

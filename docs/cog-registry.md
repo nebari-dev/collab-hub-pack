@@ -455,7 +455,8 @@ All three need an ordinary Hub sign-in and answer 404
   the lifetime to the longest single install.
 - **Revocable, at once.** Revoking deletes the row and its tokens with it;
   the next request with one of those tokens is a 401. A user holds at most
-  20 live credentials; exchanging past that drops the oldest.
+  20 live credentials; exchanging past that drops the oldest, and one
+  user's exchanges are serialized so concurrent ones cannot exceed it.
 - **Worth only what its owner is.** On a membership-resolving deployment the
   owner's membership is read again at every token mint *and on every `/v2`
   request*, by the same lookup the catalog's authentication makes. A member
@@ -633,9 +634,11 @@ and userinfo, so a pre-signed storage URL is not logged with its signature,
 and the transport trace (`httpcore`, DEBUG) loses every header value, so
 neither a redirect's `Location` nor a `Set-Cookie` or `WWW-Authenticate` is
 logged. These two filters are **process-wide**: they are installed when a
-deployment turns on `cogs.index.enabled` or `cogs.serve.enabled` and then
-apply to every HTTP client in the process, not only the registry's. A Hub
-that does neither logs exactly as before.
+deployment turns on `cogs.serve.enabled` and then apply to every HTTP client
+in the process, not only the registry's. With serving off, logging is
+exactly what it was. That includes a deployment that only indexes: its
+indexer follows the same redirects, and its DEBUG transport trace is
+unfiltered, as it has always been; keep that logger above DEBUG there.
 
 ### Replicas and the indexer
 
