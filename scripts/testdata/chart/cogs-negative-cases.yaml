@@ -339,6 +339,36 @@ cases:
       does refuse a public URL that disagrees with web.public_base_url, the
       one other statement of its own origin, which api/tests covers.
 
+  - name: two publish sources
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: one, kind: static, url: https://one.example.com, publish: true}
+            - {id: two, kind: static, url: https://two.example.com, publish: true}
+        serve: {enabled: true, publicUrl: https://hub.example.com}
+    chart_error: 'marks 2 sources publish: true \(one, two\)'
+    settings:
+      registry_sources:
+        - {id: one, kind: static, url: https://one.example.com, publish: true}
+        - {id: two, kind: static, url: https://two.example.com, publish: true}
+      serve: {enabled: true, public_url: https://hub.example.com}
+    app_error: 'marks 2 sources publish: true \(one, two\)'
+
+  - name: publish source without serving
+    layers: [template]
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, publish: true}
+    chart_error: 'source public is publish: true but cogs.serve.enabled is false'
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, publish: true}
+    app_error: "source 'public' is publish: true but cogs.serve.enabled is false"
+
   # --- structure and grammar: schema, mirrored by the API's own validators -------
 
   - name: unknown serve key
@@ -452,6 +482,37 @@ cases:
       registry_sources:
         - {id: public, kind: static, url: https://registry.example.com, repositories: [cogs/alpha], blob_redirect_hosts: [storage.example.com, storage.example.com]}
     app_error: 'blob_redirect_hosts lists .* twice'
+
+  - name: unknown publish role
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedRoles: [admin]}
+    chart_error: 'allowedRoles.*(enum|one of)'
+    settings:
+      publish: {allowed_roles: [admin]}
+    app_error: "Input should be 'operator', 'owner' or 'member'"
+
+  - name: blank publish user
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedUsers: ['  ']}
+    chart_error: 'allowedUsers.*(pattern|match)'
+    settings:
+      publish: {allowed_users: ['  ']}
+    app_error: 'allowed_users entries must not be blank'
+
+  - name: unknown publish key
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedGroups: [x]}
+    chart_error: 'allowedGroups.*not allowed'
+    settings:
+      publish: {allowed_groups: [x]}
+    app_error: 'allowed_groups\s+Extra inputs are not permitted'
+    compare_render: false   # the chart renders nothing for a key it does not know
 
   - name: registry credential lifetime below the floor
     layers: [schema]
@@ -1050,3 +1111,19 @@ accepted:
         serve: {enabled: false, publicUrl: 'https://hub.example.com', tokenTtlSeconds: 60}
     settings:
       registry_sources: []
+
+  - name: a publish source with nothing configured to enumerate, and who may publish
+    values:
+      cogs:
+        registry:
+          sources:
+            - {id: public, kind: static, url: https://registry.example.com, publish: true}
+            - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
+        serve: {enabled: true, publicUrl: 'https://hub.example.com'}
+        publish: {allowedRoles: [owner, operator], allowedUsers: [8f2c1d7e-user-id]}
+    settings:
+      registry_sources:
+        - {id: public, kind: static, url: https://registry.example.com, publish: true}
+        - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
+      serve: {enabled: true, public_url: 'https://hub.example.com'}
+      publish: {allowed_roles: [owner, operator], allowed_users: [8f2c1d7e-user-id]}

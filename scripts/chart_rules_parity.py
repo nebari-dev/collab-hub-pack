@@ -70,6 +70,9 @@ INDEX_DEFAULTS = {"enabled": False, "interval_seconds": 300, "run_on_startup": T
 
 # cogs.serve (issue #179). The chart renders the block only when serving is
 # on, so everything but `enabled` falls back to the API's own defaults here.
+# cogs.publish (issue #180): two JSON lists, each rendered only when non-empty.
+PUBLISH_PREFIX = "COLLAB_HUB_API__COGS__PUBLISH__"
+PUBLISH_KEYS = ("allowed_roles", "allowed_users")
 SERVE_PREFIX = "COLLAB_HUB_API__COGS__SERVE__"
 SERVE_DEFAULTS = {
     "enabled": False,
@@ -134,7 +137,8 @@ def rendered_cogs(manifests: str) -> dict[str, Any]:
             serve[key] = int(value or 0)
         else:
             serve[key] = value
-    return {"registry_sources": sources, "index": index, "serve": serve}
+    publish = {key: json.loads(env.get(PUBLISH_PREFIX + key.upper()) or "[]") for key in PUBLISH_KEYS}
+    return {"registry_sources": sources, "index": index, "serve": serve, "publish": publish}
 
 
 def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +146,13 @@ def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
 
     index = {**INDEX_DEFAULTS, **settings.get("index", {})}
     serve = {**SERVE_DEFAULTS, **settings.get("serve", {})}
-    return {"registry_sources": settings.get("registry_sources", []), "index": index, "serve": serve}
+    publish = {key: settings.get("publish", {}).get(key, []) for key in PUBLISH_KEYS}
+    return {
+        "registry_sources": settings.get("registry_sources", []),
+        "index": index,
+        "serve": serve,
+        "publish": publish,
+    }
 
 
 def check_case(

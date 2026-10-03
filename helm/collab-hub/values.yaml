@@ -691,6 +691,11 @@ cogs:
     #   indexUrl: catalog.v1.json URL listing repositories (static)
     #   caBundlePath: per-source CA bundle path; defaults to cogs.caBundle when that is set
     #   requestTimeoutSeconds: HTTP timeout, default 10
+    #   publish: true on exactly one source makes it the one pushes through the Hub
+    #         are written to (cogs.serve.enabled required). The Hub writes with
+    #         this source's own credential, which therefore needs push. Such a
+    #         source also enumerates what is published through the Hub, so a
+    #         static one needs neither repositories nor indexUrl.
     #   blobRedirectHosts: hosts a blob redirect from this registry may point at
     #         (its object storage): exact names or leading-dot suffixes such as
     #         ".s3.amazonaws.com". Empty means no allowlist; loopback and
@@ -763,6 +768,18 @@ cogs:
     # large blob short. Needs HTTPRoute `timeouts` (Gateway API v1.2 standard
     # channel); set false on older CRDs and configure the gateway instead.
     routeTimeout: true
+
+  publish:
+    # Who may publish Cogs through the Hub, once one source is marked
+    # `publish: true`. Nobody, by default; being able to pull never implies it.
+    # -- Roles that hold the publish permission: any of "operator" (the
+    # platform role), "owner" and "member" (the caller's role in their
+    # organization). Roles exist only where the Hub resolves organizations
+    # from membership.
+    allowedRoles: []
+    # -- User ids (the Hub's ACL principal) that hold the publish permission
+    # whatever their role. The only way to grant it under claims-sourced auth.
+    allowedUsers: []
 
 # Feature flags for work in progress that is on main but not yet exposed. Every
 # flag is off until it is listed here and set to true; each entry becomes

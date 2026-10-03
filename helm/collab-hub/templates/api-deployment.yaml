@@ -401,6 +401,16 @@ spec:
             - name: COLLAB_HUB_API__COGS__SERVE__MAX_BLOB_SECONDS
               value: {{ .Values.cogs.serve.maxBlobSeconds | int64 | quote }}
             {{- end }}
+            {{- /* Who may publish through the Hub (issue #180). Rendered only when
+            someone is named: the default, nobody, needs no variable. */}}
+            {{- with .Values.cogs.publish.allowedRoles }}
+            - name: COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_ROLES
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .Values.cogs.publish.allowedUsers }}
+            - name: COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_USERS
+              value: {{ toJson . | quote }}
+            {{- end }}
             {{- if .Values.cogs.registry.sources }}
             - name: COLLAB_HUB_API__COGS__REGISTRY_SOURCES
               value: {{ include "collab-hub.cogs-registry-sources" . | quote }}
