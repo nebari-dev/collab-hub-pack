@@ -1016,6 +1016,41 @@
             }
           },
           "additionalProperties": false
+        },
+        "serve": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "publicUrl": {
+              "type": "string",
+              "pattern": "^$|^https?://[A-Za-z0-9._\\[\\]:-]+$"
+            },
+            "credentialTtlSeconds": {
+              "type": "integer",
+              "minimum": 60,
+              "maximum": 86400
+            },
+            "tokenTtlSeconds": {
+              "type": "integer",
+              "minimum": 30,
+              "maximum": 3600
+            },
+            "maxBlobBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxBlobSeconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 21600
+            },
+            "routeTimeout": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
