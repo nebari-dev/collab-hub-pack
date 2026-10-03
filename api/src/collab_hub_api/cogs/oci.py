@@ -15,6 +15,11 @@ here so the layer-selection helper can name what it selects.
 Public interface (stable for the adapters and the indexer):
 
 - :class:`OCIClient` — one registry, optionally pre-authenticated.
+- :meth:`OCIClient.fetch_manifest` / :meth:`OCIClient.open_blob` — the two
+  reads the Hub's own ``/v2/`` surface serves pulls with: a verified manifest
+  exactly as stored (an index is *not* followed), and a blob as a
+  :class:`BlobStream` whose bytes are hashed as they pass instead of being
+  buffered.
 - :class:`Descriptor` / :class:`Manifest` — the parsed content descriptors.
 - :func:`select_bundle_layers` / :func:`fetch_bundle_files` — pick and fetch
   exactly the small layers the bundle reader needs.
@@ -51,6 +56,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import re
 import ssl
 import time
@@ -146,6 +152,29 @@ _LINK_NEXT_RE = re.compile(r'<([^>]*)>\s*;(?:[^,]*?;)?\s*rel\s*=\s*"?next"?', re
 
 _TokenKey = tuple[str, str, str]
 """(token endpoint, service, scope): what makes one bearer token interchangeable with another."""
+
+
+class _RequestLogQueryFilter(logging.Filter):
+    """Drop the query string from httpx's own per-request log line.
+
+    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request, and
+    a blob redirect to object storage is a pre-signed URL: its query string
+    *is* the credential. The path stays (it says which blob), the query goes.
+    Installed on the ``httpx`` logger, so it covers every client in the
+    process; nothing reads that line for its query.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                arg.copy_with(query=None) if isinstance(arg, httpx.URL) and arg.query else arg for arg in record.args
+            )
+        return True
+
+
+_request_log_filter = _RequestLogQueryFilter()
+if not any(isinstance(existing, _RequestLogQueryFilter) for existing in logging.getLogger("httpx").filters):
+    logging.getLogger("httpx").addFilter(_request_log_filter)
 
 
 def _monotonic() -> float:
@@ -384,6 +413,36 @@ class OCIClient:
         body = await _read_bounded(response, max_bytes, what=f"blob {digest}")
         _verify_digest(body, digest, what=f"blob {digest}")
         return body
+
+    async def fetch_manifest(self, repo: str, ref: str) -> Manifest:
+        """Fetch a manifest exactly as the registry stores it, verified, without following an index.
+
+        What a pull through the Hub needs: a client that asked for an index
+        must get the index. ``Manifest.raw`` is the body, ``Manifest.digest``
+        its verified sha256 (see the module docstring for what a tag is
+        verified against).
+        """
+        _validate_repo(repo)
+        _validate_ref(ref)
+        return await self._fetch_manifest(repo, ref)
+
+    async def open_blob(self, repo: str, digest: str) -> BlobStream:
+        """Open a blob for streaming: redirects followed here, nothing read yet.
+
+        The caller drains :meth:`BlobStream.iter_verified` (or closes the
+        stream). Redirects to object storage are followed by this client, one
+        hop at a time and without the registry credential once a hop leaves
+        the registry origin, so the caller never sees a ``Location``.
+        """
+        _validate_repo(repo)
+        _validate_digest(digest)
+        response = await self._send(
+            f"/v2/{repo}/blobs/{digest}",
+            headers={},
+            scope_hint=_pull_scope(repo),
+            allow_redirects=True,
+        )
+        return BlobStream(response, digest)
 
     async def list_tags(self, repo: str) -> list[str]:
         """List a repository's tags, following ``Link: rel="next"`` pagination.
@@ -674,6 +733,97 @@ class OCIClient:
         _bound(self._tokens)
 
 
+class BlobStream:
+    """One open blob response, read as a verified stream.
+
+    Nothing is buffered beyond one chunk. :meth:`iter_verified` hashes the
+    bytes as they pass and **holds the last chunk back until the digest and
+    the size have been checked**: a body that does not hash to the digest it
+    was requested by ends in :class:`OCIDigestMismatch` *before* its final
+    bytes are released, so a consumer relaying the chunks to its own client
+    leaves that client with a short body rather than a complete wrong one.
+    """
+
+    def __init__(self, response: httpx.Response, digest: str) -> None:
+        self._response = response
+        self.digest = digest
+        self._closed = False
+
+    @property
+    def content_length(self) -> int | None:
+        """The size the registry (or its object storage) declared, when it declared a usable one."""
+
+        declared = self._response.headers.get("content-length")
+        if declared is None or not declared.isdigit():
+            return None
+        return int(declared)
+
+    async def aclose(self) -> None:
+        if not self._closed:
+            self._closed = True
+            await self._response.aclose()
+
+    async def iter_verified(self, *, max_bytes: int, expected_size: int | None = None):
+        """Yield the body's chunks; raise instead of releasing the last one if the blob is wrong.
+
+        ``max_bytes`` is the cap (:class:`OCITooLarge` once exceeded);
+        ``expected_size`` is the size a manifest descriptor promised, and a
+        body of any other length is :class:`OCIDigestMismatch`. Encoded
+        bodies are refused, as everywhere in this module. The response is
+        closed when the iteration ends, however it ends.
+        """
+
+        what = f"blob {self.digest}"
+        hasher = hashlib.sha256()
+        total = 0
+        held: bytes | None = None
+        try:
+            encoding = self._response.headers.get("content-encoding", "identity").strip().lower()
+            if encoding not in ("", "identity"):
+                raise OCIProtocolError(f"{what}: registry sent a Content-Encoding this client does not accept")
+            try:
+                async for chunk in self._response.aiter_bytes(_STREAM_CHUNK_BYTES):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise OCITooLarge(f"{what} exceeds the {max_bytes}-byte cap")
+                    if expected_size is not None and total > expected_size:
+                        raise OCIDigestMismatch(f"{what}: body is longer than the {expected_size} bytes declared")
+                    hasher.update(chunk)
+                    if held is not None:
+                        yield held
+                    held = chunk
+            except httpx.HTTPError as exc:
+                raise OCITransportError(f"{what}: {type(exc).__name__} while reading") from exc
+        finally:
+            await self.aclose()
+        if expected_size is not None and total != expected_size:
+            raise OCIDigestMismatch(f"{what}: body is {total} bytes, {expected_size} declared")
+        actual = "sha256:" + hasher.hexdigest()
+        if actual != self.digest:
+            raise OCIDigestMismatch(f"{what}: body hashes to {actual}")
+        if held is not None:
+            yield held
+
+
+def is_index_manifest(manifest: Manifest) -> bool:
+    """Whether ``manifest`` is a multi-platform index rather than an image manifest."""
+
+    return _is_index(manifest.media_type, manifest.raw)
+
+
+def index_children(manifest: Manifest) -> list[Descriptor]:
+    """The child descriptors of an index manifest (``[]`` for an image manifest)."""
+
+    if not is_index_manifest(manifest):
+        return []
+    children = _parse_json_object(manifest.raw, what="index").get("manifests")
+    if not isinstance(children, list):
+        raise OCIProtocolError("index has no 'manifests' list")
+    return [_parse_descriptor(entry, what="index entry") for entry in children]
+
+
 def select_bundle_layers(
     manifest: Manifest,
     *,
@@ -737,6 +887,18 @@ async def fetch_bundle_files(
 
 def _pull_scope(repo: str) -> str:
     return f"repository:{repo}:pull"
+
+
+def is_tag(value: object) -> bool:
+    """Whether ``value`` is a tag by the distribution grammar."""
+
+    return isinstance(value, str) and _TAG_RE.fullmatch(value) is not None
+
+
+def is_sha256_digest(value: object) -> bool:
+    """Whether ``value`` is ``sha256:`` + 64 lowercase hex digits, the one digest form this module verifies."""
+
+    return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
 
 
 def _validate_repo(repo: object) -> None:
