@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -126,6 +127,22 @@ def test_a_tool_hermes_asks_permission_for_is_refused(tmp_path):
     assert _answer(controller, track, "r", "use a tool") == "permission: cancelled"
     intents.request_cancel(track, "r", actor="alice")
     _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+
+
+def test_a_run_stopped_while_hermes_is_still_starting_leaves_no_workspace(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, {**MODEL, "COLLAB_HERMES_COMMAND":
+                                               f"{sys.executable} {FAKE_AGENT} --slow-start"})
+    intents.submit(track, OpDefinition("slowstart", (OpStep("chat", "hermes", "session"),)), by=BY)
+    workspaces = lambda: list(Path(tempfile.gettempdir()).glob("hermes-slowstart-*"))  # noqa: E731
+    _until(controller, lambda: workspaces(), "the session never began opening")
+    [workspace] = workspaces()
+    intents.request_cancel(track, "slowstart", actor="alice")
+    _until(controller, lambda: intents.describe(track, "slowstart").state is RunState.CANCELLED, "not cancelled")
+    deadline = time.monotonic() + 10
+    while workspace.exists():
+        assert time.monotonic() < deadline, "a session stopped while opening left its workspace"
+        time.sleep(0.05)
 
 
 def test_ask_answers_one_prompt(tmp_path):

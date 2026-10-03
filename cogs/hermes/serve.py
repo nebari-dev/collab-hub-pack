@@ -89,6 +89,7 @@ class Agent:
     def __init__(self):
         self.workspace = Path(tempfile.mkdtemp(prefix=f"hermes-{RUN or 'run'}-"))
         self.process = None
+        LIVE.add(self)  # from here on, a stop removes the workspace, even while the session is opening
         try:
             self._start()
         except BaseException:
@@ -164,9 +165,11 @@ class Agent:
             except subprocess.TimeoutExpired:
                 self.process.kill()
         shutil.rmtree(self.workspace, ignore_errors=True)
+        LIVE.discard(self)
 
 
 session = None
+LIVE = set()  # every Agent whose workspace exists: what a stop must clean up
 starting, opened, ended = threading.Event(), threading.Event(), threading.Event()
 SESSION_START_SECONDS = 300  # Hermes's first start in a fresh environment can take a while
 
@@ -251,9 +254,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def stop(*_):
-    """The controller stops a worker with SIGTERM first: leave nothing of the session behind."""
-    if session is not None:
-        session.close()
+    """The controller stops a worker with SIGTERM first: leave nothing of any session behind."""
+    for agent in list(LIVE):
+        agent.close()
     os._exit(0)
 
 

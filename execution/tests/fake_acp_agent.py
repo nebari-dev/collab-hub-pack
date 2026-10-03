@@ -16,6 +16,11 @@ def say(session, text):
         "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}}})
 
 
+if "--slow-start" in sys.argv:
+    import time
+
+    time.sleep(60)  # as Hermes can be, on a first start: the session is still opening
+
 for line in sys.stdin:
     message = json.loads(line)
     method, params = message.get("method"), message.get("params") or {}

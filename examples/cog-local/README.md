@@ -149,7 +149,19 @@ make clean         # this example's sign-in, run id and logs
 make demo
 ```
 
-Every step above in order, with the fake model, `login-token` for the sign-in, and a scripted ACP client, `acp_check.py`, where Toad would be. It checks each answer and fails on the first one that is wrong. CI runs it.
+Every step above in order, each under a banner that says what it does and the command it stands for, then checked: it stops at the first answer that is wrong. It signs in with `login-token` and plays Toad's part with a scripted ACP client, `acp_check.py`, so it needs no browser and no terminal interface; CI runs it. The walk-through uses the fake model, so it costs nothing. When `ANTHROPIC_API_KEY` is set, one more step restarts the controller with Claude, launches Hermes again and chats with it for real (a few Claude tokens); without the key, the step says it is skipped and why. Docker's output and the processes' logs go to `.local/`.
+
+```text
+━━━ Step 9 of 13 · Chat with Hermes the way Toad does ━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Toad is a terminal chat for agents that speak ACP, the Agent Client Protocol; make toad opens it.
+  ...
+  $ make toad   (scripted here)
+
+  > hello hermes
+  The fake model heard: hello hermes
+
+  ✔ Hermes answered, through the hub
+```
 
 ## How it fits together
 

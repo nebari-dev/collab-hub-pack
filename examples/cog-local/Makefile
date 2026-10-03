@@ -15,6 +15,9 @@ CLI := uv run --quiet --project $(ROOT)/cli collab-hub
 COG  ?= hermes
 RUN  ?= $(shell cat $(LOCAL)/run 2>/dev/null)
 TEXT ?= hello
+PROMPTS ?= "hello hermes" "what can you do?"
+# `make start` and `make shutdown` act on these processes, or on ONLY=... (model api controller).
+ONLY ?=
 
 # The model Hermes calls, decided once and handed down to every step:
 #   yours   COLLAB_MODEL_BASE_URL (with COLLAB_MODEL_NAME, COLLAB_MODEL_API_KEY) is set: that endpoint
@@ -117,9 +120,10 @@ controller: ## The run controller, which starts each Cog as a local process (for
 
 start: | $(LOCAL) ## The fake model (if used), the API and the controller in the background; logs in .local/
 	@echo "  Hermes's model: $(MODEL_SOURCE)$(if $(filter claude,$(MODEL_SOURCE)), ($(CLAUDE_MODEL)))"
-	@for name in $(if $(filter fake,$(MODEL_SOURCE)),model) api controller; do \
+	@for name in $(or $(ONLY),$(if $(filter fake,$(MODEL_SOURCE)),model) api controller); do \
 		bash -c "set -m; $(MAKE) -s $$name > $(LOCAL)/$$name.log 2>&1 & echo \$$! > $(LOCAL)/$$name.pid"; done
-	@printf "waiting for the hub on $(COLLAB_HUB_URL) "; for _ in $$(seq 1 240); do \
+	@test -f $(LOCAL)/api.pid || exit 0; \
+	printf "waiting for the hub on $(COLLAB_HUB_URL) "; for _ in $$(seq 1 240); do \
 		curl -sf $(COLLAB_HUB_URL)/health > /dev/null && { echo "up"; exit 0; }; printf .; sleep 1; done; \
 		echo " it never answered:"; tail -20 $(LOCAL)/api.log; exit 1
 
@@ -150,8 +154,8 @@ toad: ## Talk to the running Hermes from Toad, an ACP client
 say: ## Say one thing to it from the CLI instead: make say TEXT="what can you do?"
 	$(CLI) run say $(RUN) $(TEXT)
 
-acp-check: ## What Toad does, scripted: an ACP client sends a few prompts through `run connect`
-	uv run --quiet --project $(ROOT)/cli python $(CURDIR)/acp_check.py $(RUN) "hello hermes" "what can you do?"
+acp-check: ## What Toad does, scripted: an ACP client sends a few prompts (PROMPTS) through `run connect`
+	uv run --quiet --project $(ROOT)/cli python $(CURDIR)/acp_check.py $(RUN) $(PROMPTS)
 
 stop: ## Stop the Cog: terminate its run
 	$(CLI) run terminate $(RUN)
@@ -160,7 +164,7 @@ stop: ## Stop the Cog: terminate its run
 
 shutdown: ## Stop what `make start` started
 	@tree() { echo $$1; for child in $$(pgrep -P $$1); do tree $$child; done; }; \
-	for name in api controller model; do test -f $(LOCAL)/$$name.pid || continue; \
+	for name in $(or $(ONLY),api controller model); do test -f $(LOCAL)/$$name.pid || continue; \
 		pids=$$(tree $$(cat $(LOCAL)/$$name.pid)); kill -TERM $$pids 2>/dev/null; \
 		for _ in $$(seq 1 50); do alive=; for pid in $$pids; do kill -0 $$pid 2>/dev/null && alive=1; done; \
 			test -n "$$alive" || break; sleep 0.2; done; \
@@ -174,15 +178,5 @@ clean: shutdown ## Forget this example's sign-in, run and logs
 
 # --- all of it ----------------------------------------------------------------------------------
 
-demo: | $(LOCAL) ## Every step in order, against the fake model, with no browser and no terminal UI: what CI runs
-	$(MAKE) MODEL_SOURCE=fake tools hub credentials start login-token whoami cogs launch list
-	$(MAKE) -s MODEL_SOURCE=fake acp-check | tee $(LOCAL)/acp-check.out
-	@grep -q "The fake model heard: hello hermes" $(LOCAL)/acp-check.out \
-		|| { echo "Hermes did not answer through the fake model"; exit 1; }
-	$(MAKE) say TEXT="one more thing"
-	$(MAKE) stop list
-	@! $(CLI) run say $(RUN) hello 2>/dev/null || { echo "a terminated run still took a turn"; exit 1; }
-	@! pgrep -f 'cogs/hermes/[.]pixi/envs' > /dev/null || { echo "a Hermes worker outlived its run"; exit 1; }
-	$(MAKE) shutdown
-	@! curl -sf -m 2 $(COLLAB_HUB_URL)/health > /dev/null || { echo "the API is still answering"; exit 1; }
-	@echo "Done: signed in, launched Hermes, listed it, talked to it over ACP and the CLI, and stopped it."
+demo: | $(LOCAL) ## Every step in order, explained, with no browser and no terminal UI: what CI runs
+	@PORT=$(PORT) CLAUDE_MODEL=$(CLAUDE_MODEL) ./demo.sh
