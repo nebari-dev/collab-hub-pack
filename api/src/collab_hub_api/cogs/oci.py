@@ -55,12 +55,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import re
 import ssl
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -154,27 +155,83 @@ _TokenKey = tuple[str, str, str]
 """(token endpoint, service, scope): what makes one bearer token interchangeable with another."""
 
 
-class _RequestLogQueryFilter(logging.Filter):
-    """Drop the query string from httpx's own per-request log line.
+class _RequestLogFilter(logging.Filter):
+    """Drop the query string and userinfo from httpx's own per-request log line.
 
     httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request, and
     a blob redirect to object storage is a pre-signed URL: its query string
-    *is* the credential. The path stays (it says which blob), the query goes.
-    Installed on the ``httpx`` logger, so it covers every client in the
-    process; nothing reads that line for its query.
+    *is* the credential. The path stays (it says which blob), the rest goes.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple):
-            record.args = tuple(
-                arg.copy_with(query=None) if isinstance(arg, httpx.URL) and arg.query else arg for arg in record.args
-            )
+            record.args = tuple(_scrubbed_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args)
         return True
 
 
-_request_log_filter = _RequestLogQueryFilter()
-if not any(isinstance(existing, _RequestLogQueryFilter) for existing in logging.getLogger("httpx").filters):
-    logging.getLogger("httpx").addFilter(_request_log_filter)
+def _scrubbed_url(url: httpx.URL) -> httpx.URL:
+    if not url.query and not url.userinfo:
+        return url
+    return url.copy_with(query=None, userinfo=b"")
+
+
+_TRACE_HEADERS = re.compile(r"^(?P<event>\S*headers\S*)(?:\s|$)")
+_TRACE_STATUS = re.compile(r"return_value=\((?:b'[^']*',\s*)?(?P<status>[1-5][0-9]{2}),")
+_URL_USERINFO = re.compile(r"(?P<scheme>https?://)[^/\s'\"@]*@")
+_URL_QUERY = re.compile(r"(?P<url>https?://[^\s'\"?]*)\?[^\s'\"]*")
+
+
+class _TransportTraceFilter(logging.Filter):
+    """Keep header values out of httpcore's DEBUG trace.
+
+    Below httpx, the transport traces every step of a request at DEBUG, and
+    one of those lines is the response's whole header list: a redirect's
+    ``Location`` with its signature, ``Set-Cookie``, ``WWW-Authenticate``.
+    Any line about headers is cut down to its event name and the status
+    code; every other line has URL userinfo and query strings removed. The
+    trace message arrives preformatted, so this works on the text.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        headers = _TRACE_HEADERS.match(message)
+        if headers is not None:
+            found = _TRACE_STATUS.search(message)
+            status = f" status={found.group('status')}" if found else ""
+            message = f"{headers.group('event')}{status} [header values redacted]"
+        else:
+            message = _URL_USERINFO.sub(r"\g<scheme>", message)
+            message = _URL_QUERY.sub(r"\g<url>", message)
+        record.msg, record.args = message, None
+        return True
+
+
+_REQUEST_LOGGER = "httpx"
+_TRANSPORT_LOGGERS = (
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+def install_log_redaction() -> None:
+    """Install the two filters above. **Process-wide**, idempotent, and never undone.
+
+    Called when a deployment turns Cog indexing or serving on -- the two
+    things that make this process follow registry redirects -- and not
+    otherwise, so a Hub that does neither logs exactly as it did. Once
+    installed the filters apply to every httpx client in the process, not
+    only the registry's: logging filters attach to loggers, and the HTTP
+    libraries share theirs.
+    """
+
+    targets = [(_REQUEST_LOGGER, _RequestLogFilter)] + [(name, _TransportTraceFilter) for name in _TRANSPORT_LOGGERS]
+    for name, kind in targets:
+        target = logging.getLogger(name)
+        if not any(isinstance(existing, kind) for existing in target.filters):
+            target.addFilter(kind())
 
 
 def _monotonic() -> float:
@@ -324,6 +381,7 @@ class OCIClient:
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
+        redirect_hosts: Sequence[str] = (),
     ) -> None:
         try:
             origin = httpx.URL(base_url.rstrip("/"))
@@ -338,6 +396,7 @@ class OCIClient:
         self._base_url = str(origin)
         self._origin = origin
         self._credentials = credentials
+        self._redirect_hosts = tuple(host.lower() for host in redirect_hosts)
         self._token_url = token_url
         self._max_manifest_bytes = max_manifest_bytes
         self._tokens: dict[_TokenKey, _CachedToken] = {}
@@ -603,6 +662,7 @@ class OCIClient:
             if not location:
                 raise OCIProtocolError(f"{what}: redirect without a Location header")
             target = _join_url(url, location, what=f"{what} redirect")
+            self._check_redirect(url, target, what=what)
             hop_headers = dict(headers)
             if not _same_origin(target, self._origin):
                 # Object storage must never see the registry credential. Every
@@ -618,6 +678,36 @@ class OCIClient:
             await response.aclose()
             raise OCIProtocolError(f"{what}: more than {MAX_BLOB_REDIRECTS} redirects")
         return response
+
+    def _check_redirect(self, previous: httpx.URL, target: httpx.URL, *, what: str) -> None:
+        """Refuse a redirect this client must not follow. Messages never quote the target.
+
+        The registry is configured by the operator and trusted with a
+        credential, so this is defence in depth against a registry that is
+        compromised or misconfigured into pointing the Hub at something else:
+
+        - a hop that stays on the registry's own origin is always allowed;
+        - ``https`` never downgrades to ``http``;
+        - a *literal* loopback, link-local or unspecified address is never a
+          destination (that covers the cloud metadata address and its IPv6
+          and IPv4-mapped forms). Private (RFC 1918) addresses are allowed:
+          in-cluster object storage is normal;
+        - with ``redirect_hosts`` configured, the host must be on it: an
+          exact name, or a ``.suffix`` any subdomain of which matches.
+
+        A hostname that *resolves* to a refused address is not caught here;
+        the allowlist is what closes that.
+        """
+
+        if _same_origin(target, self._origin):
+            return
+        if previous.scheme == "https" and target.scheme != "https":
+            raise OCIProtocolError(f"{what}: refusing a redirect from https to http")
+        host = target.host.lower()
+        if _is_forbidden_address(host):
+            raise OCIProtocolError(f"{what}: refusing a redirect to a loopback or link-local address")
+        if self._redirect_hosts and not any(_host_allowed(host, allowed) for allowed in self._redirect_hosts):
+            raise OCIProtocolError(f"{what}: refusing a redirect to a host that is not in blob_redirect_hosts")
 
     def _proactive_auth(self, scope_hint: str) -> str | None:
         if self._use_basic and self._credentials is not None:
@@ -757,6 +847,10 @@ class BlobStream:
         if declared is None or not declared.isdigit():
             return None
         return int(declared)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     async def aclose(self) -> None:
         if not self._closed:
@@ -936,6 +1030,25 @@ def _join_url(base: httpx.URL, target: str, *, what: str) -> httpx.URL:
 def _same_origin(a: httpx.URL, b: httpx.URL) -> bool:
     # httpx drops default ports, so https://h and https://h:443 compare equal.
     return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
+
+
+def _is_forbidden_address(host: str) -> bool:
+    """Whether ``host`` is an IP literal a redirect may never target (not a name: names are not resolved)."""
+
+    try:
+        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback or address.is_link_local or address.is_unspecified
+
+
+def _host_allowed(host: str, allowed: str) -> bool:
+    if allowed.startswith("."):
+        return host.endswith(allowed)
+    return host == allowed
 
 
 def _bound(mapping: dict) -> None:

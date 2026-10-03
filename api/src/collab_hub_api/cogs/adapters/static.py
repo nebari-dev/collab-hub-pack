@@ -78,6 +78,7 @@ class StaticRegistrySource:
             ca_bundle_path=config.ca_bundle_path or None,
             timeout_seconds=config.request_timeout_seconds,
             transport=http_transport,
+            redirect_hosts=tuple(config.blob_redirect_hosts),
         )
         # The index is fetched anonymously: it may live anywhere, and the
         # registry credential must not be presented to an arbitrary URL.

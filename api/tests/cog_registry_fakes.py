@@ -83,6 +83,7 @@ class FakeOCIClient:
     timeout_seconds: float = 10.0
     max_manifest_bytes: int = 0
     transport: httpx.AsyncBaseTransport | None = None
+    redirect_hosts: tuple[str, ...] = ()
     tags: dict[str, list[str]] = field(default_factory=dict)
     manifests: dict[tuple[str, str], Manifest] = field(default_factory=dict)
     blobs: dict[str, bytes] = field(default_factory=dict)

@@ -248,10 +248,137 @@ def test_the_reference_grammar_helpers():
     assert not is_sha256_digest(None)
 
 
-def test_httpx_request_logs_lose_their_query_string(caplog):
+# -- redirects ------------------------------------------------------------------
+
+
+def redirecting(location: str, *, registry: str = REGISTRY):
+    """A registry that redirects every blob to ``location`` and records which hosts were then asked."""
+
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url.copy_with(query=None)))
+        if "/v2/" in request.url.path and request.url.host == httpx.URL(registry).host:
+            return httpx.Response(307, headers={"Location": location})
+        return httpx.Response(200, content=BODY)
+
+    return handler, asked
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "https://169.254.169.254/latest/meta-data/",
+        "https://127.0.0.1:9000/blob",
+        "https://[::1]/blob",
+        "https://[fe80::1]/blob",
+        "https://[::ffff:169.254.169.254]/blob",
+        "https://[::ffff:127.0.0.1]/blob",
+        "https://0.0.0.0/blob",
+    ],
+)
+async def test_a_redirect_to_a_loopback_or_link_local_address_is_never_followed(location):
+    handler, asked = redirecting(location)
+    async with client_for(handler) as client:
+        with pytest.raises(OCIProtocolError, match="refusing a redirect") as caught:
+            await client.open_blob(REPO, DIGEST)
+    assert len(asked) == 1, "the destination was never contacted"
+    assert "169.254" not in str(caught.value) and "127.0.0.1" not in str(caught.value)
+
+
+async def test_a_redirect_never_downgrades_https_to_http():
+    handler, asked = redirecting("http://storage.example/blob")
+    async with client_for(handler) as client:
+        with pytest.raises(OCIProtocolError, match="from https to http"):
+            await client.open_blob(REPO, DIGEST)
+    assert len(asked) == 1
+    # A registry reached over http may redirect to http: nothing is downgraded.
+    handler, asked = redirecting("http://storage.example/blob", registry="http://registry.example")
+    async with OCIClient("http://registry.example", transport=httpx.MockTransport(handler)) as client:
+        stream = await client.open_blob(REPO, DIGEST)
+        await stream.aclose()
+    assert asked[-1] == "http://storage.example/blob"
+
+
+async def test_private_addresses_and_the_registry_itself_are_allowed_without_an_allowlist():
+    for location in ("https://10.0.4.7/blob", "https://minio.storage.svc.cluster.local/blob", "/v3/elsewhere"):
+        handler, asked = redirecting(location)
+        async with client_for(handler) as client:
+            stream = await client.open_blob(REPO, DIGEST)
+            await stream.aclose()
+        assert len(asked) == 2, location
+    # A loopback registry redirecting within its own origin is the registry, not a destination.
+    local = "http://127.0.0.1:5000"
+    handler, asked = redirecting("/blobstore/x", registry=local)
+    async with OCIClient(local, transport=httpx.MockTransport(handler)) as client:
+        stream = await client.open_blob(REPO, DIGEST)
+        await stream.aclose()
+    assert asked[-1] == f"{local}/blobstore/x"
+
+
+async def test_an_allowlist_is_enforced_strictly_when_set():
+    allowed = ("storage.example.com", ".s3.amazonaws.com")
+
+    async def follow(location: str) -> int:
+        handler, asked = redirecting(location)
+        client = OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=allowed)
+        async with client:
+            stream = await client.open_blob(REPO, DIGEST)
+            await stream.aclose()
+        return len(asked)
+
+    assert await follow("https://storage.example.com/blob?sig=1") == 2
+    assert await follow("https://bucket.s3.amazonaws.com/blob") == 2
+    assert await follow("https://STORAGE.example.com/blob") == 2, "hosts compare case-insensitively"
+    assert await follow("/same-origin") == 2, "the registry's own origin needs no entry"
+    for location in (
+        "https://evil.example.com/blob",
+        "https://storage.example.com.evil.example/blob",
+        "https://s3.amazonaws.com/blob",  # the suffix's own apex is not a subdomain of it
+        "https://evils3.amazonaws.com.example/blob",
+        "https://10.0.4.7/blob",
+    ):
+        with pytest.raises(OCIProtocolError, match="not in blob_redirect_hosts"):
+            await follow(location)
+    # The allowlist cannot re-admit what is always refused.
+    handler, _ = redirecting("https://127.0.0.1/blob")
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=("127.0.0.1",)) as client:
+        with pytest.raises(OCIProtocolError, match="loopback or link-local"):
+            await client.open_blob(REPO, DIGEST)
+
+
+async def test_every_hop_of_a_redirect_chain_is_checked():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "registry.example":
+            return httpx.Response(307, headers={"Location": "https://storage.example/one"})
+        if request.url.path == "/one":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest"})
+        return httpx.Response(200, content=BODY)
+
+    async with client_for(handler) as client:
+        with pytest.raises(OCIProtocolError, match="refusing a redirect"):
+            await client.open_blob(REPO, DIGEST)
+
+
+# -- what the HTTP libraries log ---------------------------------------------------
+
+
+@pytest.fixture
+def redacted_logs():
+    """The filters installed, as a Hub that indexes or serves has them."""
+
+    oci.install_log_redaction()
+    oci.install_log_redaction()  # idempotent
+    names = (oci._REQUEST_LOGGER, *oci._TRANSPORT_LOGGERS)
+    assert all(len(logging.getLogger(name).filters) == 1 for name in names)
+    return names
+
+
+def test_httpx_request_logs_lose_their_query_string_and_userinfo(caplog, redacted_logs):
     """A pre-signed storage URL's query is its credential; httpx would log it at INFO."""
 
-    signed = httpx.URL("https://storage.example/blob/sha256:abc?X-Amz-Signature=secret-signature&x=1")
+    signed = httpx.URL("https://user:pw@storage.example/blob/sha256:abc?X-Amz-Signature=secret-signature&x=1")
     plain = httpx.URL("https://registry.example/v2/")
     with caplog.at_level(logging.INFO, logger="httpx"):
         logging.getLogger("httpx").info('HTTP Request: %s %s "%s"', "GET", signed, "HTTP/1.1 200 OK")
@@ -262,6 +389,86 @@ def test_httpx_request_logs_lose_their_query_string(caplog):
     assert messages[0] == 'HTTP Request: GET https://storage.example/blob/sha256:abc "HTTP/1.1 200 OK"'
     assert messages[1] == 'HTTP Request: GET https://registry.example/v2/ "HTTP/1.1 200 OK"'
     assert messages[2:] == ["no arguments at all", "mapping 1"]
-    assert "secret-signature" not in caplog.text
-    # Installed once, however many times the module is imported.
-    assert sum(isinstance(f, oci._RequestLogQueryFilter) for f in logging.getLogger("httpx").filters) == 1
+    assert "secret-signature" not in caplog.text and "pw@" not in caplog.text
+
+
+SENSITIVE_HEADERS = [
+    (b"Location", b"https://user:pw@storage.internal/blob?X-Amz-Signature=SIGNED-SECRET"),
+    (b"Set-Cookie", b"session=COOKIE-SECRET; HttpOnly"),
+    (b"WWW-Authenticate", b'Bearer realm="https://auth.internal/token?hint=CHALLENGE-SECRET"'),
+    (b"Content-Length", b"0"),
+]
+TRACE_SECRETS = ("SIGNED-SECRET", "COOKIE-SECRET", "CHALLENGE-SECRET", "pw@")
+
+
+@pytest.mark.parametrize(
+    ("logger_name", "return_value"),
+    [
+        ("httpcore.http11", (b"HTTP/1.1", 307, b"Temporary Redirect", SENSITIVE_HEADERS)),
+        ("httpcore.http2", (307, SENSITIVE_HEADERS)),
+    ],
+)
+async def test_the_transport_trace_never_logs_header_values(caplog, redacted_logs, logger_name, return_value):
+    """httpcore's own trace path (``httpcore._trace.Trace``), as its HTTP/1.1 and HTTP/2 connections drive it."""
+
+    import httpcore
+    from httpcore._trace import Trace
+
+    request = httpcore.Request("GET", "https://user:pw@registry.internal/v2/x?token=QUERY-SECRET")
+    target = logging.getLogger(logger_name)
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        async with Trace("receive_response_headers", target, request, {"request": request}) as trace:
+            trace.return_value = return_value
+        async with Trace("send_request_headers", target, request, {"request": request, "stream_id": 1}):
+            pass
+        async with Trace("connect_tcp", target, request, {"host": "storage.internal", "port": 443}) as trace:
+            trace.return_value = "https://user:pw@storage.internal/x?sig=QUERY-SECRET"
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "receive_response_headers.complete status=307 [header values redacted]" in text
+    assert "connect_tcp.started host='storage.internal' port=443" in text, "non-header lines keep their content"
+    assert "https://storage.internal/x" in text
+    for secret in (*TRACE_SECRETS, "QUERY-SECRET"):
+        assert secret not in text, secret
+
+
+async def test_a_real_redirect_over_a_real_socket_logs_no_signature(caplog, redacted_logs):
+    """End to end through the installed transport: a local server, a signed ``Location``, DEBUG logging on."""
+
+    import asyncio
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        request_line = await reader.readline()
+        while (await reader.readline()).strip():
+            pass
+        if b"/v2/" in request_line:
+            port = writer.get_extra_info("sockname")[1]
+            head = (
+                "HTTP/1.1 307 Temporary Redirect\r\n"
+                f"Location: http://localhost:{port}/store/blob?X-Amz-Signature=SIGNED-SECRET\r\n"
+                "Set-Cookie: session=COOKIE-SECRET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).encode()
+            writer.write(head)
+        else:
+            writer.write(
+                f"HTTP/1.1 200 OK\r\nContent-Length: {len(BODY)}\r\nConnection: close\r\n\r\n".encode() + BODY
+            )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(serve, "localhost", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with caplog.at_level(logging.DEBUG):
+            # A name, not a loopback literal: the redirect goes to another port on the same host.
+            async with OCIClient(f"http://localhost:{port + 0}") as client:
+                stream = await client.open_blob(REPO, DIGEST)
+                received, raised = await drain(stream, max_bytes=len(BODY), expected_size=len(BODY))
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert raised is None and received == BODY
+    transport_lines = [r.getMessage() for r in caplog.records if r.name.startswith("httpcore")]
+    assert any("receive_response_headers.complete" in line for line in transport_lines), "the trace path ran"
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "SIGNED-SECRET" not in text and "COOKIE-SECRET" not in text
+    assert "/store/blob" in text, "the path is still logged"

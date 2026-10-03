@@ -117,6 +117,7 @@ class HarborRegistrySource:
             ca_bundle_path=config.ca_bundle_path or None,
             timeout_seconds=config.request_timeout_seconds,
             transport=http_transport,
+            redirect_hosts=tuple(config.blob_redirect_hosts),
         )
         self._closed = False
 
