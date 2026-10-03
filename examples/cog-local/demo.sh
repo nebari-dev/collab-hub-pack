@@ -7,47 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LOCAL=.local
-PORT=${PORT:-8000}
-CLAUDE_MODEL=${CLAUDE_MODEL:-claude-opus-5-5}
 STEPS=13
-step=0
-mkdir -p "$LOCAL"
+. ./steps.sh
 
-if [ -t 1 ]; then BOLD=$'\033[1m' DIM=$'\033[2m' CYAN=$'\033[36m' GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' OFF=$'\033[0m'
-else BOLD='' DIM='' CYAN='' GREEN='' YELLOW='' RED='' OFF=''; fi
-
-# A banner for each step: what it is, and why.
-banner() {
-  step=$((step + 1))
-  local title=$1; shift
-  printf '\n\n%s%s━━━ Step %d of %d · %s %s%s\n' "$BOLD" "$CYAN" "$step" "$STEPS" "$title" \
-    "$(printf '━%.0s' $(seq 1 $((60 - ${#title}))))" "$OFF"
-  for line in "$@"; do printf '%s  %s%s\n' "$DIM" "$line" "$OFF"; done
-  echo
-}
-# The command a reader would type, then the step's own make target, quietly.
-run() {
-  local shown=$1; shift
-  printf '  %s$ %s%s\n\n' "$BOLD" "$shown" "$OFF"
-  # Targets indent their own notes by two; everything is shown at the same indent.
-  make -s --no-print-directory PORT="$PORT" "$@" 2>&1 | sed -e 's/^  //' -e 's/^/  /'
-}
-ok() { printf '\n  %s✔ %s%s\n' "$GREEN" "$1" "$OFF"; }
-skip() { printf '  %s↷ %s%s\n' "$YELLOW" "$1" "$OFF"; }
-fail() { printf '\n  %s✘ %s%s\n' "$RED" "$1" "$OFF"; exit 1; }
-cli() { uv run --quiet --project ../../cli collab-hub "$@"; }
-# Until the controller has picked the launched run up and Hermes is starting.
-wait_running() {
-  for _ in $(seq 1 120); do
-    cli run show "$(cat $LOCAL/run)" --json | grep -q '"status": "RUNNING"' && return 0
-    sleep 0.5
-  done
-  fail "the controller did not pick the run up"
-}
-export COLLAB_HUB_URL=http://127.0.0.1:$PORT COLLAB_HUB_CONFIG_DIR=$PWD/$LOCAL/cli
-
-stop_all() { make -s --no-print-directory shutdown > /dev/null 2>&1 || true; }
 trap 'status=$?; if [ $status -ne 0 ]; then stop_all; printf "\n  %sThe demo stopped at step %d. Logs: %s/*.log%s\n" "$RED" "$step" "$LOCAL" "$OFF"; fi' EXIT
 
 printf '%sA Hermes agent'"'"'s whole life as a Cog, on a hub running on this machine.%s\n' "$BOLD" "$OFF"
@@ -99,10 +61,10 @@ cli run list > "$LOCAL/runs.out"
 head -4 "$LOCAL/runs.out" | sed 's/^/  /'
 
 banner "Chat with Hermes the way Toad does" \
-  "Toad is a terminal chat for agents that speak ACP, the Agent Client Protocol; make toad opens it." \
+  "Toad is a terminal chat for agents that speak ACP, the Agent Client Protocol; make connect opens it." \
   "Here a scripted ACP client plays Toad's part: each prompt goes from the client to the hub, to" \
   "the controller, to the Hermes Cog, to Hermes and its model, and the answer comes back the same way."
-run "make toad   (scripted here)" MODEL_SOURCE=fake acp-check | tee "$LOCAL/acp-check.out"
+run "make connect   (scripted here)" MODEL_SOURCE=fake acp-check | tee "$LOCAL/acp-check.out"
 grep -q "The fake model heard: hello hermes" "$LOCAL/acp-check.out" || fail "Hermes did not answer through the fake model"
 ok "Hermes answered, through the hub"
 
@@ -138,7 +100,7 @@ else
   cli run list > "$LOCAL/runs.out"
   head -4 "$LOCAL/runs.out" | sed 's/^/  /'
   echo
-  run "make toad   (scripted here)" MODEL_SOURCE=claude acp-check \
+  run "make connect   (scripted here)" MODEL_SOURCE=claude acp-check \
     PROMPTS='"In one sentence: who are you, and which model do you run on?" "What is 17 times 23? Answer with the number only."' \
     | tee "$LOCAL/acp-check-claude.out"
   grep -q "391" "$LOCAL/acp-check-claude.out" || fail "Claude's answer is not 391"
@@ -155,4 +117,4 @@ run "make shutdown" shutdown
 ok "nothing of the demo is left running"
 
 printf '\n\n%s%sDone.%s Signed in, launched Hermes, saw it running, chatted with it over ACP and the CLI, and stopped it.\n' "$BOLD" "$GREEN" "$OFF"
-printf '%sNext: the same by hand, with Toad, as README.md walks through it: make start, make login, make launch, make toad.%s\n' "$DIM" "$OFF"
+printf '%sNext: the same by hand, with Toad, as README.md walks through it: make start, make login, make launch, make connect; or all of it at once, on Claude: make toad.%s\n' "$DIM" "$OFF"

@@ -52,7 +52,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help env tools hub credentials claude model api controller start login login-token whoami cogs launch \
-        list toad say acp-check stop shutdown down clean demo
+        list connect toad say acp-check stop shutdown down clean demo
 
 help: ## List the steps
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  make %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -73,10 +73,10 @@ env: ## Install what the example uses: the CLI, the hub, Toad, pixi, and Hermes'
 	PATH="$$HOME/.pixi/bin:$$PATH" pixi install --manifest-path $(CURDIR)/cogs/hello/pixi.toml
 	@echo "Ready. If pixi or toad was just installed, open a new shell, or add ~/.pixi/bin and ~/.local/bin to PATH."
 
-tools: ## Check what the example needs: docker, uv, pixi, and toad for `make toad`
+tools: ## Check what the example needs: docker, uv, pixi, and toad for `make connect` and `make toad`
 	@for tool in docker uv pixi; do command -v $$tool >/dev/null \
 		&& echo "  ok      $$tool" || { echo "  missing $$tool"; missing=1; }; done; \
-	command -v toad >/dev/null && echo "  ok      toad" || echo "  missing toad (only for make toad): make env"; \
+	command -v toad >/dev/null && echo "  ok      toad" || echo "  missing toad (only for make connect and make toad): make env"; \
 	test -d $(ROOT)/cogs/hermes/.pixi/envs/default && echo "  ok      Hermes's environment" \
 		|| echo "  missing Hermes's environment (the first launch installs it, slowly): make env"; \
 	test -z "$$missing"
@@ -151,8 +151,11 @@ launch: | $(LOCAL) ## Launch Hermes (COG=hermes) as NAME, holding a session; the
 list: ## The runs you launched
 	$(CLI) run list
 
-toad: ## Talk to the running Hermes from Toad, an ACP client
+connect: ## Open Toad, an ACP client, on the running Hermes (RUN), to chat with it
 	toad acp --title "$(COG) · $(RUN)" "$(CLI) run connect $(RUN)" $(CURDIR)
+
+toad: ## All in one: start the hub, launch Hermes on Claude, and open Toad on it, ready to chat
+	@PORT=$(PORT) CLAUDE_MODEL=$(CLAUDE_MODEL) ./toad.sh
 
 say: ## Say one thing to it from the CLI instead: make say TEXT="what can you do?"
 	$(CLI) run say $(RUN) $(TEXT)

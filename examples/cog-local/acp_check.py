@@ -6,7 +6,7 @@ The Agent Client Protocol is JSON-RPC over the agent's stdin and stdout, one
 message per line (https://agentclientprotocol.com). This client starts the
 agent, initializes it, opens a session, sends each prompt, and prints what the
 agent says back. It exits non-zero if any prompt goes unanswered. `make
-acp-check` runs it; `make toad` does the same through Toad's interface.
+acp-check` runs it; `make connect` does the same through Toad's interface.
 """
 
 import json

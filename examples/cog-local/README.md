@@ -18,6 +18,19 @@ make tools    # checks each one is there
 
 `make env` installs [pixi](https://pixi.sh) if it is missing (it gives each Cog its own environment), [Toad](https://github.com/batrachianai/toad) with `uv tool install`, and Hermes Agent into the Hermes Cog's environment, about 400 MB the first time. Open a new shell afterwards if pixi or Toad was new.
 
+## The quickest way: `make toad`
+
+With `ANTHROPIC_API_KEY` set, one command takes you from nothing to chatting with Hermes, running as a Cog and talking to Claude, in Toad:
+
+```sh
+export ANTHROPIC_API_KEY=...   # from https://platform.claude.com
+make toad
+```
+
+It goes through the steps below one by one, each explained under a banner as it runs: it checks the tools and your key, starts Postgres, Keycloak and the hub with Claude as Hermes's model, signs in, launches Hermes, and opens Toad on it. Type a message and press Enter; Hermes answers through the hub. Leave Toad with `ctrl+q`: Hermes keeps running, and the last lines say how to come back (`make connect`), stop it (`make stop`) or stop the hub (`make shutdown`). Without a key, it says so and stops before starting anything; `make demo` walks through the same steps against the fake model.
+
+The rest of this page is the same thing one step at a time.
+
 ## 1. Start the hub
 
 ```sh
@@ -107,7 +120,7 @@ run-d30f9866404b  hermes-on-fake-model  hermes  RUNNING  0s   Dev User
 ## 5. Talk to Hermes from Toad
 
 ```sh
-make toad       # toad acp "collab-hub run connect RUN"
+make connect    # toad acp "collab-hub run connect RUN"
 ```
 
 Toad opens with the running Hermes as its agent. Ask it a few things: `hello`, `what can you do?`, anything you would ask an assistant. With Claude or another real model, it is Hermes answering; with the fake model each answer is `The fake model heard: ...`. Leave Toad with `ctrl+q`; Hermes keeps running.
@@ -153,9 +166,9 @@ Every step above in order, each under a banner that says what it does and the co
 
 ```text
 ━━━ Step 9 of 13 · Chat with Hermes the way Toad does ━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Toad is a terminal chat for agents that speak ACP, the Agent Client Protocol; make toad opens it.
+  Toad is a terminal chat for agents that speak ACP, the Agent Client Protocol; make connect opens it.
   ...
-  $ make toad   (scripted here)
+  $ make connect   (scripted here)
 
   > hello hermes
   The fake model heard: hello hermes
@@ -168,7 +181,7 @@ Every step above in order, each under a banner that says what it does and the co
 ```text
 make login     ──▶ Keycloak (dev / dev) ──token──▶ collab-hub
 make launch    ──▶ POST /v1/runs ──▶ API ──writes──▶ Track ◀──watches── controller ──starts──▶ Hermes Cog ──▶ hermes acp
-make toad   ──▶ Toad ──ACP──▶ collab-hub run connect ──POST /v1/runs/{id}/turns──▶ API ──▶ Track
+make connect ──▶ Toad ──ACP──▶ collab-hub run connect ──POST /v1/runs/{id}/turns──▶ API ──▶ Track
                        controller ──POST /turn──▶ Hermes Cog ──ACP──▶ Hermes ──▶ model
 make stop      ──▶ POST /v1/runs/{id}/cancel ──▶ API ──▶ Track ──▶ controller stops the Cog and Hermes
 ```
@@ -187,7 +200,7 @@ This directory also has [`cogs/hello`](cogs/hello), the smallest Cog that holds 
 | Hermes answers `API call failed ... Connection error` | Nothing listens at the model's address | `make model`, or check `COLLAB_MODEL_BASE_URL` |
 | The run fails with `model-unavailable` | The controller had no model to hand Hermes | Start the controller from this directory, or set the three variables above |
 | The first launch takes minutes | pixi is installing Hermes's environment | `make env` installs it ahead of time |
-| `make toad` or `make say` says the run takes no turns | The run has ended | `make launch` again |
+| `make connect` or `make say` says the run takes no turns | The run has ended | `make launch` again |
 | `toad: command not found` | Toad was installed into `~/.local/bin` | Add it to `PATH`, or open a new shell |
 
 The Cog's own output, Hermes's included, is under `../../dev/.local/runs/`, and the processes' in `.local/` when `make start` started them.
