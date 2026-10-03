@@ -128,6 +128,38 @@ ACCEPT_REDEEM_PATH = "/invite/accept/redeem"
 session, and the guard enforces that because ``/invite`` is a guarded prefix
 and this path is absent from :data:`PUBLIC_WEB_PATHS`."""
 
+ACCEPT_SESSION_PATH = "/invite/accept/session"
+"""What the registration app asks before it shows anything: is this browser
+signed in, is that sign-in recent enough to redeem on, and the CSRF token a
+redemption must carry.
+
+In :data:`PUBLIC_WEB_PATHS`, because the app asks it on behalf of someone who
+may have no account yet and has to be told so. It is anonymous **safely**: it
+is a ``GET`` that changes nothing, and it reports only on the caller's own
+session cookie. The CSRF token it returns is bound to that session and useless
+without the HttpOnly cookie, which is the argument the panel's own session
+endpoint already rests on; a browser with no session is handed none.
+
+A sub-path of the page rather than a sibling, so the app can ask for it with a
+document-relative URL and nothing in the bundle needs to know the deployment's
+root path.
+"""
+
+REGISTRATION_ASSETS_PREFIX = "/invite/assets/"
+"""Where the registration app's hashed bundle files live.
+
+Beside the document rather than under it: the document is served at
+:data:`ACCEPT_PAGE_PATH`, with no trailing slash, and the bundle's asset URLs
+are document-relative, so a browser resolves ``./assets/…`` against
+``/invite/``.
+
+A prefix rather than enumerated paths, for the reason
+:data:`ADMIN_PANEL_ASSETS_PREFIX` is one: the names carry content hashes and
+change on every build. Unlike the panel's, these files are **public** (see
+:data:`PUBLIC_WEB_ASSET_PREFIXES`), because the people who load them are
+invitees with no account yet.
+"""
+
 ADMIN_INVITATIONS_PATH = "/admin/invitations"
 """The operator invitation page (#91): ``GET`` renders it, ``POST`` issues.
 
@@ -292,6 +324,7 @@ PUBLIC_WEB_PATHS = frozenset(
         STYLE_ASSET_PATH,
         WEB_LOGO_PATH,
         ACCEPT_PAGE_PATH,
+        ACCEPT_SESSION_PATH,
         DATA_STATEMENT_PATH,
         TERMS_PATH,
         PRIVACY_PATH,
@@ -330,6 +363,41 @@ minted from that token. Gating them on a session would therefore mean the
 documents could only be read by someone who had already accepted them, which
 is not a stricter policy but an incoherent one.
 """
+
+PUBLIC_WEB_ASSET_PREFIXES: tuple[str, ...] = (REGISTRATION_ASSETS_PREFIX,)
+"""Directories whose files are served without a session.
+
+The second, narrower way to be public, for built bundle files that cannot be
+listed in :data:`PUBLIC_WEB_PATHS` because their names change on every build.
+What an entry grants is exactly one flat directory: a path is public only when
+it is the prefix followed by a single segment (see :func:`is_public_web_path`),
+so nothing nested below it, and not the directory itself, is exempt.
+
+It is anonymous **safely** on the same grounds as the stylesheet and the
+wordmark: the files are a build output, identical for everyone, holding no
+data and reading nothing from the request. The route that serves them takes
+one file name, checks it against a strict pattern, and answers only files that
+exist inside the bundle's asset directory.
+"""
+
+
+def is_public_web_path(path: str) -> bool:
+    """Whether *path* is served without a session. **The one definition.**
+
+    Read by the guard (against the request path), by the route lint and by the
+    public-router seam (against route path templates), so the three cannot
+    disagree about what anonymous means on this surface.
+    """
+
+    if path in PUBLIC_WEB_PATHS:
+        return True
+    for prefix in PUBLIC_WEB_ASSET_PREFIXES:
+        if path.startswith(prefix):
+            name = path[len(prefix) :]
+            if name and "/" not in name:
+                return True
+    return False
+
 
 CSRF_ENFORCED_IN_ROUTE: frozenset[str] = frozenset(
     {
@@ -722,6 +790,12 @@ def on_admin_panel(path: str) -> bool:
         path in (ADMIN_PANEL_DOCUMENT, ADMIN_PANEL_REDIRECT)
         or path.startswith(ADMIN_PANEL_ASSETS_PREFIX)
     )
+
+
+def on_registration_app(path: str) -> bool:
+    """Whether *path* is the registration app's document or one of its files."""
+
+    return path == ACCEPT_PAGE_PATH or path.startswith(REGISTRATION_ASSETS_PREFIX)
 
 
 def answers_json(path: str) -> bool:

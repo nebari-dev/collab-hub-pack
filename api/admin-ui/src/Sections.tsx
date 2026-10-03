@@ -481,6 +481,12 @@ export function Usage() {
   return (
     <>
       <p>Activity across every organization on this hub.</p>
+      <p>
+        Someone is counted here once they have used the hub from the desktop app or the API as a
+        member of an organization, and an organization is listed once one of its members has. The
+        Users screen lists every account the identity provider holds, including people who have
+        never used the hub, so it can show a larger number.
+      </p>
       <div className="figures">
         <Figure Icon={UsersIcon} value={users} label="people have used this hub" />
         <Figure Icon={Activity} value={events} label="recorded actions" />

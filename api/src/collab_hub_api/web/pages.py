@@ -65,11 +65,12 @@ opening it.
 (and the CSRF token in it) off-origin. Documents only — assets get the plain
 security headers.
 
-**This is the default and it stays the default.** Exactly one page differs —
-the invitation-acceptance page, which cannot read its URL fragment without
-script — and it differs *for its own path only*, through
-:func:`headers_for_path`, with a hash-pinned ``script-src``. If you are here
-because the surface looks inconsistent, read :mod:`.acceptance`: the fix is
+**This is the default and it stays the default.** The two built bundles
+differ (the admin panel, and the registration app that serves the
+invitation-acceptance page, which cannot read its URL fragment without
+script), and they differ *for their own paths only*, through
+:func:`headers_for_path`. If you are here because the surface looks
+inconsistent, read :data:`ADMIN_PANEL_CONTENT_SECURITY_POLICY`: the fix is
 never to add a script source here.
 """
 
@@ -82,10 +83,10 @@ ADMIN_PANEL_CONTENT_SECURITY_POLICY = (
 )
 """The admin panel's policy: still ``default-src 'none'``, widened to ``'self'``.
 
-The second exception to the no-script rule, and the first that is a whole
-subtree rather than one page. It is stated as a full policy rather than as a
-diff against :data:`CONTENT_SECURITY_POLICY`, so that reading this constant
-tells you everything the panel is permitted to do.
+The exception to the no-script rule, for a built bundle's document and its
+files. It is stated as a full policy rather than as a diff against
+:data:`CONTENT_SECURITY_POLICY`, so that reading this constant tells you
+everything the panel is permitted to do.
 
 What it does **not** contain is the point:
 
@@ -105,6 +106,22 @@ exfiltrate to another origin is refused by the browser.
 
 ADMIN_PANEL_HEADERS = {**SECURITY_HEADERS, "Content-Security-Policy": ADMIN_PANEL_CONTENT_SECURITY_POLICY}
 
+REGISTRATION_APP_HEADERS = ADMIN_PANEL_HEADERS
+"""The registration app answers with the panel's policy, by name.
+
+It is the same kind of thing -- a bundle built by ``admin-ui``, served from
+this origin, writing over ``fetch`` -- so it needs exactly what the panel needs
+and nothing the panel does not. One policy for both means a directive loosened
+for one is visibly loosened for the other; the name is separate so that a
+reader of :func:`headers_for_path` sees which surface each branch is for.
+
+This replaced a policy that pinned one inline script by its SHA-256 digest. A
+bundle cannot be pinned that way: its scripts are files, so ``script-src`` has
+to name their origin. What is kept is everything else -- no inline script, no
+``eval``, no external origin, and ``connect-src 'self'`` so the page can talk
+only to this hub.
+"""
+
 
 def headers_for_path(path: str) -> dict[str, str]:
     """The response headers this surface serves for *path*.
@@ -115,39 +132,27 @@ def headers_for_path(path: str) -> dict[str, str]:
     exists to constrain, so it would travel wherever someone copied it. A
     path cannot travel.
 
-    Every path answers with :data:`PAGE_HEADERS` except the acceptance page,
-    which answers with the same headers and a CSP whose only addition is one
-    SHA-256 script digest and ``connect-src 'self'``.
+    Every path answers with :data:`PAGE_HEADERS` except the two built
+    bundles, whose documents and files answer with the same headers and a CSP
+    that lets them run their own script.
     """
 
-    from .surface import on_admin_panel
+    from .surface import on_admin_panel, on_registration_app
 
     if on_admin_panel(path):
         # Scoped to the panel's own document and bundle files, not to all of
         # ``/admin``: the policy below forbids form submission outright, which
         # the operator invitation page could not live under.
         return ADMIN_PANEL_HEADERS
-    return _script_page_headers().get(path, PAGE_HEADERS)
+    if on_registration_app(path):
+        # The same shape and the same scoping: the document and its bundle
+        # files, not all of ``/invite``.
+        return REGISTRATION_APP_HEADERS
+    return PAGE_HEADERS
 
-
-def _script_page_headers() -> dict[str, dict[str, str]]:
-    """The path → headers exceptions. One entry, and it is reviewed.
-
-    Imported inside the function because :mod:`.acceptance` composes its page
-    with :func:`render_page` from this module; a module-level import would be
-    a cycle. Same pattern the authorization lint uses for ``surface``.
-    """
-
-    from .acceptance import ACCEPT_PAGE_PATH, ACCEPTANCE_PAGE_HEADERS
-
-    return {ACCEPT_PAGE_PATH: ACCEPTANCE_PAGE_HEADERS}
 
 STYLESHEET = """\
 :root { color-scheme: light dark; }
-/* The acceptance page ships every outcome as a hidden section and reveals
-   one. A later rule that set `display` on `section` would defeat the `hidden`
-   attribute and show all of them at once, so this pins it. */
-[hidden] { display: none !important; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
        Helvetica, Arial, sans-serif; margin: 4rem auto; max-width: 40rem;
        padding: 0 1.25rem; color: #1a1a2e; line-height: 1.55; }
@@ -251,10 +256,10 @@ class WebSecurityHeadersMiddleware(BaseHTTPMiddleware):
             # surface's headers on its worst-case response. The traceback is
             # logged, never rendered: this is a browser surface.
             #
-            # ``PAGE_HEADERS`` unconditionally, including on the acceptance
-            # path: this document carries no script, so the strictest policy
-            # is the correct one and a failing page must not be the thing
-            # that hands out a script budget.
+            # ``PAGE_HEADERS`` unconditionally, including on the paths that
+            # serve a bundle: this document carries no script, so the strictest
+            # policy is the correct one and a failing page must not be the
+            # thing that hands out a script budget.
             logger.exception("web_unhandled_error", extra={"path": request.url.path})
             return HTMLResponse(
                 _ERROR_DOCUMENT,

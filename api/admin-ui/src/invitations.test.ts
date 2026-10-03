@@ -24,6 +24,14 @@ describe("invitationNotice", () => {
     expect(invitationNotice({ state: "refused", reason: "already_live" }).text).toMatch(/already has a live invitation/);
   });
 
+  it("says why a single-organization hub will not issue the invitation", () => {
+    const notice = invitationNotice({ state: "refused", reason: "organization_creation_refused" });
+
+    expect(notice.bad).toBe(true);
+    expect(notice.text).toMatch(/single organization/);
+    expect(notice.text).not.toMatch(/did not go through/);
+  });
+
   it("falls back when the request never got an answer", () => {
     expect(invitationNotice({ state: "error" })).toEqual({
       text: "That did not go through. Nothing was created.",

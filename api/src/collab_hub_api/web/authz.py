@@ -245,7 +245,7 @@ def route_offence(route: object, prefixes: Sequence[str]) -> str | None:
     says so.
     """
 
-    from .surface import ALLOWED_WEB_MOUNTS, CSRF_ENFORCED_IN_ROUTE, PUBLIC_WEB_PATHS
+    from .surface import ALLOWED_WEB_MOUNTS, CSRF_ENFORCED_IN_ROUTE, is_public_web_path
 
     path = getattr(route, "path", None)
     if not isinstance(path, str) or not on_web_surface(path, prefixes):
@@ -262,7 +262,7 @@ def route_offence(route: object, prefixes: Sequence[str]) -> str | None:
         return f"{path} is a WebSocket route, which this surface does not serve"
     if not isinstance(route, APIRoute):
         return f"{path} is a {type(route).__name__}, which this surface does not serve"
-    if path in PUBLIC_WEB_PATHS:
+    if is_public_web_path(path):
         return None
     if not route_enforces_session(route):
         return f"{path} requires no web session and is not in PUBLIC_WEB_PATHS"

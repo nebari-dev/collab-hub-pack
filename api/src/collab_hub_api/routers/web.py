@@ -73,7 +73,6 @@ from ..web.surface import (
     LANDING_PATH,
     ORG_INVITATIONS_PATH,
     PRIVACY_PATH,
-    PUBLIC_WEB_PATHS,
     SIGNED_OUT_PATH,
     SIGNIN_PATH,
     SIGNOUT_PATH,
@@ -82,6 +81,7 @@ from ..web.surface import (
     WebSurface,
     answers_json,
     clamped_session_lifetime,
+    is_public_web_path,
 )
 from ..web.terms_of_service import terms_of_service_page
 
@@ -284,9 +284,11 @@ def _refuse_unless_safely_public(route: object) -> None:
     * an **actual** :class:`~fastapi.routing.APIRoute` — an ``isinstance``,
       not a duck-typed ``.path``, because a fabricated object satisfied the
       structural version of this check in #88's review;
-    * a path already in :data:`~..web.surface.PUBLIC_WEB_PATHS`, so choosing
-      this argument buys placement and never anonymity — anonymity still costs
-      the reviewed line in the allowlist;
+    * a path already in :data:`~..web.surface.PUBLIC_WEB_PATHS` (or a file
+      directly inside one of its public asset directories, see
+      :func:`~..web.surface.is_public_web_path`), so choosing this argument
+      buys placement and never anonymity: anonymity still costs the reviewed
+      line in the allowlist;
     * a method set within :data:`SAFE_PUBLIC_METHODS`, so an anonymous path
       cannot also carry a handler that changes something.
     """
@@ -298,7 +300,7 @@ def _refuse_unless_safely_public(route: object) -> None:
             " WebSocketRoute is outside the session model, and anything else cannot be"
             " checked at all."
         )
-    if route.path not in PUBLIC_WEB_PATHS:
+    if not is_public_web_path(route.path):
         raise RuntimeError(
             f"{route.path!r} was passed to make_router as a public page route but is not in"
             " web.surface.PUBLIC_WEB_PATHS. Anonymous access to this surface is granted"

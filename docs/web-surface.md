@@ -68,7 +68,7 @@ than dead-ending a signed-in operator.
 | `COLLAB_HUB_API__WEB__SESSION_LIFETIME_SECONDS` | Absolute session lifetime. Default **and hard ceiling** 8 hours; may be lowered, never raised (the stateless-session risk argument rests on this number). Enforced on `WebSurface` (which is slotted, so the accessor cannot be shadowed on an instance) and clamped at mint time through a module-level function on the validated field, not only in config validation. No sliding renewal. |
 | `COLLAB_HUB_API__WEB__SCOPE` | Default `openid email profile`; must include `openid`. |
 | `COLLAB_HUB_API__WEB__PUBLIC_BASE_URL` | External origin the surface builds its absolute URLs from, the OIDC redirect URI among them. **Required** when the surface is enabled on a membership-resolving deployment — startup refuses without it, because those origins must never be derived from a forgeable request `Host` (see below). Also what makes the redirect URI correct behind a proxy whose forwarded headers are not trusted. Same https/loopback rule as the issuer. |
-| `COLLAB_HUB_API__WEB__ADMIN_UI_DIST` | Directory holding the built admin panel. The image sets it to `/var/collab-hub-api/admin-ui-dist`. Empty, or a directory with no `index.html`, mounts no panel routes (the second case logs `admin_ui_dist_missing_index`). The panel and its `/admin/api/*` endpoints mount only on a membership-resolving deployment (`orgSource` `membership` or `single`). |
+| `COLLAB_HUB_API__WEB__ADMIN_UI_DIST` | Directory holding the built admin panel, and inside it the registration app in `registration/`. The image sets it to `/var/collab-hub-api/admin-ui-dist`. Empty, or a directory with no `index.html`, mounts no panel routes (the second case logs `admin_ui_dist_missing_index`). With no `registration/index.html` the invitation page answers 503 with a plain notice (logged as `registration_ui_missing_index`). The panel and its `/admin/api/*` endpoints mount only on a membership-resolving deployment (`orgSource` `membership` or `single`). |
 | `COLLAB_HUB_API__WEB__ADMIN_GROUP` | Identity-provider group whose members hold the operator role, reconciled at each sign-in from the ID token's `groups` claim. Matches with or without a leading slash. Empty (default) turns sync off. Needs a groups mapper on the client so the ID token carries the claim; see [frames-operations.md](frames-operations.md#where-operator-rows-come-from-source-and-sign-in-sync). |
 
 The realm's JWKS endpoint is derived from the issuer URL — there is no
@@ -196,13 +196,14 @@ elsewhere" shape as `web_platform_role_source_missing`.
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a CSP with
   `default-src 'none'`, `frame-ancestors 'none'`, `form-action 'self'`, and
   **no script source**. The server-rendered pages serve no JavaScript. Two
-  path-scoped exceptions carry their own policy: the acceptance page, described
-  under [Invitation acceptance](#invitation-acceptance-inviteaccept), and the
-  admin panel at `/admin`, `/admin/` and `/admin/assets/*`, which serves a built
-  single-page bundle under `ADMIN_PANEL_CONTENT_SECURITY_POLICY`
-  (`web/pages.py`):
+  built bundles are the path-scoped exceptions, and they share one policy,
+  `ADMIN_PANEL_CONTENT_SECURITY_POLICY` (`web/pages.py`):
   `default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
-  `web.surface.on_admin_panel()` decides which paths get it.
+  One is the admin panel at `/admin`, `/admin/` and `/admin/assets/*`
+  (`web.surface.on_admin_panel()` decides which paths get it). The other is the
+  registration app at `/invite/accept` and `/invite/assets/*`
+  (`web.surface.on_registration_app()`), described under
+  [Invitation acceptance](#invitation-acceptance-inviteaccept).
   They are applied by middleware keyed on the path rather than by each handler,
   so responses no handler of this surface produced — redirects, a 405, an
   unmatched `/web/*` path answered by the mounted MCP catch-all ([#86]), and an
@@ -322,7 +323,9 @@ a protection the middleware does not itself enforce.
 | `GET /web/data-statement` | The data statement ([#146]): what is stored, who can see it, and the address deletion requests go to. **Anonymous** — see below. The copy lives in `web/data_statement.py` and the acceptance page renders the same constant above its accept control. Links to the two documents below. |
 | `GET /web/terms` | The canonical Terms of Service ([#95]). **Anonymous** — see below. The copy lives in `web/terms_of_service.py` as one constant; placeholder until counsel replaces it. |
 | `GET /web/privacy` | The canonical Privacy Statement ([#95]). **Anonymous** — see below. The copy lives in `web/privacy_statement.py`, same shape. |
-| `GET /invite/accept` | The acceptance page ([#90]). **Anonymous** — see below. |
+| `GET /invite/accept` | The acceptance page ([#90]): the registration app's document, served from `web.admin_ui_dist`/`registration`. **Anonymous**, see below. |
+| `GET /invite/accept/session` | What the app asks first, as JSON: whether this browser is signed in, whether that sign-in is recent enough to redeem on, the session's CSRF token, and the data statement. **Anonymous**: it reports only on the caller's own session, and hands a browser with none no token. |
+| `GET /invite/assets/*` | The registration app's hashed bundle files. **Anonymous**. File names are checked against a strict pattern and must resolve inside the assets directory; anything else is 404, and anything nested deeper is not public. |
 | `POST /invite/accept/redeem` | Redeems the token from a JSON body. Session + CSRF required. |
 | `GET /admin/invitations` | The operator invitation page ([#91]). Session + `operator`. |
 | `POST /admin/invitations` | Issues one invitation and renders its link. Session + `operator` + CSRF. |
@@ -346,10 +349,18 @@ per request.
 ### Authenticated by default
 
 Every path under a guarded prefix requires a session unless it appears in
-`web.surface.PUBLIC_WEB_PATHS`, which names exactly nine: sign-in, the
+`web.surface.PUBLIC_WEB_PATHS`, which names exactly ten: sign-in, the
 callback, the signed-out confirmation, the stylesheet, the product wordmark,
-the acceptance page, the data statement, and the Terms of Service and Privacy
-Statement.
+the acceptance page and its session answer, the data statement, and the Terms
+of Service and Privacy Statement.
+
+One directory of files is public as well, through
+`web.surface.PUBLIC_WEB_ASSET_PREFIXES`: the registration app's bundle at
+`/invite/assets/`, whose file names change on every build and so cannot be
+listed. The grant is a single flat directory. A path is public only when it is
+the prefix followed by one segment, so nothing nested below it is exempt.
+`web.surface.is_public_web_path()` is the one definition the guard, the route
+lint and the public-router seam all read.
 
 The last two ([#95]) are linked from the deployment's Keycloak
 terms-acceptance step, which runs *before* Keycloak issues a token — and this
@@ -617,40 +628,51 @@ reads it in the browser, banks it in `sessionStorage` across the Keycloak
 registration / sign-in round trip, and sends it to
 `POST /invite/accept/redeem` in a **JSON body**.
 
-### The one page that runs JavaScript
+### The registration app
+
+The page is a small React app, built by `api/admin-ui` beside the admin panel
+(`admin-ui/registration`, `npm run build`) into its own bundle. It is kept
+separate from the panel on purpose: its own source directory, its own build
+output, its own public paths under `/invite`, and none of the panel's code in
+what an invitee downloads. It was server-rendered markup with one inline
+script until the registration pages moved under the React project.
 
 A fragment is only readable from client-side script. Keeping the token out of
 the request line and keeping the surface script-free are mutually exclusive,
-and the token requirement wins — so this page, and only this page, relaxes the
-CSP:
+and the token requirement wins, so this page runs script.
 
-```
-default-src 'none'; style-src 'self'; script-src 'sha256-…';
-connect-src 'self'; img-src 'self'; base-uri 'none';
-form-action 'self'; frame-ancestors 'none'
-```
+What the server sends is deliberately small:
 
-Everything about that is deliberately narrow:
+- **The document** (`GET /invite/accept`) is a build output: the same bytes for
+  everyone, reading nothing from the request.
+- **The session answer** (`GET /invite/accept/session`) carries what only the
+  server knows: whether the browser is signed in, whether its verified-address
+  claims are current, the CSRF token, whether this deployment requires a
+  verified address (which decides the copy), and the data statement text.
+- **The copy and the states** live in the app (`registration/states.json`). The
+  API suite reads that file and checks that every outcome word the redemption
+  endpoint can answer has a page there, so a new terminal state fails a test
+  instead of showing the general failure.
 
-- **Scoped by path.** `web.pages.headers_for_path()` returns this policy for
-  `/invite/accept` and the default policy for every other path, and the
-  security-header middleware consults it. Path in, policy out — the same shape
-  as the session guard, and for the same reason: a per-response flag would be
-  set by whoever is most likely to get it wrong.
-- **Pinned to one hash.** No `'unsafe-inline'`, no `'unsafe-eval'`, and
-  deliberately no `'self'` — one SHA-256 digest is the page's entire script
-  budget, so an injected `<script>`, same-origin or not, does not run. The
-  digest is computed at import from the served bytes, so the policy cannot
-  drift from the code, and a test re-derives it from the response body.
-- **Everything else is unchanged.** `no-referrer`, `no-store`, `nosniff`,
-  frame-deny, `default-src 'none'`, `base-uri 'none'` and
-  `frame-ancestors 'none'` all still apply. `connect-src 'self'` is the only
-  other addition, and it is what the redemption POST needs.
-- **A failed page is stricter, not looser.** If the page raises, the surface's
-  error document is served with the default no-script policy.
+The policy on these paths:
 
-If the inconsistency looks like a bug: it is not. Narrow the exception if you
-can; do not widen `CONTENT_SECURITY_POLICY` to match it.
+- **Scoped by path.** `web.pages.headers_for_path()` returns the bundle policy
+  for `/invite/accept` and `/invite/assets/*` and the default policy for every
+  other path, and the security-header middleware consults it. Path in, policy
+  out, the same shape as the session guard.
+- **`script-src 'self'`.** A bundle's scripts are files, so the policy names
+  this origin. It replaced a policy that pinned one inline script by its
+  SHA-256 digest, which a bundle cannot use. No `'unsafe-inline'`, no
+  `'unsafe-eval'` and no external origin.
+- **Everything else holds.** `no-referrer`, `no-store`, `nosniff`, frame-deny,
+  `default-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`, and
+  `connect-src 'self'` so the page can talk only to this hub. `form-action` is
+  `'none'`: the app submits no HTML forms.
+- **A failed page is stricter, not looser.** If serving the document raises,
+  the surface's error document is served with the default no-script policy.
+
+A deployment started without the built bundle keeps the route and answers 503
+with a server-rendered notice saying the invitation has not been used.
 
 ### Token handling, and what is actually proven
 
@@ -1069,10 +1091,10 @@ naming:
 - No RP-initiated (Keycloak) logout: sign-out ends the app session only; the
   Keycloak SSO session is the IdP's own, and ending it belongs to the page
   that needs that semantics.
-- No JavaScript on the server-rendered pages except the acceptance page:
-  plain documents and forms, so the CSP forbids script outright on every other
-  server-rendered path. That includes the operator page, which once rendered a
-  live secret, so it is checked explicitly. The admin panel at
-  `/admin` is a separate single-page app: it serves its own bundle from this
-  origin under its own CSP (`script-src 'self'`, no inline script, no other
-  origin), quoted in full in the headers list above.
+- No JavaScript on the server-rendered pages: plain documents and forms, so
+  the CSP forbids script outright on every server-rendered path. That includes
+  the operator page, which once rendered a live secret, so it is checked
+  explicitly. The admin panel at `/admin` and the registration app at
+  `/invite/accept` are separate React bundles: each serves its own files from
+  this origin under the bundle CSP (`script-src 'self'`, no inline script, no
+  other origin), quoted in full in the headers list above.

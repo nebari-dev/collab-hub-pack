@@ -7,6 +7,8 @@ const ISSUE_OUTCOMES: Record<string, string> = {
   send_failed:
     "The invitation was created, but the email could not be sent. They will need the link another way.",
   already_live: "That address already has a live invitation, so a second one was not created.",
+  organization_creation_refused:
+    "This hub is set up for a single organization, and an invitation from this screen creates a new one, so the hub refused it. Nothing was created.",
   invalid_email: "That does not look like an email address.",
   unavailable: "This hub cannot issue invitations right now.",
 };

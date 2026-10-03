@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
+from registration_bundle import built_dist
 from starlette.routing import Mount, Route, WebSocketRoute
 
 from collab_hub_api.config import WEB_SESSION_LIFETIME_CEILING_SECONDS, Config
@@ -2345,8 +2346,9 @@ def test_the_documents_honour_a_root_path() -> None:
 
 async def test_the_guard_leaves_the_public_allowlist_reachable(tmp_path, idp):
     # The allowlist is what the guard consults instead of route structure, so
-    # sign-in must still work with no session at all.
-    app = make_web_app(tmp_path, idp)
+    # sign-in must still work with no session at all. Built with the
+    # registration bundle, so the invitation page answers as it does deployed.
+    app = make_web_app(tmp_path, idp, web={"admin_ui_dist": str(built_dist(tmp_path))})
     async with web_client(app) as client:
         for path in sorted(PUBLIC_WEB_PATHS):
             response = await client.get(path)
