@@ -101,7 +101,7 @@ The process that accepts runs is not the one that advances them (ADR-0002 D4).
 
 | Route | What it does |
 |---|---|
-| `POST /v1/runs` | Submit an Op: `steps`, each with `name`, `cog`, `entry_point`, `input` and `gate`. Records `op_submitted` with who submitted it, and answers 201 with the run, `SUBMITTED`. A `cog` that is not a package the controller can launch is a 422 naming the packages it can |
+| `POST /v1/runs` | Submit an Op: `steps`, each with `name`, `cog`, `entry_point`, `input` and `gate`, and optionally the run's own `name`, a label for listings. Records `op_submitted` with who submitted it, and answers 201 with the run, `SUBMITTED`. A `cog` that is not a package the controller can launch is a 422 naming the packages it can |
 | `GET /v1/runs` | The caller's organization's runs, newest first; `status`, `limit` and `offset` |
 | `GET /v1/runs/{id}` | One run: its status, each step's state, and each completed step's `output` |
 | `GET /v1/runs/launchable` | The Cog packages a step's `cog` may name |

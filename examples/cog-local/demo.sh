@@ -89,7 +89,7 @@ run "collab-hub cog list --launchable" MODEL_SOURCE=fake cogs
 banner "Launch Hermes" \
   "The API records the launch; the controller starts the Hermes Cog as a process of its own," \
   "which starts Hermes and opens a session with it. The run's id is kept in $LOCAL/run."
-run "collab-hub cog launch hermes --entry session" MODEL_SOURCE=fake launch
+run "collab-hub cog launch hermes --entry session --name hermes-on-fake-model" MODEL_SOURCE=fake launch
 wait_running
 
 banner "See it running" \
@@ -131,8 +131,12 @@ else
   make -s --no-print-directory shutdown ONLY=controller > /dev/null
   make -s --no-print-directory start ONLY=controller MODEL_SOURCE=claude | sed -e 's/^  //' -e 's/^/  /'
   echo
-  run "collab-hub cog launch hermes --entry session" MODEL_SOURCE=claude launch
+  run "collab-hub cog launch hermes --entry session --name hermes-on-$CLAUDE_MODEL" MODEL_SOURCE=claude launch
   wait_running
+  echo
+  printf '  %s$ collab-hub run list%s\n\n' "$BOLD" "$OFF"
+  cli run list > "$LOCAL/runs.out"
+  head -4 "$LOCAL/runs.out" | sed 's/^/  /'
   echo
   run "make toad   (scripted here)" MODEL_SOURCE=claude acp-check \
     PROMPTS='"In one sentence: who are you, and which model do you run on?" "What is 17 times 23? Answer with the number only."' \

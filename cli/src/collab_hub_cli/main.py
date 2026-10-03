@@ -416,7 +416,7 @@ def _age(timestamp: str) -> str:
 
 
 def _print_run(run: dict) -> None:
-    rows = [["run", run["id"]], ["status", run["status"]],
+    rows = [["run", run["id"] + (f"  ({run['name']})" if run.get("name") else "")], ["status", run["status"]],
             ["runs on", f"backend {run['backend']}, workers {run['location']}"],
             ["submitted", f"{run['submitted_at']} by {run.get('submitted_by_name') or run['submitted_by']}"]]
     if run.get("cancel_requested_by") and not run["ended"]:
@@ -479,6 +479,8 @@ def cog_launch(
         "--gate", help="When the step's Gate asks a person: never, error (the default), warn or always.")] = "error",
     watch: Annotated[bool, typer.Option(
         "--watch", help="Follow the run until it ends or waits at a Gate, and exit with its outcome.")] = False,
+    run_name: Annotated[str | None, typer.Option(
+        "--name", help="What to call the run in `run list`, e.g. hermes-on-claude.")] = None,
     as_json: JsonOption = False,
 ) -> None:
     """Launch a Cog: submit a one-step Op that invokes one of its entry points.
@@ -497,8 +499,10 @@ def cog_launch(
     step = {"name": name.split("/")[-1], "cog": name, "entry_point": entry, "input": value,
             "gate": {"escalate": gate}}
     with Hub(_target()) as hub:
-        run = hub.request("POST", "/v1/runs", json={"steps": [step]}).json()
-        _err(f"Launched {name} as {run['id']} on the {run['backend']} backend, workers {run['location']}.")
+        body = {"steps": [step], **({"name": run_name} if run_name else {})}
+        run = hub.request("POST", "/v1/runs", json=body).json()
+        called = f" ({run_name})" if run_name else ""
+        _err(f"Launched {name} as {run['id']}{called} on the {run['backend']} backend, workers {run['location']}.")
         if not watch:
             if as_json:
                 _print_json(run)
@@ -527,8 +531,8 @@ def run_list(
     if not runs:
         _err("No runs.")
         return
-    _table(["RUN", "COG", "STATUS", "AGE", "BY"], [
-        [run["id"], ",".join(dict.fromkeys(step["cog"] for step in run["steps"])), run["status"],
+    _table(["RUN", "NAME", "COG", "STATUS", "AGE", "BY"], [
+        [run["id"], run.get("name"), ",".join(dict.fromkeys(step["cog"] for step in run["steps"])), run["status"],
          _age(run["submitted_at"]), run.get("submitted_by_name") or run["submitted_by"]]
         for run in runs
     ])

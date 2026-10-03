@@ -113,6 +113,17 @@ async def test_a_submitted_run_waits_for_a_controller_and_completes_once_one_pic
     assert listed["status"] == "COMPLETED" and listed["steps"][0]["output"] is None
 
 
+async def test_a_run_can_be_named_and_is_listed_by_that_name(runs_client):
+    created = (await runs_client.post("/v1/runs", json={**ECHO, "name": "echo on Claude"})).json()
+    assert created["name"] == "echo on Claude"
+    assert (await runs_client.get(f"/v1/runs/{created['id']}")).json()["name"] == "echo on Claude"
+    unnamed = (await runs_client.post("/v1/runs", json=ECHO)).json()
+    assert unnamed["name"] is None
+    assert [item["name"] for item in (await runs_client.get("/v1/runs")).json()["items"]] == [None, "echo on Claude"]
+    for bad in ("", " leading space", "x" * 65, "semi;colon"):
+        assert (await runs_client.post("/v1/runs", json={**ECHO, "name": bad})).status_code == 422, bad
+
+
 async def test_runs_are_listed_newest_first_filtered_by_status_and_paged(runs_client, controller):
     first = (await runs_client.post("/v1/runs", json=ECHO)).json()["id"]
     settle(controller)

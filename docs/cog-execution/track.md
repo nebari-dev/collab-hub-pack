@@ -42,8 +42,9 @@ Three kinds of event share the Track:
 | `interrupted` | `backend` | the host stopped under `none` and the run cannot resume |
 | `retry_requested` | `from_status`, `attempt` (`same` or `new`), `budget_epoch` | a run is retried |
 
-`op_submitted` also carries `submitted_by` (`user`, `org_id`, `workspace_id`)
-when a client submitted the run through the run API, which is what scopes the
+`op_submitted` also carries `submitted_by` (`user`, `org_id`, `workspace_id`,
+and a `name` for showing) when a client submitted the run through the run API,
+and the run's `name` when the client gave it one, which is what scopes the
 run to its organization. `cancel_requested` (`actor`) is what the API records
 when a client asks for a run to be cancelled: it leaves the run's state where
 it is, and the controller that reads it ends the run, which `cancelled`

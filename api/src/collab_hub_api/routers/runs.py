@@ -124,6 +124,8 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     steps: list[StepRequest] = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+    """What to call the run in listings, e.g. ``hermes-on-claude``. A label: runs are found by their id."""
 
     @field_validator("steps")
     @classmethod
@@ -156,6 +158,8 @@ class RunStatus(BaseModel):
     ended: bool
     steps: list[StepStatus]
     submitted_by: str | None
+    name: str | None = None
+    """What the run was called when it was launched, if anything."""
     submitted_by_name: str | None = None
     """Who submitted the run, for showing: their name or address when the sign-in carried one. Never
     compared with anything; ``submitted_by`` is the principal."""
@@ -204,7 +208,7 @@ def _status(view: intents.RunView, service: RunService, *, outputs: bool = False
                           attempt=step.attempt, error=step.error,
                           output=step.output if outputs else None, output_ref=step.output_ref if outputs else None)
                for step in view.steps],
-        submitted_by=view.submitted_by.get("user"), submitted_by_name=view.submitted_by.get("name"),
+        name=view.name, submitted_by=view.submitted_by.get("user"), submitted_by_name=view.submitted_by.get("name"),
         submitted_at=view.submitted_at.isoformat(), updated_at=view.updated_at.isoformat(),
         cancel_requested_by=view.cancel_requested_by, error=view.error, reason=view.reason,
         backend=service.backend, location=service.location,
@@ -246,7 +250,7 @@ def submit_run(body: RunRequest, auth: AuthDep, service: ServiceDep) -> RunStatu
     by = {"user": auth.user, "org_id": auth.org_id, "workspace_id": auth.workspace_id}
     if auth.display.name or auth.display.email:
         by["name"] = auth.display.name or auth.display.email
-    intents.submit(service.track, op, by=by)
+    intents.submit(service.track, op, by=by, name=body.name)
     return _status(intents.describe(service.track, run_id), service)
 
 

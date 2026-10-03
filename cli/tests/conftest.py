@@ -181,7 +181,8 @@ class Stub:
                     return httpx.Response(200, json={**cog, "versions": [cog]})
             return httpx.Response(404, json={"error": {"code": "cog_not_found", "message": f"No Cog {cog_id}"}})
         if path == "/v1/runs" and request.method == "POST":
-            [step] = json.loads(request.content)["steps"]
+            submitted = json.loads(request.content)
+            [step] = submitted["steps"]
             if step["cog"] not in self.launchable:
                 return httpx.Response(422, json={"error": {
                     "code": "cog_not_launchable",
@@ -193,6 +194,7 @@ class Stub:
                    "submitted_by": user, "submitted_at": "2026-10-02T08:00:00+00:00",
                    "updated_at": "2026-10-02T08:00:00+00:00", "cancel_requested_by": None, "error": None,
                    "reason": None, "backend": "none", "location": "local", "_input": step["input"],
+                   "name": submitted.get("name"),
                    "_gate": step["gate"]}
             self.runs.insert(0, run)
             return httpx.Response(201, json=run)

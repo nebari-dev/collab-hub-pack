@@ -30,12 +30,12 @@ def _append(track: TrackStore, run_id: str, event_type: str, payload: Mapping[st
     track.append(TrackEvent(run_id=run_id, event_type=event_type, payload=dict(payload), schema=SCHEMA_VERSION))
 
 
-def submit(track: TrackStore, op: OpDefinition, *, by: Mapping[str, Any]) -> None:
+def submit(track: TrackStore, op: OpDefinition, *, by: Mapping[str, Any], name: str | None = None) -> None:
     """Record that ``by`` submitted an Op. Nothing runs here: a controller picks the run up.
 
     A run id submitted twice is refused by the Track (``OneSubmissionPerRun``).
     """
-    for record in Run.submit(op.run_id, _serialize_op(op), by=by).records:
+    for record in Run.submit(op.run_id, _serialize_op(op), by=by, name=name).records:
         _append(track, op.run_id, record.event_type, record.payload)
 
 
@@ -107,6 +107,8 @@ class RunView:
     cancel_requested_by: str | None = None
     error: str | None = None
     reason: str | None = None
+    name: str | None = None
+    """What the client called the run when it submitted it, if anything: a label, never an id."""
 
     @property
     def status(self) -> str:
@@ -154,7 +156,7 @@ def describe(track: TrackStore, run_id: str) -> RunView | None:
     return RunView(
         run_id=run_id, state=run.state, op=op,
         steps=tuple(StepView(name=step.name, cog=step.cog, **steps[step.name]) for step in op.steps),
-        submitted_by=dict(submission.payload.get("submitted_by") or {}),
+        submitted_by=dict(submission.payload.get("submitted_by") or {}), name=submission.payload.get("name"),
         submitted_at=submission.occurred_at, updated_at=events[-1].occurred_at,
         cancel_requested_by=cancel_requested_by, error=error, reason=reason,
     )

@@ -84,14 +84,14 @@ The example keeps its sign-in in `.local/cli`, so it does not touch your own `co
 
 ```sh
 make cogs          # the Cogs this hub can launch: hermes among them
-make launch        # collab-hub cog launch hermes --entry session
+make launch        # collab-hub cog launch hermes --entry session --name hermes-on-...
 ```
 
 ```text
-Launched hermes as run-d30f9866404b on the none backend, workers local.
+Launched hermes as run-d30f9866404b (hermes-on-fake-model) on the none backend, workers local.
 ```
 
-The controller starts the Hermes Cog as a process in its own environment, and the Cog starts Hermes and opens a session with it. The run's id is kept in `.local/run` for the next steps; pass `RUN=...` to act on another run.
+The controller starts the Hermes Cog as a process in its own environment, and the Cog starts Hermes and opens a session with it. The run is named after the Cog and its model, `hermes-on-claude-opus-5-5` with Claude (`NAME=...` to choose your own), and its id is kept in `.local/run` for the next steps; pass `RUN=...` to act on another run.
 
 ## 4. See it running
 
@@ -100,8 +100,8 @@ make list          # collab-hub run list
 ```
 
 ```text
-RUN               COG     STATUS   AGE  BY
-run-d30f9866404b  hermes  RUNNING  0s   Dev User
+RUN               NAME                  COG     STATUS   AGE  BY
+run-d30f9866404b  hermes-on-fake-model  hermes  RUNNING  0s   Dev User
 ```
 
 ## 5. Talk to Hermes from Toad
@@ -129,8 +129,8 @@ make list
 
 ```text
 run-d30f9866404b ended CANCELLED.
-RUN               COG     STATUS     AGE  BY
-run-d30f9866404b  hermes  CANCELLED  4s   Dev User
+RUN               NAME                  COG     STATUS     AGE  BY
+run-d30f9866404b  hermes-on-fake-model  hermes  CANCELLED  4s   Dev User
 ```
 
 The controller stops the Cog's process and Hermes with it, and the run takes no more turns. Saying `bye` to it ends the session too, and the run then ends `COMPLETED` instead.

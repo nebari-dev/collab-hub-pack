@@ -257,11 +257,15 @@ class Run(Context):
     escalations: Mapping[str, int] = field(default_factory=dict)
 
     @classmethod
-    def submit(cls, run_id: str, op: Mapping[str, Any], *, by: Mapping[str, Any] | None = None) -> Transition[Run]:
-        """A new run, and the record of its submission; ``by`` is who submitted it, when a client did."""
+    def submit(cls, run_id: str, op: Mapping[str, Any], *, by: Mapping[str, Any] | None = None,
+               name: str | None = None) -> Transition[Run]:
+        """A new run, and the record of its submission; ``by`` is who submitted it, when a client did, and
+        ``name`` what they called it."""
         payload: dict[str, Any] = {"op": dict(op)}
         if by is not None:
             payload["submitted_by"] = dict(by)
+        if name is not None:
+            payload["name"] = name
         return Transition(cls(run_id=run_id), (Record("op_submitted", payload),))
 
     def pickup(self) -> Transition[Run]:

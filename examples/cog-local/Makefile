@@ -40,6 +40,9 @@ export COLLAB_MODEL_PROVIDER := anthropic
 export COLLAB_MODEL_NAME     := $(CLAUDE_MODEL)
 export COLLAB_MODEL_API_KEY  := $(ANTHROPIC_API_KEY)
 endif
+# The run's name in `run list`: the Cog and the model it talks to, e.g. hermes-on-claude-opus-5-5.
+MODEL_LABEL = $(if $(filter claude,$(MODEL_SOURCE)),$(CLAUDE_MODEL),$(if $(filter fake,$(MODEL_SOURCE)),fake-model,$(or $(COLLAB_MODEL_NAME),your-model)))
+NAME ?= $(COG)-on-$(MODEL_LABEL)
 ifeq ($(MODEL_SOURCE),fake)
 export COLLAB_MODEL_PROVIDER := openai-compatible
 export COLLAB_MODEL_BASE_URL := http://127.0.0.1:8090/v1
@@ -141,8 +144,8 @@ whoami: ## Who the hub says you are
 cogs: ## The Cogs this hub can launch
 	$(CLI) cog list --launchable
 
-launch: | $(LOCAL) ## Launch Hermes (COG=hermes), holding a session; the run's id goes to .local/run
-	$(CLI) cog launch $(COG) --entry session --gate never > $(LOCAL)/run
+launch: | $(LOCAL) ## Launch Hermes (COG=hermes) as NAME, holding a session; the run's id goes to .local/run
+	$(CLI) cog launch $(COG) --entry session --gate never --name "$(NAME)" > $(LOCAL)/run
 	@echo "  run $$(cat $(LOCAL)/run)"
 
 list: ## The runs you launched

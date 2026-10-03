@@ -88,7 +88,7 @@ collab-hub run watch run-3eb7ab0eaf43                           # follow it unti
 collab-hub run terminate run-3eb7ab0eaf43                       # cancel it, and wait until it has ended
 ```
 
-`cog launch NAME` submits a one-step Op through `POST /v1/runs`: `NAME` is a Cog package the hub's run controller can launch, and a name it cannot is refused with the names it can. `--entry` names the entry point (`run` by default), `--input` its input as JSON, and `--gate` when the step's Gate asks a person (`never`, `error`, `warn` or `always`). Without `--watch` it prints the run's id and returns; the run controller starts the run. It says which durability backend and which location the run is on, since a run on `none` does not survive a controller restart and a `local` worker shares the controller's host.
+`cog launch NAME` submits a one-step Op through `POST /v1/runs`, and `--name LABEL` names the run in `run list` (`hermes-on-claude`, say): `NAME` is a Cog package the hub's run controller can launch, and a name it cannot is refused with the names it can. `--entry` names the entry point (`run` by default), `--input` its input as JSON, and `--gate` when the step's Gate asks a person (`never`, `error`, `warn` or `always`). Without `--watch` it prints the run's id and returns; the run controller starts the run. It says which durability backend and which location the run is on, since a run on `none` does not survive a controller restart and a `local` worker shares the controller's host.
 
 ### Talking to a running Cog
 

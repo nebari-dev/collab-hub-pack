@@ -40,6 +40,16 @@ def test_cog_launch_takes_the_entry_point_the_gate_and_input_from_stdin(stub, cl
                     "gate": {"escalate": "never"}}
 
 
+def test_cog_launch_names_the_run_and_run_list_shows_the_name(stub, cli):
+    launched = cli("--hub", HUB, "cog", "launch", "echo", "--name", "echo-on-claude")
+    assert launched.exit_code == 0 and "run-000000000001 (echo-on-claude)" in launched.stderr
+    assert json.loads(stub.requests[-1].content)["name"] == "echo-on-claude"
+    lines = cli("--hub", HUB, "run", "list").stdout.splitlines()
+    assert lines[1].split()[:3] == ["run-000000000001", "echo-on-claude", "echo"]
+    shown = cli("--hub", HUB, "run", "show", "run-000000000001").stdout
+    assert "run        run-000000000001  (echo-on-claude)" in shown
+
+
 def test_cog_launch_without_input_sends_none(stub, cli):
     assert cli("--hub", HUB, "cog", "launch", "echo").exit_code == 0
     assert stub.runs[0]["_input"] is None
@@ -82,7 +92,7 @@ def test_run_list_shows_what_was_launched_and_filters_by_status(stub, cli):
     cli("--hub", HUB, "cog", "launch", "slow")
     stub.runs[1].update(status="COMPLETED", ended=True)
     lines = cli("--hub", HUB, "run", "list").stdout.splitlines()
-    assert lines[0].split() == ["RUN", "COG", "STATUS", "AGE", "BY"]
+    assert lines[0].split() == ["RUN", "NAME", "COG", "STATUS", "AGE", "BY"]
     assert [line.split()[:3] for line in lines[1:]] == [["run-000000000002", "slow", "SUBMITTED"],
                                                         ["run-000000000001", "echo", "COMPLETED"]]
     only = json.loads(cli("--hub", HUB, "run", "list", "--status", "completed", "--json").stdout)
