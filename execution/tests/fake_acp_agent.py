@@ -30,6 +30,8 @@ for line in sys.stdin:
         send({"id": message["id"], "result": {"sessionId": "s-1"}})
     elif method == "session/prompt":
         text = " ".join(block.get("text", "") for block in params["prompt"])
+        if text == "exit":
+            sys.exit(3)  # as Hermes would, crashing in the middle of a session
         if text == "use a tool":
             # Ask the client for permission, as Hermes does before a tool, and report its answer.
             send({"id": "permission-1", "method": "session/request_permission", "params": {

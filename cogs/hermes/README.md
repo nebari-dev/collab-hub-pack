@@ -18,7 +18,7 @@ It serves the seam every Cog worker serves (`GET /healthz`, `POST /invoke`, and 
 | `session` | none | Opens a Hermes session and holds it. Each turn the hub delivers is one prompt, answered with what Hermes said. It ends on `bye`, or when the run is terminated and the worker with it |
 | `ask` | `{"prompt": "..."}` | Answers one prompt and returns `{"answer": "..."}` |
 
-A turn that arrives while Hermes is still starting waits for the session, up to five minutes.
+A turn that arrives while Hermes is still starting waits for the session, up to five minutes. If Hermes exits during a session, the session ends at once and the step fails `model-call-failed`, saying so, rather than holding the run open.
 
 ## Its model
 

@@ -123,8 +123,15 @@ controller: ## The run controller, which starts each Cog as a local process (for
 
 start: | $(LOCAL) ## The fake model (if used), the API and the controller in the background; logs in .local/
 	@echo "  Hermes's model: $(MODEL_SOURCE)$(if $(filter claude,$(MODEL_SOURCE)), ($(CLAUDE_MODEL)))"
+	@# What an earlier `make start` left running is stopped first: a pid file is never overwritten
+	@# while its process lives, so nothing started here escapes `make shutdown`.
+	@$(MAKE) -s --no-print-directory shutdown ONLY="$(or $(ONLY),$(if $(filter fake,$(MODEL_SOURCE)),model) api controller)" > /dev/null
 	@for name in $(or $(ONLY),$(if $(filter fake,$(MODEL_SOURCE)),model) api controller); do \
 		bash -c "set -m; $(MAKE) -s $$name > $(LOCAL)/$$name.log 2>&1 & echo \$$! > $(LOCAL)/$$name.pid"; done
+	@sleep 2; for name in $(or $(ONLY),$(if $(filter fake,$(MODEL_SOURCE)),model) api controller); do \
+		kill -0 $$(cat $(LOCAL)/$$name.pid) 2>/dev/null && continue; \
+		echo "  the $$name stopped as it started:"; tail -5 $(LOCAL)/$$name.log | sed 's/^/    /'; \
+		echo "  (another one may be running: stop it, or the make demo / make toad that started it)"; exit 1; done
 	@test -f $(LOCAL)/api.pid || exit 0; \
 	printf "waiting for the hub on $(COLLAB_HUB_URL) "; for _ in $$(seq 1 240); do \
 		curl -sf $(COLLAB_HUB_URL)/health > /dev/null && { echo "up"; exit 0; }; printf .; sleep 1; done; \
@@ -171,10 +178,12 @@ stop: ## Stop the Cog: terminate its run
 shutdown: ## Stop what `make start` started
 	@tree() { echo $$1; for child in $$(pgrep -P $$1); do tree $$child; done; }; \
 	for name in $(or $(ONLY),api controller model); do test -f $(LOCAL)/$$name.pid || continue; \
-		pids=$$(tree $$(cat $(LOCAL)/$$name.pid)); kill -TERM $$pids 2>/dev/null; \
+		group=$$(cat $(LOCAL)/$$name.pid); pids=$$(tree $$group); \
+		kill -TERM -- -$$group 2>/dev/null; kill -TERM $$pids 2>/dev/null; \
 		for _ in $$(seq 1 50); do alive=; for pid in $$pids; do kill -0 $$pid 2>/dev/null && alive=1; done; \
 			test -n "$$alive" || break; sleep 0.2; done; \
-		kill -KILL $$pids 2>/dev/null; rm -f $(LOCAL)/$$name.pid; echo "  stopped the $$name"; done; true
+		kill -KILL -- -$$group 2>/dev/null; kill -KILL $$pids 2>/dev/null; \
+		rm -f $(LOCAL)/$$name.pid; echo "  stopped the $$name"; done; true
 
 down: shutdown ## Stop the containers too (their data is kept)
 	$(MAKE) -C $(DEV) down

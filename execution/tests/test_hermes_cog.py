@@ -145,6 +145,19 @@ def test_a_run_stopped_while_hermes_is_still_starting_leaves_no_workspace(tmp_pa
         time.sleep(0.05)
 
 
+def test_a_session_whose_hermes_exits_ends_failed_and_leaves_nothing(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, MODEL)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    workspace = Path(json.loads(_answer(controller, track, "r", "env"))["cwd"])
+    turn = intents.request_turn(track, "r", text="exit", actor="alice")  # the stand-in exits on this
+    _until(controller, lambda: intents.describe(track, "r").state.ended, "the run stayed open without its Hermes")
+    view = intents.describe(track, "r")
+    assert view.state is RunState.FAILED and view.error == "model-call-failed" and "Hermes exited" in view.reason
+    assert intents.turns(track.replay("r"))[turn.turn].state == "failed"
+    assert not workspace.exists()
+
+
 def test_ask_answers_one_prompt(tmp_path):
     track = InMemoryTrackStore()
     controller = _controller(tmp_path, track, MODEL)

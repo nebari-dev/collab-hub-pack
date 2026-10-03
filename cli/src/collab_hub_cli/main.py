@@ -39,6 +39,7 @@ RUN_EXIT = {"COMPLETED": 0, "INTERRUPTED": EXIT_INTERRUPTED, "WAITING_AT_GATE": 
             "CANCELLED": EXIT_CANCELLED}
 GATE_POLICIES = ("never", "error", "warn", "always")
 POLL_SECONDS = 0.5
+TURN_TIMEOUT_SECONDS = 300.0
 
 app = typer.Typer(
     name="collab-hub",
@@ -566,19 +567,30 @@ def run_watch(run_id: Annotated[str, typer.Argument(help="The run's id.")], as_j
 def run_say(
     run_id: Annotated[str, typer.Argument(help="The run's id.")],
     text: Annotated[list[str], typer.Argument(help="What to say: one turn of the Cog's session.")],
+    timeout: Annotated[float, typer.Option(
+        "--timeout", min=1, help="How long to wait for the answer, in seconds.")] = TURN_TIMEOUT_SECONDS,
     as_json: JsonOption = False,
 ) -> None:
     """Say one thing to a Cog that holds a session, and print what it answered.
 
     The hub records the turn on the run's Track, the run controller hands it to
-    the Cog's worker, and the answer comes back the same way.
+    the Cog's worker, and the answer comes back the same way. With no answer
+    within --timeout, it says what the run is doing and exits; the turn stays
+    on the run, and is still answered if its worker comes up.
     """
 
     with Hub(_target()) as hub:
         turn = hub.request("POST", f"/v1/runs/{run_id}/turns", json={"text": " ".join(text)}).json()
-        while turn["state"] == "pending":
+        deadline = time.monotonic() + timeout
+        while turn["state"] == "pending" and time.monotonic() < deadline:
             time.sleep(POLL_SECONDS)
             turn = hub.get_json(f"/v1/runs/{run_id}/turns/{turn['turn']}")
+        if turn["state"] == "pending":
+            status = hub.get_json(f"/v1/runs/{run_id}")["status"]
+            _err(f"error: no answer within {timeout:g} seconds; the run is {status}"
+                 + (" (is a run controller watching the hub?)" if status == "SUBMITTED" else "")
+                 + f". The turn stays on the run: collab-hub run show {run_id}")
+            raise typer.Exit(EXIT_HUB)
     if as_json:
         _print_json(turn)
     elif turn["state"] == "answered":

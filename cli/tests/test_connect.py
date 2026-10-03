@@ -158,3 +158,48 @@ def test_a_session_on_a_run_that_ended_is_refused(stub, cli, tmp_path):
     client.send("session/new", {"cwd": str(tmp_path), "mcpServers": []})
     [refused] = client.close()
     assert refused["error"]["code"] == acp.HUB_FAILED and "has ended CANCELLED" in refused["error"]["message"]
+
+
+def test_a_cancel_sent_right_behind_its_prompt_is_not_lost(stub, cli, tmp_path):
+    run_id = _launched(stub, cli)
+    stub.hold_turns = True
+    client = Client(run_id, tmp_path)
+    client.bridge.answer_timeout = 2  # with the cancel lost, the prompt would wait this long and end_turn
+    late_start = client.bridge._prompt
+
+    def scheduled_late(*args):
+        threading.Event().wait(0.3)  # the prompt's thread starts after the reader has handled the cancel
+        late_start(*args)
+
+    client.bridge._prompt = scheduled_late
+    client.send("initialize", {"protocolVersion": 1})
+    client.answered(client.send("session/new", {"cwd": str(tmp_path), "mcpServers": []}))
+    # Back to back: the reader handles the prompt, then the cancel, before the prompt's thread runs.
+    client.send("session/prompt", {"sessionId": f"{run_id}-1", "prompt": [{"type": "text", "text": "slow"}]})
+    client.send("session/cancel", {"sessionId": f"{run_id}-1"}, notify=True)
+    by_id = {message["id"]: message for message in client.close() if "id" in message}
+    assert by_id[3]["result"]["stopReason"] == "cancelled"
+
+
+def test_a_prompt_with_no_answer_in_time_says_why_and_ends_the_turn(stub, cli, tmp_path):
+    run_id = _launched(stub, cli)
+    stub.hold_turns = True
+    stub.runs[0]["status"] = "SUBMITTED"
+    client = Client(run_id, tmp_path)
+    client.bridge.answer_timeout = 0.2
+    client.send("initialize", {"protocolVersion": 1})
+    client.answered(client.send("session/new", {"cwd": str(tmp_path), "mcpServers": []}))
+    client.send("session/prompt", {"sessionId": f"{run_id}-1", "prompt": [{"type": "text", "text": "hello"}]})
+    messages = client.close()
+    [said] = [m["params"]["update"]["content"]["text"] for m in messages if m.get("method") == "session/update"]
+    assert said.startswith("No answer within 0.2 seconds: the run is SUBMITTED, and no run controller")
+    assert {m["id"]: m for m in messages if "id" in m}[3]["result"]["stopReason"] == "end_turn"
+
+
+def test_run_say_gives_up_after_its_timeout_and_says_what_the_run_is_doing(stub, cli):
+    run_id = _launched(stub, cli)
+    stub.hold_turns = True
+    stub.runs[0]["status"] = "SUBMITTED"
+    said = cli("--hub", HUB, "run", "say", run_id, "hello", "--timeout", "1")
+    assert said.exit_code == 1
+    assert "no answer within 1 seconds; the run is SUBMITTED (is a run controller watching the hub?)" in said.stderr

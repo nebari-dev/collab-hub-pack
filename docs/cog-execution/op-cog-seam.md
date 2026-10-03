@@ -73,7 +73,8 @@ bearing the run token like every request from the controller, answered with
 `{"text": ...}`. The session ends when the entry point's `/invoke` returns its
 envelope — the Cog decides when, `hello` on `bye` — or when the run is
 terminated and the worker torn down. A worker with no session open answers
-`/turn` with 404.
+`/turn` with 404; the controller retries a turn so answered for a short grace,
+since a worker may be invoked and not yet have opened its session.
 
 Turns come only from the run controller, which takes them from the run's
 Track, so a client never reaches a worker and every turn is recorded. This is

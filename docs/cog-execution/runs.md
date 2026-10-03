@@ -136,8 +136,18 @@ worker's `POST /turn`, and records the answer (`turn_answered`) or why there
 is none (`turn_failed`). A turn asked before the worker is up waits for it; one
 still waiting when the run ends fails with it. Nothing reaches a worker but
 through the controller, and every turn and its answer are on the Track. A
-worker that holds no session answers `/turn` with 404, which fails the turn
-and leaves the run as it was.
+worker that holds no session answers `/turn` with 404: within 30 seconds of the
+first such answer the controller takes it for a session still opening and tries
+again, after that it fails the turn and leaves the run as it was. A run waiting
+at a Gate takes no turns (409), since nothing can answer them until the Gate is
+decided.
+
+Both processes read a run incrementally (`intents.RunViews`): each read asks
+the Track only for the events after the last one seen, and rebuilds a run's
+view only when it has new ones, so listing runs and watching them cost what
+changed rather than all of their history. A run whose Track cannot be replayed
+is logged once and left out of listings and of the controller's passes; it
+never hides another.
 
 The `collab-hub` CLI is a client of these routes (`cog launch`, `cog list
 --launchable`, `run list`, `run show`, `run watch`, `run say`, `run connect`,

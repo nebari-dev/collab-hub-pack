@@ -99,7 +99,7 @@ collab-hub run say run-c42c387d6e23 sum 1 2 3            # one turn: prints what
 toad acp "collab-hub run connect run-c42c387d6e23"       # the same Cog, from an ACP client
 ```
 
-`run say` sends one turn and prints the answer. `run connect` serves the run as an agent of the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so a client such as [Toad](https://github.com/batrachianai/toad) can talk to the Cog: each prompt becomes one turn, sent to the hub and read back, and the answer is streamed to the client. Start it from the client, not by hand; it writes nothing but the protocol to stdout. A cancelled prompt stops waiting, though its turn stays on the run.
+`run say` sends one turn and prints the answer; with none within `--timeout` seconds (300 by default) it says what the run is doing and exits 1, and the turn stays on the run. `run connect` serves the run as an agent of the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so a client such as [Toad](https://github.com/batrachianai/toad) can talk to the Cog: each prompt becomes one turn, sent to the hub and read back, and the answer is streamed to the client. Start it from the client, not by hand; it writes nothing but the protocol to stdout. A cancelled prompt stops waiting, though its turn stays on the run.
 
 `run terminate` asks the hub to cancel the run and waits until the controller has ended it; `--no-wait` returns once the request is recorded. A run that has already ended is refused, naming its status.
 

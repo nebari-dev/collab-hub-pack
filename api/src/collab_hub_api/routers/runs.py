@@ -57,6 +57,7 @@ class RunService:
     def __init__(self, track: TrackStore, packages: DirectoryPackageSource | None, *, backend: str,
                  location: str) -> None:
         self.track = track
+        self.views = intents.RunViews(track)  # read incrementally: a page costs what changed, not all history
         self.packages = packages
         self.backend = backend
         self.location = location
@@ -220,8 +221,11 @@ def _not_found(run_id: str) -> JSONResponse:
 
 
 def _visible(service: RunService, run_id: str, auth: AuthContext) -> intents.RunView | None:
-    """The run, when the caller's organization submitted it."""
-    view = intents.describe(service.track, run_id)
+    """The run, when the caller's organization submitted it; a run that cannot be read is not shown."""
+    try:
+        view = service.views.view(run_id)
+    except intents.RunUnreadable:
+        return None
     if view is None or view.submitted_by.get("org_id") != auth.org_id:
         return None
     return view
@@ -261,9 +265,7 @@ def list_runs(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> RunPage:
-    wanted = run_status.upper() if run_status else None
-    views = [view for view in intents.list_runs(service.track)
-             if view.submitted_by.get("org_id") == auth.org_id and (wanted is None or view.status == wanted)]
+    views = service.views.views(org_id=auth.org_id, status=run_status.upper() if run_status else None)
     page = views[offset:offset + limit]
     return RunPage(items=[_status(view, service) for view in page],
                    next_offset=offset + limit if offset + limit < len(views) else None)
@@ -305,6 +307,9 @@ def ask_turn(run_id: RunId, body: TurnRequest, auth: AuthDep, service: ServiceDe
         view = intents.request_turn(service.track, run_id, text=body.text, actor=auth.user)
     except intents.RunEnded as exc:
         return error_response(status.HTTP_409_CONFLICT, "run_ended", f"Run {run_id} takes no turns: {exc.reason}")
+    except ValueError as exc:
+        # The limit is in bytes; the request model bounds characters, which a non-ASCII text can pass.
+        return error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, "turn_too_long", str(exc))
     return _turn(view)
 
 
@@ -313,7 +318,7 @@ def get_turn(run_id: RunId, turn: Annotated[str, Path(pattern=r"^[0-9a-f]{12}$")
              service: ServiceDep) -> TurnStatus | JSONResponse:
     if _visible(service, run_id, auth) is None:
         return _not_found(run_id)
-    view = intents.turns(service.track.replay(run_id)).get(turn)
+    view = service.views.turns(run_id).get(turn)
     if view is None:
         return error_response(status.HTTP_404_NOT_FOUND, "turn_not_found", f"No turn {turn} in run {run_id}")
     return _turn(view)

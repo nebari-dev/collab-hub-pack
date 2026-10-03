@@ -285,9 +285,12 @@ controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cog
 # OpenAI-compatible endpoint by setting these before `make controller`, or at
 # Claude with COLLAB_MODEL_PROVIDER=anthropic; the key is read from your
 # environment, never from the make command line.
+FAKE_MODEL_PORT ?= 8090
+ifneq ($(COLLAB_MODEL_PROVIDER),anthropic)
+# The fake model's defaults; with Claude the Cog picks its own model unless COLLAB_MODEL_NAME says.
 export COLLAB_MODEL_BASE_URL ?= http://127.0.0.1:$(FAKE_MODEL_PORT)/v1
 export COLLAB_MODEL_NAME ?= fake-model
-FAKE_MODEL_PORT ?= 8090
+endif
 
 fake-model: ## An OpenAI-compatible model that answers without one, for the Hermes Cog (port 8090)
 	python3 $(CURDIR)/fake-model/fake_model.py --port $(FAKE_MODEL_PORT)

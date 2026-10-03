@@ -32,12 +32,14 @@ METHOD_NOT_FOUND, INVALID_PARAMS, HUB_FAILED = -32601, -32602, -32000
 class Bridge:
     """One ACP connection: the client on the other end of stdin and stdout, the run on the hub."""
 
-    def __init__(self, hub: Hub, run_id: str, stdin: IO[str], stdout: IO[str], *, poll_seconds: float = 0.25):
+    def __init__(self, hub: Hub, run_id: str, stdin: IO[str], stdout: IO[str], *, poll_seconds: float = 0.25,
+                 answer_timeout: float = 300.0):
         self.hub = hub
         self.run_id = run_id
         self.stdin = stdin
         self.stdout = stdout
         self.poll_seconds = poll_seconds
+        self.answer_timeout = answer_timeout
         self._write = threading.Lock()
         self._cancelled: set[str] = set()
         self._sessions: set[str] = set()
@@ -95,7 +97,10 @@ class Bridge:
                 if session_id not in self._sessions:
                     self._error(request_id, INVALID_PARAMS, f"no session {session_id!r}")
                     return
-                # A prompt waits on the hub; the loop keeps reading, so a cancel can reach it.
+                # A prompt waits on the hub; the loop keeps reading, so a cancel can reach it. A cancel
+                # left from an earlier prompt is cleared here, before reading on, so one sent right
+                # behind this prompt is never lost.
+                self._cancelled.discard(session_id)
                 prompt = threading.Thread(target=self._prompt, args=(request_id, session_id, params), daemon=True)
                 self._prompts.append(prompt)
                 prompt.start()
@@ -128,7 +133,6 @@ class Bridge:
         return {"sessionId": session_id}
 
     def _prompt(self, request_id: Any, session_id: str, params: dict[str, Any]) -> None:
-        self._cancelled.discard(session_id)
         text = "\n".join(block.get("text", "") for block in params.get("prompt") or []
                          if isinstance(block, dict) and block.get("type") == "text").strip()
         if not text:
@@ -137,18 +141,27 @@ class Bridge:
             return
         try:
             turn = self.hub.request("POST", f"/v1/runs/{self.run_id}/turns", json={"text": text}).json()
-            while turn["state"] == "pending":
+            deadline = time.monotonic() + self.answer_timeout
+            while turn["state"] == "pending" and time.monotonic() < deadline:
                 if session_id in self._cancelled:
                     # The turn stays on the Track and may still be answered there; this prompt stops waiting.
                     self._result(request_id, {"sessionId": session_id, "stopReason": "cancelled"})
                     return
                 time.sleep(self.poll_seconds)
                 turn = self.hub.get_json(f"/v1/runs/{self.run_id}/turns/{turn['turn']}")
+            if turn["state"] == "pending":
+                status = self.hub.get_json(f"/v1/runs/{self.run_id}")["status"]
         except (HubError, AuthError, RealmError) as exc:
             self._say(session_id, f"The hub could not deliver this: {exc}")
         else:
-            self._say(session_id, turn["answer"] if turn["state"] == "answered"
-                      else f"The Cog did not answer: {turn['error']}")
+            if turn["state"] == "answered":
+                self._say(session_id, turn["answer"])
+            elif turn["state"] == "pending":
+                self._say(session_id, f"No answer within {self.answer_timeout:g} seconds: the run is {status}"
+                          + (", and no run controller has picked it up" if status == "SUBMITTED" else "")
+                          + ". The message stays on the run, and is answered if its Cog comes up.")
+            else:
+                self._say(session_id, f"The Cog did not answer: {turn['error']}")
         self._result(request_id, {"sessionId": session_id, "stopReason": "end_turn"})
 
 

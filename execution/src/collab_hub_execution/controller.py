@@ -26,14 +26,14 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import intents
-from .intents import cancel_request
 from .locations import AGENT_LOCATIONS
 from .runner import LifecycleRunner
-from .states import InvalidTransition, Run, RunState
-from .track import SqliteTrackStore, upgrade
+from .states import InvalidTransition, RunState
+from .track import SqliteTrackStore
 
 _log = logging.getLogger("collab_hub_execution.controller")
 
@@ -41,13 +41,17 @@ _log = logging.getLogger("collab_hub_execution.controller")
 class RunController:
     """Watches a Track and advances what it finds there, on one lifecycle runner."""
 
-    def __init__(self, runner: LifecycleRunner, *, poll_interval: float = 0.25) -> None:
+    def __init__(self, runner: LifecycleRunner, *, poll_interval: float = 0.25, session_grace: float = 30.0) -> None:
         self.runner = runner
         self.poll_interval = poll_interval
+        self.session_grace = session_grace
+        """How long a worker that was invoked may answer a turn "no session" before the turn fails."""
         self._ended: set[str] = set()
         self._advancing: dict[str, threading.Thread] = {}
         self._cancelling: dict[str, threading.Thread] = {}
         self._turning: dict[str, threading.Thread] = {}
+        self._first_refused: dict[str, float] = {}  # turn -> when its worker first said no session was open
+        self.views = intents.RunViews(runner.track)
 
     def start(self) -> tuple[str, ...]:
         """What a controller does first: record every run a stopped one left unfinished as interrupted."""
@@ -57,28 +61,37 @@ class RunController:
         return interrupted
 
     def tick(self) -> None:
-        """One pass over the Track: start what was submitted, deliver what was asked."""
-        track = self.runner.track
-        for run_id in track.run_ids():
+        """One pass over the Track: start what was submitted, deliver what was asked.
+
+        Each run is read incrementally (``RunViews``), and each is handled on its
+        own: a run whose Track cannot be read is logged and passed over, never
+        stopping the pass for the runs after it.
+        """
+        for run_id in self.runner.track.run_ids():
             if run_id in self._ended:
                 continue
-            events = tuple(upgrade(event) for event in track.replay(run_id))
-            run = Run.replay(events)
-            if run is None:
-                continue
-            if run.state.ended:
-                self._ended.add(run_id)
-                continue
-            asked = cancel_request(events)
-            if asked is not None:
-                if not self._alive(self._cancelling, run_id):
-                    self._spawn(self._cancelling, run_id, self._cancel, run_id, asked)
-            elif run.state is RunState.SUBMITTED and not self._alive(self._advancing, run_id):
-                op = self.runner._submitted_definition(run_id, events)
-                self._spawn(self._advancing, run_id, self._advance, op)
-            if (any(view.state == "pending" for view in intents.turns(events).values())
-                    and not self._alive(self._turning, run_id)):
-                self._spawn(self._turning, run_id, self._deliver_turns, run_id)
+            try:
+                self._look_at(run_id)
+            except intents.RunUnreadable:
+                continue  # RunViews logged it once; it is read again only when its Track moves
+            except Exception:  # noqa: BLE001 - one run's trouble never stops the pass
+                _log.exception("handling %s failed; the next pass tries again", run_id)
+
+    def _look_at(self, run_id: str) -> None:
+        view = self.views.view(run_id)
+        if view is None:
+            return
+        if view.state.ended:
+            self._ended.add(run_id)
+            return
+        if view.cancel_requested_by is not None:
+            if not self._alive(self._cancelling, run_id):
+                self._spawn(self._cancelling, run_id, self._cancel, run_id, view.cancel_requested_by)
+        elif view.state is RunState.SUBMITTED and not self._alive(self._advancing, run_id):
+            self._spawn(self._advancing, run_id, self._advance, view.op)
+        if (any(turn.state == "pending" for turn in self.views.turns(run_id).values())
+                and not self._alive(self._turning, run_id)):
+            self._spawn(self._turning, run_id, self._deliver_turns, run_id)
 
     @staticmethod
     def _alive(threads: dict[str, threading.Thread], run_id: str) -> bool:
@@ -116,7 +129,7 @@ class RunController:
         """
         track = self.runner.track
         while True:
-            waiting = [view for view in intents.turns(track.replay(run_id)).values() if view.state == "pending"]
+            waiting = [view for view in self.views.turns(run_id).values() if view.state == "pending"]
             if not waiting:
                 return
             worker = self.runner.live_worker(run_id)
@@ -129,10 +142,22 @@ class RunController:
             try:
                 answer = worker.turn(view.turn, view.text)
             except Exception as exc:  # noqa: BLE001 - recorded on the Track as the turn's failure
+                if getattr(exc, "status", None) == 404 and self._still_opening(view.turn):
+                    # The worker was invoked and has not opened its session yet: the next pass tries again.
+                    return
                 intents.answer_turn(track, run_id, view.turn, error=f"{type(exc).__name__}: {exc}"[:1024])
                 continue
+            self._first_refused.pop(view.turn, None)
             intents.answer_turn(track, run_id, view.turn, text=answer)
             _log.info("turn %s of %s answered", view.turn, run_id)
+
+    def _still_opening(self, turn: str) -> bool:
+        """Whether a worker that holds no session yet is still within its grace to open one."""
+        first = self._first_refused.setdefault(turn, time.monotonic())
+        if time.monotonic() - first < self.session_grace:
+            return True
+        self._first_refused.pop(turn, None)
+        return False
 
     def run(self, stop: threading.Event) -> None:
         """Watch the Track until ``stop`` is set."""

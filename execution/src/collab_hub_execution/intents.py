@@ -9,9 +9,11 @@ and acts on it.
 
 from __future__ import annotations
 
+import logging
+import threading
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -20,6 +22,7 @@ from .states import InvalidTransition, Run, RunState
 from .track import SCHEMA_VERSION, TrackEvent, TrackStore, upgrade
 
 CANCEL_REQUESTED = "cancel_requested"
+_log = logging.getLogger(__name__)
 
 
 class RunEnded(InvalidTransition):
@@ -117,7 +120,11 @@ class RunView:
 
 def describe(track: TrackStore, run_id: str) -> RunView | None:
     """The run's view, replayed from its Track; ``None`` for a run never submitted."""
-    events = tuple(upgrade(event) for event in track.replay(run_id))
+    return _view(run_id, tuple(upgrade(event) for event in track.replay(run_id)))
+
+
+def _view(run_id: str, events: tuple[TrackEvent, ...]) -> RunView | None:
+    """A run's view from its events, already in schema v1; ``None`` for a run never submitted."""
     run = Run.replay(events)
     if run is None:
         return None
@@ -163,9 +170,86 @@ def describe(track: TrackStore, run_id: str) -> RunView | None:
 
 
 def list_runs(track: TrackStore) -> tuple[RunView, ...]:
-    """Every run on the Track, newest submission first."""
-    views = [view for view in (describe(track, run_id) for run_id in track.run_ids()) if view is not None]
-    return tuple(sorted(views, key=lambda view: view.submitted_at, reverse=True))
+    """Every run on the Track that can be read, newest submission first."""
+    return RunViews(track).views()
+
+
+class RunUnreadable(ValueError):
+    """A run whose Track the run machine cannot replay, or whose submission cannot be read."""
+
+
+@dataclass
+class _Kept:
+    events: list[TrackEvent]
+    last_sequence: int = 0
+    built_at: int = -1
+    view: RunView | None = None
+    turns: dict[str, TurnView] | None = None
+    unreadable: str | None = None
+
+
+class RunViews:
+    """Run views kept current by reading only what each run's Track gained since the last read.
+
+    Reading a run asks its Track for the events after the last one already
+    read, so a run that has not moved costs one empty query, and a view is
+    rebuilt only when its run has new events. A run whose Track cannot be
+    replayed is set aside, logged once, and left out of :meth:`views`: one
+    unreadable run never hides every other. Safe to share between threads.
+    """
+
+    def __init__(self, track: TrackStore) -> None:
+        self.track = track
+        self._lock = threading.Lock()
+        self._kept: dict[str, _Kept] = {}
+
+    def _refresh(self, run_id: str) -> _Kept:
+        with self._lock:
+            kept = self._kept.setdefault(run_id, _Kept(events=[]))
+            fresh = self.track.replay(run_id, after_sequence=kept.last_sequence)
+            if fresh:
+                kept.events.extend(upgrade(event) for event in fresh)
+                kept.last_sequence = max(event.sequence or 0 for event in fresh)
+            if kept.built_at != kept.last_sequence:
+                kept.built_at, kept.turns = kept.last_sequence, None
+                try:
+                    kept.view, kept.unreadable = _view(run_id, tuple(kept.events)), None
+                except (InvalidTransition, LookupError, KeyError, TypeError, ValueError) as exc:
+                    kept.view, kept.unreadable = None, f"{type(exc).__name__}: {exc}"
+                    _log.warning("run %s cannot be read, and is left out: %s", run_id, kept.unreadable)
+            return kept
+
+    def events(self, run_id: str) -> tuple[TrackEvent, ...]:
+        return tuple(self._refresh(run_id).events)
+
+    def view(self, run_id: str) -> RunView | None:
+        """The run's view; ``None`` for a run never submitted. :class:`RunUnreadable` for one that cannot be read."""
+        kept = self._refresh(run_id)
+        if kept.unreadable is not None:
+            raise RunUnreadable(f"run {run_id!r} cannot be read: {kept.unreadable}")
+        return kept.view
+
+    def turns(self, run_id: str) -> dict[str, TurnView]:
+        kept = self._refresh(run_id)
+        with self._lock:
+            if kept.turns is None:
+                kept.turns = turns(kept.events)
+            return kept.turns
+
+    def views(self, *, org_id: str | None = None, status: str | None = None) -> tuple[RunView, ...]:
+        """The runs that can be read, newest submission first; an organization's, in a status, when given."""
+        found = []
+        for run_id in self.track.run_ids():
+            kept = self._refresh(run_id)
+            view = kept.view
+            if view is None:
+                continue
+            if org_id is not None and view.submitted_by.get("org_id") != org_id:
+                continue
+            if status is not None and view.status != status:
+                continue
+            found.append(view)
+        return tuple(sorted(found, key=lambda view: view.submitted_at, reverse=True))
 
 
 # --- turns: talking to a Cog while its step runs ------------------------------------------------
@@ -201,20 +285,16 @@ def turns(events: Iterable[TrackEvent]) -> dict[str, TurnView]:
             asked[turn] = TurnView(turn=turn, text=payload.get("text", ""), actor=payload.get("actor"),
                                    state="pending")
         elif event.event_type == TURN_ANSWERED and turn in asked:
-            asked[turn] = _replace(asked[turn], state="answered", answer=payload.get("text"))
+            asked[turn] = replace(asked[turn], state="answered", answer=payload.get("text"))
         elif event.event_type == TURN_FAILED and turn in asked:
-            asked[turn] = _replace(asked[turn], state="failed", error=payload.get("error"))
+            asked[turn] = replace(asked[turn], state="failed", error=payload.get("error"))
     run = Run.replay(events)
     if run is not None and run.state.ended:
         # A turn still waiting when its run ended will never be answered.
         for turn, view in asked.items():
             if view.state == "pending":
-                asked[turn] = _replace(view, state="failed", error=f"the run ended {run.state.name}")
+                asked[turn] = replace(view, state="failed", error=f"the run ended {run.state.name}")
     return asked
-
-
-def _replace(view: TurnView, **changes: Any) -> TurnView:
-    return TurnView(**{**{name: getattr(view, name) for name in TurnView.__slots__}, **changes})
 
 
 def request_turn(track: TrackStore, run_id: str, *, text: str, actor: str) -> TurnView:
@@ -230,7 +310,8 @@ def request_turn(track: TrackStore, run_id: str, *, text: str, actor: str) -> Tu
 
     def advancing(events: tuple[TrackEvent, ...]) -> bool:
         run = Run.replay(tuple(upgrade(event) for event in events))
-        return run is not None and not run.state.ended
+        # A run waiting at a Gate has no session to answer until it is decided, which is not offered yet.
+        return run is not None and not run.state.ended and run.state is not RunState.WAITING_AT_GATE
 
     request = TrackEvent(run_id=run_id, event_type=TURN_REQUESTED,
                          payload={"turn": turn, "text": text, "actor": actor}, schema=SCHEMA_VERSION)
@@ -239,6 +320,8 @@ def request_turn(track: TrackStore, run_id: str, *, text: str, actor: str) -> Tu
         view = describe(track, run_id)
         if view is None:
             raise LookupError(f"no run {run_id!r} on the Track")
+        if view.state is RunState.WAITING_AT_GATE:
+            raise RunEnded(view.state, TURN_REQUESTED, "the run is waiting at a Gate, and takes no turns there")
         raise RunEnded(view.state, TURN_REQUESTED, f"the run has ended {view.status}")
     return turns(track.replay(run_id))[turn]
 

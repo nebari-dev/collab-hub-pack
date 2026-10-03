@@ -50,6 +50,19 @@ def test_cog_launch_names_the_run_and_run_list_shows_the_name(stub, cli):
     assert "run        run-000000000001  (echo-on-claude)" in shown
 
 
+def test_a_refused_field_is_named_in_the_error(stub, cli, monkeypatch):
+    import httpx
+
+    from collab_hub_cli import hub
+
+    refusal = httpx.Response(422, json={"error": {"code": "validation_error", "message": "Request validation failed",
+                                                  "details": [{"loc": ["body", "name"],
+                                                               "msg": "String should match pattern"}]}})
+    assert hub.error_message(refusal) == ("Request validation failed: name: String should match pattern (HTTP 422)")
+    bare = httpx.Response(422, json={"error": {"code": "x", "message": "Refused", "details": {"refused": {}}}})
+    assert hub.error_message(bare) == "Refused (HTTP 422)"
+
+
 def test_cog_launch_without_input_sends_none(stub, cli):
     assert cli("--hub", HUB, "cog", "launch", "echo").exit_code == 0
     assert stub.runs[0]["_input"] is None

@@ -361,3 +361,38 @@ async def test_a_run_shows_who_submitted_it_by_name_and_is_scoped_by_principal(r
             listed = (await client.get("/v1/runs")).json()["items"]
     assert run["submitted_by"] == "3b8ec34f" and run["submitted_by_name"] == "Dev User"
     assert [item["submitted_by_name"] for item in listed] == ["Dev User"]
+
+
+async def test_refusals_on_the_run_api_use_the_error_envelope(runs_client):
+    # The API's error envelope, as on the other /v1 routes, with what was refused in its details.
+    bad_name = await runs_client.post("/v1/runs", json={**ECHO, "name": "a/b"})
+    assert bad_name.status_code == 422
+    error = bad_name.json()["error"]
+    assert error["code"] == "validation_error" and error["details"][0]["loc"] == ["body", "name"]
+    bad_id = await runs_client.get("/v1/runs/has spaces")
+    assert bad_id.status_code == 422 and bad_id.json()["error"]["code"]
+
+
+async def test_a_turn_over_the_limit_in_bytes_is_refused_with_422_not_500(runs_client):
+    run_id = (await runs_client.post("/v1/runs", json=SLOW)).json()["id"]
+    from collab_hub_execution import intents
+
+    text = "字" * (intents.MAX_TURN_TEXT // 3 + 1)  # fewer characters than the limit, more bytes
+    assert len(text) < intents.MAX_TURN_TEXT < len(text.encode())
+    refused = await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": text})
+    assert refused.status_code == 422 and refused.json()["error"]["code"] == "turn_too_long"
+
+
+async def test_a_run_that_cannot_be_read_is_left_out_of_the_list_and_not_found_alone(runs_client, runs_config):
+    from collab_hub_execution.track import SCHEMA_VERSION, TrackEvent
+
+    good = (await runs_client.post("/v1/runs", json=ECHO)).json()["id"]
+    track = SqliteTrackStore(runs_config.runs.track_path)
+    by = {"user": "dev-user", "org_id": "dev-org", "workspace_id": "default"}
+    track.append(TrackEvent(run_id="run-broken00000", event_type="op_submitted",
+                            payload={"op": {"run_id": "run-broken00000", "steps": []}, "submitted_by": by},
+                            schema=SCHEMA_VERSION))
+    track.append(TrackEvent(run_id="run-broken00000", event_type="gate_decided", payload={"outcome": "approve"},
+                            schema=SCHEMA_VERSION))
+    assert [item["id"] for item in (await runs_client.get("/v1/runs")).json()["items"]] == [good]
+    assert (await runs_client.get("/v1/runs/run-broken00000")).status_code == 404

@@ -50,6 +50,10 @@ ENVIRONMENTS = ("pixi", "host")
 class TurnRefused(RuntimeError):
     """A turn the worker did not answer: it holds no session, refused it, or answered something else."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class WorkerStartFailed(RuntimeError):
     """A local worker that did not come up: it could not be started, exited, or never became ready."""
@@ -94,7 +98,8 @@ class _LocalWorker(_KubernetesWorker):
                                   headers={"Authorization": f"Bearer {self._run_token}"})
         if response.status_code != 200:
             raise TurnRefused(f"the worker answered HTTP {response.status_code}"
-                              + (": it holds no session" if response.status_code == 404 else ""))
+                              + (": it holds no session" if response.status_code == 404 else ""),
+                              status=response.status_code)
         try:
             answer = response.json()["text"]
         except (ValueError, KeyError, TypeError):

@@ -199,8 +199,19 @@ def invoke(entry_point, value):
                 session = Agent()
             finally:
                 opened.set()  # a turn waiting on the session is answered now: by it, or by its absence
-            ended.wait()  # until `bye`; a terminated run kills this process instead
+            # Until `bye`, or until Hermes exits on its own: a session whose Hermes is gone can never
+            # answer again, so it ends, failed, rather than holding the run open. A terminated run
+            # kills this process instead.
+            while not ended.wait(1):
+                if session.process.poll() is not None:
+                    break
+            code = session.process.poll() if not ended.is_set() else None
+            ended.set()
             session.close()
+            if code is not None:
+                detail = f"Hermes exited (code {code}) during the session, after {len(session.turns)} turns"
+                log(detail)
+                return 502, envelope(entry_point, error={"code": "model-call-failed", "detail": detail})
             return 200, envelope(entry_point, payload={"turns": len(session.turns)})
     except (OSError, RuntimeError) as exc:
         log(f"{entry_point} failed: {exc}")

@@ -32,6 +32,8 @@ from collab_hub_execution import (
     intents,
 )
 from collab_hub_execution.controller import RunController
+from collab_hub_execution.locations.local import TurnRefused
+from collab_hub_execution.track import SCHEMA_VERSION, TrackEvent
 
 BY = {"user": "alice", "org_id": "acme"}
 
@@ -295,7 +297,7 @@ def _local_controller(tmp_path, track):
                                flags=re.M))
     runner = LifecycleRunner(track=track, location="local", location_settings={
         "packages": [root], "work_dir": tmp_path / "runs", "environment": "host", "interaction_timeout": None})
-    return RunController(runner, poll_interval=0.01)
+    return RunController(runner, poll_interval=0.01, session_grace=0.5)
 
 
 def _until(controller, check, what):
@@ -379,3 +381,110 @@ def test_a_turn_is_bounded_and_answered_one_way():
         intents.request_turn(track, "r", text="x" * (intents.MAX_TURN_TEXT + 1), actor="alice")
     with pytest.raises(ValueError, match="a text or failed with an error"):
         intents.answer_turn(track, "r", "t", text="a", error="b")
+
+
+# --- review: unreadable runs, a session not open yet, reading only what is new ---------------
+
+
+def test_one_run_that_cannot_be_read_hides_no_other_run():
+    track = InMemoryTrackStore()
+    # A Track the run machine could not have written: a decision with no Gate ever escalated.
+    submission = {"op": {"run_id": "broken", "steps": []}}
+    track.append(TrackEvent(run_id="broken", event_type="op_submitted", payload=submission, schema=SCHEMA_VERSION))
+    track.append(TrackEvent(run_id="broken", event_type="gate_decided", payload={"outcome": "approve"},
+                            schema=SCHEMA_VERSION))
+    intents.submit(track, OpDefinition("good", (OpStep("a", "echo", "run", 1),)), by=BY)
+    controller = _controller(track, {"echo": lambda entry, value: value})
+    _settle(controller)
+    assert intents.describe(track, "good").state is RunState.COMPLETED  # picked up, despite the broken run
+    assert [view.run_id for view in intents.list_runs(track)] == ["good"]  # listed, the broken one left out
+    with pytest.raises(intents.RunUnreadable, match="broken"):
+        intents.RunViews(track).view("broken")
+
+
+class _OpensLate:
+    """An executor whose worker answers "no session" to its first turns, as one still opening it does."""
+
+    def __init__(self, refusals):
+        self.refusals, self.release = refusals, threading.Event()
+
+    def materialize(self, cog, run_id, instance=""):
+        executor = self
+
+        class Worker:
+            def interact(self, entry_point, input=None, idempotency_key=None, **_):
+                executor.release.wait(10)
+                return ResultEnvelope.success({"ok": True})
+
+            def turn(self, turn, text):
+                if executor.refusals > 0:
+                    executor.refusals -= 1
+                    raise TurnRefused("the worker answered HTTP 404: it holds no session", status=404)
+                return f"heard: {text}"
+
+        return Worker()
+
+    def teardown(self, worker):
+        pass
+
+
+def test_a_turn_that_reaches_a_worker_still_opening_its_session_waits_for_it():
+    track, executor = InMemoryTrackStore(), _OpensLate(refusals=3)
+    controller = RunController(LifecycleRunner(executor=executor, track=track), poll_interval=0.01, session_grace=10)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "c", "session"),)), by=BY)
+    turn = intents.request_turn(track, "r", text="hello", actor="alice")
+    deadline = time.monotonic() + 10
+    while intents.turns(track.replay("r"))[turn.turn].state == "pending":
+        assert time.monotonic() < deadline
+        controller.tick()
+        time.sleep(0.01)
+    assert intents.turns(track.replay("r"))[turn.turn].answer == "heard: hello" and executor.refusals == 0
+    executor.release.set()
+    _settle(controller)
+
+
+def test_a_worker_that_never_opens_a_session_fails_the_turn_after_the_grace():
+    track, executor = InMemoryTrackStore(), _OpensLate(refusals=10**6)
+    controller = RunController(LifecycleRunner(executor=executor, track=track), poll_interval=0.01, session_grace=0.3)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "c", "session"),)), by=BY)
+    turn = intents.request_turn(track, "r", text="hello", actor="alice")
+    deadline = time.monotonic() + 10
+    while intents.turns(track.replay("r"))[turn.turn].state == "pending":
+        assert time.monotonic() < deadline
+        controller.tick()
+        time.sleep(0.01)
+    assert "holds no session" in intents.turns(track.replay("r"))[turn.turn].error
+    executor.release.set()
+    _settle(controller)
+
+
+def test_a_run_waiting_at_a_gate_takes_no_turns():
+    track = InMemoryTrackStore()
+    intents.submit(track, OpDefinition("r", (OpStep("a", "echo", "run", gate=Gate(escalate="always")),)), by=BY)
+    _settle(_controller(track, {"echo": lambda entry, value: value}))
+    with pytest.raises(intents.RunEnded, match="waiting at a Gate"):
+        intents.request_turn(track, "r", text="hello", actor="alice")
+
+
+def test_run_views_read_only_what_each_track_gained():
+    class Counting(InMemoryTrackStore):
+        def __init__(self):
+            super().__init__()
+            self.read: list[int] = []
+
+        def replay(self, run_id, *, after_sequence=0):
+            events = super().replay(run_id, after_sequence=after_sequence)
+            self.read.append(len(events))
+            return events
+
+    track = Counting()
+    for n in range(3):
+        intents.submit(track, OpDefinition(f"r{n}", (OpStep("a", "echo", "run"),)), by=BY)
+    views = intents.RunViews(track)
+    assert len(views.views()) == 3 and track.read == [1, 1, 1]
+    track.read.clear()
+    assert len(views.views(org_id="acme")) == 3 and track.read == [0, 0, 0]  # nothing new: nothing read
+    intents.request_cancel(track, "r1", actor="bob")
+    track.read.clear()
+    assert views.view("r1").cancel_requested_by == "bob" and track.read == [1]  # only the new event
+    assert views.views(org_id="other") == () and views.views(status="SUBMITTED")[0].run_id in ("r0", "r1", "r2")
