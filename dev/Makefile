@@ -127,7 +127,7 @@ LEVEL1_ENV := \
 # Level 1 only: the run API (/v1/runs), behind its feature flag, over the SQLite
 # Track `make controller` watches. PACKAGES are the directories a Cog package
 # may be launched from, the same ones the controller is given.
-COGS ?= $(CURDIR)/cogs:$(ROOT)/examples/cog-local/cogs
+COGS ?= $(CURDIR)/cogs:$(ROOT)/cogs:$(ROOT)/examples/cog-local/cogs
 RUNS_ENV := \
   COLLAB_HUB_API__FEATURES__COG_RUNS=true \
   COLLAB_HUB_API__RUNS__TRACK_PATH=$(LOCAL)/track.sqlite \
@@ -224,7 +224,7 @@ KC_CONNECTOR_ENV := \
         keycloak-admin realm-import broker-role idp-google idp-github idp-list \
         token sub whoami seed-org psql \
         kind-up kind-cluster kind-image kind-redeploy kind-forward kind-logs \
-        kind-smoke kind-down test lint clean
+        kind-smoke kind-down test lint clean op controller fake-model
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "; \
@@ -277,7 +277,18 @@ controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cog
 		echo "the controller runs each Cog in its own pixi environment: install pixi (https://pixi.sh)"; exit 1; }
 	cd $(ROOT)/execution && uv run --quiet python -m collab_hub_execution.controller \
 		--track $(LOCAL)/track.sqlite $(foreach dir,$(subst :, ,$(COGS)),--packages $(dir)) \
-		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local --interaction-timeout 0
+		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local --interaction-timeout 0 \
+		--deliver hermes:COLLAB_MODEL_BASE_URL --deliver hermes:COLLAB_MODEL_NAME --deliver hermes:COLLAB_MODEL_API_KEY
+
+# The model the Hermes Cog calls: `make fake-model` by default. Point it at a real
+# OpenAI-compatible endpoint by setting these before `make controller`; the key is
+# read from your environment, never from the make command line.
+export COLLAB_MODEL_BASE_URL ?= http://127.0.0.1:$(FAKE_MODEL_PORT)/v1
+export COLLAB_MODEL_NAME ?= fake-model
+FAKE_MODEL_PORT ?= 8090
+
+fake-model: ## An OpenAI-compatible model that answers without one, for the Hermes Cog (port 8090)
+	python3 $(CURDIR)/fake-model/fake_model.py --port $(FAKE_MODEL_PORT)
 
 # ---------------------------------------------------------------------------
 ## Level 2 — API with real datastores

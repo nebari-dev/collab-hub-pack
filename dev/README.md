@@ -1154,8 +1154,18 @@ holding a session stays in one for as long as someone talks to it. A worker
 that hangs is stopped by terminating its run.
 
 Cog packages are found in `COGS`, a `:`-separated list that defaults to
-`dev/cogs` (the fake Cogs) and `examples/cog-local/cogs` (`hello`); both
-targets read it, so set it on both to add a directory of your own. A worker's
+`dev/cogs` (the fake Cogs), `cogs` at the root (`hermes`, the Hermes harness
+Cog) and `examples/cog-local/cogs` (`hello`); both targets read it, so set it
+on both to add a directory of your own.
+
+**The Hermes Cog's model.** `make controller` hands the Hermes Cog's workers,
+and no other's, the model in `COLLAB_MODEL_BASE_URL`, `COLLAB_MODEL_NAME` and
+`COLLAB_MODEL_API_KEY`. By default it is `make fake-model`, an OpenAI-compatible
+endpoint on port 8090 that answers `The fake model heard: ...` with no account
+and no network ([`fake-model/fake_model.py`](fake-model/fake_model.py)). Set
+the three in your environment to use a real one. Hermes's environment is about
+400 MB, installed by pixi on its first launch, or ahead of time with
+`make -C ../examples/cog-local env`. A worker's
 output is under `.local/runs/`.
 
 **What persists.** The Track file, until `make clean`. The controller keeps
@@ -1309,8 +1319,16 @@ that gap.
 |---|---|---|
 | 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
 | 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
-| 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub`; `examples/cog-local`'s `make demo`: the CLI signs in to the realm, launches a Cog the controller runs as a local process, lists it, talks to it over ACP and with `run say`, terminates it, and no worker is left |
+| 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
+
+The examples have a workflow of their own,
+[`.github/workflows/examples.yaml`](../.github/workflows/examples.yaml), run on
+pull requests that touch what they use: `examples/cog-local`'s `make demo`
+starts Postgres and Keycloak, signs in with the CLI, launches the Hermes Cog
+against the fake model, talks to it over ACP and with `run say`, and
+terminates it with no worker left. It is apart from this one because Hermes's
+environment is about 400 MB.
 
 **Coverage relaxes as the levels get more expensive**, which is how the levels
 are meant to be used in the first place.
@@ -1363,7 +1381,7 @@ works as a set:
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
 | `OP` | `echo` | The Op `make op` runs: a file under `ops/`, without `.yaml` |
 | `BACKEND` | `none` | The durability backend `make op` runs on; only `none` is built |
-| `COGS` | `dev/cogs:examples/cog-local/cogs` | The directories `make api` and `make controller` find Cog packages in, `:`-separated |
+| `COGS` | `dev/cogs:cogs:examples/cog-local/cogs` | The directories `make api` and `make controller` find Cog packages in, `:`-separated |
 | `LOCATION` | *(empty)* | Where `make op` runs each step's worker: empty for in process, `local` for a real process per worker (needs pixi) |
 
 ## Files in this directory

@@ -1,4 +1,4 @@
-# A Cog's whole life on a hub running on your machine, one target per step.
+# A Hermes agent's whole life as a Cog, on a hub running on your machine: one target per step.
 # README.md walks through them; `make help` lists them; `make demo` runs them all.
 
 ROOT  := $(abspath ../..)
@@ -11,13 +11,22 @@ export COLLAB_HUB_URL        := http://127.0.0.1:$(PORT)
 export COLLAB_HUB_CONFIG_DIR := $(LOCAL)/cli
 CLI := uv run --quiet --project $(ROOT)/cli collab-hub
 
-# The run the steps below act on: the last one `make launch` started, or RUN=...
+# The Cog to launch, and the run the steps below act on: the last one `make launch` started.
+COG  ?= hermes
 RUN  ?= $(shell cat $(LOCAL)/run 2>/dev/null)
-TEXT ?= help
+TEXT ?= hello
+
+# The model Hermes calls. Unless you set COLLAB_MODEL_BASE_URL (and COLLAB_MODEL_NAME,
+# COLLAB_MODEL_API_KEY) in your environment, it is the fake one `make start` runs on port 8090.
+ifeq ($(origin COLLAB_MODEL_BASE_URL),undefined)
+export FAKE_MODEL := yes
+export COLLAB_MODEL_BASE_URL := http://127.0.0.1:8090/v1
+export COLLAB_MODEL_NAME     := fake-model
+endif
 
 .DEFAULT_GOAL := help
-.PHONY: help env tools hub credentials api controller start login login-token whoami cogs launch list \
-        connect say acp-check stop shutdown down clean demo
+.PHONY: help env tools hub credentials model api controller start login login-token whoami cogs launch \
+        list connect say acp-check stop shutdown down clean demo
 
 help: ## List the steps
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  make %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,24 +34,28 @@ help: ## List the steps
 $(LOCAL):
 	@mkdir -p $@
 
-# --- 1. the hub, and who signs in to it ---------------------------------------------------------
+# --- 0. what the example needs ------------------------------------------------------------------
 
-env: ## Install what the example uses: the CLI, the hub's Python, toad, pixi, and the Cog's environment
+env: ## Install what the example uses: the CLI, the hub, Toad, pixi, and Hermes's environment
 	@command -v uv >/dev/null || { echo "install uv first: https://docs.astral.sh/uv/getting-started/installation/"; exit 1; }
 	cd $(ROOT)/cli && uv sync --quiet
 	cd $(ROOT)/api && uv sync --quiet --group runs
 	cd $(ROOT)/execution && uv sync --quiet
 	uv tool install --quiet -U batrachian-toad --python 3.14
 	@command -v pixi >/dev/null || { echo "installing pixi (https://pixi.sh)"; curl -fsSL https://pixi.sh/install.sh | bash; }
+	PATH="$$HOME/.pixi/bin:$$PATH" pixi install --manifest-path $(ROOT)/cogs/hermes/pixi.toml
 	PATH="$$HOME/.pixi/bin:$$PATH" pixi install --manifest-path $(CURDIR)/cogs/hello/pixi.toml
 	@echo "Ready. If pixi or toad was just installed, open a new shell, or add ~/.pixi/bin and ~/.local/bin to PATH."
 
 tools: ## Check what the example needs: docker, uv, pixi, and toad for `make connect`
 	@for tool in docker uv pixi; do command -v $$tool >/dev/null \
 		&& echo "  ok      $$tool" || { echo "  missing $$tool"; missing=1; }; done; \
-	command -v toad >/dev/null && echo "  ok      toad" \
-		|| echo "  missing toad (only for make connect): make env"; \
+	command -v toad >/dev/null && echo "  ok      toad" || echo "  missing toad (only for make connect): make env"; \
+	test -d $(ROOT)/cogs/hermes/.pixi/envs/default && echo "  ok      Hermes's environment" \
+		|| echo "  missing Hermes's environment (the first launch installs it, slowly): make env"; \
 	test -z "$$missing"
+
+# --- 1. the hub, and who signs in to it ---------------------------------------------------------
 
 hub: ## Start Postgres and Keycloak (containers), with the realm and its users
 	$(MAKE) -C $(DEV) services keycloak
@@ -54,17 +67,20 @@ credentials: | $(LOCAL) ## Show who to sign in as, and check the realm issues th
 	@$(MAKE) -s --no-print-directory -C $(DEV) token > /dev/null && echo "  the realm signs dev in: ok" \
 		|| { echo "  the realm did not issue a token: is it up? (make hub)"; exit 1; }
 
-# --- 2. the two processes: the API accepts runs, the controller runs them ------------------------
+# --- 2. the processes: a model, the API that accepts runs, the controller that runs them ---------
 
-api: ## The hub's API, verifying the realm's tokens (foreground: terminal 1)
+model: ## The fake model Hermes calls, on port 8090 (foreground); skip it to use your own
+	$(MAKE) -C $(DEV) fake-model
+
+api: ## The hub's API, verifying the realm's tokens (foreground)
 	$(MAKE) -C $(DEV) api-oidc API_PORT=$(PORT)
 
-controller: ## The run controller, which starts each Cog as a local process (foreground: terminal 2)
+controller: ## The run controller, which starts each Cog as a local process (foreground)
 	$(MAKE) -C $(DEV) controller
 
-start: | $(LOCAL) ## Both of the above in the background instead, logs in .local/
-	@bash -c 'set -m; $(MAKE) -s api > $(LOCAL)/api.log 2>&1 & echo $$! > $(LOCAL)/api.pid'
-	@bash -c 'set -m; $(MAKE) -s controller > $(LOCAL)/controller.log 2>&1 & echo $$! > $(LOCAL)/controller.pid'
+start: | $(LOCAL) ## The model (unless yours), the API and the controller in the background; logs in .local/
+	@for name in $(if $(FAKE_MODEL),model) api controller; do \
+		bash -c "set -m; $(MAKE) -s $$name > $(LOCAL)/$$name.log 2>&1 & echo \$$! > $(LOCAL)/$$name.pid"; done
 	@printf "waiting for the hub on $(COLLAB_HUB_URL) "; for _ in $$(seq 1 240); do \
 		curl -sf $(COLLAB_HUB_URL)/health > /dev/null && { echo "up"; exit 0; }; printf .; sleep 1; done; \
 		echo " it never answered:"; tail -20 $(LOCAL)/api.log; exit 1
@@ -83,32 +99,34 @@ whoami: ## Who the hub says you are
 cogs: ## The Cogs this hub can launch
 	$(CLI) cog list --launchable
 
-launch: | $(LOCAL) ## Launch hello, holding a session; the run's id goes to .local/run
-	$(CLI) cog launch hello --entry session --gate never > $(LOCAL)/run
+launch: | $(LOCAL) ## Launch Hermes (COG=hermes), holding a session; the run's id goes to .local/run
+	$(CLI) cog launch $(COG) --entry session --gate never > $(LOCAL)/run
 	@echo "  run $$(cat $(LOCAL)/run)"
 
 list: ## The runs you launched
 	$(CLI) run list
 
-connect: ## Talk to the running Cog from Toad, an ACP client
-	toad acp --title "hello · $(RUN)" "$(CLI) run connect $(RUN)" $(CURDIR)
+connect: ## Talk to the running Hermes from Toad, an ACP client
+	toad acp --title "$(COG) · $(RUN)" "$(CLI) run connect $(RUN)" $(CURDIR)
 
-say: ## Say one thing to the running Cog from the CLI: make say TEXT="sum 1 2 3"
+say: ## Say one thing to it from the CLI instead: make say TEXT="what can you do?"
 	$(CLI) run say $(RUN) $(TEXT)
 
 acp-check: ## What Toad does, scripted: an ACP client sends a few prompts through `run connect`
-	uv run --quiet --project $(ROOT)/cli python $(CURDIR)/acp_check.py $(RUN) help "sum 1 2 3" whoami
+	uv run --quiet --project $(ROOT)/cli python $(CURDIR)/acp_check.py $(RUN) "hello hermes" "what can you do?"
 
 stop: ## Stop the Cog: terminate its run
 	$(CLI) run terminate $(RUN)
 
 # --- 4. shutting down ---------------------------------------------------------------------------
 
-shutdown: ## Stop the API and the controller that `make start` started
-	@for name in api controller; do test -f $(LOCAL)/$$name.pid || continue; \
-		group=$$(cat $(LOCAL)/$$name.pid); kill -TERM -- -$$group 2>/dev/null; \
-		for _ in $$(seq 1 50); do kill -0 -- -$$group 2>/dev/null || break; sleep 0.2; done; \
-		kill -KILL -- -$$group 2>/dev/null; rm -f $(LOCAL)/$$name.pid; echo "  stopped the $$name"; done; true
+shutdown: ## Stop what `make start` started
+	@tree() { echo $$1; for child in $$(pgrep -P $$1); do tree $$child; done; }; \
+	for name in api controller model; do test -f $(LOCAL)/$$name.pid || continue; \
+		pids=$$(tree $$(cat $(LOCAL)/$$name.pid)); kill -TERM $$pids 2>/dev/null; \
+		for _ in $$(seq 1 50); do alive=; for pid in $$pids; do kill -0 $$pid 2>/dev/null && alive=1; done; \
+			test -n "$$alive" || break; sleep 0.2; done; \
+		kill -KILL $$pids 2>/dev/null; rm -f $(LOCAL)/$$name.pid; echo "  stopped the $$name"; done; true
 
 down: shutdown ## Stop the containers too (their data is kept)
 	$(MAKE) -C $(DEV) down
@@ -118,11 +136,15 @@ clean: shutdown ## Forget this example's sign-in, run and logs
 
 # --- all of it ----------------------------------------------------------------------------------
 
-demo: ## Every step in order, with no browser and no terminal UI: what CI runs
-	$(MAKE) tools hub credentials start login-token whoami cogs launch list acp-check
-	$(MAKE) say TEXT="hello Ada"
+demo: | $(LOCAL) ## Every step in order, with no browser and no terminal UI: what CI runs
+	$(MAKE) tools hub credentials start login-token whoami cogs launch list
+	$(MAKE) -s acp-check | tee $(LOCAL)/acp-check.out
+	@grep -q "The fake model heard: hello hermes" $(LOCAL)/acp-check.out \
+		|| { echo "Hermes did not answer through the fake model"; exit 1; }
+	$(MAKE) say TEXT="one more thing"
 	$(MAKE) stop list
 	@! $(CLI) run say $(RUN) hello 2>/dev/null || { echo "a terminated run still took a turn"; exit 1; }
-	@! pgrep -f 'cog-local/cogs/hello/[.]pixi/envs' > /dev/null || { echo "a hello worker outlived its run"; exit 1; }
+	@! pgrep -f 'cogs/hermes/[.]pixi/envs' > /dev/null || { echo "a Hermes worker outlived its run"; exit 1; }
 	$(MAKE) shutdown
-	@echo "Done: signed in, launched, listed, talked to over ACP and the CLI, and stopped."
+	@! curl -sf -m 2 $(COLLAB_HUB_URL)/health > /dev/null || { echo "the API is still answering"; exit 1; }
+	@echo "Done: signed in, launched Hermes, listed it, talked to it over ACP and the CLI, and stopped it."

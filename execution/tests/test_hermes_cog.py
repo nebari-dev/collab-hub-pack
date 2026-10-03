@@ -1,0 +1,176 @@
+"""The Hermes harness Cog (`cogs/hermes`): Hermes Agent behind the seam, driven over ACP.
+
+Most of these run the Cog's real worker against a stand-in ACP agent, so they
+need neither Hermes's 400 MB environment nor a model. The last runs Hermes
+itself against the fake model, where the Cog's pixi environment is installed.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from collab_hub_execution import InMemoryTrackStore, LifecycleRunner, OpDefinition, OpStep, RunState, intents
+from collab_hub_execution.controller import RunController, _deliveries
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+HERMES = REPOSITORY / "cogs" / "hermes"
+FAKE_AGENT = Path(__file__).resolve().parent / "fake_acp_agent.py"
+FAKE_MODEL = REPOSITORY / "dev" / "fake-model" / "fake_model.py"
+BY = {"user": "alice", "org_id": "acme"}
+
+
+def _controller(tmp_path, track, environment):
+    """A controller over a copy of the Hermes Cog that runs under this Python, against a stand-in agent."""
+    root = tmp_path / "cogs"
+    shutil.copytree(HERMES, root / "hermes", ignore=shutil.ignore_patterns(".pixi"))
+    manifest = root / "hermes" / "pixi.toml"
+    manifest.write_text(re.sub(r'^serve = .*$', f'serve = "{sys.executable} serve.py"', manifest.read_text(),
+                               flags=re.M))
+    environment = {"COLLAB_HERMES_COMMAND": f"{sys.executable} {FAKE_AGENT}", **environment}
+    runner = LifecycleRunner(track=track, location="local", location_settings={
+        "packages": [root], "work_dir": tmp_path / "runs", "environment": "host", "interaction_timeout": None,
+        "deliver": lambda cog, run_id, instance: environment if cog == "hermes" else {}})
+    return RunController(runner, poll_interval=0.01)
+
+
+def _until(controller, check, what, seconds=60):
+    deadline = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < deadline, what
+        controller.tick()
+        time.sleep(0.02)
+
+
+def _answer(controller, track, run_id, text):
+    turn = intents.request_turn(track, run_id, text=text, actor="alice")
+    _until(controller, lambda: intents.turns(track.replay(run_id))[turn.turn].state != "pending", f"no answer: {text}")
+    view = intents.turns(track.replay(run_id))[turn.turn]
+    assert view.state == "answered", view.error
+    return view.answer
+
+
+MODEL = {"COLLAB_MODEL_BASE_URL": "http://127.0.0.1:9/v1", "COLLAB_MODEL_NAME": "a-model",
+         "COLLAB_MODEL_API_KEY": "the-key"}
+
+
+def test_a_hermes_session_answers_each_turn_with_what_the_agent_said(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, MODEL)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    # Asked before the session is open: the worker waits for it rather than refusing the turn.
+    assert _answer(controller, track, "r", "hello") == "agent heard: hello"
+    assert _answer(controller, track, "r", "and again") == "agent heard: and again"
+    assert _answer(controller, track, "r", "bye").startswith("Bye!")
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.COMPLETED, "the session did not end")
+    assert intents.describe(track, "r").steps[0].output == {"turns": 2}
+
+
+def test_hermes_gets_the_delivered_model_in_a_home_of_its_own_and_never_the_secrets_in_its_environment(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, MODEL)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    seen = json.loads(_answer(controller, track, "r", "env"))
+    assert seen["model"] == {"provider": "custom", "base_url": "http://127.0.0.1:9/v1", "default": "a-model",
+                             "api_key": "the-key"}
+    assert seen["run_token"] is False and seen["api_key_env"] is False
+    assert Path(seen["cwd"]).name.startswith("hermes-r-")  # a workspace of the run's, not the package
+    intents.request_cancel(track, "r", actor="alice")
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+
+
+def test_a_tool_hermes_asks_permission_for_is_refused(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, MODEL)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    assert _answer(controller, track, "r", "use a tool") == "permission: cancelled"
+    intents.request_cancel(track, "r", actor="alice")
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+
+
+def test_ask_answers_one_prompt(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, MODEL)
+    intents.submit(track, OpDefinition("r", (OpStep("ask", "hermes", "ask", {"prompt": "one question"}),)), by=BY)
+    _until(controller, lambda: intents.describe(track, "r").state.ended, "the run did not end")
+    view = intents.describe(track, "r")
+    assert view.state is RunState.COMPLETED and view.steps[0].output == {"answer": "agent heard: one question"}
+
+
+def test_without_a_model_the_step_fails_and_says_why(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _controller(tmp_path, track, {})
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    _until(controller, lambda: intents.describe(track, "r").state.ended, "the run did not end")
+    view = intents.describe(track, "r")
+    assert view.state is RunState.FAILED and view.error == "model-unavailable"
+    assert "COLLAB_MODEL_BASE_URL" in view.reason
+
+
+def test_the_controller_delivers_a_variable_to_the_cog_named_and_no_other(monkeypatch):
+    monkeypatch.setenv("COLLAB_MODEL_BASE_URL", "http://model")
+    monkeypatch.delenv("COLLAB_MODEL_API_KEY", raising=False)
+    deliver = _deliveries(["hermes:COLLAB_MODEL_BASE_URL", "hermes:COLLAB_MODEL_API_KEY"])
+    assert deliver("hermes", "r", "s:0") == {"COLLAB_MODEL_BASE_URL": "http://model"}  # unset ones are skipped
+    assert deliver("hello", "r", "s:0") == {}
+    with pytest.raises(SystemExit, match="COG:NAME"):
+        _deliveries(["COLLAB_MODEL_BASE_URL"])
+
+
+NEEDS_HERMES = pytest.mark.skipif(
+    not (HERMES / ".pixi" / "envs" / "default").is_dir() or shutil.which("pixi") is None,
+    reason="the Hermes Cog's pixi environment is not installed (make -C examples/cog-local env)")
+
+
+def _hermes_session(tmp_path, model_command, port):
+    """Hermes itself, in its own environment, in a session, against a model this test runs."""
+    model = subprocess.Popen([sys.executable, *model_command], stderr=open(tmp_path / "model.log", "w"))
+    track = InMemoryTrackStore()
+    runner = LifecycleRunner(track=track, location="local", location_settings={
+        "packages": [REPOSITORY / "cogs"], "allow": ["hermes"], "work_dir": tmp_path / "runs",
+        "interaction_timeout": None,
+        "deliver": lambda cog, run_id, instance: {"COLLAB_MODEL_BASE_URL": f"http://127.0.0.1:{port}/v1",
+                                                  "COLLAB_MODEL_NAME": "fake-model"}})
+    controller = RunController(runner, poll_interval=0.02)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
+    return model, track, controller
+
+
+def _end(model, track, controller):
+    try:
+        intents.request_cancel(track, "r", actor="alice")
+        _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "not cancelled")
+    finally:
+        model.terminate()
+        model.wait(timeout=10)
+
+
+@NEEDS_HERMES
+def test_hermes_itself_answers_through_the_fake_model(tmp_path):
+    model, track, controller = _hermes_session(tmp_path, [str(FAKE_MODEL), "--port", "18791"], 18791)
+    try:
+        assert _answer(controller, track, "r", "hello hermes") == "The fake model heard: hello hermes"
+    finally:
+        _end(model, track, controller)
+
+
+@NEEDS_HERMES
+def test_hermes_runs_no_command_even_when_its_model_orders_one(tmp_path):
+    # Decision 14: prompt in, answer out. The model asks for the `terminal` tool; Hermes has none to run.
+    marker = tmp_path / "hermes-ran-a-command"
+    ordering = Path(__file__).resolve().parent / "tool_ordering_model.py"
+    model, track, controller = _hermes_session(tmp_path, [str(ordering), "18792", str(marker)], 18792)
+    try:
+        answer = _answer(controller, track, "r", "please run a command")
+    finally:
+        _end(model, track, controller)
+    assert not marker.exists(), "Hermes ran the command its model ordered"
+    assert "Tool 'terminal' does not exist" in answer
+    assert "offered: []" in (tmp_path / "model.log").read_text()  # no tool was even offered to the model

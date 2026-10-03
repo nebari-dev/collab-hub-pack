@@ -1,0 +1,225 @@
+"""The Hermes harness Cog's worker: Hermes Agent behind the hub's seam. Standard library only.
+
+The run controller starts this with the package's `serve` task, in the
+package's pixi environment, where Hermes Agent is installed. It serves the
+seam every Cog worker serves:
+
+    GET  /healthz   200 once it can answer
+    POST /invoke    {entry_point, input, idempotency_key} -> a result envelope
+    POST /turn      {turn, text} -> {text}, while a `session` is open
+
+and drives Hermes over the Agent Client Protocol: it starts `hermes acp` as a
+child process and is its ACP client, one JSON-RPC message per line on the
+child's stdin and stdout. The hub never sees ACP, and Hermes never sees the hub.
+Hermes runs with no tools (`hermes_acp.py`): it answers, and does nothing else.
+
+Entry points:
+
+- `session` opens a Hermes session and holds it: each turn the hub delivers
+  is one prompt, answered with what Hermes said. It ends on `bye`, or when the
+  run is terminated and this process with it.
+- `ask` answers one prompt, `input.prompt`, and returns.
+
+The model comes from the controller, in the environment: `COLLAB_MODEL_BASE_URL`
+(an OpenAI-compatible endpoint), `COLLAB_MODEL_NAME` and `COLLAB_MODEL_API_KEY`.
+Hermes gets a home of its own for the run, so nothing of the machine's own
+Hermes setup is read or changed. Should Hermes ask permission for anything, the
+worker refuses, since nobody is there to answer it.
+"""
+
+import hmac
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+COG = os.environ.get("COLLAB_COG_ID", "hermes")
+RUN = os.environ.get("COLLAB_RUN_ID", "")
+TOKEN = os.environ.get("COLLAB_RUN_TOKEN", "")
+# Overridable so the worker can be tested against a stand-in agent; Hermes itself by default.
+AGENT = shlex.split(os.environ.get("COLLAB_HERMES_COMMAND", "")) or [
+    sys.executable, str(Path(__file__).resolve().parent / "hermes_acp.py")]
+
+
+def log(message):
+    print(f"hermes cog: {message}", file=sys.stderr, flush=True)
+
+
+def hermes_home(root):
+    """A Hermes home for this run: the model the controller delivered, and nothing else."""
+    home = Path(root) / "hermes-home"
+    home.mkdir(parents=True, exist_ok=True)
+    base_url = os.environ.get("COLLAB_MODEL_BASE_URL", "")
+    if not base_url:
+        raise RuntimeError("no model: the controller delivers COLLAB_MODEL_BASE_URL to this Cog")
+    model = {"provider": "custom", "base_url": base_url,
+             "default": os.environ.get("COLLAB_MODEL_NAME", ""),
+             "api_key": os.environ.get("COLLAB_MODEL_API_KEY", "") or "none"}
+    # JSON is YAML: Hermes reads this file as its config.yaml.
+    (home / "config.yaml").write_text(json.dumps({"model": model}, indent=2))
+    (home / "config.yaml").chmod(0o600)
+    return home
+
+
+class Agent:
+    """Hermes over ACP: one child process, one session, one prompt at a time."""
+
+    def __init__(self):
+        self.workspace = Path(tempfile.mkdtemp(prefix=f"hermes-{RUN or 'run'}-"))
+        env = {**os.environ, "HERMES_HOME": str(hermes_home(self.workspace))}
+        for name in ("COLLAB_RUN_TOKEN", "COLLAB_MODEL_API_KEY"):
+            env.pop(name, None)  # Hermes reads the key from its config; it never needs the run token
+        self.process = subprocess.Popen(AGENT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+                                        text=True, env=env, cwd=self.workspace)
+        self.lock = threading.Lock()
+        self.next_id = 0
+        self.turns = []
+        self.call("initialize", {"protocolVersion": 1, "clientCapabilities": {},
+                                 "clientInfo": {"name": "collab-hub-cog-hermes", "version": "0.1.0"}})
+        self.session = self.call("session/new", {"cwd": str(self.workspace), "mcpServers": []})[0]["sessionId"]
+        log(f"session {self.session} open in {self.workspace}")
+
+    def _send(self, message):
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+        self.process.stdin.flush()
+
+    def call(self, method, params):
+        """One request to Hermes; returns its result and what Hermes said on the way."""
+        self.next_id += 1
+        request_id = self.next_id
+        self._send({"id": request_id, "method": method, "params": params})
+        said = []
+        for line in self.process.stdout:
+            if not line.strip():
+                continue
+            message = json.loads(line)
+            if message.get("method") == "session/update":
+                update = message["params"]["update"]
+                if update.get("sessionUpdate") == "agent_message_chunk":
+                    said.append(update.get("content", {}).get("text", ""))
+            elif "method" in message and "id" in message:
+                self._refuse(message)
+            elif message.get("id") == request_id:
+                if "error" in message:
+                    raise RuntimeError(f"Hermes refused {method}: {message['error'].get('message')}")
+                return message["result"], "".join(said)
+        raise RuntimeError(f"Hermes stopped before answering {method}")
+
+    def _refuse(self, request):
+        """A request from Hermes to its client: permission for a tool is refused, anything else unknown."""
+        if request["method"] == "session/request_permission":
+            log(f"refused permission: {request['params'].get('toolCall', {}).get('title', '?')}")
+            self._send({"id": request["id"], "result": {"outcome": {"outcome": "cancelled"}}})
+        else:
+            self._send({"id": request["id"], "error": {"code": -32601, "message": "not offered by this client"}})
+
+    def prompt(self, text):
+        with self.lock:
+            result, said = self.call("session/prompt", {"sessionId": self.session,
+                                                        "prompt": [{"type": "text", "text": text}]})
+        if result.get("stopReason") not in (None, "end_turn"):
+            said += f"\n\n(Hermes stopped: {result['stopReason']})"
+        return said.strip() or "(Hermes said nothing)"
+
+    def close(self):
+        if self.process.poll() is None:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+session = None
+starting, opened, ended = threading.Event(), threading.Event(), threading.Event()
+SESSION_START_SECONDS = 300  # Hermes's first start in a fresh environment can take a while
+
+
+def envelope(entry_point, *, payload=None, error=None):
+    """A version-1 result envelope: what every Cog answers `/invoke` with."""
+    return {
+        "envelope": 1, "cog": {"id": COG, "version": "0.1.0"}, "task": entry_point,
+        "ok": error is None, "error": error, "payload": payload,
+        "raw": None, "problems": [], "binding": None, "usage": None,
+    }
+
+
+def invoke(entry_point, value):
+    global session
+    value = value or {}
+    try:
+        if entry_point == "ask":
+            agent = Agent()
+            try:
+                return 200, envelope(entry_point, payload={"answer": agent.prompt(str(value.get("prompt", "")))})
+            finally:
+                agent.close()
+        if entry_point == "session":
+            starting.set()
+            try:
+                session = Agent()
+            finally:
+                opened.set()  # a turn waiting on the session is answered now: by it, or by its absence
+            ended.wait()  # until `bye`; a terminated run kills this process instead
+            session.close()
+            return 200, envelope(entry_point, payload={"turns": len(session.turns)})
+    except (OSError, RuntimeError) as exc:
+        log(f"{entry_point} failed: {exc}")
+        error = {"code": "model-unavailable", "detail": str(exc)[:500]}
+        return 503, envelope(entry_point, error=error)
+    error = {"code": "invalid-input", "detail": f"hermes has no entry point {entry_point!r}: it has ask and session"}
+    return 422, envelope(entry_point, error=error)
+
+
+def turn(text):
+    if text.strip().lower() in ("bye", "/bye"):
+        ended.set()
+        return "Bye! The Hermes session ends, and the run completes."
+    session.turns.append(text)
+    return session.prompt(text)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):  # noqa: N802
+        self._send(200, {"ok": True}) if self.path == "/healthz" else self._send(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        presented = self.headers.get("Authorization", "").removeprefix("Bearer ")
+        if not TOKEN or not hmac.compare_digest(presented.encode(), TOKEN.encode()):
+            return self._send(401, {"error": "not the run token of this worker"})
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path == "/invoke":
+            return self._send(*invoke(request.get("entry_point"), request.get("input")))
+        if self.path == "/turn":
+            # A turn may come while Hermes is still starting the session: it waits for it.
+            if not starting.is_set() or not opened.wait(SESSION_START_SECONDS) or ended.is_set():
+                return self._send(404, {"error": "no session is open"})
+            if session is None:
+                return self._send(503, {"error": "the Hermes session could not be opened"})
+            try:
+                return self._send(200, {"text": turn(str(request.get("text", "")))})
+            except (OSError, RuntimeError) as exc:
+                return self._send(502, {"error": str(exc)[:500]})
+        self._send(404, {"error": "not found"})
+
+    def log_message(self, *args):
+        pass
+
+
+if __name__ == "__main__":
+    host, port = os.environ.get("COLLAB_COG_HOST", "127.0.0.1"), int(os.environ["COLLAB_COG_PORT"])
+    log(f"serving run {RUN} on {host}:{port}")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

@@ -140,7 +140,9 @@ def test_a_prompt_the_hub_refuses_is_told_to_the_client_and_ends_the_turn(stub, 
     client.send("initialize", {"protocolVersion": 1})
     client.answered(client.send("session/new", {"cwd": str(tmp_path), "mcpServers": []}))
     stub.runs[0].update(status="COMPLETED", ended=True)
-    client.send("session/prompt", {"sessionId": f"{run_id}-1", "prompt": [{"type": "text", "text": "hi"}]})
+    # One prompt at a time, as a client sends them: each waits for the one before to be answered.
+    client.answered(client.send("session/prompt", {"sessionId": f"{run_id}-1",
+                                                   "prompt": [{"type": "text", "text": "hi"}]}))
     client.send("session/prompt", {"sessionId": f"{run_id}-1", "prompt": [{"type": "image", "data": ""}]})
     messages = client.close()
     texts = [m["params"]["update"]["content"]["text"] for m in messages if m.get("method") == "session/update"]

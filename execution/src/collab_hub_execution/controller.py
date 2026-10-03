@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import logging
+import os
 import signal
 import sys
 import threading
@@ -148,6 +149,21 @@ class RunController:
         return not any(thread.is_alive() for thread in threads)
 
 
+def _deliveries(specs: list[str]):
+    """``COG:NAME`` pairs as what the local executor delivers: each Cog's variables, read when its worker starts."""
+    wanted: dict[str, list[str]] = {}
+    for spec in specs:
+        cog, _, name = spec.partition(":")
+        if not cog or not name:
+            raise SystemExit(f"--deliver takes COG:NAME, not {spec!r}")
+        wanted.setdefault(cog, []).append(name)
+
+    def deliver(cog: str, run_id: str, instance: str) -> dict[str, str]:
+        return {name: os.environ[name] for name in wanted.get(cog, ()) if name in os.environ}
+
+    return deliver
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="The run controller: advances the runs submitted to a Track.")
     parser.add_argument("--track", required=True, help="the SQLite Track file the API writes submissions to")
@@ -159,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", default="none")
     parser.add_argument("--location", default="local", choices=AGENT_LOCATIONS)
     parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument("--deliver", action="append", default=[], metavar="COG:NAME",
+                        help="deliver the variable NAME from this process's environment to the workers of COG, "
+                             "and to no other; repeat for several. How a Cog gets its model until bindings do it")
     parser.add_argument("--interaction-timeout", type=float, default=60.0, metavar="SECONDS",
                         help="how long one interaction with a worker may take; 0 for no limit, which a Cog "
                              "holding a session for as long as someone talks to it needs")
@@ -168,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s controller %(message)s", datefmt="%H:%M:%S",
                         stream=sys.stderr)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per /healthz poll is noise here
+
+    deliveries = _deliveries(args.deliver)
 
     track_path = Path(args.track)
     SqliteTrackStore.ensure_schema(track_path)
@@ -183,7 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         track=SqliteTrackStore(track_path), backend=args.backend, location=args.location,
         location_settings={"packages": args.packages, "allow": args.allow, "work_dir": args.work_dir,
                            "environment": args.environment,
-                           "interaction_timeout": args.interaction_timeout or None})
+                           "interaction_timeout": args.interaction_timeout or None,
+                           "deliver": deliveries})
     controller = RunController(runner, poll_interval=args.poll_interval)
     controller.start()
 
