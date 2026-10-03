@@ -1016,6 +1016,18 @@
             }
           },
           "additionalProperties": false
+        },
+        "indexer": {
+          "type": "object",
+          "properties": {
+            "replicas": {
+              "type": "integer"
+            },
+            "resources": {
+              "$ref": "#/$defs/resources"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
