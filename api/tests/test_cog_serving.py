@@ -39,7 +39,6 @@ from collab_hub_api.cogs.oci import (
     MEDIA_TYPE_PIXI_CONFIG,
     MEDIA_TYPE_PIXI_LOCK,
     MEDIA_TYPE_PIXI_TOML,
-    OCITransportError,
 )
 from collab_hub_api.cogs.registry import build_registry_sources
 from collab_hub_api.cogs.registry_credentials import CREDENTIAL_SECRET_PREFIX, PULL_TOKEN_PREFIX
@@ -464,6 +463,11 @@ def test_only_pull_on_a_repository_is_ever_granted():
     ) == ["cogs/a", "cogs/b"]
     many = [f"repository:cogs/r{i}:pull" for i in range(40)]
     assert len(requested_repositories(many)) == registry_router.MAX_TOKEN_SCOPES
+    # The input is bounded before it is parsed: a huge scope list is not walked to its end.
+    flood = ["repository:cogs/a:push " * 100_000 + "repository:cogs/z:pull"]
+    assert requested_repositories(flood) == []
+    assert requested_repositories(["garbage"] * 10_000 + ["repository:cogs/z:pull"]) == []
+    assert requested_repositories(["x " * 70 + "repository:cogs/z:pull"]) == []
 
 
 # -- pulling ---------------------------------------------------------------------
@@ -517,33 +521,53 @@ async def test_a_nebi_bundle_round_trips_with_only_a_hub_sign_in(hub: Hub):
     assert hub.upstream.served("/blobs/") == len(ALPHA.blobs)
 
 
-async def test_the_manifest_is_read_from_the_registry_once_per_replica(hub: Hub):
+async def test_every_read_costs_at_most_one_request_to_the_source(hub: Hub):
+    """Nothing is scanned: a manifest read is one fetch, a blob read one fetch, a HEAD of a blob none."""
+
+    hub.seed(REPO, ALPHA, "latest")
+    for index in range(5):
+        hub.seed(REPO, Bundle(f"other-{index}"), f"other-{index}", pushed_at=T0 - timedelta(days=index + 1))
+    headers = await hub.pull_token(REPO)
+    await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)  # the source's token dance happens here
+    config = sha256(ALPHA.config)
+
+    async def cost(method: str, url: str, expect: int) -> int:
+        before = len(hub.upstream.requests)
+        response = await hub.request(method, url, headers=headers)
+        assert response.status_code == expect, (method, url, response.status_code)
+        return len(hub.upstream.requests) - before
+
+    assert await cost("GET", f"/v2/{REPO}/manifests/latest", 200) == 1
+    assert await cost("HEAD", f"/v2/{REPO}/manifests/{ALPHA.digest}", 200) == 1
+    assert await cost("GET", f"/v2/{REPO}/tags/list", 200) == 0
+    assert await cost("HEAD", f"/v2/{REPO}/blobs/{config}", 200) == 0
+    assert await cost("GET", f"/v2/{REPO}/blobs/{config}", 200) == 2, "the registry, then its redirect to storage"
+    # What is not there costs the source nothing at all, however many versions the repository holds.
+    assert await cost("GET", f"/v2/{REPO}/manifests/{'sha256:' + 'f' * 64}", 404) == 0
+    assert await cost("GET", f"/v2/{REPO}/blobs/{'sha256:' + 'f' * 64}", 404) == 0
+    assert await cost("HEAD", f"/v2/{REPO}/blobs/{'sha256:' + 'f' * 64}", 404) == 0
+    assert await cost("GET", f"/v2/{REPO}/manifests/no-such-tag", 404) == 0
+
+
+async def test_a_blob_is_pullable_once_a_manifest_that_references_it_has_been_served(hub: Hub):
+    """Reachability is stored data: recorded when the manifest is served, and never guessed from the registry."""
+
     hub.seed(REPO, ALPHA, "latest")
     headers = await hub.pull_token(REPO)
-    for _ in range(3):
-        assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
-        blob = await hub.get(f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers=headers)
-        assert blob.content == ALPHA.config
-    assert hub.upstream.served("/manifests/") == 1
+    config = sha256(ALPHA.config)
+    before = len(hub.upstream.requests)
+    unknown = await hub.get(f"/v2/{REPO}/blobs/{config}", headers=headers)
+    assert unknown.status_code == 404 and unknown.json()["errors"][0]["code"] == "BLOB_UNKNOWN"
+    assert len(hub.upstream.requests) == before, "a blob no served manifest references is not asked for upstream"
 
-
-async def test_a_blob_request_on_a_cold_replica_finds_its_manifest(hub: Hub):
-    """No manifest request first: the blob's reachability is established from the catalog's rows."""
-
-    older = Bundle("older")
-    hub.seed(REPO, older, "0.9.0", pushed_at=T0 - timedelta(days=1))
-    hub.seed(REPO, ALPHA, "latest")
-    headers = await hub.pull_token(REPO)
-    blob = await hub.get(f"/v2/{REPO}/blobs/{sha256(older.config)}", headers=headers)
-    assert blob.status_code == 200 and blob.content == older.config
-    # A burst for one cold artifact reads its manifest once.
-    hub.serving.front._reach_cache.clear()
-    before = hub.upstream.served("/manifests/")
-    answers = await asyncio.gather(
-        *(hub.get(f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers=headers) for _ in range(5))
-    )
-    assert {answer.status_code for answer in answers} == {200}
-    assert hub.upstream.served("/manifests/") - before == 1
+    assert (await hub.request("HEAD", f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
+    recorded = hub.catalog.find_blob(REPO, config, ("backing",))
+    assert [(blob.manifest_digest, blob.size) for blob in recorded] == [(ALPHA.digest, len(ALPHA.config))]
+    assert (await hub.get(f"/v2/{REPO}/blobs/{config}", headers=headers)).content == ALPHA.config
+    # Recorded for the repository it was served from, and for no other.
+    hub.seed(OTHER_REPO, BETA, "latest")
+    other = await hub.pull_token(OTHER_REPO)
+    assert (await hub.get(f"/v2/{OTHER_REPO}/blobs/{config}", headers=other)).status_code == 404
 
 
 async def test_tags_come_from_the_catalog_and_page(hub: Hub):
@@ -584,16 +608,12 @@ async def test_a_tag_resolves_to_the_newest_push_across_sources(make_hub, tmp_pa
     assert (await hub.get(f"/v2/{REPO}/manifests/orphan", headers=headers)).status_code == 404
 
 
-async def test_a_multi_platform_index_is_served_with_its_children(hub: Hub):
+async def test_an_index_is_served_as_stored_and_its_children_only_if_indexed_themselves(hub: Hub):
+    """Indexes are not traversed: a child manifest needs its own pullable row, like any other manifest."""
+
     amd, arm = Bundle("amd64"), Bundle("arm64")
     hub.upstream.publish(REPO, amd)
     hub.upstream.publish(REPO, arm)
-    nested = hub.upstream.publish_raw(
-        REPO,
-        MEDIA_TYPE_OCI_INDEX,
-        json.dumps({"schemaVersion": 2, "mediaType": MEDIA_TYPE_OCI_INDEX, "manifests": []}).encode(),
-    )
-    missing = {"mediaType": MEDIA_TYPE_OCI_MANIFEST, "digest": "sha256:" + "e" * 64, "size": 2}
     index_body = json.dumps(
         {
             "schemaVersion": 2,
@@ -601,44 +621,33 @@ async def test_a_multi_platform_index_is_served_with_its_children(hub: Hub):
             "manifests": [
                 {"mediaType": MEDIA_TYPE_OCI_MANIFEST, "digest": amd.digest, "size": len(amd.manifest)},
                 {"mediaType": MEDIA_TYPE_OCI_MANIFEST, "digest": arm.digest, "size": len(arm.manifest)},
-                {"mediaType": MEDIA_TYPE_OCI_INDEX, "digest": nested, "size": 10},
-                missing,
             ],
         }
     ).encode()
     index_digest = hub.upstream.publish_raw(REPO, MEDIA_TYPE_OCI_INDEX, index_body, "multi")
     hub.catalog.upsert(catalog_row(REPO, index_digest, tags=("multi",)))
+    # One child is indexed in its own right; the other exists only inside the index.
+    hub.catalog.upsert(catalog_row(REPO, amd.digest, tags=("amd64",)))
     headers = await hub.pull_token(REPO)
 
     index = await hub.get(f"/v2/{REPO}/manifests/multi", headers=headers)
     assert index.content == index_body and index.headers["content-type"] == MEDIA_TYPE_OCI_INDEX
-    for child in (amd, arm):
-        manifest = await hub.get(f"/v2/{REPO}/manifests/{child.digest}", headers=headers)
-        assert manifest.status_code == 200 and manifest.content == child.manifest
-        blob = await hub.get(f"/v2/{REPO}/blobs/{sha256(child.config)}", headers=headers)
-        assert blob.content == child.config
-    # An index nested in the index is not followed, and a child the registry lacks is skipped.
-    assert (await hub.get(f"/v2/{REPO}/manifests/{nested}", headers=headers)).status_code == 404
-    assert (await hub.get(f"/v2/{REPO}/manifests/{missing['digest']}", headers=headers)).status_code == 404
+    assert index.headers["docker-content-digest"] == index_digest
+    # The index contributes no blobs and no children.
+    assert hub.catalog.find_blob(REPO, sha256(arm.config), ("backing",)) == []
+    before = len(hub.upstream.requests)
+    for url in (f"/v2/{REPO}/manifests/{arm.digest}", f"/v2/{REPO}/blobs/{sha256(arm.config)}"):
+        assert (await hub.get(url, headers=headers)).status_code == 404, url
+    assert len(hub.upstream.requests) == before, "an unindexed child is not fetched to find out"
 
-
-async def test_a_large_manifest_is_served_without_being_kept(hub: Hub, monkeypatch):
-    from collab_hub_api.cogs import serving
-
-    monkeypatch.setattr(serving, "MAX_CACHED_MANIFEST_BYTES", 10)
-    hub.seed(REPO, ALPHA, "latest")
-    headers = await hub.pull_token(REPO)
-    for _ in range(2):
-        manifest = await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)
-        assert manifest.content == ALPHA.manifest
-    # Read once for its reach, and once more for each response.
-    assert hub.upstream.served("/manifests/") == 3
-    # ... and when the registry stops answering for it, that is an outage, then a 404.
-    path = f"/v2/{REPO}/manifests/{ALPHA.digest}"
-    hub.upstream.fail[path] = httpx.Response(500, text="boom")
-    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 503
-    hub.upstream.fail[path] = httpx.Response(404, text="gone")
-    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 404
+    child = await hub.get(f"/v2/{REPO}/manifests/{amd.digest}", headers=headers)
+    assert child.status_code == 200 and child.content == amd.manifest
+    assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(amd.config)}", headers=headers)).content == amd.config
+    # Removing the child's row removes the child and its blobs, whatever the index still lists.
+    hub.catalog.mark_removed_one("backing", REPO, amd.digest)
+    assert (await hub.get(f"/v2/{REPO}/manifests/{amd.digest}", headers=headers)).status_code == 404
+    assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(amd.config)}", headers=headers)).status_code == 404
+    assert (await hub.get(f"/v2/{REPO}/manifests/multi", headers=headers)).status_code == 200
 
 
 # -- only what the catalog holds, never a pass-through ---------------------------
@@ -655,7 +664,7 @@ async def test_nothing_outside_the_catalog_is_served(hub: Hub):
     hub.seed(REPO, non_cog, "noncog", status=STATUS_NON_COG)
     hub.seed(REPO, failed, "failed", status=STATUS_FAILED)
     headers = await hub.pull_token(REPO, UNINDEXED_REPO)
-    # Warm, so the assertions below are about what the Hub refuses to ask for.
+    # The source's own token dance, out of the way of the count below.
     assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
     asked = len(hub.upstream.requests)
 
@@ -683,11 +692,10 @@ async def test_nothing_outside_the_catalog_is_served(hub: Hub):
     await refused("/v2/nothing-like-a-registry-path", "NAME_UNKNOWN")
     assert len(hub.upstream.requests) == asked, "none of those reached the backing registry"
 
-    # A digest the registry holds but no indexed manifest names: the pullable
-    # manifests are consulted (they are cached), the registry is not asked for it.
+    # A digest the registry holds but no indexed manifest names.
     await refused(f"/v2/{REPO}/manifests/{stray.digest}", "MANIFEST_UNKNOWN")
     await refused(f"/v2/{REPO}/blobs/{sha256(stray.config)}", "BLOB_UNKNOWN")
-    assert not any(stray.digest in path or sha256(stray.config) in path for path in hub.upstream.paths())
+    assert len(hub.upstream.requests) == asked, "none of those reached the backing registry either"
 
 
 async def test_the_registry_surface_is_read_only(hub: Hub):
@@ -696,6 +704,9 @@ async def test_the_registry_surface_is_read_only(hub: Hub):
         ("PUT", f"/v2/{REPO}/manifests/latest"),
         ("PATCH", f"/v2/{REPO}/blobs/uploads/abc"),
         ("DELETE", f"/v2/{REPO}/manifests/latest"),
+        ("POST", "/v2"),
+        ("PUT", "/v2/"),
+        ("DELETE", "/v2"),
     ):
         response = await hub.request(method, url)
         assert response.status_code == 405
@@ -1078,6 +1089,7 @@ async def test_a_blob_over_the_size_limit_is_refused_without_asking_the_registry
     hub = await make_hub(serve={"enabled": True, "public_url": HUB_URL, "max_blob_bytes": 100_000})
     hub.seed(REPO, ALPHA, "latest")
     headers = await hub.pull_token(REPO)
+    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
     big = sha256(ALPHA.files["model.bin"][1])
     for method in ("GET", "HEAD"):
         refused = await hub.request(method, f"/v2/{REPO}/blobs/{big}", headers=headers)
@@ -1094,6 +1106,7 @@ async def test_a_blob_over_the_size_limit_is_refused_without_asking_the_registry
 async def test_a_blob_response_is_bounded_in_time(hub: Hub):
     hub.seed(REPO, ALPHA, "latest")
     headers = await hub.pull_token(REPO)
+    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
     url = f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}"
     assert (await hub.get(url, headers=headers)).status_code == 200
     hub.app.state.cog_registry_serving = replace(hub.serving, max_blob_seconds=0.05)
@@ -1132,48 +1145,38 @@ async def test_a_storage_outage_is_a_503_in_the_registry_format(hub: Hub, monkey
     assert (await hub.get("/v2/token", headers=ALICE)).status_code == 503
 
 
-async def test_an_unreadable_manifest_makes_its_blobs_unavailable_not_unknown(hub: Hub):
+async def test_a_source_that_cannot_answer_is_unavailable_and_one_that_lost_the_content_is_unknown(hub: Hub):
     hub.seed(REPO, ALPHA, "latest")
-    hub.seed(REPO, BETA, "older", pushed_at=T0 - timedelta(days=1))
     headers = await hub.pull_token(REPO)
-    hub.upstream.fail[f"/v2/{REPO}/manifests/{BETA.digest}"] = httpx.Response(500, text="boom")
-    # A blob of the readable manifest is found; one that might belong to the unreadable one is a 503.
-    assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers=headers)).status_code == 200
-    unknown = await hub.get(f"/v2/{REPO}/blobs/{sha256(BETA.config)}", headers=headers)
-    assert unknown.status_code == 503
-    assert (await hub.get(f"/v2/{REPO}/manifests/{'sha256:' + 'f' * 64}", headers=headers)).status_code == 503
-    # Once the registry says the manifest is gone, the answer is a plain 404.
-    hub.upstream.fail[f"/v2/{REPO}/manifests/{BETA.digest}"] = httpx.Response(404, text="gone")
-    assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(BETA.config)}", headers=headers)).status_code == 404
-    assert (await hub.get(f"/v2/{REPO}/manifests/older", headers=headers)).status_code == 404
+    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 200
+    manifest_path, config = f"/v2/{REPO}/manifests/{ALPHA.digest}", sha256(ALPHA.config)
+
+    hub.upstream.fail[manifest_path] = httpx.Response(500, text="boom")
+    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 503
+    hub.upstream.fail[manifest_path] = httpx.Response(404, text="gone")
+    assert (await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)).status_code == 404
+
+    hub.upstream.fail[f"/v2/{REPO}/blobs/{config}"] = httpx.Response(502, text="boom")
+    assert (await hub.get(f"/v2/{REPO}/blobs/{config}", headers=headers)).status_code == 503
+    hub.upstream.fail[f"/v2/{REPO}/blobs/{config}"] = httpx.Response(404, text="gone")
+    assert (await hub.get(f"/v2/{REPO}/blobs/{config}", headers=headers)).status_code == 404
 
 
-async def test_a_reader_that_goes_away_does_not_cancel_the_requests_that_joined_it(hub: Hub):
+async def test_metadata_reads_run_under_their_own_deadline(hub: Hub):
     hub.seed(REPO, ALPHA, "latest")
-    front = hub.serving.front
-    (row,) = hub.catalog.list_pullable(REPO)
-    started, release = asyncio.Event(), asyncio.Event()
-    real = front._read_reach
+    headers = await hub.pull_token(REPO)
+    hub.app.state.cog_registry_serving = replace(hub.serving, max_metadata_seconds=0.05)
 
-    async def slow(target):
-        started.set()
-        await release.wait()
-        return await real(target)
+    async def stalled(*_args, **_kwargs):
+        await asyncio.sleep(5)
 
-    front._read_reach = slow
-    leader = asyncio.create_task(front._reach(row))
-    await started.wait()
-    follower = asyncio.create_task(front._reach(row))
-    await asyncio.sleep(0)
-    leader.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await leader
-    with pytest.raises(OCITransportError, match="interrupted"):
-        await follower
-    # Nothing is left in flight, and the next request reads normally.
-    front._read_reach = real
-    assert front._inflight == {}
-    assert ALPHA.digest in (await front._reach(row)).manifests
+    (source,) = hub.serving.front.sources
+    source.oci().fetch_manifest = stalled
+    for method in ("GET", "HEAD"):
+        slow = await hub.request(method, f"/v2/{REPO}/manifests/latest", headers=headers)
+        assert slow.status_code == 503, method
+    slow = await hub.get(f"/v2/{REPO}/manifests/latest", headers=headers)
+    assert slow.json()["errors"][0]["code"] == "UNAVAILABLE"
 
 
 # -- startup ------------------------------------------------------------------------
@@ -1224,3 +1227,80 @@ async def test_serving_closes_its_own_sources_at_shutdown(tmp_path, monkeypatch)
         assert app.state.cog_indexer is None and app.state.cog_registry_sources == []
         assert source.host == BACKING_HOST
     assert source.oci()._http.is_closed
+
+
+# -- the response owns the upstream; the log filters are opt-in ----------------------
+
+
+async def test_a_response_that_fails_before_its_first_chunk_still_closes_the_upstream():
+    """A generator that never started runs no cleanup, so the response closes the blob itself."""
+
+    from starlette.requests import ClientDisconnect
+
+    from collab_hub_api.cogs.oci import OCIClient
+    from collab_hub_api.cogs.serving import ServedBlob
+    from collab_hub_api.routers.registry import _BlobResponse
+
+    body = b"blob bytes"
+    client = OCIClient(BACKING_URL, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)))
+
+    async def respond(send) -> ServedBlob:
+        blob = ServedBlob(await client.open_blob(REPO, sha256(body)), len(body))
+        response = _BlobResponse(
+            blob, deadline=asyncio.get_running_loop().time() + 5, what="x", headers={"Content-Length": str(len(body))}
+        )
+        assert not blob.closed
+
+        async def receive():
+            await asyncio.sleep(3600)
+
+        scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "GET"}
+        # Starlette reports a failed send as the client having disconnected.
+        with pytest.raises((ConnectionError, ClientDisconnect)):
+            await response(scope, receive, send)
+        return blob
+
+    async def refuse_everything(message):
+        raise ConnectionError("client went away before the response started")
+
+    assert (await respond(refuse_everything)).closed
+
+    async def refuse_the_body(message):
+        if message["type"] == "http.response.body":
+            raise ConnectionError("client went away mid-body")
+
+    blob = await respond(refuse_the_body)
+    assert blob.closed
+    await blob.aclose()  # idempotent
+    await client.aclose()
+
+
+def test_log_redaction_is_installed_only_by_a_hub_that_indexes_or_serves(tmp_path, monkeypatch):
+    installed: list[int] = []
+    monkeypatch.setattr(config_module, "install_log_redaction", lambda: installed.append(1))
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+
+    plain = settings(tmp_path, serve={})
+    make_app(Config.parse(plain))
+    assert installed == [], "sources alone, with neither indexing nor serving, change no logging"
+
+    make_app(Config.parse(settings(tmp_path)))
+    assert installed == [1]
+
+    indexing = settings(tmp_path, serve={})
+    indexing["cogs"]["index"] = {"enabled": True}
+    make_app(Config.parse(indexing))
+    assert installed == [1, 1]
+
+
+def test_importing_the_oci_client_installs_no_log_filter():
+    import subprocess
+    import sys
+
+    probe = (
+        "import logging, collab_hub_api.cogs.oci, collab_hub_api.config;"
+        "names = ['httpx', 'httpcore.http11', 'httpcore.http2', 'httpcore.connection'];"
+        "print([len(logging.getLogger(n).filters) for n in names])"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "[0, 0, 0, 0]"

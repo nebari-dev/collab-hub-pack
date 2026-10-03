@@ -26,6 +26,7 @@ from .cogs.catalog import (
     UnavailableCogCatalogStore,
 )
 from .cogs.indexer import CogIndexer
+from .cogs.oci import install_log_redaction
 from .cogs.registry import CogRegistrySourceConfig, build_registry_sources, registry_host
 from .cogs.registry_credentials import (
     InMemoryRegistryCredentialStore,
@@ -919,12 +920,12 @@ class CogServeConfig(BaseModel):
             parts.port  # noqa: B018 - raises for a non-numeric or out-of-range port
         except ValueError:
             raise ValueError("cogs.serve.public_url has an invalid port") from None
-        if parts.path not in ("", "/") or parts.query or parts.fragment or "?" in value or "#" in value:
+        if parts.path or parts.query or parts.fragment or "?" in value or "#" in value:
             raise ValueError(
                 "cogs.serve.public_url must be a bare origin (scheme://host[:port]) with no path, query or "
-                "fragment: registry clients address /v2/ at the root of a host"
+                "fragment, and no trailing slash: registry clients address /v2/ at the root of a host"
             )
-        return value.rstrip("/")
+        return value
 
     @property
     def host(self) -> str:
@@ -1429,6 +1430,9 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
             f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
             "connection for the whole sweep while everything else needs another."
         )
+    # This process is about to follow registry redirects: keep signed
+    # storage URLs out of the HTTP libraries' own logs (process-wide).
+    install_log_redaction()
     sources = build_registry_sources(list(cogs.registry_sources))
     return CogIndexing(
         CogIndexer(store, sources),
@@ -1485,6 +1489,7 @@ def build_cog_registry_serving(
             "cogs.serve.public_url and web.public_base_url name different hosts: the Hub serves /v2/ on the "
             "same origin as its API, and clients accept a registry credential only for that origin."
         )
+    install_log_redaction()
     return CogRegistryServing(
         front=CogRegistryFront(
             store,

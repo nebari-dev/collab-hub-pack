@@ -26,6 +26,11 @@ challenge otherwise. The token endpoint mints a pull token for either
   gateway's ``IdToken-*`` cookie), for a client that attaches it per request
   and never stores it.
 
+A pull token is checked on every request, and so is its owner: on a
+membership-resolving deployment the owner's current membership is read again
+each time (:func:`require_admitted`), so a member removed after a token was
+minted is refused on the next request, not when the token expires.
+
 The path-protection middleware does not run on ``/v2``: its refusal is the
 Hub API's JSON envelope, and a registry client needs the challenge above to
 find the token endpoint at all. Nothing here is reachable without one of the
@@ -39,7 +44,10 @@ followed by the Hub's OCI client rather than relayed.
 **Streaming.** A blob is relayed chunk by chunk, hashed as it passes, and
 its last chunk is held until the hash and the length have been checked, so
 a blob that fails verification reaches the client short, never complete and
-wrong. The whole response is bounded by ``cogs.serve.max_blob_seconds``.
+wrong. Every request runs under one aggregate deadline, from its first
+lookup: ``cogs.serve.max_blob_seconds`` for a blob body, thirty seconds for
+everything else. The response owns the open upstream blob and closes it
+however the exchange ends.
 """
 
 from __future__ import annotations
@@ -51,6 +59,7 @@ import logging
 from collections.abc import AsyncIterator
 from datetime import UTC
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -70,6 +79,7 @@ from ..cogs.serving import (
     CogRegistryServing,
     ManifestUnknown,
     RepositoryUnknown,
+    ServedBlob,
     ServeError,
     UpstreamUnavailable,
 )
@@ -77,6 +87,7 @@ from ..frames.auth import NoOrganizationError, auth_context_from_membership, get
 from ..frames.db import postgres_error_classes
 from ..frames.identity import PINNED_IDENTITY_CLAIM
 from ..frames.org_source import org_source_resolves_membership
+from ..frames.orgs import OrgsUnavailableError
 
 logger = logging.getLogger("frames_server.cogs.registry")
 
@@ -86,6 +97,9 @@ REGISTRY_PATH_PREFIX = "/v2"
 API_VERSION_HEADERS = {"Docker-Distribution-API-Version": "registry/2.0"}
 MAX_TOKEN_SCOPES = 16
 """Repositories one pull token may name; a client asks for one, a multi-repository tool for a few."""
+MAX_SCOPE_ENTRIES = 64
+MAX_SCOPE_LENGTH = 8192
+"""How much of a token request's ``scope`` input is looked at at all: entries, and characters per parameter."""
 MAX_TAGS_PAGE = 1000
 
 
@@ -155,18 +169,54 @@ def _unavailable() -> RegistryError:
 
 
 def _storage_errors() -> tuple[type[Exception], ...]:
-    return (RegistryCredentialsUnavailableError, CogCatalogUnavailableError, *postgres_error_classes())
+    return (
+        RegistryCredentialsUnavailableError,
+        CogCatalogUnavailableError,
+        OrgsUnavailableError,
+        *postgres_error_classes(),
+    )
+
+
+def require_admitted(request: Request, user_id: str) -> None:
+    """Refuse a principal the catalog would not admit *now*.
+
+    A pull token (and the credential it came from) outlives the request that
+    proved who its owner was, so the owner's standing is read again wherever
+    one is used: on a membership-resolving deployment, the same store lookup
+    the catalog's own authentication makes, with the same outcome -- a
+    removed member, or one who never had an organization, is refused, and a
+    lookup that fails propagates (to a 503) rather than admitting anyone.
+
+    Under claims-sourced auth there is nothing server-side to re-read: the
+    organization is whatever the Hub token said when it was presented, and
+    the token and credential lifetimes are the bound.
+    """
+
+    if not org_source_resolves_membership():
+        return
+    try:
+        auth_context_from_membership({PINNED_IDENTITY_CLAIM: user_id}, request.app.state.org_store)
+    except NoOrganizationError:
+        raise _denied("this account is not part of an organization") from None
+
+
+def _find_grant(request: Request, token: str) -> TokenGrant | None:
+    grant = _serving(request).credentials.find_token(secret_digest(token))
+    if grant is not None:
+        require_admitted(request, grant.user_id)
+    return grant
 
 
 async def _grant(request: Request, repository: str | None) -> TokenGrant:
-    """The live pull token this request presents, allowed on ``repository`` when one is named."""
+    """The live pull token this request presents, whose owner is still admitted, allowed on ``repository``."""
 
     serving = _serving(request)
     scheme, _, token = request.headers.get("Authorization", "").partition(" ")
     token = token.strip()
     if scheme.lower() != "bearer" or not token:
         raise _unauthorized(serving, repository)
-    grant = await run_in_threadpool(serving.credentials.find_token, secret_digest(token))
+    # One threadpool hop: the token lookup and the admission lookup both block.
+    grant = await run_in_threadpool(_find_grant, request, token)
     if grant is None:
         raise _unauthorized(serving, repository)
     if repository is not None and not grant.allows_pull(repository):
@@ -187,16 +237,20 @@ def requested_repositories(scopes: list[str]) -> list[str]:
     narrows a request -- the client finds out when it uses the token.
     """
 
-    names: list[str] = []
-    for scope in scopes:
-        for entry in scope.split():
+    names: dict[str, None] = {}
+    examined = 0
+    for scope in scopes[:MAX_SCOPE_ENTRIES]:
+        for entry in scope[:MAX_SCOPE_LENGTH].split():
+            examined += 1
+            if examined > MAX_SCOPE_ENTRIES or len(names) >= MAX_TOKEN_SCOPES:
+                return list(names)
             kind, _, rest = entry.partition(":")
             name, _, actions = rest.rpartition(":")
             if kind != "repository" or "pull" not in actions.split(","):
                 continue
-            if is_repository_path(name) and name not in names:
-                names.append(name)
-    return names[:MAX_TOKEN_SCOPES]
+            if is_repository_path(name):
+                names.setdefault(name)
+    return list(names)
 
 
 def _basic_credential(header: str) -> tuple[str, str] | None:
@@ -245,15 +299,9 @@ def _credential_principal(request: Request, username: str, password: str) -> tup
     credential = serving.credentials.find_credential(username, secret_digest(password)) if username else None
     if credential is None:
         raise _token_refused(serving)
-    if org_source_resolves_membership():
-        # The credential outlives the request it was exchanged on, so the one
-        # fact the Hub can re-check cheaply is re-checked at every mint: a
-        # member removed from their organization stops pulling here, as they
-        # stop everywhere else, on the next request.
-        try:
-            auth_context_from_membership({PINNED_IDENTITY_CLAIM: credential.user_id}, request.app.state.org_store)
-        except NoOrganizationError:
-            raise _denied("this account is not part of an organization") from None
+    # The credential outlives the request it was exchanged on; its owner's
+    # standing is read again at every mint, as it is at every read.
+    require_admitted(request, credential.user_id)
     return credential.user_id, credential.id
 
 
@@ -323,16 +371,25 @@ def parse_registry_path(rest: str) -> tuple[str, str, str] | None:
     return kind, rest[:index], rest[index + len(kind) + 2 :]
 
 
-class _BoundedStreamingResponse(StreamingResponse):
-    """A streaming response with a wall-clock deadline on the whole exchange.
+class _BlobResponse(StreamingResponse):
+    """A blob relayed under a wall-clock deadline, by a response that owns the open blob.
 
     The deadline covers time spent waiting on the *client* as well as on the
-    registry: a reader that stops reading would otherwise hold a registry
+    source: a reader that stops reading would otherwise hold a registry
     connection open for as long as it liked.
+
+    Ownership is the other half. However the response ends -- completed,
+    past its deadline while blocked in ``send``, the client gone, a failure
+    before the first chunk -- the upstream response is closed here, in a
+    ``finally`` shielded from the cancellation that may be what ended it.
+    The chunk generators cannot be relied on for that: one suspended at a
+    ``yield`` is only cleaned up when something closes it, and one that
+    never started has no cleanup to run.
     """
 
-    def __init__(self, *args, deadline: float, what: str, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, blob: ServedBlob, *, deadline: float, what: str, headers: dict[str, str]) -> None:
+        super().__init__(_relay(blob, what), headers=headers)
+        self._blob = blob
         self._deadline = deadline
         self._what = what
 
@@ -343,11 +400,14 @@ class _BoundedStreamingResponse(StreamingResponse):
         except TimeoutError:
             logger.warning("cog_serve_blob_timed_out", extra={"blob": self._what})
             raise BlobStreamAborted(f"{self._what}: exceeded the registry's time limit") from None
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._blob.aclose()
 
 
-async def _relay(chunks: AsyncIterator[bytes], what: str) -> AsyncIterator[bytes]:
+async def _relay(blob: ServedBlob, what: str) -> AsyncIterator[bytes]:
     try:
-        async for chunk in chunks:
+        async for chunk in blob.chunks:
             yield chunk
     except OCIError as exc:
         # After the headers: the only honest signal left is a short body. The
@@ -364,43 +424,49 @@ def _digest_headers(digest: str) -> dict[str, str]:
 async def _serve(request: Request, rest: str) -> Response:
     serving = _serving(request)
     head = request.method == "HEAD"
+    now = asyncio.get_running_loop().time()
     parsed = parse_registry_path(rest)
-    if parsed is None:
-        await _grant(request, None)
-        raise RegistryError(status.HTTP_404_NOT_FOUND, "NAME_UNKNOWN", "repository name not known to registry")
-    kind, name, reference = parsed
-    await _grant(request, name)
-
-    if kind == "tags":
-        return _tags_response(request, name, await serving.front.tags(name))
-
-    if kind == "manifests":
-        manifest = await serving.front.manifest(name, reference)
-        headers = {
-            **_digest_headers(manifest.digest),
-            "Content-Type": manifest.media_type,
-            "Content-Length": str(len(manifest.body)),
-        }
-        return Response(b"" if head else manifest.body, headers=headers)
-
-    headers = {**_digest_headers(reference), "Content-Type": "application/octet-stream"}
-    if head:
-        size = await serving.front.blob_size(name, reference)
-        return Response(b"", headers={**headers, "Content-Length": str(size)})
-    # One deadline for the whole exchange: opening the blob at the source,
-    # then relaying it to a client that may or may not keep reading.
-    deadline = asyncio.get_running_loop().time() + serving.max_blob_seconds
+    kind = parsed[0] if parsed is not None else None
+    streaming = kind == "blobs" and not head
+    # One aggregate deadline per request, set before the first lookup: the
+    # token, the catalog, the source, and (for a blob body) the relay to the
+    # client all spend from it.
+    deadline = now + (serving.max_blob_seconds if streaming else serving.max_metadata_seconds)
+    blob: ServedBlob | None = None
     try:
         async with asyncio.timeout_at(deadline):
+            if parsed is None:
+                await _grant(request, None)
+                raise RegistryError(status.HTTP_404_NOT_FOUND, "NAME_UNKNOWN", "repository name not known to registry")
+            _kind, name, reference = parsed
+            await _grant(request, name)
+
+            if kind == "tags":
+                return _tags_response(request, name, await serving.front.tags(name))
+
+            if kind == "manifests":
+                manifest = await serving.front.manifest(name, reference)
+                headers = {
+                    **_digest_headers(manifest.digest),
+                    "Content-Type": manifest.media_type,
+                    "Content-Length": str(len(manifest.body)),
+                }
+                return Response(b"" if head else manifest.body, headers=headers)
+
+            headers = {**_digest_headers(reference), "Content-Type": "application/octet-stream"}
+            if head:
+                size = await serving.front.blob_size(name, reference)
+                return Response(b"", headers={**headers, "Content-Length": str(size)})
             blob = await serving.front.blob(name, reference)
     except TimeoutError:
+        if blob is not None:
+            await blob.aclose()
         raise _unavailable() from None
-    what = f"{name}@{reference}"
-    return _BoundedStreamingResponse(
-        _relay(blob.chunks, what),
-        headers={**headers, "Content-Length": str(blob.size)},
+    return _BlobResponse(
+        blob,
         deadline=deadline,
-        what=what,
+        what=f"{name}@{reference}",
+        headers={**headers, "Content-Length": str(blob.size)},
     )
 
 
@@ -461,8 +527,9 @@ async def read(request: Request, rest: str) -> Response:
     return await _answer(request, rest)
 
 
+@router.api_route(REGISTRY_PATH_PREFIX, methods=["POST", "PUT", "PATCH", "DELETE"])
 @router.api_route(REGISTRY_PATH_PREFIX + "/{rest:path}", methods=["POST", "PUT", "PATCH", "DELETE"])
-async def write(_request: Request, rest: str) -> Response:
+async def write(_request: Request, rest: str = "") -> Response:
     """Pushes and deletes are not served: this surface is read-only."""
 
     return error_response(

@@ -429,7 +429,7 @@ def test_serving_is_off_by_default_with_documented_limits():
     ("public_url", "host"),
     [
         ("https://hub.example.com", "hub.example.com"),
-        ("  https://hub.example.com/  ", "hub.example.com"),
+        ("  https://hub.example.com  ", "hub.example.com"),
         ("https://hub.example.com:8443", "hub.example.com:8443"),
         ("http://localhost:8000", "localhost:8000"),
         ("https://[::1]:5000", "[::1]:5000"),
@@ -445,7 +445,7 @@ def test_the_registry_host_is_the_public_urls_host_and_port(public_url, host):
     serve = parse_cogs(registry_sources=[static_source()], serve={"enabled": True, "public_url": public_url}).cogs.serve
 
     assert serve.host == host
-    assert serve.public_url == public_url.strip().rstrip("/")
+    assert serve.public_url == public_url.strip()
 
 
 @pytest.mark.parametrize(
@@ -455,6 +455,7 @@ def test_the_registry_host_is_the_public_urls_host_and_port(public_url, host):
         ("https://", "must be an http\\(s\\) origin with a host"),
         ("https://hub.example.com:99999", "has an invalid port"),
         ("https://hub.example.com/v2", "must be a bare origin"),
+        ("https://hub.example.com/", "must be a bare origin"),
         ("https://hub.example.com?x=1", "must be a bare origin"),
         ("https://hub.example.com/#", "must be a bare origin"),
         ("https://user:secret-pw@hub.example.com", "must not embed a username or password"),
@@ -464,6 +465,17 @@ def test_a_public_url_that_is_not_a_bare_origin_is_refused(public_url, message):
     with pytest.raises(ValidationError, match=message) as caught:
         parse_cogs(registry_sources=[static_source()], serve={"enabled": True, "public_url": public_url})
     assert "secret-pw" not in str(caught.value)
+
+
+def test_blob_redirect_hosts_are_hostnames_or_dot_suffixes():
+    source = static_source(blob_redirect_hosts=[" storage.example.com ", ".s3.amazonaws.com", "10.0.0.7"])
+    parsed = parse_cogs(registry_sources=[source]).cogs.registry_sources[0]
+    assert parsed.blob_redirect_hosts == ["storage.example.com", ".s3.amazonaws.com", "10.0.0.7"]
+    assert parse_cogs(registry_sources=[static_source()]).cogs.registry_sources[0].blob_redirect_hosts == []
+    bad_entries = ("https://storage.example.com", "storage.example.com:9000", "Storage.Example.com", "a/b", "", ".")
+    for bad in (*bad_entries, "*.x"):
+        with pytest.raises(ValidationError, match="blob_redirect_hosts entry"):
+            parse_cogs(registry_sources=[static_source(blob_redirect_hosts=[bad])])
 
 
 def test_serving_needs_a_source_and_a_public_url_only_when_enabled():
