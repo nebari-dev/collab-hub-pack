@@ -27,6 +27,7 @@ import sys
 import threading
 from pathlib import Path
 
+from . import intents
 from .intents import cancel_request
 from .locations import AGENT_LOCATIONS
 from .runner import LifecycleRunner
@@ -45,6 +46,7 @@ class RunController:
         self._ended: set[str] = set()
         self._advancing: dict[str, threading.Thread] = {}
         self._cancelling: dict[str, threading.Thread] = {}
+        self._turning: dict[str, threading.Thread] = {}
 
     def start(self) -> tuple[str, ...]:
         """What a controller does first: record every run a stopped one left unfinished as interrupted."""
@@ -73,6 +75,9 @@ class RunController:
             elif run.state is RunState.SUBMITTED and not self._alive(self._advancing, run_id):
                 op = self.runner._submitted_definition(run_id, events)
                 self._spawn(self._advancing, run_id, self._advance, op)
+            if (any(view.state == "pending" for view in intents.turns(events).values())
+                    and not self._alive(self._turning, run_id)):
+                self._spawn(self._turning, run_id, self._deliver_turns, run_id)
 
     @staticmethod
     def _alive(threads: dict[str, threading.Thread], run_id: str) -> bool:
@@ -103,6 +108,31 @@ class RunController:
             return
         _log.info("cancel of %s by %s delivered", run_id, actor)
 
+    def _deliver_turns(self, run_id: str) -> None:
+        """Hand the run's waiting turns to its live worker, one at a time and in order.
+
+        A turn asked before the worker is up waits for it: the next pass delivers it.
+        """
+        track = self.runner.track
+        while True:
+            waiting = [view for view in intents.turns(track.replay(run_id)).values() if view.state == "pending"]
+            if not waiting:
+                return
+            worker = self.runner.live_worker(run_id)
+            if worker is None:
+                return
+            view = waiting[0]
+            if not hasattr(worker, "turn"):
+                intents.answer_turn(track, run_id, view.turn, error="this Cog's worker takes no turns")
+                continue
+            try:
+                answer = worker.turn(view.turn, view.text)
+            except Exception as exc:  # noqa: BLE001 - recorded on the Track as the turn's failure
+                intents.answer_turn(track, run_id, view.turn, error=f"{type(exc).__name__}: {exc}"[:1024])
+                continue
+            intents.answer_turn(track, run_id, view.turn, text=answer)
+            _log.info("turn %s of %s answered", view.turn, run_id)
+
     def run(self, stop: threading.Event) -> None:
         """Watch the Track until ``stop`` is set."""
         while not stop.is_set():
@@ -114,7 +144,8 @@ class RunController:
 
     def idle(self) -> bool:
         """Whether nothing is being advanced or cancelled right now."""
-        return not any(thread.is_alive() for thread in (*self._advancing.values(), *self._cancelling.values()))
+        threads = (*self._advancing.values(), *self._cancelling.values(), *self._turning.values())
+        return not any(thread.is_alive() for thread in threads)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", default="none")
     parser.add_argument("--location", default="local", choices=AGENT_LOCATIONS)
     parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument("--interaction-timeout", type=float, default=60.0, metavar="SECONDS",
+                        help="how long one interaction with a worker may take; 0 for no limit, which a Cog "
+                             "holding a session for as long as someone talks to it needs")
     parser.add_argument("--environment", default="pixi", choices=("pixi", "host"),
                         help="how a package's serve task is run: in its own pixi environment, or directly")
     args = parser.parse_args(argv)
@@ -148,7 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = LifecycleRunner(
         track=SqliteTrackStore(track_path), backend=args.backend, location=args.location,
         location_settings={"packages": args.packages, "allow": args.allow, "work_dir": args.work_dir,
-                           "environment": args.environment})
+                           "environment": args.environment,
+                           "interaction_timeout": args.interaction_timeout or None})
     controller = RunController(runner, poll_interval=args.poll_interval)
     controller.start()
 

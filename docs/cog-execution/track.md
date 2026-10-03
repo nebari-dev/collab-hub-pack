@@ -47,7 +47,10 @@ when a client submitted the run through the run API, which is what scopes the
 run to its organization. `cancel_requested` (`actor`) is what the API records
 when a client asks for a run to be cancelled: it leaves the run's state where
 it is, and the controller that reads it ends the run, which `cancelled`
-records. It is written with the store's conditional append (`append_if`), which
+records. `turn_requested` (`turn`, `text`, `actor`) is a client's turn for a Cog that
+holds a session; the controller records `turn_answered` (`turn`, `text`) or
+`turn_failed` (`turn`, `error`) once the worker answered or could not. None of
+the three moves the run. A cancel request is written with the store's conditional append (`append_if`), which
 checks the run's Track and appends in one step: the request is recorded only
 if the run has not ended and holds no request yet, so none is ever written
 after a run's end and two racing requests leave one. A request belongs to the

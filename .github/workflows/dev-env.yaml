@@ -184,16 +184,6 @@ jobs:
           grep -q "^interrupted $run:" /tmp/op-after-kill.log \
             || { echo "the killed host's run was not recorded interrupted"; exit 1; }
 
-      # The whole path a user takes, across three processes: the CLI launches a Cog through
-      # /v1/runs, the API records it, the run controller starts its worker as a local process,
-      # and the CLI lists the run and terminates another. The script checks each step itself.
-      - name: examples/cog-local launches, lists and terminates a Cog from the CLI
-        run: API_PORT=8017 examples/cog-local/demo.sh
-
-      - name: Example logs on failure
-        if: failure()
-        run: tail -40 dev/.local/example-api.log dev/.local/example-controller.log || true
-
       - name: make clean removes the scratch state
         run: |
           make -C dev clean
@@ -322,6 +312,21 @@ jobs:
           # And with a token instead of a browser, as a script would.
           make -s -C dev token | $CLI --hub http://127.0.0.1:8000 login --with-token
           $CLI whoami --json | python3 -c 'import json, sys; assert json.load(sys.stdin)["email"] == "dev@example.com"'
+
+      # A Cog's whole life, the way examples/cog-local/README.md walks through it: the CLI signs
+      # in to this realm, launches a Cog the run controller starts as a local process, lists it,
+      # talks to it over ACP and from the CLI, and terminates it. `make demo` checks each step.
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: examples/cog-local -- sign in, launch, list, talk over ACP, stop
+        run: make -C examples/cog-local demo PORT=8017
+
+      - name: Example logs on failure
+        if: failure()
+        run: tail -40 examples/cog-local/.local/api.log examples/cog-local/.local/controller.log || true
 
       - name: Logs on failure
         if: failure()

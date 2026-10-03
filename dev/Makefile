@@ -267,15 +267,17 @@ op: ## Run a fake Op and print its Track (OP=echo|needs-review|fails|slow|spende
 	cd $(ROOT)/execution && LOCATION=$(LOCATION) uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
 		--backend $(BACKEND) --track $(LOCAL)/track.sqlite
 
-# The process that advances the runs `make api` accepts: it watches the same
-# SQLite Track, starts each submitted run's worker as a local process (the Cog
-# package's `serve` task in its own pixi environment), and delivers cancels.
+# The process that advances the runs `make api` (or `make api-oidc`) accepts: it
+# watches the same SQLite Track, starts each submitted run's worker as a local
+# process (the Cog package's `serve` task in its own pixi environment), and
+# delivers cancels and turns. No limit on how long an interaction takes: a Cog
+# holding a session stays in one for as long as someone talks to it.
 controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cogs launched through /v1/runs as local processes
 	@command -v pixi >/dev/null || { \
 		echo "the controller runs each Cog in its own pixi environment: install pixi (https://pixi.sh)"; exit 1; }
 	cd $(ROOT)/execution && uv run --quiet python -m collab_hub_execution.controller \
 		--track $(LOCAL)/track.sqlite $(foreach dir,$(subst :, ,$(COGS)),--packages $(dir)) \
-		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local
+		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local --interaction-timeout 0
 
 # ---------------------------------------------------------------------------
 ## Level 2 — API with real datastores
@@ -289,7 +291,7 @@ api-pg: services | $(LOCAL)/frames ## Starts Postgres+S3, then the API: history,
 # ---------------------------------------------------------------------------
 
 api-oidc: services keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
-	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) uv run python -m collab_hub_api
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(RUNS_ENV) uv run --group runs python -m collab_hub_api
 
 # Connector routes exchange the CALLER's bearer with the broker, so the
 # dev-auth shortcut cannot reach them -- it authenticates a subject without

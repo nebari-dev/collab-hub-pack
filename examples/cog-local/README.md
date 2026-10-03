@@ -1,123 +1,177 @@
-# Launch a Cog from the CLI, on your own machine
+# A Cog's whole life, on your machine
 
-The shortest path from nothing to a Cog running: the hub's API and its run controller as two plain processes, a Cog that is one short Python file, and the `collab-hub` CLI to launch it, list it and stop it. No container, no cluster, no sign-in.
+Start a hub, sign in, launch a Cog, see it running, talk to it from [Toad](https://github.com/batrachianai/toad), and stop it. Everything runs on your machine: the hub's API and its run controller are two processes, the sign-in is a real one against a local Keycloak, and the Cog is a process of its own.
 
-```text
-collab-hub cog launch hello ──POST /v1/runs──▶ API ──writes──▶ Track ◀──watches── run controller
-                                                                                       │ starts
-collab-hub run list / show  ──GET /v1/runs───▶ API ──reads───▶ Track ◀──records── hello worker
-```
-
-The API only records what you asked for and reads back what happened. The controller, a separate process, is the one that starts the Cog's worker. They share a file, the Track, and never call each other.
+Each step is one `make` target in this directory. Run `make help` to list them.
 
 ## What you need
 
-- [uv](https://docs.astral.sh/uv/), which runs the API, the controller and the CLI.
-- [pixi](https://pixi.sh), which gives the Cog its own environment.
+- [Docker](https://docs.docker.com/get-docker/), for Postgres and Keycloak.
+- [uv](https://docs.astral.sh/uv/getting-started/installation/), for the Python environments.
 
-## Run it in one go
-
-From the repository root:
+Then, once, from this directory:
 
 ```sh
-examples/cog-local/demo.sh
+make env      # the CLI, the hub's Python, Toad, pixi, and the Cog's own environment
+make tools    # checks each one is there
 ```
 
-It starts the API and the controller, launches `hello` twice through the CLI (once to completion, once to terminate it mid-run), checks each result, and stops both processes. The first run takes a little longer while pixi installs the Cog's Python. Set `API_PORT=8010` if port 8000 is taken.
+`make env` installs [pixi](https://pixi.sh) if it is missing (it gives each Cog its own environment) and [Toad](https://github.com/batrachianai/toad) with `uv tool install`. Open a new shell afterwards if either was new.
 
-## Run it by hand
-
-Three terminals, all from the repository root.
-
-**1. The hub's API**, at dev level 1: dev auth, no database, and the run API switched on.
+## 1. Start the hub
 
 ```sh
-make -C dev api
+make hub           # Postgres and Keycloak, in containers
+make credentials   # who to sign in as: user dev, password dev
 ```
 
-**2. The run controller**, which advances what the API accepts.
+Keycloak comes with a realm, `nebari`, and its users. `make credentials` shows the one this example signs in as and checks the realm issues a token for it.
+
+Now the hub itself. It is two processes, so use two terminals:
 
 ```sh
-make -C dev controller
+make api           # terminal 1: the hub's API, on http://127.0.0.1:8000
+make controller    # terminal 2: the run controller
 ```
 
-**3. The CLI.** Point it at the hub once; with dev auth there is nothing to sign in to.
+Or run both in the background with `make start` (logs in `.local/`, stopped with `make shutdown`). The API accepts what you ask for and records it. The controller is the one that starts Cogs. They share a record of every run, the Track, and never call each other.
+
+## 2. Sign in with the CLI
 
 ```sh
-cd cli
-uv run collab-hub --hub http://localhost:8000 login
-uv run collab-hub whoami
-```
-
-Launch the Cog and follow the run to its end:
-
-```sh
-uv run collab-hub cog launch hello --input '{"name": "Ada"}' --watch
+make login         # opens Keycloak in your browser: sign in as dev / dev
+make whoami
 ```
 
 ```text
-Launched hello as run-3eb7ab0eaf43 on the none backend, workers local.
-run-3eb7ab0eaf43: COMPLETED
-run        run-3eb7ab0eaf43
-status     COMPLETED
-runs on    backend none, workers local
-submitted  2026-10-02T16:46:15.475555+00:00 by dev-user
-
-STEP   COG    ENTRY  STATE      ERROR
-hello  hello  run    completed
-
-hello answered:
-{
-  "greeting": "Hello, Ada!",
-  "pid": 1104975,
-  "run": "run-3eb7ab0eaf43"
-}
+user          3b8ec34f-eaa3-4056-897e-c2179651bc69
+name          Dev User <dev@example.com>
+organization  dev-org
+signed in     yes, token expires 2026-10-03T07:11:02Z
 ```
 
-The `pid` is the worker's: a real process the controller started for this run and stopped when the step ended.
+No browser on this machine? `make login-token` signs in with a token the realm issues for the same user.
 
-Launch one that takes two minutes, see it running, and terminate it:
+The example keeps its sign-in in `.local/cli`, so it does not touch your own `collab-hub` profile.
+
+## 3. Launch the Cog
 
 ```sh
-uv run collab-hub cog launch hello --input '{"name": "Ada", "seconds": 120}'
-uv run collab-hub run list
-uv run collab-hub run terminate run-2fd83720b1d8     # the id `cog launch` printed
-uv run collab-hub run list
+make cogs          # the Cogs this hub can launch: hello among them
+make launch        # collab-hub cog launch hello --entry session
 ```
 
 ```text
-RUN               COG    STATUS     AGE  BY
-run-2fd83720b1d8  hello  CANCELLED  1s   dev-user
-run-3eb7ab0eaf43  hello  COMPLETED  2s   dev-user
+Launched hello as run-c42c387d6e23 on the none backend, workers local.
 ```
 
-`run show ID` prints one run again, and every command takes `--json`.
+The controller starts `hello` as a process, in its own environment, and opens a session with it. The run's id is kept in `.local/run` for the next steps; pass `RUN=...` to act on another run.
 
-## What is in this directory
+## 4. See it running
 
-| Path | What it is |
+```sh
+make list          # collab-hub run list
+```
+
+```text
+RUN               COG    STATUS   AGE  BY
+run-c42c387d6e23  hello  RUNNING  0s   Dev User
+```
+
+## 5. Talk to it from Toad
+
+```sh
+make connect       # toad acp "collab-hub run connect RUN"
+```
+
+Toad opens with the Cog as its agent. Try a few commands:
+
+| Say | `hello` answers |
 |---|---|
-| `cogs/hello/serve.py` | The Cog's worker: `GET /healthz` and `POST /invoke`, standard library only |
-| `cogs/hello/pixi.toml` | The package: its `serve` task is the command the controller starts a worker with |
-| `cogs/hello/pixi.lock` | The environment that task runs in, pinned |
-| `demo.sh` | The walk-through above as one script that checks itself; CI runs it |
+| `help` | what it can do |
+| `hello Ada` | `Hello, Ada!` |
+| `sum 1 2 3` | `1 + 2 + 3 = 6` |
+| `whoami` | the run and the process you are talking to |
+| `history` | what you said so far |
 
-`make -C dev api` and `make -C dev controller` both look for Cog packages in `dev/cogs` and in `examples/cog-local/cogs`, so `hello` can be launched by name. A name that is in neither is refused, with the names that can be launched.
+Toad speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP). `collab-hub run connect` is the agent it starts: it turns each prompt into one turn of the run, sent to the hub, delivered to the Cog by the controller, and read back. Toad never reaches the Cog directly, and every turn and its answer are recorded with the run. Leave Toad with `ctrl+q`; the Cog keeps running.
 
-## Write your own
+The same from the CLI, one turn at a time:
 
-Copy `cogs/hello` to `cogs/<name>`, change `run()` in `serve.py`, and launch it with `collab-hub cog launch <name>`. Three things make a directory a Cog package here:
+```sh
+make say TEXT="sum 1 2 3"    # collab-hub run say RUN sum 1 2 3
+```
 
-- a `pixi.toml` with a `serve` task, and its `pixi.lock` (`pixi lock` writes it);
-- a worker that listens on `COLLAB_COG_HOST`:`COLLAB_COG_PORT` and answers `GET /healthz` with 200;
-- `POST /invoke`, which checks the bearer token against `COLLAB_RUN_TOKEN` and answers with a result envelope (`docs/cog-execution/result-envelope.md`).
+## 6. Stop the Cog
 
-A worker's output is under `dev/.local/runs/`, in the directory its run's `worker_started` event names.
+```sh
+make stop          # collab-hub run terminate RUN
+make list
+```
+
+```text
+run-c42c387d6e23 ended CANCELLED.
+RUN               COG    STATUS     AGE  BY
+run-c42c387d6e23  hello  CANCELLED  2s   Dev User
+```
+
+The controller stops the Cog's process, and the run takes no more turns. Saying `bye` to the Cog ends its session too, and the run then ends `COMPLETED` instead.
+
+## 7. Shut down
+
+```sh
+make shutdown      # the API and the controller, if `make start` started them
+make down          # the containers; their data is kept
+make clean         # this example's sign-in, run id and logs
+```
+
+## All of it, in one command
+
+```sh
+make demo
+```
+
+Every step above in order, with `login-token` for the sign-in and a scripted ACP client, `acp_check.py`, where Toad would be. It checks each answer and fails on the first one that is wrong. CI runs it.
+
+## How it fits together
+
+```text
+make login     ──▶ Keycloak (dev / dev) ──token──▶ collab-hub
+make launch    ──▶ POST /v1/runs ──────▶ API ──writes──▶ Track ◀──watches── controller ──starts──▶ hello
+make connect   ──▶ Toad ──ACP──▶ collab-hub run connect ──POST /v1/runs/{id}/turns──▶ API ──▶ Track
+                                                         controller ──POST /turn──▶ hello ──answer──▶ Track
+make stop      ──▶ POST /v1/runs/{id}/cancel ──▶ API ──▶ Track ──▶ controller stops hello
+```
+
+The Cog is the directory [`cogs/hello`](cogs/hello):
+
+| File | What it is |
+|---|---|
+| `serve.py` | The worker: `GET /healthz`, `POST /invoke` for its two entry points, and `POST /turn` while a session is open. Standard library only |
+| `pixi.toml` | The package: its `serve` task is the command the controller starts the worker with |
+| `pixi.lock` | The environment that task runs in, pinned |
+
+`hello` has two entry points. `session`, launched above, stays open and answers turns until it is told `bye` or its run is terminated. `run` answers once: `collab-hub cog launch hello --input '{"name": "Ada"}' --watch`.
+
+To write your own, copy `cogs/hello` to `cogs/<name>`, change `Session.answer` in `serve.py`, run `pixi lock` in it, and `collab-hub cog launch <name> --entry session`. The controller finds Cogs here and in `dev/cogs`.
+
+## When something is off
+
+| What you see | Why | What to do |
+|---|---|---|
+| `make api` stops with Postgres or Keycloak errors | The containers are not up | `make hub` |
+| `make login` says the hub runs dev auth | Another API, `make -C ../../dev api`, holds the port | Stop it, or `make ... PORT=8010` on every step |
+| The run stays `SUBMITTED` | No controller is running | `make controller`, or `make start` |
+| `make connect` or `make say` says the run takes no turns | The run has ended | `make launch` again |
+| `toad: command not found` | Toad was installed into `~/.local/bin` | Add it to `PATH`, or open a new shell |
+| The first launch takes a while | pixi is installing the Cog's Python | `make env` installs it ahead of time |
+
+The Cog's own output is under `../../dev/.local/runs/`, and the API's and the controller's in `.local/` when `make start` started them.
 
 ## What this does not show yet
 
-- **A restart.** The controller runs on the `none` backend, which keeps nothing: stop it mid-run and the run is recorded `INTERRUPTED` when a controller next starts.
-- **Gates.** A step whose Gate escalates waits at it, and deciding one from the CLI comes later; `--gate never` avoids it.
-- **A deployed hub.** The run API is behind the `cog_runs` feature flag, off by default, and a worker here is a process on the controller's host. A cluster runs workers as pods, which is a later phase of [`COG_EXECUTION.md`](../../COG_EXECUTION.md).
+- **A restart.** The controller runs on the `none` backend, which keeps nothing: stop it while the Cog runs and the run is recorded `INTERRUPTED` when a controller starts again.
+- **A deployed hub.** The run API is behind the `cog_runs` feature flag, off by default, and a Cog here is a process on the controller's machine. On a cluster a Cog runs as a pod, a later phase of [`COG_EXECUTION.md`](../../COG_EXECUTION.md).
+- **A model.** `hello` answers by itself. The Hermes harness Cog, which answers with a model, is a later phase of the plan, and runs the same way.
 
-More: [`docs/cog-execution/runs.md`](../../docs/cog-execution/runs.md) for the run API and the controller, [`cli/README.md`](../../cli/README.md) for the CLI, [`dev/README.md`](../../dev/README.md) for the dev environment.
+More: [`docs/cog-execution/runs.md`](../../docs/cog-execution/runs.md) for the run API and the controller, [`cli/README.md`](../../cli/README.md) for every CLI command.

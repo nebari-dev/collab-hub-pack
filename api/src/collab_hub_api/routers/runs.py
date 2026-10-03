@@ -14,6 +14,11 @@ API constructs no executor and never calls the controller.
 - ``POST /v1/runs/{id}/cancel`` -- record a request to cancel; the controller
   tears the worker down and the run ends ``CANCELLED``. A run that has ended
   answers 409, naming its status.
+- ``POST /v1/runs/{id}/turns``, ``GET /v1/runs/{id}/turns/{turn}`` -- talk to a
+  Cog whose step holds a session: the API records the turn, the controller
+  delivers it to the run's live worker and records the answer, which the client
+  reads back. Every turn and its answer are on the Track.
+- ``GET /v1/runs/launchable`` -- the Cog packages a step may name.
 
 Runs are scoped to the organization that submitted them: another
 organization's run is a 404, never a 403. Events, payloads, decisions and
@@ -151,6 +156,9 @@ class RunStatus(BaseModel):
     ended: bool
     steps: list[StepStatus]
     submitted_by: str | None
+    submitted_by_name: str | None = None
+    """Who submitted the run, for showing: their name or address when the sign-in carried one. Never
+    compared with anything; ``submitted_by`` is the principal."""
     submitted_at: str
     updated_at: str
     cancel_requested_by: str | None = None
@@ -160,6 +168,27 @@ class RunStatus(BaseModel):
     """The durability backend the run is advanced on. ``none`` keeps nothing across a controller restart."""
     location: str
     """Where the run's workers are. A ``local`` worker shares the controller's host."""
+
+
+class TurnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=intents.MAX_TURN_TEXT)
+
+
+class TurnStatus(BaseModel):
+    turn: str
+    text: str
+    state: Literal["pending", "answered", "failed"]
+    """``pending`` until the run's worker answers."""
+    answer: str | None = None
+    error: str | None = None
+    asked_by: str | None = None
+
+
+class Launchable(BaseModel):
+    items: list[str]
+    """The Cog packages a step's ``cog`` may name."""
 
 
 class RunPage(BaseModel):
@@ -175,7 +204,7 @@ def _status(view: intents.RunView, service: RunService, *, outputs: bool = False
                           attempt=step.attempt, error=step.error,
                           output=step.output if outputs else None, output_ref=step.output_ref if outputs else None)
                for step in view.steps],
-        submitted_by=view.submitted_by.get("user"),
+        submitted_by=view.submitted_by.get("user"), submitted_by_name=view.submitted_by.get("name"),
         submitted_at=view.submitted_at.isoformat(), updated_at=view.updated_at.isoformat(),
         cancel_requested_by=view.cancel_requested_by, error=view.error, reason=view.reason,
         backend=service.backend, location=service.location,
@@ -213,8 +242,11 @@ def submit_run(body: RunRequest, auth: AuthDep, service: ServiceDep) -> RunStatu
         OpStep(name=step.name, cog=step.cog, entry_point=step.entry_point, input=step.input,
                gate=Gate(escalate=step.gate.escalate, approvers=tuple(step.gate.approvers)))
         for step in body.steps))
-    intents.submit(service.track, op, by={"user": auth.user, "org_id": auth.org_id,
-                                          "workspace_id": auth.workspace_id})
+    # `user` is the principal the run is scoped and checked by; `name` is only for showing who it was.
+    by = {"user": auth.user, "org_id": auth.org_id, "workspace_id": auth.workspace_id}
+    if auth.display.name or auth.display.email:
+        by["name"] = auth.display.name or auth.display.email
+    intents.submit(service.track, op, by=by)
     return _status(intents.describe(service.track, run_id), service)
 
 
@@ -233,6 +265,11 @@ def list_runs(
                    next_offset=offset + limit if offset + limit < len(views) else None)
 
 
+@router.get("/launchable", response_model=Launchable)
+def launchable(auth: AuthDep, service: ServiceDep) -> Launchable:
+    return Launchable(items=list(service.launchable()))
+
+
 @router.get("/{run_id}", response_model=RunStatus)
 def get_run(run_id: RunId, auth: AuthDep, service: ServiceDep) -> RunStatus | JSONResponse:
     view = _visible(service, run_id, auth)
@@ -249,3 +286,30 @@ def cancel_run(run_id: RunId, auth: AuthDep, service: ServiceDep) -> RunStatus |
         return error_response(status.HTTP_409_CONFLICT, "run_ended",
                               f"Run {run_id} cannot be cancelled: {exc.reason}")
     return _status(view, service)
+
+
+def _turn(view: intents.TurnView) -> TurnStatus:
+    return TurnStatus(turn=view.turn, text=view.text, state=view.state, answer=view.answer, error=view.error,
+                      asked_by=view.actor)
+
+
+@router.post("/{run_id}/turns", status_code=status.HTTP_202_ACCEPTED, response_model=TurnStatus)
+def ask_turn(run_id: RunId, body: TurnRequest, auth: AuthDep, service: ServiceDep) -> TurnStatus | JSONResponse:
+    if _visible(service, run_id, auth) is None:
+        return _not_found(run_id)
+    try:
+        view = intents.request_turn(service.track, run_id, text=body.text, actor=auth.user)
+    except intents.RunEnded as exc:
+        return error_response(status.HTTP_409_CONFLICT, "run_ended", f"Run {run_id} takes no turns: {exc.reason}")
+    return _turn(view)
+
+
+@router.get("/{run_id}/turns/{turn}", response_model=TurnStatus)
+def get_turn(run_id: RunId, turn: Annotated[str, Path(pattern=r"^[0-9a-f]{12}$")], auth: AuthDep,
+             service: ServiceDep) -> TurnStatus | JSONResponse:
+    if _visible(service, run_id, auth) is None:
+        return _not_found(run_id)
+    view = intents.turns(service.track.replay(run_id)).get(turn)
+    if view is None:
+        return error_response(status.HTTP_404_NOT_FOUND, "turn_not_found", f"No turn {turn} in run {run_id}")
+    return _turn(view)

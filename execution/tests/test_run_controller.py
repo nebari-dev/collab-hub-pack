@@ -7,10 +7,13 @@ what was submitted and delivers what was asked. Neither calls the other.
 
 from __future__ import annotations
 
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from locations_support import gone, packages
@@ -276,3 +279,103 @@ def test_the_controller_process_runs_a_submitted_package_and_holds_its_track(tmp
         controller.wait(timeout=30)
     assert controller.returncode == 0
     assert gone(worker)
+
+
+# --- turns: talking to a session Cog while its step runs -----------------------------------------
+
+EXAMPLE_COGS = Path(__file__).resolve().parents[2] / "examples" / "cog-local" / "cogs"
+
+
+def _local_controller(tmp_path, track):
+    """A controller whose workers are real processes: the example's `hello` and the fake Cogs, under this Python."""
+    root = packages(tmp_path)
+    shutil.copytree(EXAMPLE_COGS / "hello", root / "hello", ignore=shutil.ignore_patterns(".pixi"))
+    manifest = root / "hello" / "pixi.toml"
+    manifest.write_text(re.sub(r'^serve = .*$', f'serve = "{sys.executable} serve.py"', manifest.read_text(),
+                               flags=re.M))
+    runner = LifecycleRunner(track=track, location="local", location_settings={
+        "packages": [root], "work_dir": tmp_path / "runs", "environment": "host", "interaction_timeout": None})
+    return RunController(runner, poll_interval=0.01)
+
+
+def _until(controller, check, what):
+    deadline = time.monotonic() + 30
+    while not check():
+        assert time.monotonic() < deadline, what
+        controller.tick()
+        time.sleep(0.02)
+
+
+def test_a_session_cog_answers_turns_in_order_and_ends_when_told(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _local_controller(tmp_path, track)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hello", "session"),)), by=BY)
+    # Asked before the worker is up: it waits, and is delivered once the session is open.
+    first = intents.request_turn(track, "r", text="sum 1 2 3", actor="alice")
+    assert first.state == "pending" and first.actor == "alice"
+    second = intents.request_turn(track, "r", text="whoami", actor="alice")
+    answered = lambda turn: intents.turns(track.replay("r"))[turn.turn].state == "answered"  # noqa: E731
+    _until(controller, lambda: answered(first) and answered(second), "the turns were not answered")
+    asked = intents.turns(track.replay("r"))
+    assert asked[first.turn].answer == "1 + 2 + 3 = 6"
+    assert "Run `r`" in asked[second.turn].answer
+    # Every turn and its answer are on the Track, in the order they were asked.
+    kinds = [event.event_type for event in track.replay("r") if event.event_type.startswith("turn_")]
+    assert kinds == ["turn_requested", "turn_requested", "turn_answered", "turn_answered"]
+    bye = intents.request_turn(track, "r", text="bye", actor="alice")
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.COMPLETED, "the session did not end")
+    assert intents.turns(track.replay("r"))[bye.turn].answer.startswith("Bye!")
+    view = intents.describe(track, "r")
+    assert view.steps[0].output == {"turns": 3, "said": ["sum 1 2 3", "whoami", "bye"]}
+    with pytest.raises(intents.RunEnded, match="has ended COMPLETED"):
+        intents.request_turn(track, "r", text="hello", actor="alice")
+    with pytest.raises(LookupError):
+        intents.request_turn(track, "absent", text="hello", actor="alice")
+
+
+def test_a_terminated_session_fails_the_turns_still_waiting(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _local_controller(tmp_path, track)
+    intents.submit(track, OpDefinition("r", (OpStep("chat", "hello", "session"),)), by=BY)
+    _until(controller, lambda: "interaction_started" in _types(track, "r"), "the session never opened")
+    intents.request_cancel(track, "r", actor="bob")
+    late = intents.request_turn(track, "r", text="time", actor="alice")  # the run has not ended yet
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.CANCELLED, "the run was not cancelled")
+    _settle(controller)
+    turn = intents.turns(track.replay("r"))[late.turn]
+    # Either it was never delivered, or it reached a worker already being torn down: failed both ways.
+    assert turn.state == "failed"
+    assert turn.error == "the run ended CANCELLED" or turn.error.startswith(
+        ("TurnRefused", "ConnectError", "RemoteProtocolError", "ReadError")), turn.error
+
+
+def test_a_cog_that_holds_no_session_fails_the_turn_and_its_run_goes_on(tmp_path):
+    track = InMemoryTrackStore()
+    controller = _local_controller(tmp_path, track)
+    intents.submit(track, OpDefinition("r", (OpStep("wait", "slow", "run", {"seconds": 2}),)), by=BY)
+    _until(controller, lambda: "interaction_started" in _types(track, "r"), "the step never started")
+    turn = intents.request_turn(track, "r", text="hello", actor="alice")
+    _until(controller, lambda: intents.turns(track.replay("r"))[turn.turn].state == "failed", "no failure recorded")
+    assert "it holds no session" in intents.turns(track.replay("r"))[turn.turn].error
+    _until(controller, lambda: intents.describe(track, "r").state is RunState.COMPLETED, "the run did not complete")
+
+
+def test_a_worker_with_no_turns_at_all_is_said_so():
+    track, release = InMemoryTrackStore(), threading.Event()
+    intents.submit(track, OpDefinition("r", (OpStep("a", "c", "run"),)), by=BY)
+    controller = _controller(track, {"c": lambda entry, value: release.wait(10) and value})
+    _until(controller, lambda: "interaction_started" in _types(track, "r"), "the step never started")
+    turn = intents.request_turn(track, "r", text="hello", actor="alice")
+    _until(controller, lambda: intents.turns(track.replay("r"))[turn.turn].state == "failed", "no failure recorded")
+    assert intents.turns(track.replay("r"))[turn.turn].error == "this Cog's worker takes no turns"
+    release.set()
+    _settle(controller)
+
+
+def test_a_turn_is_bounded_and_answered_one_way():
+    track = InMemoryTrackStore()
+    intents.submit(track, OpDefinition("r", (OpStep("a", "c", "run"),)), by=BY)
+    with pytest.raises(ValueError, match="at most"):
+        intents.request_turn(track, "r", text="x" * (intents.MAX_TURN_TEXT + 1), actor="alice")
+    with pytest.raises(ValueError, match="a text or failed with an error"):
+        intents.answer_turn(track, "r", "t", text="a", error="b")

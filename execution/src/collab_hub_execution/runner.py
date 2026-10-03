@@ -494,6 +494,18 @@ class LifecycleRunner(WorkflowEngine):
                 continue
         return tuple(interrupted)
 
+    def live_worker(self, run_id: str) -> CogWorker | None:
+        """The worker this host has invoked for the run and not yet let go of; ``None`` otherwise.
+
+        What a session Cog's turns are delivered to while its step is in flight.
+        """
+        with self._lock:
+            advancing = self._advancing.get(run_id)
+            attempt = advancing.attempt if advancing is not None else None
+            if attempt is None or not attempt.invoked or attempt.released or attempt.worker is None:
+                return None
+            return attempt.worker
+
     def cancel(self, run_id: str, *, actor: str) -> RunState:
         """End a run ``cancelled``, recording who cancelled it, and tear its worker down.
 

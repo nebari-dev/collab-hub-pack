@@ -98,7 +98,7 @@ async def test_a_submitted_run_waits_for_a_controller_and_completes_once_one_pic
     run = created.json()
     assert run["status"] == "SUBMITTED" and run["ended"] is False
     assert run["backend"] == "none" and run["location"] == "local"  # so a client assumes nothing of either
-    assert run["submitted_by"] == "dev-user"
+    assert run["submitted_by"] == "dev-user" and run["submitted_by_name"] is None  # dev auth carries no name
     assert run["steps"] == [{"name": "greet", "cog": "echo", "entry_point": "run", "state": "pending",
                              "attempt": None, "error": None, "output": None, "output_ref": None}]
     # The API started nothing: the run advances only once a controller reads the Track.
@@ -296,3 +296,57 @@ def test_package_directories_arrive_from_the_environment_as_one_path_list(monkey
     monkeypatch.setenv("COLLAB_HUB_API__RUNS__TRACK_PATH", str(tmp_path / "t.sqlite"))
     runs = Config.parse({"storage": {"frames_path": str(tmp_path)}}).runs
     assert runs.packages == [str(tmp_path / "a"), str(tmp_path / "b")] and runs.track_path.endswith("t.sqlite")
+
+
+async def test_the_hub_names_the_cogs_it_can_launch(runs_client):
+    assert (await runs_client.get("/v1/runs/launchable")).json() == {"items": ["echo", "slow"]}
+
+
+async def test_a_turn_is_recorded_answered_through_the_track_and_read_back(runs_client, runs_config):
+    from collab_hub_execution import intents
+
+    run_id = (await runs_client.post("/v1/runs", json=SLOW)).json()["id"]
+    asked = await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": "sum 1 2"})
+    assert asked.status_code == 202
+    turn = asked.json()
+    assert turn["state"] == "pending" and turn["text"] == "sum 1 2" and turn["asked_by"] == "dev-user"
+    # The controller's half, as it records an answer.
+    track = SqliteTrackStore(runs_config.runs.track_path)
+    intents.answer_turn(track, run_id, turn["turn"], text="1 + 2 = 3")
+    answered = (await runs_client.get(f"/v1/runs/{run_id}/turns/{turn['turn']}")).json()
+    assert answered["state"] == "answered" and answered["answer"] == "1 + 2 = 3"
+    missing = await runs_client.get(f"/v1/runs/{run_id}/turns/000000000000")
+    assert missing.status_code == 404 and missing.json()["error"]["code"] == "turn_not_found"
+    assert (await runs_client.get(f"/v1/runs/{run_id}/turns/not-a-turn")).status_code == 422
+    assert (await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": ""})).status_code == 422
+
+
+async def test_a_run_that_ended_takes_no_turns(runs_client, controller):
+    run_id = (await runs_client.post("/v1/runs", json=ECHO)).json()["id"]
+    settle(controller)
+    refused = await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": "hello"})
+    assert refused.status_code == 409 and "has ended COMPLETED" in refused.json()["error"]["message"]
+
+
+async def test_another_organization_can_neither_talk_to_a_run_nor_read_its_turns(runs_client, monkeypatch):
+    run_id = (await runs_client.post("/v1/runs", json=SLOW)).json()["id"]
+    turn = (await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": "hi"})).json()["turn"]
+    monkeypatch.setenv("DEV_AUTH_ORG", "another-org")
+    assert (await runs_client.post(f"/v1/runs/{run_id}/turns", json={"text": "hi"})).status_code == 404
+    assert (await runs_client.get(f"/v1/runs/{run_id}/turns/{turn}")).status_code == 404
+
+
+async def test_a_run_shows_who_submitted_it_by_name_and_is_scoped_by_principal(runs_config, monkeypatch):
+    from collab_hub_api.frames.auth import AuthContext, DisplayIdentity, get_auth_context
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    app = make_app(runs_config)
+    app.dependency_overrides[get_auth_context] = lambda: AuthContext(
+        user="3b8ec34f", home_org_id="dev-org", workspace_id="default",
+        display=DisplayIdentity(name="Dev User", email="dev@example.com"))
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            run = (await client.post("/v1/runs", json=ECHO)).json()
+            listed = (await client.get("/v1/runs")).json()["items"]
+    assert run["submitted_by"] == "3b8ec34f" and run["submitted_by_name"] == "Dev User"
+    assert [item["submitted_by_name"] for item in listed] == ["Dev User"]

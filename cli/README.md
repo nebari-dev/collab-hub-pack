@@ -90,6 +90,17 @@ collab-hub run terminate run-3eb7ab0eaf43                       # cancel it, and
 
 `cog launch NAME` submits a one-step Op through `POST /v1/runs`: `NAME` is a Cog package the hub's run controller can launch, and a name it cannot is refused with the names it can. `--entry` names the entry point (`run` by default), `--input` its input as JSON, and `--gate` when the step's Gate asks a person (`never`, `error`, `warn` or `always`). Without `--watch` it prints the run's id and returns; the run controller starts the run. It says which durability backend and which location the run is on, since a run on `none` does not survive a controller restart and a `local` worker shares the controller's host.
 
+### Talking to a running Cog
+
+```sh
+collab-hub cog list --launchable                         # the Cogs this hub can launch
+collab-hub cog launch hello --entry session --gate never # a Cog that holds a session
+collab-hub run say run-c42c387d6e23 sum 1 2 3            # one turn: prints what it answered
+toad acp "collab-hub run connect run-c42c387d6e23"       # the same Cog, from an ACP client
+```
+
+`run say` sends one turn and prints the answer. `run connect` serves the run as an agent of the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so a client such as [Toad](https://github.com/batrachianai/toad) can talk to the Cog: each prompt becomes one turn, sent to the hub and read back, and the answer is streamed to the client. Start it from the client, not by hand; it writes nothing but the protocol to stdout. A cancelled prompt stops waiting, though its turn stays on the run.
+
 `run terminate` asks the hub to cancel the run and waits until the controller has ended it; `--no-wait` returns once the request is recorded. A run that has already ended is refused, naming its status.
 
 These commands need a hub with the run API on (the `cog_runs` feature flag). [`examples/cog-local`](../examples/cog-local/README.md) runs all of them against a hub on your own machine.
@@ -102,6 +113,7 @@ Tables for people by default; `--json`, which every command takes, prints one JS
 - `logout --json`: `{hub, profile, was_signed_in, revoked, warning}`.
 - `whoami --json`: the hub's `GET /v1/me` answer plus `hub`, `profile`, `signed_in` and `token_expires_at`.
 - `cog list --json` and `cog show --json`: the catalog API's items and Cog, as the hub returns them.
+- `run say --json`: the turn, with its `state`, `answer` or `error`. `cog list --launchable --json`: the names.
 - `cog launch --json`, `run show --json`, `run watch --json` and `run terminate --json`: the run, as `GET /v1/runs/{id}` returns it; `run list --json`: the runs.
 
 | Code | Meaning |

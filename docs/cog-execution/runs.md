@@ -104,6 +104,9 @@ The process that accepts runs is not the one that advances them (ADR-0002 D4).
 | `POST /v1/runs` | Submit an Op: `steps`, each with `name`, `cog`, `entry_point`, `input` and `gate`. Records `op_submitted` with who submitted it, and answers 201 with the run, `SUBMITTED`. A `cog` that is not a package the controller can launch is a 422 naming the packages it can |
 | `GET /v1/runs` | The caller's organization's runs, newest first; `status`, `limit` and `offset` |
 | `GET /v1/runs/{id}` | One run: its status, each step's state, and each completed step's `output` |
+| `GET /v1/runs/launchable` | The Cog packages a step's `cog` may name |
+| `POST /v1/runs/{id}/turns` | Ask a Cog whose step holds a session something: records `turn_requested` with the caller and answers 202 with the turn, `pending`. A run that has ended is a 409 |
+| `GET /v1/runs/{id}/turns/{turn}` | The turn: `pending`, then `answered` with the Cog's text, or `failed` with why |
 | `POST /v1/runs/{id}/cancel` | Records `cancel_requested` with the caller, once, and answers 202. A run that has ended is a 409 naming its status, checked as the request is written |
 
 Every answer names the `backend` and the `location` the run is advanced with,
@@ -125,9 +128,24 @@ This is the controller's and the API's first form, enough for one host:
   decisions and retry are later phases; until then a run waiting at a Gate can
   only be cancelled.
 
-The `collab-hub` CLI is a client of these routes (`cog launch`, `run list`,
-`run show`, `run watch`, `run terminate`), and
-[`examples/cog-local`](../../examples/cog-local/README.md) walks through all of it on one machine.
+**Turns.** Some entry points hold a session: `hello`'s `session` keeps its
+`/invoke` open and answers turns until it is told `bye` or its run is
+terminated. A client asks for a turn through the API; the controller delivers
+waiting turns to the run's live worker, one at a time and in order, on the
+worker's `POST /turn`, and records the answer (`turn_answered`) or why there
+is none (`turn_failed`). A turn asked before the worker is up waits for it; one
+still waiting when the run ends fails with it. Nothing reaches a worker but
+through the controller, and every turn and its answer are on the Track. A
+worker that holds no session answers `/turn` with 404, which fails the turn
+and leaves the run as it was.
+
+The `collab-hub` CLI is a client of these routes (`cog launch`, `cog list
+--launchable`, `run list`, `run show`, `run watch`, `run say`, `run connect`,
+`run terminate`); `run connect` serves a run as an
+[ACP](https://agentclientprotocol.com) agent, so an ACP client such as Toad
+talks to the Cog turn by turn.
+[`examples/cog-local`](../../examples/cog-local/README.md) walks through all of
+it on one machine.
 
 ## Statuses
 
@@ -211,6 +229,7 @@ same process; add `LOCATION=local` (which needs pixi) and each step's worker is
 a real process, whose `worker_started` and `worker_stopped` appear on the
 Track and whose output is under `dev/.local/runs/`. `make -C dev api` and
 `make -C dev controller` are the two processes of the section above, and
-`examples/cog-local/demo.sh` launches a Cog through them from the CLI. Stop `make op OP=slow` mid-step,
+[`examples/cog-local`](../../examples/cog-local/README.md) walks a Cog through
+its whole life on them, signed in through Keycloak: `make demo` there runs it. Stop `make op OP=slow` mid-step,
 and the next `make op` reports the run `interrupted`. See
 [dev/README.md](../../dev/README.md#running-cogs-and-ops).

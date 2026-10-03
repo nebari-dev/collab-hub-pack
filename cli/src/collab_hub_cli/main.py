@@ -333,10 +333,26 @@ def cog_list(
     source_id: Annotated[str | None, typer.Option(
         "--source-id", help="Only this registry source; the newest version is chosen within it.")] = None,
     query: Annotated[str | None, typer.Option("--query", "-q", help="Text in the name or description.")] = None,
+    launchable: Annotated[bool, typer.Option(
+        "--launchable", help="The Cogs this hub can launch now, instead of the catalog.")] = False,
     as_json: JsonOption = False,
 ) -> None:
-    """List the Cogs in the hub's catalog, each at its newest version, following every page."""
+    """List the Cogs in the hub's catalog, each at its newest version, following every page.
 
+    With --launchable, the Cog packages the hub's run controller can launch,
+    which is what `cog launch` takes until Cogs are installed from the catalog.
+    """
+
+    if launchable:
+        with Hub(_target()) as hub:
+            names = hub.get_json("/v1/runs/launchable")["items"]
+        if as_json:
+            _print_json(names)
+        elif names:
+            typer.echo("\n".join(names))
+        else:
+            _err("This hub launches no Cogs.")
+        return
     filters = {"kind": kind, "publisher": publisher, "provides": provides, "requires": requires,
                "accepts": accepts, "produces": produces, "source_id": source_id, "q": query}
     with Hub(_target()) as hub:
@@ -402,7 +418,7 @@ def _age(timestamp: str) -> str:
 def _print_run(run: dict) -> None:
     rows = [["run", run["id"]], ["status", run["status"]],
             ["runs on", f"backend {run['backend']}, workers {run['location']}"],
-            ["submitted", f"{run['submitted_at']} by {run['submitted_by']}"]]
+            ["submitted", f"{run['submitted_at']} by {run.get('submitted_by_name') or run['submitted_by']}"]]
     if run.get("cancel_requested_by") and not run["ended"]:
         rows.append(["cancel", f"requested by {run['cancel_requested_by']}"])
     if run.get("error"):
@@ -513,7 +529,7 @@ def run_list(
         return
     _table(["RUN", "COG", "STATUS", "AGE", "BY"], [
         [run["id"], ",".join(dict.fromkeys(step["cog"] for step in run["steps"])), run["status"],
-         _age(run["submitted_at"]), run["submitted_by"]]
+         _age(run["submitted_at"]), run.get("submitted_by_name") or run["submitted_by"]]
         for run in runs
     ])
 
@@ -539,6 +555,48 @@ def run_watch(run_id: Annotated[str, typer.Argument(help="The run's id.")], as_j
     with Hub(_target()) as hub:
         run = _follow(hub, hub.get_json(f"/v1/runs/{run_id}"), _settled, quiet=False)
     _finish(run, as_json)
+
+
+@run_app.command("say")
+@handled
+def run_say(
+    run_id: Annotated[str, typer.Argument(help="The run's id.")],
+    text: Annotated[list[str], typer.Argument(help="What to say: one turn of the Cog's session.")],
+    as_json: JsonOption = False,
+) -> None:
+    """Say one thing to a Cog that holds a session, and print what it answered.
+
+    The hub records the turn on the run's Track, the run controller hands it to
+    the Cog's worker, and the answer comes back the same way.
+    """
+
+    with Hub(_target()) as hub:
+        turn = hub.request("POST", f"/v1/runs/{run_id}/turns", json={"text": " ".join(text)}).json()
+        while turn["state"] == "pending":
+            time.sleep(POLL_SECONDS)
+            turn = hub.get_json(f"/v1/runs/{run_id}/turns/{turn['turn']}")
+    if as_json:
+        _print_json(turn)
+    elif turn["state"] == "answered":
+        typer.echo(turn["answer"])
+    if turn["state"] != "answered":
+        _err(f"error: the Cog did not answer: {turn['error']}")
+        raise typer.Exit(EXIT_HUB)
+
+
+@run_app.command("connect")
+@handled
+def run_connect(run_id: Annotated[str, typer.Argument(help="The run's id.")]) -> None:
+    """Serve a running Cog as an ACP agent on stdin and stdout, for an ACP client such as Toad.
+
+    Start it from the client, not by hand: `toad acp "collab-hub run connect RUN_ID"`.
+    Each prompt becomes one turn of the run, as with `run say`.
+    """
+
+    from . import acp
+
+    with Hub(_target()) as hub:
+        acp.connect(hub, run_id)
 
 
 @run_app.command("terminate")

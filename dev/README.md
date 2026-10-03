@@ -1143,8 +1143,15 @@ The API records the submission and nothing else; the controller reads it from
 the Track, runs the Cog package's `serve` task in its own pixi environment, and
 records what happened; the CLI reads the run back through the API. `run list`,
 `run show` and `run terminate` are the other commands.
-[`examples/cog-local`](../examples/cog-local/README.md) is the walk-through,
-and `examples/cog-local/demo.sh` runs it end to end and checks it.
+`make api-oidc` serves the run API too, with real sign-in through Keycloak,
+and `make controller` works beside either. [`examples/cog-local`](../examples/cog-local/README.md)
+walks a Cog through its whole life on them — sign in, launch, list, talk to it
+from Toad over ACP, stop it — and `make -C ../examples/cog-local demo` runs it
+end to end and checks it.
+
+The controller sets no limit on how long an interaction takes, since a Cog
+holding a session stays in one for as long as someone talks to it. A worker
+that hangs is stopped by terminating its run.
 
 Cog packages are found in `COGS`, a `:`-separated list that defaults to
 `dev/cogs` (the fake Cogs) and `examples/cog-local/cogs` (`hello`); both
@@ -1300,9 +1307,9 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); `examples/cog-local/demo.sh` launches a Cog through the CLI, the API and the run controller, lists it, and terminates a second one with no worker left; every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
 | 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
-| 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
+| 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub`; `examples/cog-local`'s `make demo`: the CLI signs in to the realm, launches a Cog the controller runs as a local process, lists it, talks to it over ACP and with `run say`, terminates it, and no worker is left |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
 
 **Coverage relaxes as the levels get more expensive**, which is how the levels

@@ -46,6 +46,8 @@ class Stub:
     cogs: list[dict] = field(default_factory=list)
     runs: list[dict] = field(default_factory=list)  # newest first, as the hub lists them
     launchable: tuple[str, ...] = ("echo", "slow")
+    turns: list[dict] = field(default_factory=list)
+    hold_turns: bool = False  # leave every turn pending, as a worker that has not answered yet
     # What a run's status becomes on each later read: a list consumed one status per GET.
     progress: dict[str, list[str]] = field(default_factory=dict)
     counter: int = 0
@@ -201,11 +203,31 @@ class Stub:
             more = offset + limit < len(items)
             return httpx.Response(200, json={"items": items[offset:offset + limit],
                                              "next_offset": offset + limit if more else None})
+        if path == "/v1/runs/launchable":
+            return httpx.Response(200, json={"items": list(self.launchable)})
         if path.startswith("/v1/runs/"):
             run_id, _, action = path.removeprefix("/v1/runs/").partition("/")
             run = next((r for r in self.runs if r["id"] == run_id), None)
             if run is None:
                 return httpx.Response(404, json={"error": {"code": "run_not_found", "message": f"No run {run_id}"}})
+            if action == "turns" and request.method == "POST":
+                if run["ended"]:
+                    return httpx.Response(409, json={"error": {
+                        "code": "run_ended",
+                        "message": f"Run {run_id} takes no turns: the run has ended {run['status']}"}})
+                text = json.loads(request.content)["text"]
+                turn = {"turn": f"{len(self.turns) + 1:012x}", "text": text, "state": "pending", "answer": None,
+                        "error": None, "asked_by": user}
+                self.turns.append(turn)
+                return httpx.Response(202, json=turn)
+            if action.startswith("turns/"):
+                turn = next(t for t in self.turns if t["turn"] == action.removeprefix("turns/"))
+                if turn["state"] == "pending" and not self.hold_turns:
+                    failing = turn["text"] == "fail"
+                    turn.update(state="failed" if failing else "answered",
+                                answer=None if failing else f"you said: {turn['text']}",
+                                error="the worker answered HTTP 500" if failing else None)
+                return httpx.Response(200, json=turn)
             if action == "cancel":
                 if run["ended"]:
                     return httpx.Response(409, json={"error": {

@@ -394,6 +394,9 @@ _FACTS = frozenset({
     # What a client asked for, written by the API for the controller to deliver; the run moves
     # when the controller acts on it, which `cancelled` records.
     "cancel_requested",
+    # A turn of a session Cog: asked by a client through the API, answered through the
+    # controller. Neither moves the run.
+    "turn_requested", "turn_answered", "turn_failed",
 })
 
 # The payload fields that decide where a replayed event leads; a record and its replay must agree on them.
