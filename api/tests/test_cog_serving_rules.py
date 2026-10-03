@@ -328,3 +328,152 @@ async def test_a_reader_that_stops_reading_does_not_keep_the_upstream_open(hub: 
             await exchange
     received = sum(len(m.get("body", b"")) for m in sent if m["type"] == "http.response.body")
     assert received < len(large.files["model.bin"][1])
+
+
+async def test_tags_page_all_the_way_to_the_end(hub: Hub):
+    """10,001 tags: a default page is bounded, and following ``Link`` reaches the last one."""
+
+    hub.seed(REPO, ALPHA, "latest")
+    tags = tuple(f"v{index:05d}" for index in range(10_001))
+    hub.catalog.upsert(catalog_row(REPO, "sha256:" + "9" * 64, tags=tags, pushed_at=T0 - timedelta(days=1)))
+    headers = await hub.pull_token(REPO)
+
+    first = await hub.get(f"/v2/{REPO}/tags/list", headers=headers)
+    assert len(first.json()["tags"]) == 1000 and first.json()["tags"][0] == "latest"
+    assert first.headers["link"] == f'</v2/{REPO}/tags/list?n=1000&last=v00998>; rel="next"'
+
+    after = await hub.get(f"/v2/{REPO}/tags/list", params={"last": "v09999"}, headers=headers)
+    assert after.json()["tags"] == ["v10000"] and "link" not in after.headers
+    assert (await hub.get(f"/v2/{REPO}/tags/list", params={"last": "v10000"}, headers=headers)).json()["tags"] == []
+
+    collected, url, pages = [], f"/v2/{REPO}/tags/list?n=1000", 0
+    while url:
+        page = await hub.get(url, headers=headers)
+        assert page.status_code == 200
+        collected.extend(page.json()["tags"])
+        link = page.headers.get("link")
+        url = link[1 : link.index(">")] if link else None
+        pages += 1
+    assert collected == sorted(("latest", *tags)) and pages == 11
+    # n is capped at the page size, and still links onward.
+    capped = await hub.get(f"/v2/{REPO}/tags/list", params={"n": 50_000}, headers=headers)
+    assert len(capped.json()["tags"]) == 1000 and "link" in capped.headers
+
+
+async def test_a_blocked_database_call_answers_503_in_time_and_releases_its_worker_and_connection(hub: Hub):
+    """The request budget reaches the database: the store call is bounded by the server, not by the coroutine.
+
+    The connection here is a fake that behaves as Postgres does under a
+    ``statement_timeout``: the statement blocks, and is cancelled when the
+    timeout the Hub set for it elapses. What this proves is the Hub's half --
+    that it sets the timeout from the request budget, bounds the pool wait,
+    answers 503 in time, and that once the statement is cancelled the worker
+    thread unwinds and the connection is returned. That Postgres honours
+    ``statement_timeout`` is its own, and is exercised by the live test below.
+    """
+
+    import threading
+    import time
+    from contextlib import contextmanager
+
+    import psycopg
+
+    from collab_hub_api.cogs.catalog import PostgresCogCatalogStore
+
+    events: dict[str, float] = {}
+    state = {"timeout_ms": None, "acquire_timeout": None, "checked_out": 0}
+    released = threading.Event()
+
+    class BlockingConnection:
+        def execute(self, sql, params=None):
+            if "set_config('statement_timeout'" in sql:
+                state["timeout_ms"] = int(params[0])
+                return self
+            events["blocked_at"] = time.monotonic()
+            time.sleep(state["timeout_ms"] / 1000)  # the server gives up exactly when it was told to
+            events["cancelled_at"] = time.monotonic()
+            raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            state["acquire_timeout"] = timeout
+            state["checked_out"] += 1
+            try:
+                yield BlockingConnection()
+            finally:
+                state["checked_out"] -= 1
+                released.set()
+
+    hub.seed(REPO, ALPHA, "latest")
+    headers = await hub.pull_token(REPO)
+    serving = hub.serving
+    blocked = CogRegistryFront(PostgresCogCatalogStore(Database()), serving.front.sources, max_blob_bytes=1 << 30)
+    fields = {name: getattr(serving, name) for name in serving.__dataclass_fields__}
+    hub.app.state.cog_registry_serving = type(serving)(**{**fields, "front": blocked, "max_metadata_seconds": 0.4})
+
+    for method, path in (
+        ("GET", f"/v2/{REPO}/manifests/latest"),
+        ("HEAD", f"/v2/{REPO}/manifests/{ALPHA.digest}"),
+        ("GET", f"/v2/{REPO}/tags/list"),
+        ("HEAD", f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}"),
+        ("GET", f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}"),
+    ):
+        released.clear()
+        started = time.monotonic()
+        response = await hub.request(method, path, headers=headers)
+        elapsed = time.monotonic() - started
+        assert response.status_code == 503, (method, path, response.status_code)
+        assert elapsed < 2.0, f"{method} {path} took {elapsed:.2f}s against a 0.4s budget"
+        # The budget, not a default: the statement timeout and the pool wait are what is left of 0.4 s.
+        assert 1 <= state["timeout_ms"] <= 400 and 0 < state["acquire_timeout"] <= 0.4
+        # The worker was not abandoned mid-statement: it ran to the cancellation and gave the connection back.
+        assert await asyncio.to_thread(released.wait, 2.0), "the connection was never released"
+        assert state["checked_out"] == 0
+        assert events["cancelled_at"] - events["blocked_at"] <= 0.45
+
+
+def test_live_postgres_ends_a_statement_at_the_request_budget():
+    """The other half of the test above, against a real server: ``statement_timeout`` cancels the statement."""
+
+    import os
+    import time
+
+    url = os.environ.get("COLLAB_HUB_TEST_POSTGRES_URL", "")
+    if not url:
+        pytest.skip("set COLLAB_HUB_TEST_POSTGRES_URL to run the live statement-timeout test")
+    import psycopg
+
+    from collab_hub_api.cogs import deadline
+    from collab_hub_api.frames.db import PostgresDatabase
+
+    database = PostgresDatabase(url, min_size=0, max_size=1, timeout_seconds=10.0)
+    token = deadline.request_deadline.set(time.monotonic() + 0.3)
+    try:
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            with deadline.bounded_connection(database) as conn:
+                conn.execute("SELECT pg_sleep(10)")
+        assert time.monotonic() - started < 2.0
+        # The one pooled connection came back usable, with no timeout left on it.
+        deadline.request_deadline.set(None)
+        with database.connection() as conn:
+            assert conn.execute("SHOW statement_timeout").fetchone()["statement_timeout"] == "0"
+            assert conn.execute("SELECT 1 AS one").fetchone()["one"] == 1
+        # And a pool with no free connection is not waited on past the budget.
+        deadline.request_deadline.set(time.monotonic() + 0.3)
+        with database.connection():
+            started = time.monotonic()
+            with pytest.raises(psycopg.OperationalError):
+                with deadline.bounded_connection(database):
+                    pass
+            assert time.monotonic() - started < 2.0
+    finally:
+        deadline.request_deadline.reset(token)
+        database.close()

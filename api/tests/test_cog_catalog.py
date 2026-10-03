@@ -25,8 +25,10 @@ import pytest
 
 from collab_hub_api.cogs.catalog import (
     COG_INDEX_LOCK_KEY,
+    DEFAULT_TAGS_PAGE,
     MAX_LIST_LIMIT,
     MAX_PULL_CANDIDATES,
+    MAX_TAGS_PAGE,
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
@@ -824,6 +826,10 @@ def _exercise_pullable(store) -> None:
     assert not store.has_pullable("cogs/ab", ("mirror",)) and not store.has_pullable("cogs/a", ())
 
     assert store.list_pullable_tags("cogs/a", BOTH) == ["latest", "v0", "v1", "v2"]
+    assert store.list_pullable_tags("cogs/a", BOTH, after="v0") == ["v1", "v2"]
+    assert store.list_pullable_tags("cogs/a", BOTH, after="latest", limit=2) == ["v0", "v1"]
+    assert store.list_pullable_tags("cogs/a", BOTH, after="v2") == []
+    assert store.list_pullable_tags("cogs/a", BOTH, limit=0) == ["latest"], "clamped to at least one"
     assert store.list_pullable_tags("cogs/a", ("mirror",)) == ["v0", "v1"]
     assert store.list_pullable_tags("cogs/missing", BOTH) == []
 
@@ -852,11 +858,8 @@ def _exercise_blobs(store) -> None:
         assert all(row.repository == repository for row in rows)
         return [(row.source_id, row.manifest_digest, row.size) for row in rows]
 
-    assert where("cogs/a", blob_x) == [
-        (SOURCE, digest("1"), 10),
-        (SOURCE, digest("2"), 10),
-        ("mirror", digest("1"), 10),
-    ]
+    # One location per source: that source's newest manifest naming the blob.
+    assert where("cogs/a", blob_x) == [(SOURCE, digest("1"), 10), ("mirror", digest("1"), 10)]
     assert where("cogs/a", blob_y) == [(SOURCE, digest("1"), 20)]
     assert where("cogs/a", blob_x, ("mirror",)) == [("mirror", digest("1"), 10)]
     assert where("cogs/a", blob_z) == [], "no pullable manifest references it"
@@ -918,6 +921,20 @@ def test_lookups_are_exact_whatever_the_repository_holds(backend, request):
     assert [row.digest for row in store.find_pullable("cogs/many", (SOURCE,), digest=oldest)] == [oldest]
     assert [row.digest for row in store.find_pullable("cogs/many", (SOURCE,), tag="v0")] == [oldest]
     assert len(store.list_pullable_tags("cogs/many", (SOURCE,))) == 300
+    # Paging reaches every tag: `after` is applied before the limit.
+    paged, after = [], None
+    while page := store.list_pullable_tags("cogs/many", (SOURCE,), after=after, limit=64):
+        paged.extend(page)
+        after = page[-1]
+    assert paged == sorted(f"v{seed}" for seed in range(300))
+    # Many manifests in one source naming a blob do not crowd out another source that holds it.
+    for seed in range(MAX_PULL_CANDIDATES + 2):
+        row_digest = "sha256:" + f"{seed + 100:064x}"
+        store.record_manifest_blobs(SOURCE, "cogs/many", row_digest, [BlobDescriptor(digest("e"), 1)])
+    store.upsert(artifact("f", source_id="mirror", repository="cogs/many", pushed_at=T0 - timedelta(days=9)))
+    store.record_manifest_blobs("mirror", "cogs/many", digest("f"), [BlobDescriptor(digest("e"), 1)])
+    located = store.find_blob("cogs/many", digest("e"), (SOURCE, "mirror"))
+    assert [row.source_id for row in located] == [SOURCE, "mirror"]
     store.record_manifest_blobs(SOURCE, "cogs/many", oldest, [BlobDescriptor(digest("b"), 1)])
     assert len(store.find_blob("cogs/many", digest("b"), (SOURCE,))) == 1
     # The one bound: how many sources holding the same digest a single request may fall back across.
@@ -1110,6 +1127,12 @@ class _FakeConnection:
     @property
     def statements(self) -> list[str]:
         return [sql for sql, _ in self.calls]
+
+    @property
+    def queries(self) -> list[tuple[str, tuple]]:
+        """The calls without the budget preamble the serving lookups issue first."""
+
+        return [call for call in self.calls if not call[0].startswith("SELECT set_config")]
 
 
 class _FakeDb:
@@ -1439,18 +1462,18 @@ def test_find_pullable_is_an_exact_lookup_scoped_to_the_given_sources():
         PullableArtifact(source_id=SOURCE, repository="cogs/a", digest=DIGEST_A, tags=("v1",)),
         PullableArtifact(source_id="mirror", repository="cogs/a", digest=DIGEST_A, tags=()),
     ]
-    sql, params = conn.calls[0]
+    sql, params = conn.queries[0]
     assert f"WHERE repository = %s AND digest = %s AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
     assert "ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC" in sql and sql.endswith("LIMIT %s")
     assert params == ("cogs/a", DIGEST_A, [SOURCE, "mirror"], MAX_PULL_CANDIDATES)
 
     assert len(store.find_pullable("cogs/a", [SOURCE], tag="v1")) == 1
-    sql, params = conn.calls[1]
+    sql, params = conn.queries[1]
     assert f"WHERE repository = %s AND %s = ANY(tags) AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
     assert params == ("cogs/a", "v1", [SOURCE], MAX_PULL_CANDIDATES)
     with pytest.raises(ValueError, match="exactly one"):
         store.find_pullable("cogs/a", [SOURCE])
-    assert len(conn.calls) == 2, "refused before touching the database"
+    assert len(conn.queries) == 2, "refused before touching the database"
 
 
 def test_has_pullable_and_tags_apply_the_same_rule():
@@ -1458,11 +1481,19 @@ def test_has_pullable_and_tags_apply_the_same_rule():
     assert store.has_pullable("cogs/a", (SOURCE,)) is True
     assert store.has_pullable("cogs/a", (SOURCE,)) is False
     assert store.list_pullable_tags("cogs/a", (SOURCE,)) == ["latest", "v1"]
-    exists, _missing, tags = conn.calls
+    exists, _missing, tags = conn.queries
     assert f"WHERE repository = %s AND source_id = ANY(%s) AND {PULLABLE_SQL} LIMIT 1" in exists[0]
     assert exists[1] == ("cogs/a", [SOURCE])
     assert "SELECT DISTINCT tag FROM collab_cog_artifacts, unnest(tags) AS tag" in tags[0]
-    assert PULLABLE_SQL in tags[0] and 'ORDER BY tag COLLATE "C"' in tags[0]
+    assert PULLABLE_SQL in tags[0] and 'ORDER BY tag COLLATE "C" LIMIT %s' in tags[0]
+    # `after` is applied in the query, before the limit; the limit is clamped to a page plus one.
+    assert 'WHERE %s::text IS NULL OR tag COLLATE "C" > %s' in tags[0]
+    assert tags[1] == ("cogs/a", [SOURCE], None, None, DEFAULT_TAGS_PAGE)
+    store, conn = _fake_store()
+    store.list_pullable_tags("cogs/a", (SOURCE,), after="v1", limit=10_000_000)
+    assert conn.queries[0][1] == ("cogs/a", [SOURCE], "v1", "v1", MAX_TAGS_PAGE + 1)
+    # Every serving lookup is preceded by the request budget, as a transaction-local statement timeout.
+    assert conn.calls[0][0].startswith("SELECT set_config('statement_timeout', %s, true)")
 
 
 def test_record_manifest_blobs_is_one_idempotent_insert():
@@ -1470,11 +1501,11 @@ def test_record_manifest_blobs_is_one_idempotent_insert():
     store.record_manifest_blobs(
         SOURCE, "cogs/a", DIGEST_A, [BlobDescriptor(DIGEST_B, 12, "text/plain"), BlobDescriptor(digest("c"), 0)]
     )
-    ((sql, params),) = conn.calls
+    ((sql, params),) = conn.queries
     assert sql.startswith("INSERT INTO collab_cog_manifest_blobs") and sql.endswith("ON CONFLICT DO NOTHING")
     assert params == (SOURCE, "cogs/a", DIGEST_A, [DIGEST_B, digest("c")], [12, 0], ["text/plain", ""])
     store.record_manifest_blobs(SOURCE, "cogs/a", DIGEST_A, [])
-    assert len(conn.calls) == 1, "an index or an empty manifest writes nothing"
+    assert len(conn.queries) == 1, "an index or an empty manifest writes nothing"
 
 
 def test_find_blob_joins_recorded_blobs_to_the_pullable_rule():
@@ -1489,8 +1520,10 @@ def test_find_blob_joins_recorded_blobs_to_the_pullable_rule():
     assert store.find_blob("cogs/a", DIGEST_B, (SOURCE,)) == [
         PullableBlob(source_id=SOURCE, repository="cogs/a", manifest_digest=DIGEST_A, digest=DIGEST_B, size=12)
     ]
-    sql, params = conn.calls[0]
+    sql, params = conn.queries[0]
     assert "FROM collab_cog_manifest_blobs b JOIN collab_cog_artifacts a" in sql
+    # One location per source before the cap, so one source's manifests cannot crowd another source out.
+    assert "SELECT DISTINCT ON (b.source_id)" in sql and "ORDER BY b.source_id, a.pushed_at DESC NULLS LAST" in sql
     assert "ON a.source_id = b.source_id AND a.repository = b.repository AND a.digest = b.manifest_digest" in sql
     assert "WHERE b.repository = %s AND b.blob_digest = %s AND b.source_id = ANY(%s)" in sql
     assert "a.removed_at IS NULL AND a.status = 'indexed' AND a.cog_id IS NOT NULL" in sql

@@ -287,6 +287,78 @@ async def test_a_redirect_to_a_loopback_or_link_local_address_is_never_followed(
     assert "169.254" not in str(caught.value) and "127.0.0.1" not in str(caught.value)
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        # The same loopback address, written the ways a resolver accepts and a strict parser does not.
+        "http://2130706433/latest",
+        "http://127.1/latest",
+        "http://0x7f000001/latest",
+        "http://0x7f.0.0.1/latest",
+        "http://0177.0.0.1/latest",
+        "http://127.0.0.1./latest",
+        "http://2852039166/latest",  # 169.254.169.254
+        "http://169.254.43518/latest",
+        "http://0/latest",
+        "http://localhost/latest",
+        "http://localhost./latest",
+        "http://metadata.localhost:8080/latest",
+        "http://1.2.3./latest",
+    ],
+)
+async def test_numeric_and_local_host_forms_are_refused_through_the_redirect_path(location):
+    """Not just the classifier: the registry redirects there, and the destination is never contacted."""
+
+    handler, asked = redirecting(location, registry="http://registry.example")
+    async with OCIClient("http://registry.example", transport=httpx.MockTransport(handler)) as client:
+        # Refused by this client's own rule or, for a form httpx will not even parse, by httpx; never followed.
+        with pytest.raises(oci.OCIError) as caught:
+            await client.open_blob(REPO, DIGEST)
+    assert "refusing a redirect" in str(caught.value) or isinstance(caught.value, OCITransportError)
+    assert len(asked) == 1, asked
+
+
+def test_redirect_hosts_are_canonical_addresses_or_real_names():
+    kind = oci._redirect_host_kind
+    for host in ("storage.example.com", "s3.amazonaws.com", "10.0.4.7", "192.168.1.9", "2001:db8::1", "7f.example"):
+        assert kind(host) == "ok", host
+    for host in ("minio", "minio.storage.svc.cluster.local", "0x7f.example", "1.2.3.4.example"):
+        assert kind(host) == "ok", host
+    for host in ("127.0.0.1", "169.254.169.254", "::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0", "::"):
+        assert kind(host) == "forbidden", host
+    for host in ("localhost", "a.localhost"):
+        assert kind(host) == "forbidden", host
+    for host in ("2130706433", "127.1", "0x7f000001", "0177.0.0.1", "1.2.3", "0x", "1.2.3.4.5", "", "::g"):
+        assert kind(host) == "ambiguous", host
+
+
+async def test_a_chain_cannot_be_led_back_down_to_an_http_registry():
+    """http registry -> https storage -> the http registry again: the last hop is a downgrade, origin or not."""
+
+    seen: list[tuple[str, bool]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), "authorization" in request.headers))
+        if request.url.host == "storage.example":
+            return httpx.Response(302, headers={"Location": "http://registry.example/v2/internal/blob"})
+        if request.url.path.endswith("/internal/blob"):
+            return httpx.Response(200, content=BODY)
+        if "authorization" not in request.headers:
+            return httpx.Response(401, headers={"WWW-Authenticate": 'Basic realm="r"'})
+        return httpx.Response(307, headers={"Location": "https://storage.example/hop"})
+
+    client = OCIClient(
+        "http://registry.example",
+        credentials=oci.BasicCredentials("robot", "secret"),
+        transport=httpx.MockTransport(handler),
+    )
+    async with client:
+        with pytest.raises(OCIProtocolError, match="from https to http"):
+            await client.open_blob(REPO, DIGEST)
+    assert [url for url, _ in seen][-1] == "https://storage.example/hop", "the third hop was never made"
+    assert seen[-1][1] is False, "and the credential did not go to storage"
+
+
 async def test_a_redirect_never_downgrades_https_to_http():
     handler, asked = redirecting("http://storage.example/blob")
     async with client_for(handler) as client:

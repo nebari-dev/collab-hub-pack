@@ -418,7 +418,7 @@ oras pull hub.example.com/cogs/cog-audio-transcriber@sha256:…
 | `GET`/`HEAD /v2/` | `200 {}` with a pull token; the bearer challenge without one. |
 | `GET`/`HEAD /v2/<name>/manifests/<reference>` | The manifest, byte for byte, by tag or digest, with `Docker-Content-Digest` and its own `Content-Type`. |
 | `GET`/`HEAD /v2/<name>/blobs/<digest>` | The blob, streamed. `HEAD` answers the size from the manifest that references it. |
-| `GET /v2/<name>/tags/list` | `{"name", "tags"}`, sorted; `n` and `last` page it, with a `Link: …; rel="next"`. |
+| `GET /v2/<name>/tags/list` | `{"name", "tags"}`, sorted. A page is at most 1000 tags (also the default without `n`); `last` continues after a tag, and a `Link: …; rel="next"` is sent while more remain. |
 | `GET /v2/token` | The distribution token endpoint. |
 | any other method under `/v2/` | 405 `UNSUPPORTED`: the surface is read-only. |
 
@@ -514,7 +514,8 @@ digest)` or by a stored tag naming it. There is no window over a
 repository's versions: the oldest indexed pin pulls like the newest. Nothing
 is scanned and nothing is cached; each read is a few catalog queries and at
 most one request to the source holding the content (one more per additional
-source holding the same digest, when the first no longer has it).
+source holding the same digest or blob, up to four sources, when the first
+no longer has it).
 
 **A blob is served only while a pullable manifest of that repository
 references it**, and that is established from stored data. When the Hub
@@ -550,6 +551,12 @@ dropped connection. The response owns the open connection to the source and
 closes it however the exchange ends, including when the deadline passes
 while it is blocked sending to a client that has stopped reading (that
 client's own connection is then the server's and the gateway's to reap).
+The catalog and credential queries a request makes get the same budget from
+the database's side: the pool wait is capped at what is left, and a
+transaction-local `statement_timeout` has Postgres cancel a statement that
+outlives it, so a slow database cannot hold a worker and a connection after
+the request has answered. (The membership lookup uses the organization
+store's ordinary connection and is bounded by the pool's own timeout.)
 
 **Streaming.** Blobs are relayed in 64 KiB chunks and never buffered whole.
 Each is hashed as it passes and its last chunk is held until the hash and
@@ -569,11 +576,16 @@ Registries commonly redirect a blob request to object storage. The Hub
 follows those redirects itself, for the indexer and for pulls alike, under
 these rules:
 
-- a redirect within the registry's own origin is always followed;
-- `https` is never downgraded to `http`;
-- a **literal** loopback, link-local or unspecified address is never a
-  destination. That covers `127.0.0.0/8`, `::1`, `169.254.0.0/16` (the cloud
-  metadata address), `fe80::/10`, and their IPv4-mapped IPv6 forms;
+- `https` is never downgraded to `http`, on any hop, including one that
+  leads back to an `http` registry;
+- otherwise a redirect within the registry's own origin is followed;
+- a loopback, link-local or unspecified address is never a destination.
+  That covers `127.0.0.0/8`, `::1`, `169.254.0.0/16` (the cloud metadata
+  address), `fe80::/10`, their IPv4-mapped IPv6 forms, and `localhost`;
+- a host must be either a canonical IP literal or a name with at least one
+  non-numeric label. `2130706433`, `127.1`, `0x7f000001` and the like, which
+  a resolver reads as addresses, are refused rather than interpreted; a
+  trailing dot is ignored before every check;
 - private (RFC 1918) addresses and cluster-internal names **are** allowed:
   object storage inside the cluster is normal;
 - when a source sets `blobRedirectHosts`, a redirect off the registry's

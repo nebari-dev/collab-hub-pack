@@ -306,10 +306,15 @@ class _FakeConnection:
 
     def __init__(self, answers: dict[str, list] | None = None):
         self.calls: list[tuple[str, tuple]] = []
+        self.budgets: list[int] = []
         self.answers = answers or {}
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
+        if text.startswith("SELECT set_config('statement_timeout'"):
+            # Every call's preamble (the request budget); asserted once, below.
+            self.budgets.append(int(params[0]))
+            return _FakeResult([])
         self.calls.append((text, tuple(params or ())))
         for marker, rows in self.answers.items():
             if marker in text:
@@ -320,9 +325,11 @@ class _FakeConnection:
 class _FakeDb:
     def __init__(self, conn):
         self.conn = conn
+        self.acquire_timeouts: list[float | None] = []
 
     @contextmanager
     def connection(self, timeout=None):
+        self.acquire_timeouts.append(timeout)
         yield self.conn
 
 
@@ -449,6 +456,36 @@ def test_postgres_reads_sweep_expired_rows_at_most_once_per_interval(monkeypatch
     ]
     store.find_token("thash")
     assert len(conn.calls) == 5, "and not again until the interval has passed"
+
+
+def test_postgres_calls_are_bounded_by_the_request_budget():
+    from collab_hub_api.cogs import deadline
+
+    store, conn = _fake()
+    calls = (
+        lambda: store.find_token("t"),
+        lambda: store.find_credential("c", "h"),
+        lambda: store.revoke_credential("c", "u"),
+        lambda: store.revoke_all("u"),
+        lambda: store.create_token(token_hash="t", user_id="u", credential_id=None, repositories=(), ttl_seconds=1),
+    )
+    for call in calls:
+        call()
+    # Outside a request: the default budget, for the pool wait and for every statement.
+    assert conn.budgets == [int(deadline.DEFAULT_BUDGET_SECONDS * 1000)] * len(calls)
+    assert store._db.acquire_timeouts == [deadline.DEFAULT_BUDGET_SECONDS] * len(calls)
+
+    token = deadline.request_deadline.set(deadline.time.monotonic() + 0.5)
+    try:
+        store.find_token("t")
+        assert 1 <= conn.budgets[-1] <= 500 and 0 < store._db.acquire_timeouts[-1] <= 0.5
+        deadline.request_deadline.set(deadline.time.monotonic() - 1)
+        before = len(store._db.acquire_timeouts)
+        with pytest.raises(deadline.BudgetExhausted):
+            store.find_token("t")
+        assert len(store._db.acquire_timeouts) == before, "a spent budget does not even take a connection"
+    finally:
+        deadline.request_deadline.reset(token)
 
 
 def test_postgres_find_token_requires_a_live_credential_when_it_has_one():

@@ -46,6 +46,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from .deadline import bounded_connection
 from .registry import reference
 
 STATUS_INDEXED = "indexed"
@@ -144,8 +145,9 @@ so this only caps how many *sources holding the same content* one request
 may fall back across.
 """
 
-MAX_PULLABLE_TAGS = 10_000
-"""Tags one ``tags/list`` answer is built from."""
+DEFAULT_TAGS_PAGE = 1000
+MAX_TAGS_PAGE = 1000
+"""Tags in one ``tags/list`` page: what a request gets without ``n``, and the most ``n`` may ask for."""
 
 
 @dataclass(frozen=True)
@@ -406,8 +408,16 @@ class CogCatalogStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def list_pullable_tags(self, repository: str, source_ids: Sequence[str]) -> list[str]:
-        """Every tag a pullable row of ``repository`` carries, sorted, deduplicated."""
+    def list_pullable_tags(
+        self, repository: str, source_ids: Sequence[str], *, after: str | None = None, limit: int = DEFAULT_TAGS_PAGE
+    ) -> list[str]:
+        """One page of the tags pullable rows of ``repository`` carry: sorted (code-point order), deduplicated.
+
+        ``after`` is applied before ``limit``, so paging reaches every tag
+        however many there are. ``limit`` is clamped to
+        ``1..MAX_TAGS_PAGE + 1`` (the extra one is how a caller learns that
+        another page exists).
+        """
 
         raise NotImplementedError
 
@@ -431,7 +441,11 @@ class CogCatalogStore(ABC):
         Empty when no recorded manifest of that repository references it, or
         when every manifest that does has since been removed -- removal takes
         a version's blobs with it at once, unless another pullable manifest
-        references them too. At most :data:`MAX_PULL_CANDIDATES`, newest first.
+        references them too. One location per source (that source's newest
+        manifest naming the blob), at most :data:`MAX_PULL_CANDIDATES`
+        sources, newest first: the candidates exist to fall back across
+        sources, so several manifests in one source must not crowd another
+        source out.
         """
 
         raise NotImplementedError
@@ -440,6 +454,10 @@ class CogCatalogStore(ABC):
 def _one_of(digest: str | None, tag: str | None) -> None:
     if (digest is None) == (tag is None):
         raise ValueError("give exactly one of digest and tag")
+
+
+def _tags_limit(limit: int) -> int:
+    return max(1, min(int(limit), MAX_TAGS_PAGE + 1))
 
 
 def _bounded_limit(limit: int) -> int:
@@ -628,7 +646,7 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def has_pullable(self, repository, source_ids) -> bool:
         raise self._refuse()
 
-    def list_pullable_tags(self, repository, source_ids) -> list[str]:
+    def list_pullable_tags(self, repository, source_ids, *, after=None, limit=0) -> list[str]:
         raise self._refuse()
 
     def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
@@ -823,9 +841,9 @@ class InMemoryCogCatalogStore(CogCatalogStore):
     def has_pullable(self, repository, source_ids) -> bool:
         return bool(self._pullable_rows(repository, source_ids))
 
-    def list_pullable_tags(self, repository, source_ids) -> list[str]:
+    def list_pullable_tags(self, repository, source_ids, *, after=None, limit=DEFAULT_TAGS_PAGE) -> list[str]:
         tags = {tag for row in self._pullable_rows(repository, source_ids) for tag in row.tags}
-        return sorted(tags)[:MAX_PULLABLE_TAGS]
+        return sorted(tag for tag in tags if after is None or tag > after)[: _tags_limit(limit)]
 
     def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
         with self._lock:
@@ -835,10 +853,14 @@ class InMemoryCogCatalogStore(CogCatalogStore):
 
     def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
         found: list[PullableBlob] = []
+        seen: set[str] = set()
         for row in self._pullable_rows(repository, source_ids):
             with self._lock:
                 blob = self._blobs.get((row.source_id, repository, row.digest), {}).get(blob_digest)
-            if blob is not None:
+            # One location per source (its newest manifest naming the blob):
+            # the candidates are for falling back across sources.
+            if blob is not None and row.source_id not in seen:
+                seen.add(row.source_id)
                 found.append(
                     PullableBlob(
                         source_id=row.source_id,
@@ -1232,7 +1254,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
     def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
         _one_of(digest, tag)
         match = "digest = %s" if digest is not None else "%s = ANY(tags)"
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 f"""
                 SELECT source_id, repository, digest, tags FROM collab_cog_artifacts
@@ -1253,7 +1275,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
         ]
 
     def has_pullable(self, repository, source_ids) -> bool:
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             row = conn.execute(
                 f"""
                 SELECT 1 AS found FROM collab_cog_artifacts
@@ -1264,18 +1286,19 @@ class PostgresCogCatalogStore(CogCatalogStore):
             ).fetchone()
         return row is not None
 
-    def list_pullable_tags(self, repository, source_ids) -> list[str]:
-        with self._db.connection() as conn:
+    def list_pullable_tags(self, repository, source_ids, *, after=None, limit=DEFAULT_TAGS_PAGE) -> list[str]:
+        with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 f"""
                 SELECT tag FROM (
                     SELECT DISTINCT tag FROM collab_cog_artifacts, unnest(tags) AS tag
                     WHERE repository = %s AND source_id = ANY(%s) AND {_PULLABLE}
                 ) AS tags
+                WHERE %s::text IS NULL OR tag COLLATE "C" > %s
                 ORDER BY tag COLLATE "C"
                 LIMIT %s
                 """,
-                (repository, list(source_ids), MAX_PULLABLE_TAGS),
+                (repository, list(source_ids), after, after, _tags_limit(limit)),
             ).fetchall()
         return [row["tag"] for row in rows]
 
@@ -1283,7 +1306,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
         descriptors = list(blobs)
         if not descriptors:
             return
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             # One statement, and a no-op once the manifest has been recorded:
             # what a digest references cannot change.
             conn.execute(
@@ -1305,16 +1328,21 @@ class PostgresCogCatalogStore(CogCatalogStore):
             )
 
     def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 f"""
-                SELECT b.source_id, b.repository, b.manifest_digest, b.blob_digest, b.size
-                FROM collab_cog_manifest_blobs b
-                JOIN collab_cog_artifacts a
-                  ON a.source_id = b.source_id AND a.repository = b.repository AND a.digest = b.manifest_digest
-                WHERE b.repository = %s AND b.blob_digest = %s AND b.source_id = ANY(%s)
-                  AND {_PULLABLE_A}
-                ORDER BY a.pushed_at DESC NULLS LAST, a.indexed_at DESC, a.source_id, a.digest
+                SELECT source_id, repository, manifest_digest, blob_digest, size FROM (
+                    SELECT DISTINCT ON (b.source_id)
+                           b.source_id, b.repository, b.manifest_digest, b.blob_digest, b.size,
+                           a.pushed_at, a.indexed_at
+                    FROM collab_cog_manifest_blobs b
+                    JOIN collab_cog_artifacts a
+                      ON a.source_id = b.source_id AND a.repository = b.repository AND a.digest = b.manifest_digest
+                    WHERE b.repository = %s AND b.blob_digest = %s AND b.source_id = ANY(%s)
+                      AND {_PULLABLE_A}
+                    ORDER BY b.source_id, a.pushed_at DESC NULLS LAST, a.indexed_at DESC, a.digest
+                ) AS located
+                ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC, source_id
                 LIMIT %s
                 """,
                 (repository, blob_digest, list(source_ids), MAX_PULL_CANDIDATES),

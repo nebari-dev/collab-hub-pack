@@ -41,6 +41,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from .deadline import bounded_connection
+
 SCOPE_PULL = "pull"
 CREDENTIAL_SCOPES = frozenset({SCOPE_PULL})
 """The scopes a credential may be exchanged for. The publish half (#180) adds its own."""
@@ -364,7 +366,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
 
     def create_credential(self, *, credential_id, user_id, secret_hash, scope, session_id, ttl_seconds):
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             # Housekeeping rides the write that makes it necessary: expired
             # rows go (their tokens cascade), and so do expired tokens that
             # never had a credential.
@@ -393,7 +395,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         return _credential_from_row(row)
 
     def find_credential(self, credential_id, secret_hash):
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             row = conn.execute(
                 """
                 SELECT id, user_id, scope, session_id, created_at, expires_at
@@ -405,7 +407,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         return _credential_from_row(row) if row else None
 
     def revoke_credential(self, credential_id, user_id):
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             row = conn.execute(
                 "DELETE FROM collab_cog_registry_credentials"
                 " WHERE id = %s AND user_id = %s AND expires_at > now() RETURNING id",
@@ -414,7 +416,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         return row is not None
 
     def revoke_all(self, user_id):
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 "DELETE FROM collab_cog_registry_credentials WHERE user_id = %s RETURNING id",
                 (user_id,),
@@ -426,7 +428,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
 
     def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds):
         names = list(repositories)
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             # Tokens minted from a Hub access token have no credential whose
             # expiry would sweep them, so the mint sweeps.
             conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
@@ -457,7 +459,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         return _grant_from_row(row) if row else None
 
     def find_token(self, token_hash):
-        with self._db.connection() as conn:
+        with bounded_connection(self._db) as conn:
             self._sweep_if_due(conn)
             row = conn.execute(
                 """

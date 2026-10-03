@@ -62,7 +62,7 @@ from dataclasses import dataclass
 
 from starlette.concurrency import run_in_threadpool
 
-from .catalog import BlobDescriptor, CogCatalogStore
+from .catalog import DEFAULT_TAGS_PAGE, BlobDescriptor, CogCatalogStore
 from .oci import (
     MEDIA_TYPE_OCI_MANIFEST,
     BlobStream,
@@ -170,9 +170,13 @@ class CogRegistryFront:
 
     # -- the three reads ------------------------------------------------------
 
-    async def tags(self, repository: str) -> list[str]:
+    async def tags(self, repository: str, *, after: str | None = None, limit: int = DEFAULT_TAGS_PAGE) -> list[str]:
+        """One page of tags after ``after``; ask for one more than the page to learn whether another follows."""
+
         self._check_name(repository)
-        tags = await run_in_threadpool(self._store.list_pullable_tags, repository, self._source_ids)
+        tags = await run_in_threadpool(
+            lambda: self._store.list_pullable_tags(repository, self._source_ids, after=after, limit=limit)
+        )
         if not tags:
             # Untagged artifacts make a repository with no tags; no artifacts make no repository.
             await self._require_repository(repository)
@@ -181,24 +185,25 @@ class CogRegistryFront:
     async def manifest(self, repository: str, reference: str) -> ServedManifest:
         self._check_name(repository)
         unknown = ManifestUnknown(f"manifest {reference} is not known to {repository}")
-        if is_sha256_digest(reference):
-            lookup = {"digest": reference}
-        elif is_tag(reference):
-            lookup = {"tag": reference}
-        else:
-            await self._require_repository(repository)
-            raise unknown
-        rows = await run_in_threadpool(lambda: self._store.find_pullable(repository, self._source_ids, **lookup))
+        digest = reference if is_sha256_digest(reference) else None
+        if digest is None and is_tag(reference):
+            # A tag names the newest pullable row carrying it, and nothing
+            # more: the digest it resolves to is then looked up like any other.
+            named = await run_in_threadpool(
+                lambda: self._store.find_pullable(repository, self._source_ids, tag=reference)
+            )
+            digest = named[0].digest if named else None
+        # Every source holding that digest; the next is tried only when one no longer has it.
+        rows = (
+            await run_in_threadpool(lambda: self._store.find_pullable(repository, self._source_ids, digest=digest))
+            if digest is not None
+            else []
+        )
         if not rows:
             await self._require_repository(repository)
             raise unknown
-        # A tag names the newest row carrying it; a digest may sit in several
-        # sources, and the next is tried only when one no longer has it.
-        digest = rows[0].digest
         unavailable = False
         for row in rows:
-            if row.digest != digest:
-                continue
             try:
                 manifest = await self._sources[row.source_id].oci().fetch_manifest(repository, digest)
             except OCINotFound as exc:

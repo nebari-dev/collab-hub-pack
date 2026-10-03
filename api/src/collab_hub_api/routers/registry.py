@@ -56,6 +56,7 @@ import asyncio
 import base64
 import binascii
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC
 
@@ -64,7 +65,8 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from ..cogs.catalog import CogCatalogUnavailableError
+from ..cogs.catalog import DEFAULT_TAGS_PAGE, MAX_TAGS_PAGE, CogCatalogUnavailableError
+from ..cogs.deadline import BudgetExhausted, request_deadline
 from ..cogs.oci import OCIError
 from ..cogs.registry import is_repository_path
 from ..cogs.registry_credentials import (
@@ -100,7 +102,6 @@ MAX_TOKEN_SCOPES = 16
 MAX_SCOPE_ENTRIES = 64
 MAX_SCOPE_LENGTH = 8192
 """How much of a token request's ``scope`` input is looked at at all: entries, and characters per parameter."""
-MAX_TAGS_PAGE = 1000
 
 
 def registry_path(path: str) -> bool:
@@ -173,6 +174,7 @@ def _storage_errors() -> tuple[type[Exception], ...]:
         RegistryCredentialsUnavailableError,
         CogCatalogUnavailableError,
         OrgsUnavailableError,
+        BudgetExhausted,
         *postgres_error_classes(),
     )
 
@@ -431,7 +433,11 @@ async def _serve(request: Request, rest: str) -> Response:
     # One aggregate deadline per request, set before the first lookup: the
     # token, the catalog, the source, and (for a blob body) the relay to the
     # client all spend from it.
-    deadline = now + (serving.max_blob_seconds if streaming else serving.max_metadata_seconds)
+    budget = serving.max_blob_seconds if streaming else serving.max_metadata_seconds
+    deadline = now + budget
+    # The same budget for the blocking store calls, which a cancelled
+    # coroutine cannot stop: the database is told when to give up instead.
+    request_deadline.set(time.monotonic() + min(budget, serving.max_metadata_seconds))
     blob: ServedBlob | None = None
     try:
         async with asyncio.timeout_at(deadline):
@@ -442,7 +448,7 @@ async def _serve(request: Request, rest: str) -> Response:
             await _grant(request, name)
 
             if kind == "tags":
-                return _tags_response(request, name, await serving.front.tags(name))
+                return await _tags_response(request, serving, name)
 
             if kind == "manifests":
                 manifest = await serving.front.manifest(name, reference)
@@ -470,20 +476,21 @@ async def _serve(request: Request, rest: str) -> Response:
     )
 
 
-def _tags_response(request: Request, name: str, tags: list[str]) -> Response:
-    last = request.query_params.get("last")
-    if last:
-        tags = [tag for tag in tags if tag > last]
-    headers = dict(API_VERSION_HEADERS)
+async def _tags_response(request: Request, serving: CogRegistryServing, name: str) -> Response:
+    """One page of tags: ``n`` of them (a bounded default without ``n``) after ``last``, and a ``Link`` to the next."""
+
     raw_n = request.query_params.get("n")
-    if raw_n is not None:
-        if not raw_n.isdigit():
-            raise RegistryError(status.HTTP_400_BAD_REQUEST, "PAGINATION_NUMBER_INVALID", "n must be a number")
-        n = min(int(raw_n), MAX_TAGS_PAGE)
-        if len(tags) > n:
-            tags = tags[:n]
-            if tags:
-                headers["Link"] = f'<{REGISTRY_PATH_PREFIX}/{name}/tags/list?n={n}&last={tags[-1]}>; rel="next"'
+    if raw_n is not None and not raw_n.isdigit():
+        raise RegistryError(status.HTTP_400_BAD_REQUEST, "PAGINATION_NUMBER_INVALID", "n must be a number")
+    n = min(int(raw_n), MAX_TAGS_PAGE) if raw_n is not None else DEFAULT_TAGS_PAGE
+    last = request.query_params.get("last") or None
+    # One more than the page says whether another follows, without a count.
+    tags = await serving.front.tags(name, after=last, limit=n + 1)
+    headers = dict(API_VERSION_HEADERS)
+    if len(tags) > n:
+        tags = tags[:n]
+        if tags:
+            headers["Link"] = f'<{REGISTRY_PATH_PREFIX}/{name}/tags/list?n={n}&last={tags[-1]}>; rel="next"'
     return JSONResponse({"name": name, "tags": tags}, headers=headers)
 
 

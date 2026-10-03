@@ -686,12 +686,16 @@ class OCIClient:
         credential, so this is defence in depth against a registry that is
         compromised or misconfigured into pointing the Hub at something else:
 
-        - a hop that stays on the registry's own origin is always allowed;
-        - ``https`` never downgrades to ``http``;
-        - a *literal* loopback, link-local or unspecified address is never a
+        - ``https`` never downgrades to ``http``, on any hop, including one
+          that returns to the registry;
+        - otherwise a hop that stays on the registry's own origin is allowed;
+        - a loopback, link-local or unspecified address is never a
           destination (that covers the cloud metadata address and its IPv6
-          and IPv4-mapped forms). Private (RFC 1918) addresses are allowed:
-          in-cluster object storage is normal;
+          and IPv4-mapped forms), and neither is a host written as a bare
+          number or a short or hex/octal dotted form, which a resolver would
+          read as an address (see :func:`_redirect_host_kind`). Private
+          (RFC 1918) addresses are allowed: in-cluster object storage is
+          normal;
         - with ``redirect_hosts`` configured, the host must be on it: an
           exact name, or a ``.suffix`` any subdomain of which matches.
 
@@ -699,13 +703,19 @@ class OCIClient:
         the allowlist is what closes that.
         """
 
+        if previous.scheme == "https" and target.scheme != "https":
+            # Before the same-origin exemption: a chain that leaves an http
+            # registry for https storage may not be led back down to http,
+            # where the registry credential would be attached again.
+            raise OCIProtocolError(f"{what}: refusing a redirect from https to http")
         if _same_origin(target, self._origin):
             return
-        if previous.scheme == "https" and target.scheme != "https":
-            raise OCIProtocolError(f"{what}: refusing a redirect from https to http")
-        host = target.host.lower()
-        if _is_forbidden_address(host):
+        host = target.host.lower().rstrip(".")
+        kind = _redirect_host_kind(host)
+        if kind == "forbidden":
             raise OCIProtocolError(f"{what}: refusing a redirect to a loopback or link-local address")
+        if kind == "ambiguous":
+            raise OCIProtocolError(f"{what}: refusing a redirect to a host that is neither an IP address nor a name")
         if self._redirect_hosts and not any(_host_allowed(host, allowed) for allowed in self._redirect_hosts):
             raise OCIProtocolError(f"{what}: refusing a redirect to a host that is not in blob_redirect_hosts")
 
@@ -1032,17 +1042,41 @@ def _same_origin(a: httpx.URL, b: httpx.URL) -> bool:
     return (a.scheme, a.host, a.port) == (b.scheme, b.host, b.port)
 
 
-def _is_forbidden_address(host: str) -> bool:
-    """Whether ``host`` is an IP literal a redirect may never target (not a name: names are not resolved)."""
+_NUMERIC_LABEL = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)")
 
+
+def _redirect_host_kind(host: str) -> str:
+    """Classify a redirect host (lowercase, no trailing dot): ``"ok"``, ``"forbidden"`` or ``"ambiguous"``.
+
+    - A **canonical IP literal** (what :mod:`ipaddress` parses strictly:
+      dotted-quad IPv4 without leading zeros, or IPv6) is range-checked:
+      loopback, link-local and unspecified addresses, and their IPv4-mapped
+      IPv6 forms, are forbidden.
+    - Anything else must be a **name with at least one label that is not a
+      number**. ``2130706433``, ``127.1``, ``0x7f000001`` and ``0177.0.0.1``
+      are not names: the resolver reads them as addresses (here, loopback),
+      and they parse as no canonical literal, so they are ambiguous and
+      refused rather than interpreted.
+    - ``localhost`` and names under it are forbidden: by convention they are
+      loopback, whatever a resolver says.
+    """
+
+    if not host:
+        return "ambiguous"
     try:
-        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+        address = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
-        return False
+        if host == "localhost" or host.endswith(".localhost"):
+            return "forbidden"
+        if ":" in host or all(_NUMERIC_LABEL.fullmatch(label) for label in host.split(".")):
+            return "ambiguous"
+        return "ok"
     mapped = getattr(address, "ipv4_mapped", None)
     if mapped is not None:
         address = mapped
-    return address.is_loopback or address.is_link_local or address.is_unspecified
+    if address.is_loopback or address.is_link_local or address.is_unspecified:
+        return "forbidden"
+    return "ok"
 
 
 def _host_allowed(host: str, allowed: str) -> bool:
