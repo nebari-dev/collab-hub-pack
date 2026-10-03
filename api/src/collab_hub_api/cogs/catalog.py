@@ -135,6 +135,27 @@ class CogArtifact:
 
 logger = logging.getLogger("frames_server.cogs.catalog")
 
+MAX_PULLABLE_ROWS = 256
+"""How many of a repository's artifacts :meth:`CogCatalogStore.list_pullable` returns, newest first.
+
+A bound on what one request to the Hub's ``/v2/`` surface can make the
+catalog (and, on a cold replica, the backing registry) do. A Cog repository
+holds a handful of versions; one holding more than this serves its newest.
+"""
+
+
+@dataclass(frozen=True)
+class PullableArtifact:
+    """One artifact the Hub may serve a pull of: where it lives, and what names it.
+
+    The slim view of a catalog row the ``/v2/`` surface needs -- no card.
+    """
+
+    source_id: str
+    repository: str
+    digest: str
+    tags: tuple[str, ...] = ()
+
 
 @dataclass(frozen=True)
 class KnownArtifact:
@@ -328,6 +349,20 @@ class CogCatalogStore(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    def list_pullable(self, repository: str) -> list[PullableArtifact]:
+        """The artifacts a pull of ``repository`` through the Hub may reach, newest first.
+
+        Exactly the rows the read API lists: present (not removed), indexed,
+        with a ``cog_id`` -- across every source holding that repository
+        path. Non-Cog artifacts, failed reads and removed versions are not
+        pullable. At most :data:`MAX_PULLABLE_ROWS`, ordered like
+        :meth:`list_versions`, so the first row carrying a tag is the one the
+        tag resolves to.
+        """
+
+        raise NotImplementedError
+
 
 def _bounded_limit(limit: int) -> int:
     if limit < 1:
@@ -509,6 +544,9 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         raise self._refuse()
 
+    def list_pullable(self, repository) -> list[PullableArtifact]:
+        raise self._refuse()
+
 
 @dataclass
 class InMemoryCogCatalogStore(CogCatalogStore):
@@ -672,6 +710,14 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             ]
         rows.sort(key=_sort_key)
         return rows
+
+    def list_pullable(self, repository) -> list[PullableArtifact]:
+        rows = [row for row in self._present_cogs() if row.repository == repository]
+        rows.sort(key=_sort_key)
+        return [
+            PullableArtifact(source_id=row.source_id, repository=row.repository, digest=row.digest, tags=row.tags)
+            for row in rows[:MAX_PULLABLE_ROWS]
+        ]
 
 
 _COLUMNS = (
@@ -1046,6 +1092,27 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 (cog_id, include_removed),
             ).fetchall()
         return [_row_to_artifact(row) for row in rows]
+
+    def list_pullable(self, repository) -> list[PullableArtifact]:
+        with self._db.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT source_id, repository, digest, tags FROM collab_cog_artifacts
+                WHERE repository = %s AND removed_at IS NULL AND status = '{STATUS_INDEXED}' AND cog_id IS NOT NULL
+                ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC, source_id, repository, digest
+                LIMIT %s
+                """,
+                (repository, MAX_PULLABLE_ROWS),
+            ).fetchall()
+        return [
+            PullableArtifact(
+                source_id=row["source_id"],
+                repository=row["repository"],
+                digest=row["digest"],
+                tags=tuple(row["tags"] or ()),
+            )
+            for row in rows
+        ]
 
 
 @contextmanager

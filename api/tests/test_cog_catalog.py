@@ -26,6 +26,7 @@ import pytest
 from collab_hub_api.cogs.catalog import (
     COG_INDEX_LOCK_KEY,
     MAX_LIST_LIMIT,
+    MAX_PULLABLE_ROWS,
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
@@ -37,6 +38,7 @@ from collab_hub_api.cogs.catalog import (
     InMemoryCogCatalogStore,
     KnownArtifact,
     PostgresCogCatalogStore,
+    PullableArtifact,
     UnavailableCogCatalogStore,
     card_search_fields,
     contains_nul,
@@ -402,6 +404,7 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.list_current(),
         lambda: store.list_repositories(),
         lambda: store.list_versions("x"),
+        lambda: store.list_pullable("cogs/a"),
     ):
         with pytest.raises(CogCatalogUnavailableError):
             call()
@@ -761,6 +764,67 @@ def _exercise_read_api_listing(store) -> None:
         ("odd/o8", "1.0.0"),
         ("odd/o9", "1.0.0"),
     ]
+
+
+def _exercise_pullable(store) -> None:
+    """What a pull through the Hub (#179) may reach, run against either backend."""
+
+    store.upsert(artifact("1", repository="cogs/a", tags=("v1", "latest"), pushed_at=T0))
+    store.upsert(artifact("2", repository="cogs/a", tags=("v2", "latest"), pushed_at=T0 + timedelta(days=1)))
+    # The same path in another source is the same repository to a client.
+    store.upsert(artifact("3", source_id="mirror", repository="cogs/a", tags=("v0",), pushed_at=T0 - timedelta(days=1)))
+    store.upsert(artifact("4", repository="cogs/a", tags=("unknown-push",), pushed_at=None))
+    # Not pullable: removed, not a Cog, a failed read, a row with no cog id, another repository.
+    store.upsert(artifact("5", repository="cogs/a", tags=("gone",)))
+    store.mark_removed_one(SOURCE, "cogs/a", digest("5"))
+    store.upsert(artifact("6", repository="cogs/a", status=STATUS_NON_COG))
+    store.upsert(artifact("7", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
+    idless = card()
+    del idless["id"]
+    store.upsert(artifact("8", repository="cogs/a", document=idless))
+    store.upsert(artifact("9", repository="cogs/ab"))
+
+    rows = store.list_pullable("cogs/a")
+    assert all(isinstance(row, PullableArtifact) for row in rows)
+    # Newest push first, an unknown push time last: the first row carrying a tag is what the tag names.
+    assert [(row.source_id, row.digest) for row in rows] == [
+        (SOURCE, digest("2")),
+        (SOURCE, digest("1")),
+        ("mirror", digest("3")),
+        (SOURCE, digest("4")),
+    ]
+    assert rows[0].tags == ("latest", "v2") and rows[0].repository == "cogs/a"
+    assert [row.digest for row in store.list_pullable("cogs/ab")] == [digest("9")]
+    assert store.list_pullable("cogs") == [] and store.list_pullable("cogs/missing") == []
+
+
+def test_pullable_rows_in_memory(store):
+    _exercise_pullable(store)
+
+
+@live_postgres
+def test_live_pullable_rows(live_store):
+    store, _ = live_store
+    _exercise_pullable(store)
+
+
+def test_pullable_rows_are_bounded(store):
+    for seed in range(MAX_PULLABLE_ROWS + 3):
+        store.upsert(
+            CogArtifact(
+                source_id=SOURCE,
+                host=HOST,
+                repository="cogs/many",
+                digest="sha256:" + f"{seed:064x}",
+                status=STATUS_INDEXED,
+                pushed_at=T0 + timedelta(seconds=seed),
+                card=card(),
+                cog_id="example/cog-a",
+            )
+        )
+    rows = store.list_pullable("cogs/many")
+    assert len(rows) == MAX_PULLABLE_ROWS
+    assert rows[0].digest == "sha256:" + f"{MAX_PULLABLE_ROWS + 2:064x}", "the newest are kept"
 
 
 def test_read_api_listing_semantics_in_memory(store):
@@ -1258,6 +1322,22 @@ def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order()
     assert [row.repository for row in store.list_repositories()] == ["cogs/B", "cogs/b"]
     sql = conn.statements[0]
     assert "DISTINCT ON (repository)" in sql and "removed_at IS NULL" in sql and "cog_id IS NOT NULL" in sql
+
+
+def test_list_pullable_selects_present_cog_rows_of_one_repository():
+    rows = [
+        {"source_id": SOURCE, "repository": "cogs/a", "digest": DIGEST_A, "tags": ["v1"]},
+        {"source_id": "mirror", "repository": "cogs/a", "digest": DIGEST_B, "tags": None},
+    ]
+    store, conn = _fake_store([rows])
+    assert store.list_pullable("cogs/a") == [
+        PullableArtifact(source_id=SOURCE, repository="cogs/a", digest=DIGEST_A, tags=("v1",)),
+        PullableArtifact(source_id="mirror", repository="cogs/a", digest=DIGEST_B, tags=()),
+    ]
+    sql, params = conn.calls[0]
+    assert "WHERE repository = %s AND removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL" in sql
+    assert "ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC" in sql and sql.endswith("LIMIT %s")
+    assert params == ("cogs/a", MAX_PULLABLE_ROWS)
 
 
 def test_list_versions_orders_newest_first_and_can_include_removed():
