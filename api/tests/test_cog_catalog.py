@@ -26,11 +26,12 @@ import pytest
 from collab_hub_api.cogs.catalog import (
     COG_INDEX_LOCK_KEY,
     MAX_LIST_LIMIT,
-    MAX_PULLABLE_ROWS,
+    MAX_PULL_CANDIDATES,
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
     SWEEP_STATEMENT_TIMEOUT_SECONDS,
+    BlobDescriptor,
     CatalogFilter,
     CogArtifact,
     CogCatalogDataError,
@@ -39,6 +40,7 @@ from collab_hub_api.cogs.catalog import (
     KnownArtifact,
     PostgresCogCatalogStore,
     PullableArtifact,
+    PullableBlob,
     UnavailableCogCatalogStore,
     card_search_fields,
     contains_nul,
@@ -404,7 +406,11 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.list_current(),
         lambda: store.list_repositories(),
         lambda: store.list_versions("x"),
-        lambda: store.list_pullable("cogs/a"),
+        lambda: store.find_pullable("cogs/a", (SOURCE,), digest=digest("a")),
+        lambda: store.has_pullable("cogs/a", (SOURCE,)),
+        lambda: store.list_pullable_tags("cogs/a", (SOURCE,)),
+        lambda: store.record_manifest_blobs(SOURCE, "cogs/a", digest("a"), ()),
+        lambda: store.find_blob("cogs/a", digest("b"), (SOURCE,)),
     ):
         with pytest.raises(CogCatalogUnavailableError):
             call()
@@ -766,50 +772,136 @@ def _exercise_read_api_listing(store) -> None:
     ]
 
 
+BOTH = (SOURCE, "mirror")
+
+
 def _exercise_pullable(store) -> None:
-    """What a pull through the Hub (#179) may reach, run against either backend."""
+    """What a pull through the Hub (#179) may reach, run against either backend. Every lookup is exact."""
 
     store.upsert(artifact("1", repository="cogs/a", tags=("v1", "latest"), pushed_at=T0))
     store.upsert(artifact("2", repository="cogs/a", tags=("v2", "latest"), pushed_at=T0 + timedelta(days=1)))
-    # The same path in another source is the same repository to a client.
+    # The same path in another source is the same repository to a client, and may hold the same digest.
     store.upsert(artifact("3", source_id="mirror", repository="cogs/a", tags=("v0",), pushed_at=T0 - timedelta(days=1)))
-    store.upsert(artifact("4", repository="cogs/a", tags=("unknown-push",), pushed_at=None))
-    # Not pullable: removed, not a Cog, a failed read, a row with no cog id, another repository.
+    store.upsert(artifact("1", source_id="mirror", repository="cogs/a", tags=("v1",), pushed_at=T0 - timedelta(days=2)))
+    store.upsert(artifact("4", repository="cogs/a", tags=(), pushed_at=None))
+    # Not pullable: removed, not a Cog, a failed read, a row with no cog id. And another repository.
     store.upsert(artifact("5", repository="cogs/a", tags=("gone",)))
     store.mark_removed_one(SOURCE, "cogs/a", digest("5"))
-    store.upsert(artifact("6", repository="cogs/a", status=STATUS_NON_COG))
-    store.upsert(artifact("7", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
+    store.upsert(artifact("6", repository="cogs/a", tags=("noncog",), status=STATUS_NON_COG))
+    store.upsert(artifact("7", repository="cogs/a", tags=("failed",), status=STATUS_FAILED, read_errors=("boom",)))
     idless = card()
     del idless["id"]
-    store.upsert(artifact("8", repository="cogs/a", document=idless))
-    store.upsert(artifact("9", repository="cogs/ab"))
+    store.upsert(artifact("8", repository="cogs/a", tags=("idless",), document=idless))
+    store.upsert(artifact("9", repository="cogs/ab", tags=("v9",)))
 
-    rows = store.list_pullable("cogs/a")
-    assert all(isinstance(row, PullableArtifact) for row in rows)
-    # Newest push first, an unknown push time last: the first row carrying a tag is what the tag names.
-    assert [(row.source_id, row.digest) for row in rows] == [
-        (SOURCE, digest("2")),
-        (SOURCE, digest("1")),
-        ("mirror", digest("3")),
-        (SOURCE, digest("4")),
+    def found(**lookup) -> list[tuple[str, str]]:
+        rows = store.find_pullable("cogs/a", BOTH, **lookup)
+        assert all(isinstance(row, PullableArtifact) and row.repository == "cogs/a" for row in rows)
+        return [(row.source_id, row.digest) for row in rows]
+
+    # By digest: every source holding it, newest push first.
+    assert found(digest=digest("1")) == [(SOURCE, digest("1")), ("mirror", digest("1"))]
+    assert found(digest=digest("4")) == [(SOURCE, digest("4"))], "an unknown push time is still found"
+    # By tag: the newest row carrying it comes first; that is what the tag names.
+    assert found(tag="latest") == [(SOURCE, digest("2")), (SOURCE, digest("1"))]
+    assert found(tag="v1") == [(SOURCE, digest("1")), ("mirror", digest("1"))]
+    assert store.find_pullable("cogs/a", BOTH, tag="latest")[0].tags == ("latest", "v2")
+    # Exact means exact: no prefix, no other repository, nothing that is not pullable.
+    for nothing in ({"tag": "v"}, {"tag": "v9"}, {"digest": digest("9")}, {"tag": "gone"}, {"digest": digest("5")}):
+        assert found(**nothing) == [], nothing
+    for seed, tag in (("6", "noncog"), ("7", "failed"), ("8", "idless")):
+        assert found(digest=digest(seed)) == [] and found(tag=tag) == []
+    # Scoped to the sources the caller can reach.
+    assert [row.source_id for row in store.find_pullable("cogs/a", ("mirror",), digest=digest("1"))] == ["mirror"]
+    assert store.find_pullable("cogs/a", (), digest=digest("1")) == []
+    assert store.find_pullable("cogs/a", ("elsewhere",), tag="latest") == []
+    for bad in ({}, {"digest": digest("1"), "tag": "v1"}):
+        with pytest.raises(ValueError, match="exactly one"):
+            store.find_pullable("cogs/a", BOTH, **bad)
+
+    assert store.has_pullable("cogs/a", BOTH) and store.has_pullable("cogs/ab", (SOURCE,))
+    assert not store.has_pullable("cogs", BOTH) and not store.has_pullable("cogs/missing", BOTH)
+    assert not store.has_pullable("cogs/ab", ("mirror",)) and not store.has_pullable("cogs/a", ())
+
+    assert store.list_pullable_tags("cogs/a", BOTH) == ["latest", "v0", "v1", "v2"]
+    assert store.list_pullable_tags("cogs/a", ("mirror",)) == ["v0", "v1"]
+    assert store.list_pullable_tags("cogs/missing", BOTH) == []
+
+
+def _exercise_blobs(store) -> None:
+    """Blob reachability is stored data joined to the pullable rule at read time."""
+
+    blob_x, blob_y, blob_z = digest("x"), digest("y"), digest("z")
+    store.upsert(artifact("1", repository="cogs/a", pushed_at=T0 + timedelta(days=1)))
+    store.upsert(artifact("2", repository="cogs/a", pushed_at=T0))
+    store.upsert(artifact("1", source_id="mirror", repository="cogs/a", pushed_at=T0 - timedelta(days=1)))
+    store.upsert(artifact("3", repository="cogs/b"))
+    described = [BlobDescriptor(blob_x, 10, "application/vnd.pixi.config.v1+toml"), BlobDescriptor(blob_y, 20)]
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), described)
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), iter(described))  # idempotent
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), [BlobDescriptor(blob_x, 999)])  # first write wins
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("2"), [BlobDescriptor(blob_x, 10)])
+    store.record_manifest_blobs("mirror", "cogs/a", digest("1"), [BlobDescriptor(blob_x, 10)])
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), [])  # nothing to record
+    # Recorded for a digest that has no artifact row at all: grants nothing.
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("0"), [BlobDescriptor(blob_z, 5)])
+
+    def where(repository: str, blob: str, sources=BOTH) -> list[tuple[str, str, int]]:
+        rows = store.find_blob(repository, blob, sources)
+        assert all(isinstance(row, PullableBlob) and row.digest == blob for row in rows)
+        assert all(row.repository == repository for row in rows)
+        return [(row.source_id, row.manifest_digest, row.size) for row in rows]
+
+    assert where("cogs/a", blob_x) == [
+        (SOURCE, digest("1"), 10),
+        (SOURCE, digest("2"), 10),
+        ("mirror", digest("1"), 10),
     ]
-    assert rows[0].tags == ("latest", "v2") and rows[0].repository == "cogs/a"
-    assert [row.digest for row in store.list_pullable("cogs/ab")] == [digest("9")]
-    assert store.list_pullable("cogs") == [] and store.list_pullable("cogs/missing") == []
+    assert where("cogs/a", blob_y) == [(SOURCE, digest("1"), 20)]
+    assert where("cogs/a", blob_x, ("mirror",)) == [("mirror", digest("1"), 10)]
+    assert where("cogs/a", blob_z) == [], "no pullable manifest references it"
+    assert where("cogs/b", blob_x) == [], "another repository's manifests do not vouch for it here"
+    assert where("cogs/a", digest("q")) == [] and where("cogs/a", blob_x, ()) == []
+
+    # Removing a version takes its blobs with it, unless another pullable manifest references them.
+    store.mark_removed_one(SOURCE, "cogs/a", digest("1"))
+    assert where("cogs/a", blob_y) == []
+    assert where("cogs/a", blob_x) == [(SOURCE, digest("2"), 10), ("mirror", digest("1"), 10)]
+    # A failed re-read or a non-Cog verdict revokes them just the same.
+    store.upsert(artifact("2", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
+    assert where("cogs/a", blob_x) == [("mirror", digest("1"), 10)]
+    # Back in the registry and reindexed: pullable again, from what was recorded before.
+    store.upsert(artifact("1", repository="cogs/a", pushed_at=T0 + timedelta(days=1)))
+    assert where("cogs/a", blob_y) == [(SOURCE, digest("1"), 20)]
 
 
-def test_pullable_rows_in_memory(store):
+def test_pullable_lookups_in_memory(store):
     _exercise_pullable(store)
 
 
 @live_postgres
-def test_live_pullable_rows(live_store):
+def test_live_pullable_lookups(live_store):
     store, _ = live_store
     _exercise_pullable(store)
 
 
-def test_pullable_rows_are_bounded(store):
-    for seed in range(MAX_PULLABLE_ROWS + 3):
+def test_blob_reachability_in_memory(store):
+    _exercise_blobs(store)
+
+
+@live_postgres
+def test_live_blob_reachability(live_store):
+    store, _ = live_store
+    _exercise_blobs(store)
+
+
+@pytest.mark.parametrize("backend", ["memory", pytest.param("postgres", marks=live_postgres)])
+def test_lookups_are_exact_whatever_the_repository_holds(backend, request):
+    """A work bound on *locations of one digest*, never a window over a repository's versions."""
+
+    store = InMemoryCogCatalogStore() if backend == "memory" else request.getfixturevalue("live_store")[0]
+    oldest = "sha256:" + f"{0:064x}"
+    for seed in range(300):
         store.upsert(
             CogArtifact(
                 source_id=SOURCE,
@@ -817,14 +909,24 @@ def test_pullable_rows_are_bounded(store):
                 repository="cogs/many",
                 digest="sha256:" + f"{seed:064x}",
                 status=STATUS_INDEXED,
+                tags=(f"v{seed}",),
                 pushed_at=T0 + timedelta(seconds=seed),
                 card=card(),
                 cog_id="example/cog-a",
             )
         )
-    rows = store.list_pullable("cogs/many")
-    assert len(rows) == MAX_PULLABLE_ROWS
-    assert rows[0].digest == "sha256:" + f"{MAX_PULLABLE_ROWS + 2:064x}", "the newest are kept"
+    assert [row.digest for row in store.find_pullable("cogs/many", (SOURCE,), digest=oldest)] == [oldest]
+    assert [row.digest for row in store.find_pullable("cogs/many", (SOURCE,), tag="v0")] == [oldest]
+    assert len(store.list_pullable_tags("cogs/many", (SOURCE,))) == 300
+    store.record_manifest_blobs(SOURCE, "cogs/many", oldest, [BlobDescriptor(digest("b"), 1)])
+    assert len(store.find_blob("cogs/many", digest("b"), (SOURCE,))) == 1
+    # The one bound: how many sources holding the same digest a single request may fall back across.
+    sources = tuple(f"s{index}" for index in range(MAX_PULL_CANDIDATES + 3))
+    for source_id in sources:
+        store.upsert(artifact("c", source_id=source_id, repository="cogs/shared"))
+        store.record_manifest_blobs(source_id, "cogs/shared", digest("c"), [BlobDescriptor(digest("d"), 1)])
+    assert len(store.find_pullable("cogs/shared", sources, digest=digest("c"))) == MAX_PULL_CANDIDATES
+    assert len(store.find_blob("cogs/shared", digest("d"), sources)) == MAX_PULL_CANDIDATES
 
 
 def test_read_api_listing_semantics_in_memory(store):
@@ -1324,20 +1426,75 @@ def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order()
     assert "DISTINCT ON (repository)" in sql and "removed_at IS NULL" in sql and "cog_id IS NOT NULL" in sql
 
 
-def test_list_pullable_selects_present_cog_rows_of_one_repository():
+PULLABLE_SQL = "removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL"
+
+
+def test_find_pullable_is_an_exact_lookup_scoped_to_the_given_sources():
     rows = [
         {"source_id": SOURCE, "repository": "cogs/a", "digest": DIGEST_A, "tags": ["v1"]},
-        {"source_id": "mirror", "repository": "cogs/a", "digest": DIGEST_B, "tags": None},
+        {"source_id": "mirror", "repository": "cogs/a", "digest": DIGEST_A, "tags": None},
     ]
-    store, conn = _fake_store([rows])
-    assert store.list_pullable("cogs/a") == [
+    store, conn = _fake_store([rows, rows[:1]])
+    assert store.find_pullable("cogs/a", (SOURCE, "mirror"), digest=DIGEST_A) == [
         PullableArtifact(source_id=SOURCE, repository="cogs/a", digest=DIGEST_A, tags=("v1",)),
-        PullableArtifact(source_id="mirror", repository="cogs/a", digest=DIGEST_B, tags=()),
+        PullableArtifact(source_id="mirror", repository="cogs/a", digest=DIGEST_A, tags=()),
     ]
     sql, params = conn.calls[0]
-    assert "WHERE repository = %s AND removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL" in sql
+    assert f"WHERE repository = %s AND digest = %s AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
     assert "ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC" in sql and sql.endswith("LIMIT %s")
-    assert params == ("cogs/a", MAX_PULLABLE_ROWS)
+    assert params == ("cogs/a", DIGEST_A, [SOURCE, "mirror"], MAX_PULL_CANDIDATES)
+
+    assert len(store.find_pullable("cogs/a", [SOURCE], tag="v1")) == 1
+    sql, params = conn.calls[1]
+    assert f"WHERE repository = %s AND %s = ANY(tags) AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
+    assert params == ("cogs/a", "v1", [SOURCE], MAX_PULL_CANDIDATES)
+    with pytest.raises(ValueError, match="exactly one"):
+        store.find_pullable("cogs/a", [SOURCE])
+    assert len(conn.calls) == 2, "refused before touching the database"
+
+
+def test_has_pullable_and_tags_apply_the_same_rule():
+    store, conn = _fake_store([[{"found": 1}], [], [{"tag": "latest"}, {"tag": "v1"}]])
+    assert store.has_pullable("cogs/a", (SOURCE,)) is True
+    assert store.has_pullable("cogs/a", (SOURCE,)) is False
+    assert store.list_pullable_tags("cogs/a", (SOURCE,)) == ["latest", "v1"]
+    exists, _missing, tags = conn.calls
+    assert f"WHERE repository = %s AND source_id = ANY(%s) AND {PULLABLE_SQL} LIMIT 1" in exists[0]
+    assert exists[1] == ("cogs/a", [SOURCE])
+    assert "SELECT DISTINCT tag FROM collab_cog_artifacts, unnest(tags) AS tag" in tags[0]
+    assert PULLABLE_SQL in tags[0] and 'ORDER BY tag COLLATE "C"' in tags[0]
+
+
+def test_record_manifest_blobs_is_one_idempotent_insert():
+    store, conn = _fake_store()
+    store.record_manifest_blobs(
+        SOURCE, "cogs/a", DIGEST_A, [BlobDescriptor(DIGEST_B, 12, "text/plain"), BlobDescriptor(digest("c"), 0)]
+    )
+    ((sql, params),) = conn.calls
+    assert sql.startswith("INSERT INTO collab_cog_manifest_blobs") and sql.endswith("ON CONFLICT DO NOTHING")
+    assert params == (SOURCE, "cogs/a", DIGEST_A, [DIGEST_B, digest("c")], [12, 0], ["text/plain", ""])
+    store.record_manifest_blobs(SOURCE, "cogs/a", DIGEST_A, [])
+    assert len(conn.calls) == 1, "an index or an empty manifest writes nothing"
+
+
+def test_find_blob_joins_recorded_blobs_to_the_pullable_rule():
+    row = {
+        "source_id": SOURCE,
+        "repository": "cogs/a",
+        "manifest_digest": DIGEST_A,
+        "blob_digest": DIGEST_B,
+        "size": 12,
+    }
+    store, conn = _fake_store([[row]])
+    assert store.find_blob("cogs/a", DIGEST_B, (SOURCE,)) == [
+        PullableBlob(source_id=SOURCE, repository="cogs/a", manifest_digest=DIGEST_A, digest=DIGEST_B, size=12)
+    ]
+    sql, params = conn.calls[0]
+    assert "FROM collab_cog_manifest_blobs b JOIN collab_cog_artifacts a" in sql
+    assert "ON a.source_id = b.source_id AND a.repository = b.repository AND a.digest = b.manifest_digest" in sql
+    assert "WHERE b.repository = %s AND b.blob_digest = %s AND b.source_id = ANY(%s)" in sql
+    assert "a.removed_at IS NULL AND a.status = 'indexed' AND a.cog_id IS NOT NULL" in sql
+    assert params == ("cogs/a", DIGEST_B, [SOURCE], MAX_PULL_CANDIDATES)
 
 
 def test_list_versions_orders_newest_first_and_can_include_removed():

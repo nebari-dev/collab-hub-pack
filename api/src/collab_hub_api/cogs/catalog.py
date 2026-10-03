@@ -40,7 +40,7 @@ import json
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -135,13 +135,17 @@ class CogArtifact:
 
 logger = logging.getLogger("frames_server.cogs.catalog")
 
-MAX_PULLABLE_ROWS = 256
-"""How many of a repository's artifacts :meth:`CogCatalogStore.list_pullable` returns, newest first.
+MAX_PULL_CANDIDATES = 4
+"""Locations of one manifest (or one blob) a pull may be tried against, preferred first.
 
-A bound on what one request to the Hub's ``/v2/`` surface can make the
-catalog (and, on a cold replica, the backing registry) do. A Cog repository
-holds a handful of versions; one holding more than this serves its newest.
+A work bound, never an authorization window: every lookup behind the Hub's
+``/v2/`` surface is exact -- by digest, by stored tag, or by blob digest --
+so this only caps how many *sources holding the same content* one request
+may fall back across.
 """
+
+MAX_PULLABLE_TAGS = 10_000
+"""Tags one ``tags/list`` answer is built from."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,26 @@ class PullableArtifact:
     repository: str
     digest: str
     tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BlobDescriptor:
+    """One blob a manifest references, as its (verified) descriptor declared it."""
+
+    digest: str
+    size: int
+    media_type: str = ""
+
+
+@dataclass(frozen=True)
+class PullableBlob:
+    """Where a blob may be pulled from: a source holding a pullable manifest that references it."""
+
+    source_id: str
+    repository: str
+    manifest_digest: str
+    digest: str
+    size: int
 
 
 @dataclass(frozen=True)
@@ -349,19 +373,73 @@ class CogCatalogStore(ABC):
 
         raise NotImplementedError
 
-    @abstractmethod
-    def list_pullable(self, repository: str) -> list[PullableArtifact]:
-        """The artifacts a pull of ``repository`` through the Hub may reach, newest first.
+    # -- what pulls through the Hub need (issue #179) -------------------------
+    #
+    # "Pullable" is one rule, applied by every method below and nowhere else:
+    # the row is present (not removed), indexed, and has a ``cog_id`` -- what
+    # the read API lists -- and its source is one of ``source_ids`` (the
+    # sources this process can reach). Every lookup is exact; none pages.
 
-        Exactly the rows the read API lists: present (not removed), indexed,
-        with a ``cog_id`` -- across every source holding that repository
-        path. Non-Cog artifacts, failed reads and removed versions are not
-        pullable. At most :data:`MAX_PULLABLE_ROWS`, ordered like
-        :meth:`list_versions`, so the first row carrying a tag is the one the
-        tag resolves to.
+    @abstractmethod
+    def find_pullable(
+        self,
+        repository: str,
+        source_ids: Sequence[str],
+        *,
+        digest: str | None = None,
+        tag: str | None = None,
+    ) -> list[PullableArtifact]:
+        """The pullable rows of ``repository`` with exactly this digest, or carrying exactly this tag.
+
+        Exactly one of ``digest``/``tag`` is given. Newest first (as
+        :meth:`list_versions` orders), so the first row carrying a tag is the
+        one the tag resolves to; at most :data:`MAX_PULL_CANDIDATES` rows,
+        which for a digest are the sources holding the same content.
         """
 
         raise NotImplementedError
+
+    @abstractmethod
+    def has_pullable(self, repository: str, source_ids: Sequence[str]) -> bool:
+        """Whether ``repository`` holds any pullable row: the difference between an unknown name and an unknown ref."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_pullable_tags(self, repository: str, source_ids: Sequence[str]) -> list[str]:
+        """Every tag a pullable row of ``repository`` carries, sorted, deduplicated."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_manifest_blobs(
+        self, source_id: str, repository: str, manifest_digest: str, blobs: Iterable[BlobDescriptor]
+    ) -> None:
+        """Remember which blobs a manifest references. Idempotent; the content under a digest never changes.
+
+        Written by whoever has just *verified* the manifest's bytes against
+        its digest. The rows grant nothing by themselves: :meth:`find_blob`
+        joins them to the pullable rule at read time.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def find_blob(self, repository: str, blob_digest: str, source_ids: Sequence[str]) -> list[PullableBlob]:
+        """Where ``blob_digest`` may be pulled from in ``repository``: via a manifest that is pullable *now*.
+
+        Empty when no recorded manifest of that repository references it, or
+        when every manifest that does has since been removed -- removal takes
+        a version's blobs with it at once, unless another pullable manifest
+        references them too. At most :data:`MAX_PULL_CANDIDATES`, newest first.
+        """
+
+        raise NotImplementedError
+
+
+def _one_of(digest: str | None, tag: str | None) -> None:
+    if (digest is None) == (tag is None):
+        raise ValueError("give exactly one of digest and tag")
 
 
 def _bounded_limit(limit: int) -> int:
@@ -544,7 +622,19 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         raise self._refuse()
 
-    def list_pullable(self, repository) -> list[PullableArtifact]:
+    def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
+        raise self._refuse()
+
+    def has_pullable(self, repository, source_ids) -> bool:
+        raise self._refuse()
+
+    def list_pullable_tags(self, repository, source_ids) -> list[str]:
+        raise self._refuse()
+
+    def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
+        raise self._refuse()
+
+    def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
         raise self._refuse()
 
 
@@ -557,6 +647,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
     """
 
     _rows: dict[tuple[str, str, str], CogArtifact] = field(default_factory=dict)
+    _blobs: dict[tuple[str, str, str], dict[str, BlobDescriptor]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _sweep: threading.Lock = field(default_factory=threading.Lock)
 
@@ -711,19 +802,64 @@ class InMemoryCogCatalogStore(CogCatalogStore):
         rows.sort(key=_sort_key)
         return rows
 
-    def list_pullable(self, repository) -> list[PullableArtifact]:
-        rows = [row for row in self._present_cogs() if row.repository == repository]
+    def _pullable_rows(self, repository, source_ids) -> list[CogArtifact]:
+        allowed = set(source_ids)
+        rows = [row for row in self._present_cogs() if row.repository == repository and row.source_id in allowed]
         rows.sort(key=_sort_key)
+        return rows
+
+    def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
+        _one_of(digest, tag)
+        rows = [
+            row
+            for row in self._pullable_rows(repository, source_ids)
+            if (row.digest == digest if digest is not None else tag in row.tags)
+        ]
         return [
             PullableArtifact(source_id=row.source_id, repository=row.repository, digest=row.digest, tags=row.tags)
-            for row in rows[:MAX_PULLABLE_ROWS]
+            for row in rows[:MAX_PULL_CANDIDATES]
         ]
+
+    def has_pullable(self, repository, source_ids) -> bool:
+        return bool(self._pullable_rows(repository, source_ids))
+
+    def list_pullable_tags(self, repository, source_ids) -> list[str]:
+        tags = {tag for row in self._pullable_rows(repository, source_ids) for tag in row.tags}
+        return sorted(tags)[:MAX_PULLABLE_TAGS]
+
+    def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
+        with self._lock:
+            recorded = self._blobs.setdefault((source_id, repository, manifest_digest), {})
+            for blob in blobs:
+                recorded.setdefault(blob.digest, blob)
+
+    def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
+        found: list[PullableBlob] = []
+        for row in self._pullable_rows(repository, source_ids):
+            with self._lock:
+                blob = self._blobs.get((row.source_id, repository, row.digest), {}).get(blob_digest)
+            if blob is not None:
+                found.append(
+                    PullableBlob(
+                        source_id=row.source_id,
+                        repository=repository,
+                        manifest_digest=row.digest,
+                        digest=blob_digest,
+                        size=blob.size,
+                    )
+                )
+        return found[:MAX_PULL_CANDIDATES]
 
 
 _COLUMNS = (
     "source_id, host, repository, digest, tags, pushed_at, indexed_at, manifest_media_type, status, card, "
     "cog_id, name, version, kind, publisher, manifest_schema, read_errors, removed_at"
 )
+
+
+_PULLABLE = f"removed_at IS NULL AND status = '{STATUS_INDEXED}' AND cog_id IS NOT NULL"
+"""The one rule for what a pull through the Hub may reach; see :class:`CogCatalogStore`."""
+_PULLABLE_A = f"a.removed_at IS NULL AND a.status = '{STATUS_INDEXED}' AND a.cog_id IS NOT NULL"
 
 
 def _row_to_artifact(row: Mapping[str, Any]) -> CogArtifact:
@@ -1093,16 +1229,18 @@ class PostgresCogCatalogStore(CogCatalogStore):
             ).fetchall()
         return [_row_to_artifact(row) for row in rows]
 
-    def list_pullable(self, repository) -> list[PullableArtifact]:
+    def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
+        _one_of(digest, tag)
+        match = "digest = %s" if digest is not None else "%s = ANY(tags)"
         with self._db.connection() as conn:
             rows = conn.execute(
                 f"""
                 SELECT source_id, repository, digest, tags FROM collab_cog_artifacts
-                WHERE repository = %s AND removed_at IS NULL AND status = '{STATUS_INDEXED}' AND cog_id IS NOT NULL
+                WHERE repository = %s AND {match} AND source_id = ANY(%s) AND {_PULLABLE}
                 ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC, source_id, repository, digest
                 LIMIT %s
                 """,
-                (repository, MAX_PULLABLE_ROWS),
+                (repository, digest if digest is not None else tag, list(source_ids), MAX_PULL_CANDIDATES),
             ).fetchall()
         return [
             PullableArtifact(
@@ -1110,6 +1248,84 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 repository=row["repository"],
                 digest=row["digest"],
                 tags=tuple(row["tags"] or ()),
+            )
+            for row in rows
+        ]
+
+    def has_pullable(self, repository, source_ids) -> bool:
+        with self._db.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1 AS found FROM collab_cog_artifacts
+                WHERE repository = %s AND source_id = ANY(%s) AND {_PULLABLE}
+                LIMIT 1
+                """,
+                (repository, list(source_ids)),
+            ).fetchone()
+        return row is not None
+
+    def list_pullable_tags(self, repository, source_ids) -> list[str]:
+        with self._db.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT tag FROM (
+                    SELECT DISTINCT tag FROM collab_cog_artifacts, unnest(tags) AS tag
+                    WHERE repository = %s AND source_id = ANY(%s) AND {_PULLABLE}
+                ) AS tags
+                ORDER BY tag COLLATE "C"
+                LIMIT %s
+                """,
+                (repository, list(source_ids), MAX_PULLABLE_TAGS),
+            ).fetchall()
+        return [row["tag"] for row in rows]
+
+    def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
+        descriptors = list(blobs)
+        if not descriptors:
+            return
+        with self._db.connection() as conn:
+            # One statement, and a no-op once the manifest has been recorded:
+            # what a digest references cannot change.
+            conn.execute(
+                """
+                INSERT INTO collab_cog_manifest_blobs
+                    (source_id, repository, manifest_digest, blob_digest, size, media_type)
+                SELECT %s, %s, %s, blob.digest, blob.size, blob.media_type
+                FROM unnest(%s::text[], %s::bigint[], %s::text[]) AS blob(digest, size, media_type)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    source_id,
+                    repository,
+                    manifest_digest,
+                    [blob.digest for blob in descriptors],
+                    [blob.size for blob in descriptors],
+                    [blob.media_type for blob in descriptors],
+                ),
+            )
+
+    def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
+        with self._db.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT b.source_id, b.repository, b.manifest_digest, b.blob_digest, b.size
+                FROM collab_cog_manifest_blobs b
+                JOIN collab_cog_artifacts a
+                  ON a.source_id = b.source_id AND a.repository = b.repository AND a.digest = b.manifest_digest
+                WHERE b.repository = %s AND b.blob_digest = %s AND b.source_id = ANY(%s)
+                  AND {_PULLABLE_A}
+                ORDER BY a.pushed_at DESC NULLS LAST, a.indexed_at DESC, a.source_id, a.digest
+                LIMIT %s
+                """,
+                (repository, blob_digest, list(source_ids), MAX_PULL_CANDIDATES),
+            ).fetchall()
+        return [
+            PullableBlob(
+                source_id=row["source_id"],
+                repository=row["repository"],
+                manifest_digest=row["manifest_digest"],
+                digest=row["blob_digest"],
+                size=int(row["size"]),
             )
             for row in rows
         ]

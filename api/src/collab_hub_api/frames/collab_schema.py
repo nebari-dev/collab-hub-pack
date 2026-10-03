@@ -808,14 +808,39 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             CREATE INDEX IF NOT EXISTS collab_cog_registry_tokens_expiry_idx
             ON collab_cog_registry_tokens (expires_at)
             """,
-            # Every request on the Hub's /v2/ surface starts from "which
-            # present artifacts does the catalog hold for this repository
-            # path", across sources. The primary key leads with source_id, so
-            # that read needs its own index; partial, like the other
+            # Every request on the Hub's /v2/ surface is an exact lookup that
+            # starts from the repository path, across sources: a digest, a
+            # stored tag, or a blob. The primary key leads with source_id, so
+            # those reads need their own index; partial, like the other
             # present-row index, so the removed tail costs it nothing.
             """
             CREATE INDEX IF NOT EXISTS collab_cog_artifacts_repository_idx
-            ON collab_cog_artifacts (repository) WHERE removed_at IS NULL
+            ON collab_cog_artifacts (repository, digest) WHERE removed_at IS NULL
+            """,
+            # Which blobs a manifest references: its config and layer
+            # descriptors, written once its bytes have been verified against
+            # its digest (what a digest references never changes, so rows are
+            # only ever inserted). A blob request names a repository and a
+            # blob digest and nothing else; this is what ties it to a manifest
+            # without reading registries at request time. The rows grant
+            # nothing alone: a blob is pullable only while a row here joins
+            # to a present, indexed artifact, so removing a version takes its
+            # blobs with it. No foreign key to the artifacts table, because
+            # that table's rows are replaced whole on reindex.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_manifest_blobs (
+                source_id       text NOT NULL,
+                repository      text NOT NULL,
+                manifest_digest text NOT NULL,
+                blob_digest     text NOT NULL,
+                size            bigint NOT NULL CHECK (size >= 0),
+                media_type      text NOT NULL DEFAULT '',
+                PRIMARY KEY (source_id, repository, manifest_digest, blob_digest)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS collab_cog_manifest_blobs_blob_idx
+            ON collab_cog_manifest_blobs (repository, blob_digest)
             """,
         ),
     ),

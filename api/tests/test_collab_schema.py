@@ -49,6 +49,7 @@ COLLAB_TABLES = (
     "collab_connector_state",
     "collab_cog_registry_tokens",
     "collab_cog_registry_credentials",
+    "collab_cog_manifest_blobs",
     "collab_cog_artifacts",
     "collab_service_access_grants",
     "collab_provisioned_accounts",
@@ -366,6 +367,12 @@ def test_migration_creates_the_cog_registry_credential_schema():
     assert "repositories text[] NOT NULL DEFAULT '{}'" in tokens
     assert "expires_at timestamptz NOT NULL" in tokens
 
+    (blobs,) = server.ddl_for("collab_cog_manifest_blobs")
+    # One row per (manifest location, blob): inserted once, never updated, and
+    # deliberately not tied to the artifact row by a foreign key.
+    assert "PRIMARY KEY (source_id, repository, manifest_digest, blob_digest)" in blobs
+    assert "size bigint NOT NULL CHECK (size >= 0)" in blobs and "REFERENCES" not in blobs
+
     created = " ".join(server.statements)
     for index in (
         "CREATE INDEX IF NOT EXISTS collab_cog_registry_credentials_user_idx"
@@ -376,9 +383,12 @@ def test_migration_creates_the_cog_registry_credential_schema():
         "CREATE INDEX IF NOT EXISTS collab_cog_registry_tokens_credential_idx"
         " ON collab_cog_registry_tokens (credential_id)",
         "CREATE INDEX IF NOT EXISTS collab_cog_registry_tokens_expiry_idx ON collab_cog_registry_tokens (expires_at)",
-        # What a pull through the Hub starts from: a repository's present rows.
+        # What a pull through the Hub starts from: an exact (repository, digest) among the present rows.
         "CREATE INDEX IF NOT EXISTS collab_cog_artifacts_repository_idx"
-        " ON collab_cog_artifacts (repository) WHERE removed_at IS NULL",
+        " ON collab_cog_artifacts (repository, digest) WHERE removed_at IS NULL",
+        # ... and, for a blob, the manifests of that repository that reference it.
+        "CREATE INDEX IF NOT EXISTS collab_cog_manifest_blobs_blob_idx"
+        " ON collab_cog_manifest_blobs (repository, blob_digest)",
     ):
         assert index in created, index
     # Appended as version 13; nothing earlier mentions the tables.
@@ -386,6 +396,7 @@ def test_migration_creates_the_cog_registry_credential_schema():
         statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 13 for statement in statements
     )
     assert "collab_cog_registry" not in earlier and "collab_cog_artifacts_repository_idx" not in earlier
+    assert "collab_cog_manifest_blobs" not in earlier
     assert LATEST_COLLAB_SCHEMA_VERSION == 13
 
 
@@ -431,7 +442,7 @@ PINNED_CHECKSUMS = {
     10: "cad0ef7844a3458f9aa0528f4edf5d418300cdd40b22a65fd4ecd1e6e0a29e6b",
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
-    13: "810fa48ecd201c3793f3c6cc5177375f47ade7fe67f0879ceb7b9120413ba9c5",
+    13: "0fdba92b5b894fa4358da5ebada5a33ce23a527e181dce411268df650a71935d",
 }
 
 

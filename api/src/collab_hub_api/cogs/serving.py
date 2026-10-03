@@ -9,11 +9,29 @@ registry sources. It answers three questions and nothing else:
   how large it is;
 - :meth:`CogRegistryFront.tags` -- a repository's tags.
 
-**Only what the catalog holds is served.** Every answer starts from
-:meth:`~.catalog.CogCatalogStore.list_pullable`: the present, indexed Cog
-artifacts of one repository path. Nothing is passed through to a backing
-registry on a client's say-so, so a repository, tag or digest the catalog
-does not list is a 404 whether or not the registry holds it.
+**Every answer is an exact catalog lookup.** Nothing is scanned, cached or
+passed through: each read is a bounded number of catalog queries and at most
+one request to the source that holds the content (one more per additional
+source holding the same digest, when the first no longer has it).
+
+- **A manifest is pullable iff its digest has a pullable catalog row in that
+  repository** -- present, indexed, with a ``cog_id``; what the read API
+  lists -- found by ``(repository, digest)``, or by a stored tag that names
+  the digest. No page or window stands between a pin and its row.
+- **A blob is pullable iff a manifest that is pullable now references it**,
+  established from stored data: when the Hub serves a manifest it has just
+  verified against its digest, it records that manifest's config and layer
+  descriptors (:meth:`~.catalog.CogCatalogStore.record_manifest_blobs`). A
+  blob request is then one query joining those rows to the pullable rule. A
+  blob no recorded manifest references is unknown, with no request to any
+  registry; removing a version takes its blobs with it at once, unless
+  another pullable manifest references them.
+
+  The record is written on the manifest read, which every OCI client makes
+  before it asks for a blob, and it lives in the shared database, so a blob
+  request reaching another replica finds it. A client that asks for a blob
+  of a manifest nobody has ever pulled through the Hub gets ``BLOB_UNKNOWN``
+  until it (or anyone) reads the manifest.
 
 **Repository names are the backing repository paths**, unchanged, and are
 *not* qualified by source: a client addresses ``<hub>/<repository>@<digest>``
@@ -23,29 +41,13 @@ the same artifact, served from whichever answers; a tag both carry resolves
 to the newest push, as the catalog orders them.
 
 **Tags come from the catalog**, never from a live listing: a tag exists here
-exactly when an indexed, present row carries it, and resolves to that row's
-digest. A tag pushed since the last sweep is not served until it is indexed.
+exactly when a pullable row carries it, and resolves to that row's digest. A
+tag pushed (or moved) since the last sweep is not served until it is indexed.
 
-**Blobs are reachable only through an indexed manifest.** A blob request
-names a repository and a digest and nothing else, so the Hub establishes
-that some pullable artifact of that repository references the digest before
-it opens a stream. It does so from the manifests themselves: the *reach* of
-an artifact is its manifest's config and layer digests (and, for an index,
-its child manifests and theirs), read once from the source, verified, and
-kept in a bounded in-process cache keyed by content digest -- content never
-changes under a digest, so an entry is never stale. A client that pulls the
-manifest first, as every client does, warms that entry for its blob
-requests on the same replica; a cold replica reads the repository's pullable
-manifests (newest first, at most
-:data:`~.catalog.MAX_PULLABLE_ROWS`) until it finds the digest. The
-descriptor's ``size`` comes with it, which is how a blob response declares
-its length -- and how an oversized blob is refused -- without asking the
-registry.
-
-**Multi-platform indexes** are served as stored: the index itself, then each
-child manifest by digest, then their blobs. At most
-:data:`MAX_SERVED_INDEX_CHILDREN` children are followed, and an index nested
-inside an index is not.
+**Multi-platform indexes are not traversed.** An index whose own digest is a
+pullable row is served as the bytes it is; its child manifests are served
+only if their digests are pullable rows themselves, and an index contributes
+no blobs. Cog bundles are single manifests.
 
 Failures are :class:`ServeError` subclasses whose messages are written for
 the client: they name the Hub repository and the digest and never a backing
@@ -54,22 +56,19 @@ host, URL or credential. Upstream response bodies are never read into them.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from collections import OrderedDict
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 
 from starlette.concurrency import run_in_threadpool
 
-from .catalog import CogCatalogStore, PullableArtifact
+from .catalog import BlobDescriptor, CogCatalogStore
 from .oci import (
     MEDIA_TYPE_OCI_MANIFEST,
+    BlobStream,
     Manifest,
     OCIError,
     OCINotFound,
-    OCITransportError,
-    index_children,
     is_index_manifest,
     is_sha256_digest,
     is_tag,
@@ -78,19 +77,6 @@ from .registry import RegistrySource, is_repository_path
 from .registry_credentials import RegistryCredentialStore
 
 logger = logging.getLogger("frames_server.cogs.serving")
-
-MAX_SERVED_INDEX_CHILDREN = 32
-"""Children of one index the Hub will follow; an index listing more is served without them."""
-
-REACH_CACHE_ENTRIES = 2048
-"""Artifacts whose reach is kept in memory, least recently used first out."""
-
-MAX_CACHED_MANIFEST_BYTES = 16 * 1024
-"""Manifest bodies up to this size are kept with the reach; larger ones are re-read on demand.
-
-Bounds the cache at ``REACH_CACHE_ENTRIES * (1 + children) * 16 KiB`` in the
-worst case; a Cog manifest is one or two kilobytes.
-"""
 
 
 class ServeError(Exception):
@@ -106,7 +92,7 @@ class ManifestUnknown(ServeError):
 
 
 class BlobUnknown(ServeError):
-    """No pullable manifest of this repository references this blob."""
+    """No pullable manifest of this repository is known to reference this blob."""
 
 
 class BlobTooLarge(ServeError):
@@ -124,44 +110,44 @@ class ServedManifest:
     body: bytes
 
 
-@dataclass(frozen=True)
 class ServedBlob:
-    """An open, not-yet-read blob. Drain :attr:`chunks` or call :meth:`aclose`."""
+    """An open, not-yet-read blob. Whoever holds one owns it: drain :attr:`chunks`, then :meth:`aclose`.
 
-    digest: str
-    size: int
-    chunks: AsyncGenerator[bytes]
+    :meth:`aclose` closes the upstream response directly as well as the
+    chunk iterator, because closing a generator that never started runs none
+    of its cleanup -- and a response abandoned before its first chunk is
+    exactly when that matters.
+    """
+
+    def __init__(self, stream: BlobStream, size: int) -> None:
+        self._stream = stream
+        self.digest = stream.digest
+        self.size = size
+        self.chunks: AsyncGenerator[bytes] = stream.iter_verified(max_bytes=size, expected_size=size)
+
+    @property
+    def closed(self) -> bool:
+        return self._stream.closed
 
     async def aclose(self) -> None:
-        await self.chunks.aclose()
+        try:
+            await self.chunks.aclose()
+        finally:
+            await self._stream.aclose()
 
 
-@dataclass(frozen=True)
-class _ReachManifest:
-    media_type: str
-    size: int
-    body: bytes | None
-    """``None`` when the body is over :data:`MAX_CACHED_MANIFEST_BYTES` and must be re-read."""
+def manifest_blobs(manifest: Manifest) -> list[BlobDescriptor]:
+    """The config and layer descriptors of an image manifest (none for an index)."""
 
-
-@dataclass(frozen=True)
-class _Reach:
-    """Everything one pullable artifact makes reachable: its manifests and their blobs."""
-
-    manifests: Mapping[str, _ReachManifest]
-    blobs: Mapping[str, int]
-
-
-_ReachKey = tuple[str, str, str]
-"""(source id, repository, artifact digest)."""
-
-
-def _content_type(manifest: Manifest) -> str:
-    return manifest.media_type or MEDIA_TYPE_OCI_MANIFEST
+    descriptors = ([manifest.config] if manifest.config is not None else []) + list(manifest.layers)
+    return [
+        BlobDescriptor(digest=descriptor.digest, size=descriptor.size, media_type=descriptor.media_type)
+        for descriptor in descriptors
+    ]
 
 
 class CogRegistryFront:
-    """The catalog and the sources, as one read-only registry. One per app; safe across requests."""
+    """The catalog and the sources, as one read-only registry. One per app; holds no per-request state."""
 
     def __init__(
         self,
@@ -172,11 +158,11 @@ class CogRegistryFront:
     ) -> None:
         self._store = store
         self._sources = {source.id: source for source in sources}
+        # What every lookup is scoped to: a row whose source this process is
+        # not configured with cannot be served, and must not use up a lookup's
+        # candidates either.
+        self._source_ids = tuple(self._sources)
         self._max_blob_bytes = max_blob_bytes
-        self._reach_cache: OrderedDict[_ReachKey, _Reach] = OrderedDict()
-        # Single flight per artifact: a burst of blob requests on a cold
-        # replica reads each manifest once, not once per request.
-        self._inflight: dict[_ReachKey, asyncio.Future[_Reach]] = {}
 
     @property
     def sources(self) -> list[RegistrySource]:
@@ -185,195 +171,122 @@ class CogRegistryFront:
     # -- the three reads ------------------------------------------------------
 
     async def tags(self, repository: str) -> list[str]:
-        rows = await self._pullable(repository)
-        return sorted({tag for row in rows for tag in row.tags})
+        self._check_name(repository)
+        tags = await run_in_threadpool(self._store.list_pullable_tags, repository, self._source_ids)
+        if not tags:
+            # Untagged artifacts make a repository with no tags; no artifacts make no repository.
+            await self._require_repository(repository)
+        return tags
 
     async def manifest(self, repository: str, reference: str) -> ServedManifest:
-        rows = await self._pullable(repository)
-        if is_tag(reference):
-            # Newest first, so the first row carrying the tag is the one it names.
-            named = next((row for row in rows if reference in row.tags), None)
-            if named is None:
-                raise ManifestUnknown(f"manifest {reference} is not known to {repository}")
-            digest = named.digest
-        elif is_sha256_digest(reference):
-            digest = reference
+        self._check_name(repository)
+        unknown = ManifestUnknown(f"manifest {reference} is not known to {repository}")
+        if is_sha256_digest(reference):
+            lookup = {"digest": reference}
+        elif is_tag(reference):
+            lookup = {"tag": reference}
         else:
-            raise ManifestUnknown(f"manifest {reference} is not known to {repository}")
-
+            await self._require_repository(repository)
+            raise unknown
+        rows = await run_in_threadpool(lambda: self._store.find_pullable(repository, self._source_ids, **lookup))
+        if not rows:
+            await self._require_repository(repository)
+            raise unknown
+        # A tag names the newest row carrying it; a digest may sit in several
+        # sources, and the next is tried only when one no longer has it.
+        digest = rows[0].digest
         unavailable = False
-        candidates = [row for row in rows if row.digest == digest]
-        for row in candidates or rows:
-            # An artifact's own digest is tried in every source that holds it;
-            # any other digest must be a child of some pullable index.
+        for row in rows:
+            if row.digest != digest:
+                continue
             try:
-                reach = await self._reach(row)
-            except OCINotFound:
-                continue
-            except OCIError:
-                unavailable = True
-                continue
-            entry = reach.manifests.get(digest)
-            if entry is None:
-                continue
-            if entry.body is not None:
-                return ServedManifest(digest=digest, media_type=entry.media_type, body=entry.body)
-            try:
-                manifest = await self._source(row).oci().fetch_manifest(repository, digest)
-            except OCINotFound:
+                manifest = await self._sources[row.source_id].oci().fetch_manifest(repository, digest)
+            except OCINotFound as exc:
+                self._log_upstream(row.source_id, repository, exc)
                 continue
             except OCIError as exc:
-                self._log_upstream(row, exc)
+                self._log_upstream(row.source_id, repository, exc)
                 unavailable = True
                 continue
-            return ServedManifest(digest=digest, media_type=_content_type(manifest), body=manifest.raw)
+            if not is_index_manifest(manifest):
+                # Verified against its digest a moment ago: what it references
+                # is recorded for the blob requests that follow.
+                await run_in_threadpool(
+                    self._store.record_manifest_blobs, row.source_id, repository, digest, manifest_blobs(manifest)
+                )
+            return ServedManifest(
+                digest=digest, media_type=manifest.media_type or MEDIA_TYPE_OCI_MANIFEST, body=manifest.raw
+            )
         if unavailable:
             raise UpstreamUnavailable(f"manifest {reference} of {repository} is temporarily unavailable")
-        raise ManifestUnknown(f"manifest {reference} is not known to {repository}")
+        raise unknown
 
     async def blob_size(self, repository: str, digest: str) -> int:
-        """The size of a reachable blob, from the manifest that references it (no registry round trip)."""
+        """The size of a pullable blob, from the manifest that references it (no registry round trip)."""
 
-        _row, size = await self._locate_blob(repository, digest)
-        return size
+        return (await self._locate_blob(repository, digest))[0].size
 
     async def blob(self, repository: str, digest: str) -> ServedBlob:
-        row, size = await self._locate_blob(repository, digest)
-        try:
-            stream = await self._source(row).oci().open_blob(repository, digest)
-        except OCINotFound:
-            raise BlobUnknown(f"blob {digest} is not known to {repository}") from None
-        except OCIError as exc:
-            self._log_upstream(row, exc)
-            raise UpstreamUnavailable(f"blob {digest} of {repository} is temporarily unavailable") from None
-        declared = stream.content_length
-        if declared is not None and declared != size:
-            # The registry is about to send something other than what the
-            # manifest promised; refuse before a single byte is relayed.
-            await stream.aclose()
-            logger.warning("cog_serve_blob_size_mismatch", extra={"source_id": row.source_id, "digest": digest})
-            raise UpstreamUnavailable(f"blob {digest} of {repository} is temporarily unavailable")
-        return ServedBlob(digest=digest, size=size, chunks=stream.iter_verified(max_bytes=size, expected_size=size))
-
-    # -- what is reachable ----------------------------------------------------
-
-    async def _pullable(self, repository: str) -> list[PullableArtifact]:
-        if not is_repository_path(repository):
-            raise RepositoryUnknown(f"repository {repository} is not known to this registry")
-        rows = await run_in_threadpool(self._store.list_pullable, repository)
-        # A row whose source is no longer configured cannot be served; it is
-        # dropped here rather than failing every request for the repository.
-        rows = [row for row in rows if row.source_id in self._sources]
-        if not rows:
-            raise RepositoryUnknown(f"repository {repository} is not known to this registry")
-        return rows
-
-    async def _locate_blob(self, repository: str, digest: str) -> tuple[PullableArtifact, int]:
-        if not is_sha256_digest(digest):
-            raise BlobUnknown(f"blob {digest} is not known to {repository}")
-        rows = await self._pullable(repository)
-        # What this replica already knows first: the manifest a client pulled
-        # a moment ago answers without touching the registry.
-        cold: list[PullableArtifact] = []
-        for row in rows:
-            reach = self._cached(row)
-            if reach is None:
-                cold.append(row)
-            elif digest in reach.blobs:
-                return self._checked(row, repository, digest, reach.blobs[digest])
         unavailable = False
-        for row in cold:
+        for located in await self._locate_blob(repository, digest):
             try:
-                reach = await self._reach(row)
-            except OCINotFound:
+                stream = await self._sources[located.source_id].oci().open_blob(repository, digest)
+            except OCINotFound as exc:
+                self._log_upstream(located.source_id, repository, exc)
                 continue
-            except OCIError:
+            except OCIError as exc:
+                self._log_upstream(located.source_id, repository, exc)
                 unavailable = True
                 continue
-            if digest in reach.blobs:
-                return self._checked(row, repository, digest, reach.blobs[digest])
+            declared = stream.content_length
+            if declared is not None and declared != located.size:
+                # The source is about to send something other than what the
+                # manifest promised; refuse before a single byte is relayed.
+                await stream.aclose()
+                logger.warning(
+                    "cog_serve_blob_size_mismatch", extra={"source_id": located.source_id, "digest": digest}
+                )
+                unavailable = True
+                continue
+            return ServedBlob(stream, located.size)
         if unavailable:
-            # Not "unknown": a manifest that could not be read may be the one
-            # that references it, and a 404 would be cached by the client.
             raise UpstreamUnavailable(f"blob {digest} of {repository} is temporarily unavailable")
         raise BlobUnknown(f"blob {digest} is not known to {repository}")
 
-    def _checked(self, row: PullableArtifact, repository: str, digest: str, size: int) -> tuple[PullableArtifact, int]:
-        if size > self._max_blob_bytes:
+    # -- lookups --------------------------------------------------------------
+
+    def _check_name(self, repository: str) -> None:
+        if not is_repository_path(repository):
+            raise RepositoryUnknown(f"repository {repository} is not known to this registry")
+
+    async def _require_repository(self, repository: str) -> None:
+        if not await run_in_threadpool(self._store.has_pullable, repository, self._source_ids):
+            raise RepositoryUnknown(f"repository {repository} is not known to this registry")
+
+    async def _locate_blob(self, repository: str, digest: str):
+        self._check_name(repository)
+        unknown = BlobUnknown(f"blob {digest} is not known to {repository}")
+        if not is_sha256_digest(digest):
+            await self._require_repository(repository)
+            raise unknown
+        located = await run_in_threadpool(self._store.find_blob, repository, digest, self._source_ids)
+        if not located:
+            await self._require_repository(repository)
+            raise unknown
+        if located[0].size > self._max_blob_bytes:
             raise BlobTooLarge(
-                f"blob {digest} of {repository} is {size} bytes, over this registry's {self._max_blob_bytes}-byte limit"
+                f"blob {digest} of {repository} is {located[0].size} bytes, "
+                f"over this registry's {self._max_blob_bytes}-byte limit"
             )
-        return row, size
+        return located
 
-    def _source(self, row: PullableArtifact) -> RegistrySource:
-        return self._sources[row.source_id]
-
-    def _cached(self, row: PullableArtifact) -> _Reach | None:
-        key = (row.source_id, row.repository, row.digest)
-        reach = self._reach_cache.get(key)
-        if reach is not None:
-            self._reach_cache.move_to_end(key)
-        return reach
-
-    async def _reach(self, row: PullableArtifact) -> _Reach:
-        cached = self._cached(row)
-        if cached is not None:
-            return cached
-        key = (row.source_id, row.repository, row.digest)
-        flight = self._inflight.get(key)
-        if flight is None:
-            flight = self._inflight[key] = asyncio.get_running_loop().create_future()
-            try:
-                reach = await self._read_reach(row)
-            except BaseException as exc:
-                if isinstance(exc, OCIError):
-                    self._log_upstream(row, exc)
-                    flight.set_exception(exc)
-                else:
-                    # This request went away (a client disconnect cancels it)
-                    # or hit a bug. Requests that joined the flight are not
-                    # cancelled themselves, so they get an ordinary upstream
-                    # failure and the next one reads again.
-                    flight.set_exception(OCITransportError("manifest read was interrupted"))
-                # Retrieved here so a flight nobody else joined does not
-                # report "exception was never retrieved" at collection.
-                flight.exception()
-                raise
-            else:
-                self._reach_cache[key] = reach
-                while len(self._reach_cache) > REACH_CACHE_ENTRIES:
-                    self._reach_cache.popitem(last=False)
-                flight.set_result(reach)
-                return reach
-            finally:
-                del self._inflight[key]
-        return await asyncio.shield(flight)
-
-    async def _read_reach(self, row: PullableArtifact) -> _Reach:
-        client = self._source(row).oci()
-        root = await client.fetch_manifest(row.repository, row.digest)
-        manifests: dict[str, _ReachManifest] = {row.digest: _kept(root)}
-        blobs: dict[str, int] = {}
-        _collect_blobs(root, blobs)
-        for child in index_children(root)[:MAX_SERVED_INDEX_CHILDREN]:
-            try:
-                manifest = await client.fetch_manifest(row.repository, child.digest)
-            except OCINotFound:
-                # An index may list a platform its publisher never pushed.
-                continue
-            if is_index_manifest(manifest):
-                continue
-            manifests[child.digest] = _kept(manifest)
-            _collect_blobs(manifest, blobs)
-        return _Reach(manifests=manifests, blobs=blobs)
-
-    def _log_upstream(self, row: PullableArtifact, exc: OCIError) -> None:
+    def _log_upstream(self, source_id: str, repository: str, exc: OCIError) -> None:
         # The class and the source id only. OCIError messages carry request
         # paths, never hosts; even so the operator's handle on "which
         # registry" is the source id, and that is what is logged.
         logger.warning(
             "cog_serve_upstream_failed",
-            extra={"source_id": row.source_id, "repository": row.repository, "error": type(exc).__name__},
+            extra={"source_id": source_id, "repository": repository, "error": type(exc).__name__},
         )
 
 
@@ -389,16 +302,6 @@ class CogRegistryServing:
     """The bearer realm: ``<public url>/v2/token``."""
     credential_ttl_seconds: int
     token_ttl_seconds: int
-    max_blob_seconds: int
-
-
-def _kept(manifest: Manifest) -> _ReachManifest:
-    body = manifest.raw if len(manifest.raw) <= MAX_CACHED_MANIFEST_BYTES else None
-    return _ReachManifest(media_type=_content_type(manifest), size=len(manifest.raw), body=body)
-
-
-def _collect_blobs(manifest: Manifest, blobs: dict[str, int]) -> None:
-    if manifest.config is not None:
-        blobs[manifest.config.digest] = manifest.config.size
-    for layer in manifest.layers:
-        blobs[layer.digest] = layer.size
+    max_blob_seconds: float
+    max_metadata_seconds: float = 30.0
+    """Deadline on every read that is not a blob body: manifests, tags, and ``HEAD`` of a blob."""

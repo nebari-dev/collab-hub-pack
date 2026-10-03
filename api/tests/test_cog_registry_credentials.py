@@ -269,6 +269,10 @@ def test_expired_rows_are_swept_by_the_next_write(backend):
     old_token, _ = _token(store, old, ttl=30)
     direct, _ = _token(store, None, user="alice", ttl=30)
     clock.advance(120)
+    if isinstance(store, InMemoryRegistryCredentialStore):
+        # A read is enough to sweep: a Hub that has gone quiet does not keep expired rows.
+        assert store.find_token(secret_digest(old_token)) is None
+        assert store._credentials == {} and store._tokens == {}
     _credential(store, user="bob")
     _token(store, None, user="bob")
     if isinstance(store, InMemoryRegistryCredentialStore):
@@ -427,6 +431,24 @@ def test_postgres_create_token_without_a_credential():
     _sweep, insert = conn.calls
     assert "VALUES (%s, %s, NULL, %s, now() + make_interval(secs => %s))" in insert[0]
     assert insert[1] == ("thash", "alice", [], 300)
+
+
+def test_postgres_reads_sweep_expired_rows_at_most_once_per_interval(monkeypatch):
+    from collab_hub_api.cogs import registry_credentials
+
+    clock = [1000.0]
+    monkeypatch.setattr(registry_credentials.time, "monotonic", lambda: clock[0])
+    store, conn = _fake()
+    store.find_token("thash")
+    assert len(conn.calls) == 1, "nothing to sweep yet: the store was only just built"
+    clock[0] += registry_credentials.SWEEP_INTERVAL_SECONDS + 1
+    store.find_token("thash")
+    assert [sql for sql, _ in conn.calls[1:3]] == [
+        "DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()",
+        "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()",
+    ]
+    store.find_token("thash")
+    assert len(conn.calls) == 5, "and not again until the interval has passed"
 
 
 def test_postgres_find_token_requires_a_live_credential_when_it_has_one():

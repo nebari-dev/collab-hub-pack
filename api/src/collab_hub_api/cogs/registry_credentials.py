@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import secrets
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -52,6 +53,9 @@ PULL_TOKEN_PREFIX = "chrt_"
 CREDENTIAL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
 """Every issued id is one URL-safe path segment of this shape, and clients rely on it:
 the id goes into ``DELETE /v1/cogs/registry-credentials/{id}`` unescaped."""
+
+SWEEP_INTERVAL_SECONDS = 300.0
+"""How often a read may sweep expired rows; see ``PostgresRegistryCredentialStore._sweep_if_due``."""
 
 MAX_CREDENTIALS_PER_USER = 20
 """Live credentials one user may hold; exchanging past it drops the oldest.
@@ -301,6 +305,7 @@ class InMemoryRegistryCredentialStore(RegistryCredentialStore):
 
     def find_token(self, token_hash):
         with self._lock:
+            self._purge(self.clock())
             grant = self._tokens.get(token_hash)
             if grant is None or grant.expires_at <= self.clock():
                 return None
@@ -341,6 +346,22 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
 
     def __init__(self, db):
         self._db = db
+        self._last_sweep = time.monotonic()
+
+    def _sweep_if_due(self, conn) -> None:
+        """Delete expired rows, at most once per :data:`SWEEP_INTERVAL_SECONDS` per process.
+
+        Writes already sweep; this covers a Hub that has gone quiet, where
+        the last credentials and tokens would otherwise sit expired until
+        the next exchange. Rides a read's connection, so there is no timer.
+        """
+
+        now = time.monotonic()
+        if now - self._last_sweep < SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_sweep = now
+        conn.execute("DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()")
+        conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
 
     def create_credential(self, *, credential_id, user_id, secret_hash, scope, session_id, ttl_seconds):
         with self._db.connection() as conn:
@@ -437,6 +458,7 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
 
     def find_token(self, token_hash):
         with self._db.connection() as conn:
+            self._sweep_if_due(conn)
             row = conn.execute(
                 """
                 SELECT t.user_id, t.credential_id, t.repositories, t.created_at, t.expires_at
