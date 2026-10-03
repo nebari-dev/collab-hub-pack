@@ -50,6 +50,7 @@ and the external `url`; the rest depends on the kind.
 | `indexUrl` | static | URL of a `catalog.v1.json` listing repositories. A static source needs `repositories`, `indexUrl`, or both. |
 | `caBundlePath` | all | Per-source CA bundle path inside the pod. Defaults to the shared bundle below when that is configured. |
 | `requestTimeoutSeconds` | all | HTTP timeout, default 10, at most 60. |
+| `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. See [redirects](#redirects). |
 | `credentials` | all | Where the robot/service credential lives — see the next section. Omit for anonymous access. |
 | `webhook` | harbor | Where the shared webhook secret lives. A static source has no webhook and the render refuses the block. |
 
@@ -354,7 +355,7 @@ cogs:
 | Chart value | Setting (`COLLAB_HUB_API__COGS__SERVE__…`) | Meaning |
 | --- | --- | --- |
 | `enabled` | `ENABLED` | Mount `/v2/`, enable the credential exchange, and point catalog references at the Hub. Needs at least one source and a catalog store. |
-| `publicUrl` | `PUBLIC_URL` | The Hub's external origin, `https://host[:port]`, no path. |
+| `publicUrl` | `PUBLIC_URL` | The Hub's external origin, `https://host[:port]`: no path, no trailing slash. |
 | `credentialTtlSeconds` | `CREDENTIAL_TTL_SECONDS` | Lifetime of a registry credential. |
 | `tokenTtlSeconds` | `TOKEN_TTL_SECONDS` | Lifetime of a pull token. |
 | `maxBlobBytes` | `MAX_BLOB_BYTES` | Largest blob the Hub relays. |
@@ -380,7 +381,8 @@ and treats anything else as a Hub that does not serve installs.
 
 So `publicUrl` is not a place to name a registry host. Left empty, the chart
 derives `https://<host>` from `api.nebariapp.hostname`, else from
-`api.ingress.host`. Set it only to add a port or to say `http`; a value
+`api.ingress.host`. Set it only to add a port or to say `http` (no path and
+no trailing slash; the chart and the API refuse the same values); a value
 naming a different host than the one the chart routes fails the render, and
 the API refuses to start when it disagrees with `web.public_base_url`. It is
 configuration rather than the request's `Host` header because a value a
@@ -422,7 +424,7 @@ oras pull hub.example.com/cogs/cog-audio-transcriber@sha256:…
 
 Errors are the registry format, `{"errors": [{"code", "message", "detail"}]}`:
 `UNAUTHORIZED` (401), `DENIED` (403: the account has no organization, or a
-blob is over `maxBlobBytes`), `NAME_UNKNOWN`, `MANIFEST_UNKNOWN`,
+blob is over `maxBlobBytes`, or the token's owner has lost access), `NAME_UNKNOWN`, `MANIFEST_UNKNOWN`,
 `BLOB_UNKNOWN` (404), `UNSUPPORTED` (405), `UNAVAILABLE` (503: the source or
 the database could not answer; retry).
 
@@ -454,6 +456,13 @@ All three need an ordinary Hub sign-in and answer 404
 - **Revocable, at once.** Revoking deletes the row and its tokens with it;
   the next request with one of those tokens is a 401. A user holds at most
   20 live credentials; exchanging past that drops the oldest.
+- **Worth only what its owner is.** On a membership-resolving deployment the
+  owner's membership is read again at every token mint *and on every `/v2`
+  request*, by the same lookup the catalog's authentication makes. A member
+  removed from their organization is refused on the next request (403
+  `DENIED`), whatever tokens they hold, and a lookup that fails answers 503
+  rather than admitting anyone. Under claims-sourced auth there is nothing
+  server-side to re-read, and the two lifetimes are the bound.
 - **Useless anywhere else.** It is not a JWT. Every Hub API outside `/v2/`
   answers 401 to the credential, to its secret presented as a bearer token,
   and to a pull token; the backing registry has never heard of it.
@@ -465,10 +474,10 @@ logout), and none was added for this. What bounds a credential after
 sign-out is therefore: the client revoking it, by id (clients are expected
 to revoke each credential they hold when they are done with it and at
 sign-out, and not to rely on the revoke-all route), and its lifetime,
-fifteen minutes by default. On a membership-resolving deployment
-the owner's membership is re-read at every token mint, so a member removed
-from their organization stops pulling at the next mint, at most
-`tokenTtlSeconds` later.
+fifteen minutes by default.
+
+Expired rows are deleted by the next exchange or mint, and by a read at most
+every five minutes, so a Hub that goes quiet does not keep them.
 
 The token endpoint also accepts a Hub credential the API already accepts (a
 bearer access token, the gateway's cookie) in place of Basic auth, for a
@@ -499,22 +508,48 @@ another registry under the same path changes nothing a client sees.
 when an indexed, present row carries it, and resolves to that row's digest.
 A tag pushed since the last sweep is not served until it is indexed.
 
-**A blob is served only if an indexed manifest of that repository references
-it.** A blob request names a repository and a digest, so the Hub has to
-establish the link itself. It reads the manifests: for each pullable
-artifact, its manifest's config and layer digests (and, for an index, its
-child manifests and theirs), fetched from the source, verified, and kept in
-a bounded in-process cache keyed by digest. Content never changes under a
-digest, so an entry is never stale. A client pulls the manifest first, which
-warms the entry for its blob requests on that replica; a replica that has
-not seen the manifest reads the repository's pullable manifests, newest
-first and at most 256, until it finds the digest. The descriptor's `size`
-comes from the same place, which is how a response declares its length, and
-how an oversized blob is refused, before the registry is asked.
+**Every lookup is exact.** A manifest is pullable if and only if its digest
+has a pullable catalog row in that repository, found by `(repository,
+digest)` or by a stored tag naming it. There is no window over a
+repository's versions: the oldest indexed pin pulls like the newest. Nothing
+is scanned and nothing is cached; each read is a few catalog queries and at
+most one request to the source holding the content (one more per additional
+source holding the same digest, when the first no longer has it).
 
-**Multi-platform indexes** are served as stored: the index, each child
-manifest by digest, and their blobs. At most 32 children of one index are
-followed, and an index nested in an index is not.
+**A blob is served only while a pullable manifest of that repository
+references it**, and that is established from stored data. When the Hub
+serves a manifest, which it has just verified against its digest, it records
+the manifest's config and layer descriptors in `collab_cog_manifest_blobs`
+(migration 13). A blob request is then one query joining those rows to the
+pullable rule:
+
+- a blob no recorded manifest references is `BLOB_UNKNOWN`, and no registry
+  is asked;
+- removing a version (or a re-read marking it failed or not a Cog) makes its
+  blobs unpullable at once, unless another pullable manifest of the
+  repository references them;
+- the descriptor's `size` is how a response declares its length, and how an
+  oversized blob is refused, before the registry is asked.
+
+The record is written on the manifest read, which every OCI client makes
+before it asks for a blob, and it lives in the shared database, so the blob
+requests may land on any replica. A client that asks for a blob of a manifest
+nobody has yet pulled through the Hub gets `BLOB_UNKNOWN` until the manifest
+is read.
+
+**Multi-platform indexes are not traversed.** An index whose own digest is a
+pullable row is served as the bytes it is. Its child manifests are served
+only if their digests are pullable rows themselves, and an index contributes
+no blobs. Cog bundles are single manifests.
+
+**Deadlines.** Every `/v2` request runs under one aggregate deadline that
+starts before its first lookup: `maxBlobSeconds` for a blob body, thirty
+seconds for everything else (manifests, tags, `HEAD` of a blob). Past it the
+request ends in 503, or, for a blob whose headers are already out, in a
+dropped connection. The response owns the open connection to the source and
+closes it however the exchange ends, including when the deadline passes
+while it is blocked sending to a client that has stopped reading (that
+client's own connection is then the server's and the gateway's to reap).
 
 **Streaming.** Blobs are relayed in 64 KiB chunks and never buffered whole.
 Each is hashed as it passes and its last chunk is held until the hash and
@@ -522,10 +557,34 @@ the length match the digest and the manifest's descriptor; a blob that fails
 reaches the client short, with the connection dropped, never complete and
 wrong. Digests are never rewritten. A redirect from the registry to object
 storage is followed by the Hub, without the registry credential once it
-leaves the registry's origin; the client is never redirected. (Redirecting
+leaves the registry's origin, and subject to the [redirect rules](#redirects);
+the client is never redirected. (Redirecting
 blobs to a signed URL would take that traffic off the Hub at the price of
 showing clients the storage host; streaming is the default and the only
 mode today.)
+
+### Redirects
+
+Registries commonly redirect a blob request to object storage. The Hub
+follows those redirects itself, for the indexer and for pulls alike, under
+these rules:
+
+- a redirect within the registry's own origin is always followed;
+- `https` is never downgraded to `http`;
+- a **literal** loopback, link-local or unspecified address is never a
+  destination. That covers `127.0.0.0/8`, `::1`, `169.254.0.0/16` (the cloud
+  metadata address), `fe80::/10`, and their IPv4-mapped IPv6 forms;
+- private (RFC 1918) addresses and cluster-internal names **are** allowed:
+  object storage inside the cluster is normal;
+- when a source sets `blobRedirectHosts`, a redirect off the registry's
+  origin must name a listed host, and nothing else is followed.
+
+The trust model: a source is a registry the operator configured and gave a
+credential to, so these rules are defence in depth against a registry that
+is compromised or misconfigured into pointing the Hub elsewhere. They look
+at the URL, not at what a hostname resolves to; a name that resolves to a
+refused address is not caught unless `blobRedirectHosts` is set, which is
+what closes that. Set it wherever the storage hosts are known.
 
 ### What stays inside the Hub
 
@@ -536,10 +595,18 @@ relayed. A platform operator additionally gets `backing_reference`
 (`<backing host>/<repository>@<digest>`) on
 `…/versions/{digest}/reference` and on each of its `locations`; the field is
 absent for everyone else, and `source_id` names the source for any
-authenticated caller. Logs are the operator's: the Hub's own lines name the
-source id, and the HTTP client's request log names the URL it called, with
-its query string removed so that a pre-signed storage URL is not logged with
-its signature.
+authenticated caller.
+
+Logs are the operator's, and may name a backing host; they must not carry a
+credential. The Hub's own lines name the source id. The HTTP libraries'
+lines are filtered: the request log (`httpx`, INFO) loses URL query strings
+and userinfo, so a pre-signed storage URL is not logged with its signature,
+and the transport trace (`httpcore`, DEBUG) loses every header value, so
+neither a redirect's `Location` nor a `Set-Cookie` or `WWW-Authenticate` is
+logged. These two filters are **process-wide**: they are installed when a
+deployment turns on `cogs.index.enabled` or `cogs.serve.enabled` and then
+apply to every HTTP client in the process, not only the registry's. A Hub
+that does neither logs exactly as before.
 
 ### Replicas and the indexer
 
@@ -547,8 +614,9 @@ Serving builds its own registry sources on every replica that serves `/v2/`,
 separately from the indexer's, so an API replica that does not sweep (the
 indexer off, or running as another workload) still reaches the sources. The
 source list and its Secret-backed variables are already rendered whenever
-`registry.sources` is non-empty. Each replica keeps its own manifest cache;
-nothing is shared but the catalog and the credential tables.
+`registry.sources` is non-empty. Replicas hold no serving state of their
+own: what is pullable, which blobs a manifest references, credentials and
+tokens are all in the shared database.
 
 ### Gateway
 
@@ -574,7 +642,8 @@ same host as the API:
   temp-file limit raised past `maxBlobBytes`. Requests have no bodies.
 - **Load.** Every byte of every install goes through the API pods. Size
   their network and replica count for it, and `frames.postgres.pool` for
-  two short queries per `/v2` request.
+  a handful of short queries per `/v2` request (the token, the owner's
+  membership, the catalog lookup, and one insert per manifest read).
 
 ### Trying it
 
