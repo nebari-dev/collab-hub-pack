@@ -50,7 +50,7 @@ and the external `url`; the rest depends on the kind.
 | `indexUrl` | static | URL of a `catalog.v1.json` listing repositories. A static source needs `repositories`, `indexUrl`, or both. |
 | `caBundlePath` | all | Per-source CA bundle path inside the pod. Defaults to the shared bundle below when that is configured. |
 | `requestTimeoutSeconds` | all | HTTP timeout, default 10, at most 60. |
-| `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. See [redirects](#redirects). |
+| `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. Setting it turns the [redirect rules](#redirects) on for this source. |
 | `credentials` | all | Where the robot/service credential lives — see the next section. Omit for anonymous access. |
 | `webhook` | harbor | Where the shared webhook secret lives. A static source has no webhook and the render refuses the block. |
 
@@ -591,8 +591,20 @@ mode today.)
 ### Redirects
 
 Registries commonly redirect a blob request to object storage. The Hub
-follows those redirects itself, for the indexer and for pulls alike, under
-these rules:
+follows those redirects itself. **With serving off, and no
+`blobRedirectHosts` on the source, they are followed as they always were**
+(the registry credential is dropped once a hop leaves the registry's
+origin, and nothing else is checked), so an indexer that worked keeps
+working.
+
+**Enabling serving turns the rules below on for every source, for the
+indexer as well as for pulls.** That is a consequence of enabling serving
+worth checking before you do: a registry that redirects layers from `https`
+to plain-`http` storage, or to a loopback address, indexes today and will
+stop indexing (its artifacts are recorded as failed and leave the catalog)
+once serving is on. That is deliberate: a source the Hub could not serve a
+pull from should not look healthy in the catalog. A source that sets
+`blobRedirectHosts` has the rules on regardless of serving.
 
 - `https` is never downgraded to `http`, on any hop, including one that
   leads back to an `http` registry;

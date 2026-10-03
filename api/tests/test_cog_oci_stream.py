@@ -251,6 +251,12 @@ def test_the_reference_grammar_helpers():
 # -- redirects ------------------------------------------------------------------
 
 
+def policed(handler, registry: str = REGISTRY) -> OCIClient:
+    """A client built the way serving builds its own: with the redirect policy on."""
+
+    return OCIClient(registry, transport=httpx.MockTransport(handler), restrict_redirects=True)
+
+
 def redirecting(location: str, *, registry: str = REGISTRY):
     """A registry that redirects every blob to ``location`` and records which hosts were then asked."""
 
@@ -280,7 +286,7 @@ def redirecting(location: str, *, registry: str = REGISTRY):
 )
 async def test_a_redirect_to_a_loopback_or_link_local_address_is_never_followed(location):
     handler, asked = redirecting(location)
-    async with client_for(handler) as client:
+    async with policed(handler) as client:
         with pytest.raises(OCIProtocolError, match="refusing a redirect") as caught:
             await client.open_blob(REPO, DIGEST)
     assert len(asked) == 1, "the destination was never contacted"
@@ -310,7 +316,7 @@ async def test_numeric_and_local_host_forms_are_refused_through_the_redirect_pat
     """Not just the classifier: the registry redirects there, and the destination is never contacted."""
 
     handler, asked = redirecting(location, registry="http://registry.example")
-    async with OCIClient("http://registry.example", transport=httpx.MockTransport(handler)) as client:
+    async with policed(handler, "http://registry.example") as client:
         # Refused by this client's own rule or, for a form httpx will not even parse, by httpx; never followed.
         with pytest.raises(oci.OCIError) as caught:
             await client.open_blob(REPO, DIGEST)
@@ -351,6 +357,7 @@ async def test_a_chain_cannot_be_led_back_down_to_an_http_registry():
         "http://registry.example",
         credentials=oci.BasicCredentials("robot", "secret"),
         transport=httpx.MockTransport(handler),
+        restrict_redirects=True,
     )
     async with client:
         with pytest.raises(OCIProtocolError, match="from https to http"):
@@ -361,13 +368,13 @@ async def test_a_chain_cannot_be_led_back_down_to_an_http_registry():
 
 async def test_a_redirect_never_downgrades_https_to_http():
     handler, asked = redirecting("http://storage.example/blob")
-    async with client_for(handler) as client:
+    async with policed(handler) as client:
         with pytest.raises(OCIProtocolError, match="from https to http"):
             await client.open_blob(REPO, DIGEST)
     assert len(asked) == 1
     # A registry reached over http may redirect to http: nothing is downgraded.
     handler, asked = redirecting("http://storage.example/blob", registry="http://registry.example")
-    async with OCIClient("http://registry.example", transport=httpx.MockTransport(handler)) as client:
+    async with policed(handler, "http://registry.example") as client:
         stream = await client.open_blob(REPO, DIGEST)
         await stream.aclose()
     assert asked[-1] == "http://storage.example/blob"
@@ -376,14 +383,14 @@ async def test_a_redirect_never_downgrades_https_to_http():
 async def test_private_addresses_and_the_registry_itself_are_allowed_without_an_allowlist():
     for location in ("https://10.0.4.7/blob", "https://minio.storage.svc.cluster.local/blob", "/v3/elsewhere"):
         handler, asked = redirecting(location)
-        async with client_for(handler) as client:
+        async with policed(handler) as client:
             stream = await client.open_blob(REPO, DIGEST)
             await stream.aclose()
         assert len(asked) == 2, location
     # A loopback registry redirecting within its own origin is the registry, not a destination.
     local = "http://127.0.0.1:5000"
     handler, asked = redirecting("/blobstore/x", registry=local)
-    async with OCIClient(local, transport=httpx.MockTransport(handler)) as client:
+    async with OCIClient(local, transport=httpx.MockTransport(handler), restrict_redirects=True) as client:
         stream = await client.open_blob(REPO, DIGEST)
         await stream.aclose()
     assert asked[-1] == f"{local}/blobstore/x"
@@ -428,7 +435,23 @@ async def test_every_hop_of_a_redirect_chain_is_checked():
             return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest"})
         return httpx.Response(200, content=BODY)
 
-    async with client_for(handler) as client:
+    async with policed(handler) as client:
+        with pytest.raises(OCIProtocolError, match="refusing a redirect"):
+            await client.open_blob(REPO, DIGEST)
+
+
+async def test_without_the_policy_redirects_are_followed_as_they_always_were():
+    """The policy is an opt-in of the client: one built without it follows what main's client followed."""
+
+    for location in ("http://storage.internal/blob", "http://169.254.169.254/blob", "http://127.1/blob"):
+        handler, asked = redirecting(location)
+        async with client_for(handler) as client:
+            stream = await client.open_blob(REPO, DIGEST)
+            assert await drain(stream, max_bytes=len(BODY), expected_size=len(BODY)) == (BODY, None)
+        assert len(asked) == 2, location
+    # An allowlist is itself the opt-in, for that source.
+    handler, asked = redirecting("http://storage.internal/blob")
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=("x.example",)) as client:
         with pytest.raises(OCIProtocolError, match="refusing a redirect"):
             await client.open_blob(REPO, DIGEST)
 

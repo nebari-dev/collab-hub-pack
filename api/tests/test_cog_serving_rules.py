@@ -69,7 +69,7 @@ async def membership_hubs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config_module,
         "build_registry_sources",
-        lambda configs: build_registry_sources(configs, http_transport=transport),
+        lambda configs, **kwargs: build_registry_sources(configs, http_transport=transport, **kwargs),
     )
     values = settings(tmp_path)
     values["frames"]["orgs"] = {"backend": "memory"}

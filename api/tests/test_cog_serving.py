@@ -122,6 +122,7 @@ class FakeRegistry:
         self.tamper: dict[str, bytes] = {}
         self.blob_delay = 0.0
         self.stream_delay = 0.0
+        self.storage_scheme = "https"
         self.storage_saw_authorization = False
 
     def publish(self, repo: str, bundle: Bundle, *tags: str) -> None:
@@ -178,6 +179,10 @@ class FakeRegistry:
         if path in self.fail:
             return self.fail[path]
         _v2, _, rest = path.partition("/v2/")
+        if rest.endswith("/tags/list"):
+            repo = rest[: -len("/tags/list")]
+            tags = sorted(ref for (name, ref) in self.manifests if name == repo and not ref.startswith("sha256:"))
+            return httpx.Response(200, json={"name": repo, "tags": tags})
         if "/manifests/" in rest:
             repo, _, ref = rest.rpartition("/manifests/")
             if (repo, ref) not in self.manifests:
@@ -190,7 +195,7 @@ class FakeRegistry:
             digest = rest.rpartition("/blobs/")[2]
             if digest not in self.blobs:
                 return httpx.Response(404, json={"errors": [{"code": "BLOB_UNKNOWN", "message": BACKING_HOST}]})
-            location = f"https://{STORAGE_HOST}/store/{digest}?X-Signature={STORAGE_SIGNATURE}"
+            location = f"{self.storage_scheme}://{STORAGE_HOST}/store/{digest}?X-Signature={STORAGE_SIGNATURE}"
             return httpx.Response(307, headers={"Location": location})
         return httpx.Response(404, text=f"{BACKING_HOST}: no such route")
 
@@ -310,7 +315,7 @@ async def make_hub(tmp_path, monkeypatch):
         monkeypatch.setattr(
             config_module,
             "build_registry_sources",
-            lambda configs: build_registry_sources(configs, http_transport=transport),
+            lambda configs, **kwargs: build_registry_sources(configs, http_transport=transport, **kwargs),
         )
         app = make_app(Config.parse(settings(tmp_path, **kwargs)))
         lifespan = app.router.lifespan_context(app)
@@ -1331,3 +1336,65 @@ def test_importing_the_oci_client_installs_no_log_filter():
     )
     result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     assert result.stdout.strip() == "[0, 0, 0, 0]"
+
+
+# -- the redirect policy is serving's, not the indexer's ---------------------------
+
+
+async def test_the_same_redirects_index_with_serving_off_and_are_refused_with_serving_on(tmp_path, monkeypatch):
+    """An https registry that redirects layers to http storage: main indexes it, and so does a Hub that does not serve.
+
+    Enabling serving holds the indexer to the redirect policy too -- a source
+    the Hub could not serve a pull from must not look healthy in the catalog.
+    """
+
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "cogs" / "pixi-complete"
+    files = {
+        "pixi.toml": (MEDIA_TYPE_PIXI_TOML, (fixture / "pixi.toml").read_bytes()),
+        "COG.md": (MEDIA_TYPE_NEBI_ASSET, (fixture / "COG.md").read_bytes()),
+    }
+    config_blob = b"{}"
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": MEDIA_TYPE_OCI_MANIFEST,
+            "config": descriptor(MEDIA_TYPE_PIXI_CONFIG, config_blob),
+            "layers": [descriptor(media_type, data, title) for title, (media_type, data) in files.items()],
+        }
+    ).encode()
+
+    async def sweep(serve: dict) -> tuple[list, FakeRegistry]:
+        upstream = FakeRegistry()
+        upstream.storage_scheme = "http"  # the registry is https; its storage is plain http
+        upstream.publish_raw(REPO, MEDIA_TYPE_OCI_MANIFEST, manifest, "1.0.0")
+        upstream.blobs.update({sha256(data): data for _media_type, data in files.values()})
+        upstream.blobs[sha256(config_blob)] = config_blob
+        transport = httpx.MockTransport(upstream)
+        monkeypatch.setattr(
+            config_module,
+            "build_registry_sources",
+            lambda configs, **kwargs: build_registry_sources(configs, http_transport=transport, **kwargs),
+        )
+        values = settings(tmp_path, serve=serve)
+        values["cogs"]["index"] = {"enabled": True}
+        config = Config.parse(values)
+        store = config_module.build_cog_catalog_store(config, None)
+        indexing = config_module.build_cog_indexing(config, store)
+        try:
+            await indexing.indexer.sweep()
+        finally:
+            indexing.indexer.close()
+            for source in indexing.indexer.sources:
+                await source.aclose()
+        return store.locations(sha256(manifest)), upstream
+
+    (row,), upstream = await sweep({})
+    assert row.status == STATUS_INDEXED and row.cog_id == "example/cog-audio-transcriber", row.read_errors
+    assert [r.cog_id for r in (row,)] and any(request.url.scheme == "http" for request in upstream.requests)
+
+    (row,), upstream = await sweep({"enabled": True, "public_url": HUB_URL})
+    assert row.status == STATUS_FAILED and row.cog_id is None
+    assert any("refusing a redirect from https to http" in error for error in row.read_errors), row.read_errors
+    assert not any(request.url.host == STORAGE_HOST for request in upstream.requests), "storage was never contacted"

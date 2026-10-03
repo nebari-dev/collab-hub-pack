@@ -411,13 +411,17 @@ def build_registry_sources(
     *,
     oci_client_factory: OCIClientFactory = OCIClient,
     http_transport: httpx.AsyncBaseTransport | None = None,
+    restrict_redirects: bool = False,
 ) -> list[RegistrySource]:
     """Instantiate one adapter per configured source, or refuse to start.
 
     ``make_app`` calls this once so that a duplicate id or an unsupported kind
     fails the rollout rather than the first sweep. ``http_transport`` exists
     for tests (``httpx.MockTransport``) and is handed to every adapter's own
-    HTTP client and to the OCI client factory.
+    HTTP client and to the OCI client factory. ``restrict_redirects`` turns
+    the OCI client's redirect policy on for every source (see
+    ``OCIClient._check_redirect``); a source that sets
+    ``blob_redirect_hosts`` has it on regardless.
     """
 
     # Adapters import this module for the protocol and config types, so the
@@ -448,10 +452,18 @@ def build_registry_sources(
     for config in configs:
         if config.kind == "harbor":
             source: RegistrySource = HarborRegistrySource(
-                config, oci_client_factory=oci_client_factory, http_transport=http_transport
+                config,
+                oci_client_factory=oci_client_factory,
+                http_transport=http_transport,
+                restrict_redirects=restrict_redirects,
             )
         else:
-            source = StaticRegistrySource(config, oci_client_factory=oci_client_factory, http_transport=http_transport)
+            source = StaticRegistrySource(
+                config,
+                oci_client_factory=oci_client_factory,
+                http_transport=http_transport,
+                restrict_redirects=restrict_redirects,
+            )
         sources.append(source)
     return sources
 

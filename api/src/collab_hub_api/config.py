@@ -1430,7 +1430,11 @@ def build_cog_indexing(config: BaseConfig, store: CogCatalogStore) -> CogIndexin
             f"(configured: {pool.max_size}): the indexer's sweep occupies one pooled "
             "connection for the whole sweep while everything else needs another."
         )
-    sources = build_registry_sources(list(cogs.registry_sources))
+    # With serving off the indexer follows registry redirects exactly as it
+    # always has. With serving on it is held to the redirect policy the
+    # serving clients are: a source the Hub could not serve a pull from
+    # should not index as healthy.
+    sources = build_registry_sources(list(cogs.registry_sources), restrict_redirects=cogs.serve.enabled)
     return CogIndexing(
         CogIndexer(store, sources),
         interval_seconds=float(index.interval_seconds),
@@ -1493,7 +1497,7 @@ def build_cog_registry_serving(
     return CogRegistryServing(
         front=CogRegistryFront(
             store,
-            build_registry_sources(list(cogs.registry_sources)),
+            build_registry_sources(list(cogs.registry_sources), restrict_redirects=True),
             max_blob_bytes=serve.max_blob_bytes,
         ),
         credentials=build_cog_registry_credential_store(config, pools),

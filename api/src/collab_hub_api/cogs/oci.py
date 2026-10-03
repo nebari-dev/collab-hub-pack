@@ -382,6 +382,7 @@ class OCIClient:
         max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
         redirect_hosts: Sequence[str] = (),
+        restrict_redirects: bool = False,
     ) -> None:
         try:
             origin = httpx.URL(base_url.rstrip("/"))
@@ -397,6 +398,11 @@ class OCIClient:
         self._origin = origin
         self._credentials = credentials
         self._redirect_hosts = tuple(host.lower() for host in redirect_hosts)
+        # The redirect policy is an opt-in of whoever builds the client: on
+        # when asked for (the Hub serving pulls), or when the source names
+        # the hosts its redirects may reach. Otherwise redirects are followed
+        # as they always were, with the credential dropped off-origin.
+        self._restrict_redirects = bool(restrict_redirects or self._redirect_hosts)
         self._token_url = token_url
         self._max_manifest_bytes = max_manifest_bytes
         self._tokens: dict[_TokenKey, _CachedToken] = {}
@@ -662,7 +668,8 @@ class OCIClient:
             if not location:
                 raise OCIProtocolError(f"{what}: redirect without a Location header")
             target = _join_url(url, location, what=f"{what} redirect")
-            self._check_redirect(url, target, what=what)
+            if self._restrict_redirects:
+                self._check_redirect(url, target, what=what)
             hop_headers = dict(headers)
             if not _same_origin(target, self._origin):
                 # Object storage must never see the registry credential. Every
@@ -680,7 +687,10 @@ class OCIClient:
         return response
 
     def _check_redirect(self, previous: httpx.URL, target: httpx.URL, *, what: str) -> None:
-        """Refuse a redirect this client must not follow. Messages never quote the target.
+        """Refuse a redirect a client built with the redirect policy must not follow. Messages never quote the target.
+
+        Applied only when the client was constructed with
+        ``restrict_redirects`` or a ``redirect_hosts`` allowlist.
 
         The registry is configured by the operator and trusted with a
         credential, so this is defence in depth against a registry that is
