@@ -503,6 +503,26 @@ cases:
       publish: {allowed_users: ['  ']}
     app_error: 'allowed_users entries must not be blank'
 
+  - name: a publish role listed twice
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedRoles: [owner, owner]}
+    chart_error: 'allowedRoles.*(unique|are equal)'
+    settings:
+      publish: {allowed_roles: [owner, owner]}
+    app_error: "allowed_roles lists 'owner' twice"
+
+  - name: a publish user listed twice
+    layers: [schema]
+    values:
+      cogs:
+        publish: {allowedUsers: [8f2c1d7e-user-id, 8f2c1d7e-user-id]}
+    chart_error: 'allowedUsers.*(unique|are equal)'
+    settings:
+      publish: {allowed_users: [8f2c1d7e-user-id, 8f2c1d7e-user-id]}
+    app_error: "allowed_users lists '8f2c1d7e-user-id' twice"
+
   - name: unknown publish key
     layers: [schema]
     values:

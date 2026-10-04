@@ -966,12 +966,25 @@ class CogPublishConfig(BaseModel):
     allowed_roles: list[Literal["operator", "owner", "member"]] = Field(default_factory=list)
     allowed_users: list[str] = Field(default_factory=list)
 
+    @field_validator("allowed_roles")
+    @classmethod
+    def _check_roles(cls, value: list[str]) -> list[str]:
+        # The chart's schema refuses a repeated entry (uniqueItems); so does this.
+        for role in value:
+            if value.count(role) > 1:
+                raise ValueError(f"cogs.publish.allowed_roles lists {role!r} twice")
+        return value
+
     @field_validator("allowed_users")
     @classmethod
     def _check_users(cls, value: list[str]) -> list[str]:
         cleaned = [user.strip() for user in value]
         if any(not user for user in cleaned):
             raise ValueError("cogs.publish.allowed_users entries must not be blank")
+        # As written, like the chart's uniqueItems: the two layers refuse the same lists.
+        for user in value:
+            if value.count(user) > 1:
+                raise ValueError(f"cogs.publish.allowed_users lists {user!r} twice")
         return cleaned
 
 
