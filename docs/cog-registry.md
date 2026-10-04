@@ -782,11 +782,15 @@ organization. What the registry answers decides what becomes of it:
 A pending repository is not ownership a sweep relies on at once: two minutes
 after it was written, sweeps start looking there. What they find is listed
 either way, and the row is committed **only if a digest found there is one
-that organization attempted to publish to that repository** (this is how a
-publish the registry accepted but the Hub failed to record is recovered).
-Anything else found there was pushed to the registry some other way and
-proves nothing about whose the name is: it is listed as out-of-band content
-with no publisher, the row stays pending, the Hub logs
+the registry is known to have accepted from that organization for that
+repository**. That is the recovery path for a publish whose acceptance was
+recorded and whose commit was not: it settles at the next sweep. Nothing
+else found there proves whose the name is, and that includes a digest the
+organization merely attempted: the attempt may have stored nothing, and the
+same bytes can be pushed by anyone. So when acceptance itself was never
+recorded, or the content was pushed to the registry some other way, it is
+listed as out-of-band content with no publisher, the row stays pending, the
+Hub logs
 `cog_publish_pending_repository_holds_other_content`, and from then on only
 a platform operator may publish there, until an operator sorts it out
 (release the name, below, or publish). If the registry has no such
@@ -825,8 +829,11 @@ platform operators only. That is decided from the registry as well as the
 catalog: before a name is given to an organization for the first time, the
 Hub asks the publish source whether the repository already holds a tag (one
 request), so a repository pushed to the registry directly is protected even
-before any sweep has indexed it. If the registry cannot answer, the publish
-is refused with 503 and nothing is reserved or forwarded. So one
+before any sweep has indexed it. Only an answer that says so counts as
+"nothing there": a missing repository, or a tag list for that repository
+that is explicitly empty. If the registry cannot answer, or answers with
+anything else (no `tags` field, another repository's name, not JSON), the
+publish is refused with 503 and nothing is reserved or forwarded. So one
 organization cannot overwrite another organization's Cog, or a tag of it,
 nor content nobody published through the Hub.
 
@@ -964,7 +971,7 @@ manifest. Whichever write then lists the digest (the request itself, a
 retried push, a later sweep) takes the publisher from the earliest accepted
 attempt, and a publisher that is on a row stays there. An attempt that was
 refused is deleted by its own request and no other; one whose outcome was
-never known attributes nothing, to anyone, and is purged after thirty days. The
+never known attributes nothing, to anyone, and is purged after a day. The
 consequence is stated plainly: **if the registry accepted a manifest and the
 Hub could not record that it had, the publisher of that digest is unknown**
 (`published_by` is null, as for a version pushed to the registry directly)
