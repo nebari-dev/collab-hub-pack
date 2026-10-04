@@ -81,6 +81,7 @@ class StaticRegistrySource:
             transport=http_transport,
             redirect_hosts=tuple(config.blob_redirect_hosts),
             restrict_redirects=restrict_redirects,
+            name=config.id,
         )
         # The index is fetched anonymously: it may live anywhere, and the
         # registry credential must not be presented to an arbitrary URL.

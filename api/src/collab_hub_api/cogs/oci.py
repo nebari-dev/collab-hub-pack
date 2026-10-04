@@ -62,6 +62,7 @@ import re
 import ssl
 import time
 from collections.abc import AsyncIterable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -155,17 +156,32 @@ _TokenKey = tuple[str, str, str]
 """(token endpoint, service, scope): what makes one bearer token interchangeable with another."""
 
 
-class _RequestLogFilter(logging.Filter):
-    """Drop the query string and userinfo from httpx's own per-request log line.
+_registry_write: ContextVar[str | None] = ContextVar("cog_registry_write", default=None)
+"""What a write to a registry is logged as, while :meth:`OCIClient._write` sends it; ``None`` otherwise."""
 
-    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request, and
-    a blob redirect to object storage is a pre-signed URL: its query string
-    *is* the credential. The path stays (it says which blob), the rest goes.
+
+class _RequestLogFilter(logging.Filter):
+    """Keep what must not be logged out of httpx's own per-request log line.
+
+    httpx logs ``HTTP Request: GET <url> ...`` at INFO for every request.
+
+    - For a read, the query string and userinfo are dropped: a blob redirect
+      to object storage is a pre-signed URL, and its query string *is* the
+      credential. The path stays (it says which blob).
+    - For a **write** to a registry (publishing through the Hub, issue #180)
+      the URL goes altogether. It is an upload session's URL at the backing
+      registry -- its host, and a path that may itself be the capability to
+      write to that session -- so the line carries what the operation was
+      and which source it went to, and nothing the registry said.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple):
-            record.args = tuple(_scrubbed_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args)
+            write = _registry_write.get()
+            record.args = tuple(
+                (write if write is not None else _scrubbed_url(arg)) if isinstance(arg, httpx.URL) else arg
+                for arg in record.args
+            )
         return True
 
 
@@ -396,7 +412,11 @@ class OCIClient:
         transport: httpx.AsyncBaseTransport | None = None,
         redirect_hosts: Sequence[str] = (),
         restrict_redirects: bool = False,
+        name: str | None = None,
     ) -> None:
+        # What this registry is called in logs where its URL must not appear:
+        # the configured source id.
+        self._name = name or "registry"
         try:
             origin = httpx.URL(base_url.rstrip("/"))
         except httpx.InvalidURL as exc:
@@ -608,8 +628,14 @@ class OCIClient:
         finally:
             await response.aclose()
 
-    async def cancel_upload(self, repo: str, location: str) -> None:
-        """Ask the registry to drop an upload session. Best effort: a registry that will not is not an error."""
+    async def cancel_upload(self, repo: str, location: str) -> bool:
+        """Ask the registry to drop an upload session; never raises an :class:`OCIError`.
+
+        Returns whether the session is known to be gone: the registry
+        dropped it, or no longer knows it. ``False`` -- it could not be
+        asked, or it refused -- means the session may still be there, and
+        the caller keeps what it needs to ask again.
+        """
 
         _validate_repo(repo)
         try:
@@ -617,8 +643,9 @@ class OCIClient:
                 "DELETE", self._session_url(location), scope_hint=_push_scope(repo), what="upload cancel"
             )
         except OCIError:
-            return
+            return False
         await response.aclose()
+        return 200 <= response.status_code < 300 or response.status_code == 404
 
     async def put_manifest(self, repo: str, ref: str, body: bytes, media_type: str) -> None:
         """Store a manifest under a tag or its digest."""
@@ -718,10 +745,15 @@ class OCIClient:
             request = self._http.build_request(method, url, headers=dict(headers), content=content)
         except (UnicodeError, ValueError, TypeError) as exc:
             raise OCIProtocolError(f"{what}: request could not be constructed: {type(exc).__name__}") from exc
+        # httpx logs the request line as the response's headers arrive, in
+        # this task: the log filter reads this instead of the URL.
+        logged = _registry_write.set(f"[registry write: {what}, source {self._name}]")
         try:
             return await self._http.send(request, stream=True, follow_redirects=False)
         except httpx.HTTPError as exc:
             raise OCITransportError(f"{what}: {type(exc).__name__}") from exc
+        finally:
+            _registry_write.reset(logged)
 
     async def list_tags(self, repo: str) -> list[str]:
         """List a repository's tags, following ``Link: rel="next"`` pagination.

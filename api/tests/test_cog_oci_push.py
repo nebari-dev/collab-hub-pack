@@ -220,11 +220,16 @@ async def test_blob_size_answers_only_what_the_registry_states():
             await client.blob_size(REPO, "latest")
 
 
-async def test_cancel_is_best_effort_and_transport_failures_are_wrapped():
+async def test_cancel_says_whether_the_session_is_gone_and_transport_failures_are_wrapped():
     registry = Registry()
     async with client_for(registry) as client:
-        await client.cancel_upload(REPO, SESSION)
+        assert await client.cancel_upload(REPO, SESSION) is True
         assert ("DELETE", SESSION, True, b"") in registry.seen
+        # A session the registry no longer knows is as gone as one it just dropped; anything else is not.
+        for status, gone in ((204, True), (404, True), (500, False), (405, False), (403, False)):
+            registry.answers[f"DELETE /v2/{REPO}/blobs/uploads/abc"] = httpx.Response(status, text="whatever")
+            assert await client.cancel_upload(REPO, SESSION) is gone, status
+        assert await client.cancel_upload(REPO, "https://elsewhere.example/v2/x/blobs/uploads/abc") is False
 
     def unreachable(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("cannot reach registry.example", request=request)
@@ -233,7 +238,49 @@ async def test_cancel_is_best_effort_and_transport_failures_are_wrapped():
         with pytest.raises(OCITransportError) as caught:
             await client.start_upload(REPO)
         assert str(caught.value) == "upload start: ConnectError"
-        await client.cancel_upload(REPO, SESSION)  # swallowed
+        assert await client.cancel_upload(REPO, SESSION) is False  # swallowed, and reported as not gone
+
+
+async def test_a_write_is_logged_as_its_operation_and_source_and_a_read_as_before(caplog):
+    """httpx logs every request's URL at INFO. For a write that is the upload session: host, path and state."""
+
+    import logging
+
+    from collab_hub_api.cogs import oci
+
+    oci.install_log_redaction()
+    registry = Registry()
+    caplog.set_level(logging.INFO, logger="httpx")
+    async with client_for(registry, name="backing") as client:
+        location = await client.start_upload(REPO)
+        client._tokens.clear()  # no token in hand: the challenge is taken on a status request to the session
+        await client.upload_chunk(REPO, location, stream(b"payload"), offset=0, length=7)
+        await client.finish_upload(REPO, location, sha256(b"payload"))
+        await client.cancel_upload(REPO, location)
+        await client.put_manifest(REPO, "1.0.0", b"{}", "application/vnd.oci.image.manifest.v1+json")
+        await client.blob_size(REPO, sha256(b"payload"))
+    async with client_for(registry) as unnamed:
+        await unnamed.start_upload(REPO)
+    lines = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    assert [line for line in lines if "/token" not in line] == [
+        'HTTP Request: POST [registry write: upload start, source backing] "HTTP/1.1 401 Unauthorized"',
+        'HTTP Request: POST [registry write: upload start, source backing] "HTTP/1.1 202 Accepted"',
+        'HTTP Request: GET [registry write: upload status, source backing] "HTTP/1.1 401 Unauthorized"',
+        'HTTP Request: GET [registry write: upload status, source backing] "HTTP/1.1 204 No Content"',
+        'HTTP Request: PATCH [registry write: upload chunk, source backing] "HTTP/1.1 202 Accepted"',
+        'HTTP Request: PUT [registry write: upload finish, source backing] "HTTP/1.1 201 Created"',
+        'HTTP Request: DELETE [registry write: upload cancel, source backing] "HTTP/1.1 201 Created"',
+        'HTTP Request: PUT [registry write: manifest put, source backing] "HTTP/1.1 201 Created"',
+        'HTTP Request: HEAD [registry write: blob check, source backing] "HTTP/1.1 401 Unauthorized"',
+        'HTTP Request: HEAD [registry write: blob check, source backing] "HTTP/1.1 200 OK"',
+        'HTTP Request: POST [registry write: upload start, source registry] "HTTP/1.1 401 Unauthorized"',
+        'HTTP Request: POST [registry write: upload start, source registry] "HTTP/1.1 202 Accepted"',
+    ]
+    text = "\n".join(lines)
+    assert "abc" not in text and "_state" not in text and "opaque" not in text, "no session path, no session state"
+    # The token endpoint is a read, logged as reads always were; and once the write is over, so is everything else.
+    assert f"HTTP Request: GET {REGISTRY}/token" in text
+    assert oci._registry_write.get() is None
 
 
 async def test_an_undeclared_length_is_sent_chunked_and_a_declared_one_with_its_range():
