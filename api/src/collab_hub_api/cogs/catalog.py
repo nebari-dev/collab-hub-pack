@@ -431,8 +431,13 @@ class CogCatalogStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def attempted_digests(self, source_id: str, repository: str, org_id: str | None) -> set[str]:
-        """The digests this organization has attempted to publish to this repository, accepted or not."""
+    def accepted_digests(self, source_id: str, repository: str, org_id: str | None) -> set[str]:
+        """The digests the registry is known to have accepted from this organization for this repository.
+
+        Accepted attempts only. That an organization *tried* to publish a
+        digest says nothing about how a digest found in the registry got
+        there: the same bytes can be pushed by anyone.
+        """
 
         raise NotImplementedError
 
@@ -560,13 +565,8 @@ def new_attempt_id() -> str:
     return "pub-" + secrets.token_hex(16)
 
 
-UNACCEPTED_ATTEMPT_MAX_AGE_SECONDS = 30 * 24 * 3600
-"""How long an attempt that never resolved is kept.
-
-It attributes nothing either way. What it is kept for is a sweep settling a
-pending repository: content found there counts as that organization's only
-if it is a digest the organization attempted to publish.
-"""
+UNACCEPTED_ATTEMPT_MAX_AGE_SECONDS = 24 * 3600
+"""How long an attempt that never resolved is kept. It attributes nothing, and settles nothing, either way."""
 
 
 def _keep_publication(
@@ -790,7 +790,7 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def accept_publication(self, attempt_id) -> None:
         raise self._refuse()
 
-    def attempted_digests(self, source_id, repository, org_id) -> set[str]:
+    def accepted_digests(self, source_id, repository, org_id) -> set[str]:
         raise self._refuse()
 
     def forget_publication(self, attempt_id) -> None:
@@ -902,12 +902,14 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             if attempt is not None and attempt["accepted_at"] is None:
                 attempt["accepted_at"] = datetime.now(UTC)
 
-    def attempted_digests(self, source_id, repository, org_id) -> set[str]:
+    def accepted_digests(self, source_id, repository, org_id) -> set[str]:
         with self._lock:
             return {
                 attempt["key"][2]
                 for attempt in self._attempts.values()
-                if attempt["key"][:2] == (source_id, repository) and attempt["org_id"] == org_id
+                if attempt["key"][:2] == (source_id, repository)
+                and attempt["org_id"] == org_id
+                and attempt["accepted_at"] is not None
             }
 
     def forget_publication(self, attempt_id) -> None:
@@ -1370,12 +1372,13 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 (attempt_id,),
             )
 
-    def attempted_digests(self, source_id, repository, org_id) -> set[str]:
+    def accepted_digests(self, source_id, repository, org_id) -> set[str]:
         with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 """
                 SELECT DISTINCT digest FROM collab_cog_publication_attempts
                 WHERE source_id = %s AND repository = %s AND published_org IS NOT DISTINCT FROM %s
+                  AND accepted_at IS NOT NULL
                 """,
                 (source_id, repository, org_id),
             ).fetchall()

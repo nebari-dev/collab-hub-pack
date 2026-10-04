@@ -543,27 +543,66 @@ async def test_an_attempt_that_could_not_even_be_recorded_forwards_nothing_and_h
     assert store._repositories == {}, "so the name is not left pending behind it"
 
 
-async def test_when_acceptance_cannot_be_recorded_the_publisher_stays_unknown(hub: Hub):
-    client = await pusher(hub)
+async def test_when_acceptance_cannot_be_recorded_the_publisher_stays_unknown_and_an_operator_settles_it(hub: Hub):
+    client, store = await pusher(hub, ALICE, REPO, OTHER), store_of(hub)
     await upload(client, COG)
+    await upload(client, COG, OTHER)
     accept = hub.catalog.accept_publication
 
     def down(attempt_id):
         raise CogCatalogUnavailableError("the database is away")
 
     hub.catalog.accept_publication = down
-    status, _code, message = errors(await client.manifest(COG, "1.0.0"))
-    assert status == 503 and "stored in the registry" in message
+    for repo in (REPO, OTHER):
+        status, _code, message = errors(await client.manifest(COG, "1.0.0", repo))
+        assert status == 503 and "stored in the registry" in message
     hub.catalog.accept_publication = accept
-    # The sweep's two steps: it lists the digest, and settles the repository -- the digest is one its
-    # organization attempted to publish there, whoever in it that was.
+
+    # Putting the manifest again before any sweep has been there settles everything: this time it is recorded.
+    assert (await client.manifest(COG, "1.0.0", OTHER)).status_code == 201
+    assert store.get_repository(OTHER).committed is True
+    assert hub.catalog.get(COG.digest, repository=OTHER).published_by == "alice"
+
+    # Otherwise the sweep lists the digest, and settles nothing by it: that the organization attempted this
+    # digest does not show that its attempt is how the digest got there.
     hub.catalog.upsert(replace(COG_ROW(hub), tags=("1.0.0",)))
-    publishing.settle_found(store_of(hub), hub.catalog)("backing", {REPO: [COG.digest]})
-    assert store_of(hub).get_repository(REPO).committed is True
-    assert hub.catalog.get(COG.digest).published_by is None, "not guessed from an attempt nobody confirmed"
-    # Published again, and recorded this time: now it is known.
-    assert (await client.manifest(COG, "1.0.0")).status_code == 201
-    assert hub.catalog.get(COG.digest).published_by == "alice"
+    publishing.settle_found(store, hub.catalog)("backing", {REPO: [COG.digest]})
+    assert store.get_repository(REPO).committed is False
+    assert hub.catalog.get(COG.digest, repository=REPO).published_by is None, "and nobody is guessed as publisher"
+    # From then on it is an operator's to resolve: the organization's own retry is refused.
+    assert errors(await client.manifest(COG, "1.0.0"))[:2] == (403, "DENIED")
+
+
+async def test_a_digest_pushed_directly_does_not_settle_a_pending_repository_for_whoever_attempted_it(
+    sweeping_hub: Hub,
+):
+    """A's PUT of digest D gets a 500 and stores nothing; somebody pushes D there directly; a sweep runs."""
+
+    hub, store = sweeping_hub, store_of(sweeping_hub)
+    now = [datetime.now(UTC)]
+    store.clock = lambda: now[0]
+    alice = await pusher(hub, ALICE)
+    await upload(alice, COG)
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(500, text="boom")
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 503
+    del hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"]
+    assert (REPO, "1.0.0") not in hub.upstream.manifests, "the registry stored nothing"
+    # The very same digest, pushed to the registry by somebody else.
+    hub.upstream.publish_raw(REPO, MEDIA_TYPE_OCI_MANIFEST, COG.manifest, "1.0.0")
+
+    now[0] += FOREVER
+    for _ in range(2):
+        assert (await hub.app.state.cog_indexer.sweep()).errors == []
+        record = store.get_repository(REPO)
+        assert (record.owner_org_id, record.committed) == ("org-a", False), "identical content is not acceptance"
+    row = hub.catalog.get(COG.digest)
+    assert (row.status, row.published_by) == (STATUS_INDEXED, None)
+    # So the organization cannot move the tag to something else of its own.
+    newer = CogBundle(extra=b"what A would overwrite it with")
+    await_upload = await alice.start()
+    assert await_upload.status_code == 403
+    assert errors(await alice.manifest(newer, "1.0.0"))[:2] == (403, "DENIED")
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == COG.manifest
 
 
 def COG_ROW(hub: Hub):
@@ -1279,6 +1318,13 @@ async def test_a_repository_the_registry_already_holds_cannot_be_claimed_before_
     # One request to the registry decided it, and it asked for one tag.
     asked = [request for request in hub.upstream.requests if request.url.path == f"/v2/{REPO}/tags/list"]
     assert [str(request.url.query, "ascii") for request in asked[-1:]] == ["n=1"]
+
+    # A tag listing that does not say what the repository holds is not "nothing": 200 with an empty object.
+    hub.upstream.fail[f"/v2/{REPO}/tags/list"] = httpx.Response(200, json={})
+    assert errors(await alice.manifest(COG, "1.0.0"))[:2] == (503, "UNAVAILABLE")
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == theirs.manifest and manifest_puts(hub) == []
+    assert store._repositories == {} and hub.catalog._attempts == {}
+    del hub.upstream.fail[f"/v2/{REPO}/tags/list"]
 
     # When the registry cannot say, the answer is not "new": nothing is reserved and nothing forwarded.
     hub.upstream.fail[f"/v2/{OTHER}/tags/list"] = httpx.Response(500, text="boom")

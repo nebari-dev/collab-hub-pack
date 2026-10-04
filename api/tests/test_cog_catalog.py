@@ -416,7 +416,7 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.note_publication("pub-1", SOURCE, "cogs/a", digest("a"), user_id="u", org_id=None),
         lambda: store.accept_publication("pub-1"),
         lambda: store.forget_publication("pub-1"),
-        lambda: store.attempted_digests(SOURCE, "cogs/a", None),
+        lambda: store.accepted_digests(SOURCE, "cogs/a", None),
         lambda: store.record_published(artifact("a"), tag=None),
         lambda: store.repository_known("cogs/a"),
         lambda: store.find_pullable("cogs/a", (SOURCE,), digest=digest("a")),
@@ -1059,13 +1059,13 @@ def _exercise_attempts(store) -> None:
     assert publisher("3") == ("carol", "org-a")
     store.mark_removed_one(SOURCE, "cogs/a", digest("2"))
     assert _unresolved(store) == 1, "only the one just noted is left unresolved; erin's is gone, not accepted late"
-    # What an organization attempted to publish to a repository, accepted or not: what a sweep settling a
-    # pending repository compares its findings with.
-    assert store.attempted_digests(SOURCE, "cogs/a", "org-a") >= {digest("2"), digest("3"), digest("9")}
-    assert store.attempted_digests(SOURCE, "cogs/a", "org-b") == {digest("3")}
-    assert store.attempted_digests(SOURCE, "cogs/a", None) == set()
-    assert store.attempted_digests(SOURCE, "cogs/elsewhere", "org-a") == set()
-    assert store.attempted_digests("mirror", "cogs/a", "org-a") == set()
+    # What the registry is known to have accepted from an organization for a repository: what a sweep
+    # settling a pending repository compares its findings with. Attempts that were only made are not in it.
+    assert store.accepted_digests(SOURCE, "cogs/a", "org-a") == {digest("2"), digest("3")}
+    assert store.accepted_digests(SOURCE, "cogs/a", "org-b") == {digest("3")}
+    assert store.accepted_digests(SOURCE, "cogs/a", None) == set()
+    assert store.accepted_digests(SOURCE, "cogs/elsewhere", "org-a") == set()
+    assert store.accepted_digests("mirror", "cogs/a", "org-a") == set()
     # An attempt attributes its own digest, source and repository, and nothing else.
     _accepted(store, "4", repository="cogs/elsewhere")
     _accepted(store, "4", source_id="mirror")
@@ -1859,10 +1859,11 @@ def test_attempts_are_rows_of_their_own_and_only_an_accepted_one_can_be_read_as_
     )
     assert len(conn.calls) == 8, "each under the request's statement timeout"
     asked, conn = _fake_store([[{"digest": DIGEST_A}, {"digest": DIGEST_B}]])
-    assert asked.attempted_digests(SOURCE, "cogs/a", None) == {DIGEST_A, DIGEST_B}
+    assert asked.accepted_digests(SOURCE, "cogs/a", None) == {DIGEST_A, DIGEST_B}
     assert conn.queries[0] == (
         "SELECT DISTINCT digest FROM collab_cog_publication_attempts"
-        " WHERE source_id = %s AND repository = %s AND published_org IS NOT DISTINCT FROM %s",
+        " WHERE source_id = %s AND repository = %s AND published_org IS NOT DISTINCT FROM %s"
+        " AND accepted_at IS NOT NULL",
         (SOURCE, "cogs/a", None),
     )
     assert len({new_attempt_id() for _ in range(50)}) == 50

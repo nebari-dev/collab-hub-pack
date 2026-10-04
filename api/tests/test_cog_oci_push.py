@@ -231,7 +231,7 @@ async def test_has_tags_is_one_request_and_reads_no_into_nothing_but_a_clear_ans
 
     async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
         for answer, expected in (
-            (httpx.Response(200, json={"tags": ["v1"]}, headers={"Link": '</v2/x?last=v1>; rel="next"'}), True),
+            (httpx.Response(200, json={"name": REPO, "tags": ["v1"]}, headers={"Link": '</v2/x>; rel="next"'}), True),
             (httpx.Response(200, json={"name": REPO, "tags": []}), False),
             (httpx.Response(200, json={"name": REPO, "tags": None}), False),
             (httpx.Response(404, json={"errors": [{"code": "NAME_UNKNOWN"}]}), False),
@@ -239,11 +239,25 @@ async def test_has_tags_is_one_request_and_reads_no_into_nothing_but_a_clear_ans
             answers.append(answer)
             assert await client.has_tags(REPO) is expected
         assert seen == [f"{REGISTRY}/v2/{REPO}/tags/list?n=1"] * 4, "one request each, never a second page"
-        for unclear in (httpx.Response(500, text="boom"), httpx.Response(200, json={"tags": "v1"}),
-                        httpx.Response(200, text="not json")):
+        # "Nothing there" is only ever read from an answer that says so. A document that is not this
+        # repository's tag list is not an answer, whatever its status.
+        for unclear in (
+            httpx.Response(500, text="boom"),
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"name": REPO}),
+            httpx.Response(200, json={"tags": []}),
+            httpx.Response(200, json={"name": "cogs/another", "tags": []}),
+            httpx.Response(200, json={"name": REPO, "tags": "v1"}),
+            httpx.Response(200, json={"name": REPO, "tags": {}}),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, text="not json"),
+        ):
             answers.append(unclear)
             with pytest.raises(OCIError):
                 await client.has_tags(REPO)
+        # The listing other callers use stays as tolerant as it was.
+        answers.append(httpx.Response(200, json={}))
+        assert await client.list_tags(REPO) == []
         with pytest.raises(OCIInvalidReference):
             await client.has_tags("Not/Valid")
 

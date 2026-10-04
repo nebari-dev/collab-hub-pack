@@ -888,11 +888,13 @@ def settle_found(store: PublishStore, catalog: CogCatalogStore):
     """What a sweep calls with what it found in a source: settles pending repositories, strictly.
 
     A pending repository is committed only when the sweep found, in it, a
-    digest its organization attempted to publish there: that is the content
-    whose outcome the Hub lost track of. Anything else found in a pending
-    repository proves nothing about whose it is -- it was pushed to the
-    registry some other way -- so the row stays pending, the content is
-    indexed like any out-of-band content, and one line says so.
+    digest the registry is **known to have accepted** from its organization
+    for that repository: the publish whose acceptance was recorded and whose
+    commit was not. Nothing else found there proves whose it is. A digest
+    the organization merely *attempted* does not either -- the attempt may
+    have stored nothing, and the same bytes can be pushed by anyone -- so
+    the row stays pending, the content is indexed like any out-of-band
+    content, one line says so, and an operator resolves it.
     """
 
     def settle(source_id: str, found) -> None:
@@ -900,8 +902,8 @@ def settle_found(store: PublishStore, catalog: CogCatalogStore):
             digests = set(found.get(record.repository, ()))
             if not digests:
                 continue
-            attempted = catalog.attempted_digests(source_id, record.repository, record.owner_org_id)
-            if digests & attempted:
+            accepted = catalog.accepted_digests(source_id, record.repository, record.owner_org_id)
+            if digests & accepted:
                 store.commit_found(source_id, record.repository, owner_org_id=record.owner_org_id)
             else:
                 logger.warning(

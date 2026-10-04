@@ -789,10 +789,14 @@ class OCIClient:
     async def has_tags(self, repo: str) -> bool:
         """Whether the repository holds at least one tag: one request, never paged.
 
-        ``False`` for a repository the registry does not have. Anything the
-        registry says that is not a tag list raises, like :meth:`list_tags`:
-        the caller asked a yes-or-no question and must not read "no" into an
-        answer that was not one.
+        ``False`` for a repository the registry does not have, and for one
+        whose tag list is explicitly empty (``"tags": []`` or ``"tags":
+        null``). The answer is read **strictly**, unlike :meth:`list_tags`:
+        the caller asked a yes-or-no question whose "no" gives a name away,
+        so a document that is not the tag list of this repository -- no
+        ``tags`` field at all, one that is not a list, a ``name`` that is
+        missing or another repository's, a body that is not JSON -- raises
+        instead of being read as "nothing there".
         """
 
         _validate_repo(repo)
@@ -801,7 +805,12 @@ class OCIClient:
         except OCINotFound:
             return False
         body = await _read_bounded(response, MAX_TAG_PAGE_BYTES, what="tag list")
-        listed = _parse_json_object(body, what="tag list").get("tags")
+        payload = _parse_json_object(body, what="tag list")
+        if payload.get("name") != repo:
+            raise OCIProtocolError("tag list is not this repository's")
+        if "tags" not in payload:
+            raise OCIProtocolError("tag list has no 'tags' field")
+        listed = payload["tags"]
         if listed is None:
             return False
         if not isinstance(listed, list):
