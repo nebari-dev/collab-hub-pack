@@ -732,6 +732,7 @@ cogs:
   publish:
     allowedRoles: []                 # operator | owner | member
     allowedUsers: []                 # Hub user ids
+    maxPendingRepositories: 20       # unsettled names one organization may hold
 ```
 
 `publish: true` on more than one source, or without `cogs.serve.enabled`, is
@@ -779,11 +780,26 @@ organization. What the registry answers decides what becomes of it:
   can simply publish again, which settles it.
 
 A pending repository is not ownership a sweep relies on at once: two minutes
-after it was written, sweeps start looking there. If they find content, it
-is listed and the row is committed (this is how a publish the registry
-accepted but the Hub failed to record is recovered); if the registry has no
-such repository, that is an empty answer, not an error, and the row stays
-pending. An upload alone never creates a row. Of two organizations
+after it was written, sweeps start looking there. What they find is listed
+either way, and the row is committed **only if a digest found there is one
+that organization attempted to publish to that repository** (this is how a
+publish the registry accepted but the Hub failed to record is recovered).
+Anything else found there was pushed to the registry some other way and
+proves nothing about whose the name is: it is listed as out-of-band content
+with no publisher, the row stays pending, the Hub logs
+`cog_publish_pending_repository_holds_other_content`, and from then on only
+a platform operator may publish there, until an operator sorts it out
+(release the name, below, or publish). If the registry has no such
+repository, that is an empty answer, not an error, and the row stays
+pending. An upload alone never creates a row.
+
+One organization may hold at most `cogs.publish.maxPendingRepositories`
+(20 by default) pending names at once. Nothing pending expires, so this is
+what bounds the names a publisher can leave behind while the registry is
+failing; past it, a manifest for one more new name is refused with 429
+`TOOMANYREQUESTS` before anything is forwarded. Publishing again to a name
+that is already pending is never refused by it, and settling or releasing
+one makes room. Of two organizations
 publishing a new name at once, one holds it and the other's manifest is
 refused before anything is written.
 
@@ -802,11 +818,17 @@ DELETE FROM collab_cog_repositories WHERE repository = 'cogs/example' AND NOT co
 
 After that a push to the repository needs the publish
 permission *and* membership of the owning organization. Platform operators
-are excepted from the ownership rule, not from the permission. A repository
-the catalog already knows that was **not** published through the Hub, one
-pushed to the registry directly and found by the indexer, accepts pushes
-from platform operators only. So one organization cannot overwrite another
-organization's Cog, or a tag of it.
+are excepted from the ownership rule, not from the permission.
+
+**A repository that was not published through the Hub** accepts pushes from
+platform operators only. That is decided from the registry as well as the
+catalog: before a name is given to an organization for the first time, the
+Hub asks the publish source whether the repository already holds a tag (one
+request), so a repository pushed to the registry directly is protected even
+before any sweep has indexed it. If the registry cannot answer, the publish
+is refused with 503 and nothing is reserved or forwarded. So one
+organization cannot overwrite another organization's Cog, or a tag of it,
+nor content nobody published through the Hub.
 
 **Checked on every request.** The permission, the caller's current
 organization and roles, and the repository's ownership are checked on every
@@ -855,7 +877,7 @@ that does not fit, or **another request is writing to this upload: retry**;
 416 for a chunk out of order), `DIGEST_INVALID` (400), `SIZE_INVALID` (413:
 over `maxBlobBytes`), `MANIFEST_INVALID` (400, or 413 for a manifest over
 5 MiB), `TOOMANYREQUESTS` (429: too many uploads open or still being cleaned
-up), `UNSUPPORTED` (405), `UNAVAILABLE` (503).
+up, or the organization already has `maxPendingRepositories` names pending), `UNSUPPORTED` (405), `UNAVAILABLE` (503).
 
 One answer is neither a success nor a refusal: **the registry accepted the
 manifest and the catalog does not list it**. It is 503 `UNAVAILABLE` when the
@@ -942,7 +964,7 @@ manifest. Whichever write then lists the digest (the request itself, a
 retried push, a later sweep) takes the publisher from the earliest accepted
 attempt, and a publisher that is on a row stays there. An attempt that was
 refused is deleted by its own request and no other; one whose outcome was
-never known attributes nothing, to anyone, and is purged after a day. The
+never known attributes nothing, to anyone, and is purged after thirty days. The
 consequence is stated plainly: **if the registry accepted a manifest and the
 Hub could not record that it had, the publisher of that digest is unknown**
 (`published_by` is null, as for a version pushed to the registry directly)
