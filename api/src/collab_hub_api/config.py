@@ -33,7 +33,7 @@ from .cogs.publish_store import (
     PublishStore,
     UnavailablePublishStore,
 )
-from .cogs.publishing import CogPublisher, PublishPolicy
+from .cogs.publishing import CogPublisher, PublishPolicy, settle_found
 from .cogs.registry import CogRegistrySourceConfig, build_registry_sources, registry_host
 from .cogs.registry_credentials import (
     InMemoryRegistryCredentialStore,
@@ -965,6 +965,15 @@ class CogPublishConfig(BaseModel):
 
     allowed_roles: list[Literal["operator", "owner", "member"]] = Field(default_factory=list)
     allowed_users: list[str] = Field(default_factory=list)
+    max_pending_repositories: int = Field(default=20, ge=1, le=1000)
+    """How many repositories one organization may have pending at once.
+
+    A repository is pending from its first publish until the registry is
+    known to have accepted a manifest for it, and stays pending while that
+    outcome is unknown. Nothing expires, so this is what bounds the names an
+    organization can hold during a registry outage. Publishing again to a
+    name that is already pending is never refused by it.
+    """
 
     @field_validator("allowed_roles")
     @classmethod
@@ -1524,7 +1533,7 @@ def build_cog_indexing(
             store,
             sources,
             published_repositories=publish_store.published_repositories if publishing else None,
-            repositories_found=publish_store.commit_found if publishing else None,
+            repositories_found=settle_found(publish_store, store) if publishing else None,
         ),
         interval_seconds=float(index.interval_seconds),
         run_on_startup=index.run_on_startup,
@@ -1602,6 +1611,7 @@ def build_cog_registry_serving(
             ),
             max_blob_bytes=serve.max_blob_bytes,
             max_blob_seconds=serve.max_blob_seconds,
+            max_pending_repositories=cogs.publish.max_pending_repositories,
         )
     return CogRegistryServing(
         front=CogRegistryFront(store, sources, max_blob_bytes=serve.max_blob_bytes),

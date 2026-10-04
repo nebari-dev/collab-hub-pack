@@ -102,7 +102,7 @@ from .oci import (
     is_sha256_digest,
     is_tag,
 )
-from .publish_store import PublishStore, UploadLimitError, UploadSession, new_upload_id
+from .publish_store import PendingLimitError, PublishStore, UploadLimitError, UploadSession, new_upload_id
 from .registry import ArtifactRef, RegistrySource, is_repository_path
 from .serving import manifest_blobs
 
@@ -160,8 +160,11 @@ class ManifestInvalid(PublishError):
         self.errors = errors or (message,)
 
 
-class UploadLimited(PublishError):
-    """The caller holds too many sessions the registry has not let go of yet."""
+class PublishLimited(PublishError):
+    """A bound was reached: unfinished uploads of this user's, or pending repositories of this organization's."""
+
+
+UploadLimited = PublishLimited
 
 
 class PublishUnavailable(PublishError):
@@ -278,6 +281,7 @@ class CogPublisher:
         policy: PublishPolicy,
         max_blob_bytes: int,
         max_blob_seconds: float = 900.0,
+        max_pending_repositories: int = 20,
     ) -> None:
         self._catalog = catalog
         self._store = store
@@ -286,6 +290,7 @@ class CogPublisher:
         self.policy = policy
         self._max_blob_bytes = max_blob_bytes
         self._lease_seconds = max_blob_seconds + LEASE_MARGIN_SECONDS
+        self._max_pending = max_pending_repositories
 
     @property
     def source_id(self) -> str:
@@ -309,11 +314,42 @@ class CogPublisher:
         record = self._store.get_repository(repository)
         if record is not None:
             self._require_owner(publisher, record.owner_org_id, repository)
-        elif self._catalog.repository_known(repository) and not publisher.is_operator:
-            raise PublishDenied(
-                f"{repository} already exists and was not published through this Hub; "
-                "only a platform operator may publish to it"
-            )
+        # Content the catalog has indexed in a repository nobody has been
+        # confirmed to own -- no row, or a row still pending, which a sweep
+        # would have committed had the content been its organization's --
+        # was not published through the Hub.
+        if (record is None or not record.committed) and not publisher.is_operator:
+            if self._catalog.repository_known(repository):
+                raise self._out_of_band(repository)
+
+    def _out_of_band(self, repository: str) -> PublishDenied:
+        return PublishDenied(
+            f"{repository} already exists and was not published through this Hub; "
+            "only a platform operator may publish to it"
+        )
+
+    async def _require_new(self, publisher: Publisher, repository: str) -> None:
+        """Before a name is given to anyone: refuse one the registry already holds content under.
+
+        The catalog only knows what a sweep has indexed. A repository pushed
+        to the registry directly a moment ago is not in it yet, and granting
+        its name here would hand somebody else's content to the publisher's
+        organization. So the registry is asked -- one request -- and an
+        answer that is not a clear "nothing there" fails closed: nothing is
+        reserved and nothing is forwarded.
+        """
+
+        if publisher.is_operator:
+            return
+        try:
+            holds_content = await self._source.oci().has_tags(repository)
+        except OCIError as exc:
+            self._log_upstream("repository check", exc)
+            raise PublishUnavailable(
+                "the registry could not be asked whether this repository exists; try again"
+            ) from None
+        if holds_content:
+            raise self._out_of_band(repository)
 
     def _require_owner(self, publisher: Publisher, owner_org_id: str | None, repository: str) -> None:
         if publisher.is_operator:
@@ -623,8 +659,15 @@ class CogPublisher:
             await self._abandon(held)
 
     async def _abandon(self, held: _Held, *, cancel: bool = True) -> None:
-        """End a session this request holds: cancelled at the registry first, and only then forgotten."""
+        """End a session this request holds: cancelled at the registry first, and only then forgotten.
 
+        From its first line the session's fate is unknown until the record
+        says otherwise: if the cancellation is cut off, or what it did cannot
+        be recorded, the hold must not be given back as if nothing had
+        happened (see :meth:`_leased`).
+        """
+
+        held.uncertain = True
         renew_budget()
         session = held.session
         gone = True
@@ -689,15 +732,27 @@ class CogPublisher:
 
         row = await self._validate(repository, manifest, (tag,) if tag is not None else ())
 
+        if await run_in_threadpool(self._store.get_repository, repository) is None:
+            await self._require_new(publisher, repository)
         # The name is this organization's from here, durably and before the
         # registry can have anything: pending until the registry answers.
         # Of two organizations publishing a new name at once, one holds it
         # and the other is refused here, before the write.
-        record = await run_in_threadpool(
-            lambda: self._store.reserve_repository(
-                repository, source_id=self._source.id, owner_org_id=publisher.org_id, created_by=publisher.user_id
+        try:
+            record = await run_in_threadpool(
+                lambda: self._store.reserve_repository(
+                    repository,
+                    source_id=self._source.id,
+                    owner_org_id=publisher.org_id,
+                    created_by=publisher.user_id,
+                    max_pending=self._max_pending,
+                )
             )
-        )
+        except PendingLimitError:
+            raise PublishLimited(
+                f"this organization already has {self._max_pending} repositories whose first publish is unresolved, "
+                "which is the limit; publish to one of them again, or ask a platform operator to release one"
+            ) from None
         holding = not record.committed and record.owner_org_id == publisher.org_id
         if record.committed:
             self._require_owner(publisher, record.owner_org_id, repository)
@@ -827,6 +882,34 @@ class _Held:
     leased: bool = True
     uncertain: bool = False
     """Something was forwarded to the registry session and what it took has not been established."""
+
+
+def settle_found(store: PublishStore, catalog: CogCatalogStore):
+    """What a sweep calls with what it found in a source: settles pending repositories, strictly.
+
+    A pending repository is committed only when the sweep found, in it, a
+    digest its organization attempted to publish there: that is the content
+    whose outcome the Hub lost track of. Anything else found in a pending
+    repository proves nothing about whose it is -- it was pushed to the
+    registry some other way -- so the row stays pending, the content is
+    indexed like any out-of-band content, and one line says so.
+    """
+
+    def settle(source_id: str, found) -> None:
+        for record in store.pending_repositories(source_id):
+            digests = set(found.get(record.repository, ()))
+            if not digests:
+                continue
+            attempted = catalog.attempted_digests(source_id, record.repository, record.owner_org_id)
+            if digests & attempted:
+                store.commit_found(source_id, record.repository, owner_org_id=record.owner_org_id)
+            else:
+                logger.warning(
+                    "cog_publish_pending_repository_holds_other_content",
+                    extra={"source_id": source_id, "repository": record.repository},
+                )
+
+    return settle
 
 
 class _LimitExceeded(Exception):

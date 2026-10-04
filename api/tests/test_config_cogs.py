@@ -538,10 +538,14 @@ def test_publish_settings_round_trip_through_the_environment_as_the_chart_render
     monkeypatch.setenv("COLLAB_HUB_API__COGS__SERVE__PUBLIC_URL", "https://hub.example.com")
     monkeypatch.setenv("COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_ROLES", '["owner","operator"]')
     monkeypatch.setenv("COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_USERS", '["user-1"]')
+    monkeypatch.setenv("COLLAB_HUB_API__COGS__PUBLISH__MAX_PENDING_REPOSITORIES", "7")
 
     cogs = Config().cogs
 
     assert cogs.publish.allowed_roles == ["owner", "operator"] and cogs.publish.allowed_users == ["user-1"]
+    assert cogs.publish.max_pending_repositories == 7
+    monkeypatch.delenv("COLLAB_HUB_API__COGS__PUBLISH__MAX_PENDING_REPOSITORIES")
+    assert Config().cogs.publish.max_pending_repositories == 20
     assert cogs.registry_sources[0].publish is True
 
 

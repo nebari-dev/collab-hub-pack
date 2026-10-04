@@ -20,11 +20,13 @@ from collab_hub_api.cogs.publish_store import (
     MAX_UPLOAD_ROWS_PER_USER,
     MAX_UPLOAD_SESSIONS_PER_USER,
     PENDING_ENUMERATION_GRACE_SECONDS,
+    PENDING_LOCK_CLASS,
     UPLOAD_HARD_AGE_SECONDS,
     UPLOAD_ID_PREFIX,
     UPLOAD_OPEN_LOCK_CLASS,
     UPLOAD_SESSION_TTL_SECONDS,
     InMemoryPublishStore,
+    PendingLimitError,
     PostgresPublishStore,
     PublishStoreUnavailableError,
     RepositoryRecord,
@@ -54,11 +56,12 @@ def test_the_unavailable_store_refuses_every_call():
     store = UnavailablePublishStore()
     calls = (
         lambda: store.get_repository("cogs/a"),
-        lambda: store.reserve_repository("cogs/a", source_id="s", owner_org_id="o", created_by="u"),
+        lambda: store.reserve_repository("cogs/a", source_id="s", owner_org_id="o", created_by="u", max_pending=1),
         lambda: store.commit_repository("cogs/a", source_id="s", owner_org_id="o", created_by="u"),
         lambda: store.release_repository("cogs/a", owner_org_id="o"),
         lambda: store.published_repositories("s"),
-        lambda: store.commit_found("s", ["cogs/a"]),
+        lambda: store.pending_repositories("s"),
+        lambda: store.commit_found("s", "cogs/a", owner_org_id="o"),
         lambda: store.open_upload(upload_id="up-1", user_id="u", repository="cogs/a", source_id="s", lease_seconds=1),
         lambda: store.attach_upload("up-1", lease=LEASE, upstream_location=LOCATION),
         lambda: store.record_orphan(
@@ -167,8 +170,10 @@ def _open(store, user="alice", repository="cogs/a", upload_id=None, location=LOC
     return store.get_upload(slot.id, user_id=user, repository=repository)
 
 
-def _reserve(store, repository="cogs/a", org="org-a", user="alice", source="backing"):
-    return store.reserve_repository(repository, source_id=source, owner_org_id=org, created_by=user)
+def _reserve(store, repository="cogs/a", org="org-a", user="alice", source="backing", max_pending=20):
+    return store.reserve_repository(
+        repository, source_id=source, owner_org_id=org, created_by=user, max_pending=max_pending
+    )
 
 
 def _commit(store, repository="cogs/a", org="org-a", user="alice", source="backing"):
@@ -254,11 +259,48 @@ def test_sweeps_are_sent_to_a_pending_repository_after_a_grace_period_and_settle
     clock.advance(10)
     assert store.published_repositories("backing") == ["cogs/a", "cogs/done", "cogs/empty"]
     assert store.published_repositories("mirror") == []
-    # A sweep found content in two of them; the wrong source and unknown names settle nothing.
-    assert store.commit_found("mirror", ["cogs/a"]) == 0 and store.commit_found("backing", []) == 0
-    assert store.commit_found("backing", ["cogs/a", "cogs/done", "cogs/unknown", "cogs/a"]) == 1
+    # What is pending is what a sweep has to settle; and it settles one only for the organization it checked.
+    assert [record.repository for record in store.pending_repositories("backing")] == ["cogs/a", "cogs/empty"]
+    assert store.pending_repositories("mirror") == []
+    assert store.commit_found("mirror", "cogs/a", owner_org_id="org-a") is False
+    assert store.commit_found("backing", "cogs/a", owner_org_id="org-b") is False
+    assert store.commit_found("backing", "cogs/unknown", owner_org_id="org-a") is False
+    assert store.commit_found("backing", "cogs/a", owner_org_id="org-a") is True
+    assert store.commit_found("backing", "cogs/a", owner_org_id="org-a") is False, "already settled"
     assert store.get_repository("cogs/a") == RepositoryRecord("cogs/a", "backing", "org-a", "alice", committed=True)
     assert store.get_repository("cogs/empty").committed is False, "nothing found there: still pending, still owned"
+
+
+def test_an_organization_holds_a_bounded_number_of_pending_names(backend):
+    """Nothing pending ever expires, so this is what bounds the names held through a registry outage."""
+
+    store, clock = backend
+    for name in ("cogs/one", "cogs/two"):
+        assert _reserve(store, name, max_pending=2).committed is False
+    with pytest.raises(PendingLimitError):
+        _reserve(store, "cogs/three", max_pending=2)
+    assert store.get_repository("cogs/three") is None, "refused: no row, nothing held"
+    # Trying again at a name that is already pending is never refused, however full the organization is.
+    assert _reserve(store, "cogs/one", user="carol", max_pending=2).owner_org_id == "org-a"
+    assert _reserve(store, "cogs/one", max_pending=1).owner_org_id == "org-a"
+    # The bound is each organization's own; an operator with no organization has one as well.
+    assert _reserve(store, "cogs/theirs", org="org-b", user="bob", max_pending=2).owner_org_id == "org-b"
+    assert _reserve(store, "cogs/op", org=None, user="operator", max_pending=1).owner_org_id is None
+    with pytest.raises(PendingLimitError):
+        _reserve(store, "cogs/op-two", org=None, user="operator", max_pending=1)
+    # Committed and other organizations' rows are read as they stand, not counted and not refused.
+    _commit(store, "cogs/settled", org="org-b", user="bob")
+    assert _reserve(store, "cogs/settled", max_pending=2).owner_org_id == "org-b"
+    assert _reserve(store, "cogs/theirs", max_pending=2).owner_org_id == "org-b"
+    # Time frees nothing. Settling a name does, and so does the refusal of its last attempt.
+    clock.advance(30 * 24 * 3600)
+    with pytest.raises(PendingLimitError):
+        _reserve(store, "cogs/three", max_pending=2)
+    _commit(store, "cogs/two")
+    assert _reserve(store, "cogs/three", max_pending=2).committed is False
+    for _ in range(3):
+        store.release_repository("cogs/one", owner_org_id="org-a")
+    assert _reserve(store, "cogs/four", max_pending=2).committed is False
 
 
 # -- upload sessions -------------------------------------------------------------------
@@ -485,6 +527,22 @@ def test_live_concurrent_reservations_opens_and_leases():
         store.release_repository("cogs/shared", owner_org_id="org-a")
         assert _reserve(store, "cogs/shared", org="org-b", user="bob").owner_org_id == "org-b"
 
+        # The bound on pending names is atomic: many new names at once, exactly as many rows as allowed.
+        def take(index: int) -> bool:
+            try:
+                _reserve(store, f"cogs/bounded-{index}", org="org-q", user="quinn", max_pending=5)
+            except PendingLimitError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            taken = list(pool.map(take, range(36)))
+        with database.connection() as conn:
+            pending = conn.execute(
+                "SELECT count(*) AS n FROM collab_cog_repositories WHERE NOT committed AND owner_org_id = 'org-q'"
+            ).fetchone()["n"]
+        assert (sum(taken), pending) == (5, 5)
+
         with ThreadPoolExecutor(max_workers=12) as pool:
             list(pool.map(lambda _i: _open(store), range(MAX_UPLOAD_SESSIONS_PER_USER + 40)))
         with database.connection() as conn:
@@ -595,21 +653,37 @@ OWN_PENDING = (
 )
 
 
-def test_postgres_reserve_never_changes_whose_a_row_is():
+def test_postgres_reserve_never_changes_whose_a_row_is_and_counts_new_names_under_a_lock():
     store, conn = _fake({"SELECT repository, source_id": [REPOSITORY_ROW]})
-    record = _reserve(store, org="org-b", user="bob")
+    record = _reserve(store, org="org-b", user="bob", max_pending=7)
     assert record == RepositoryRecord("cogs/a", "backing", "org-a", "alice"), "the record that stands"
-    insert, read = conn.calls
-    assert insert[0].startswith("INSERT INTO collab_cog_repositories")
-    assert "VALUES (%s, %s, %s, %s, false, 1)" in insert[0]
-    # On conflict the only thing that can change is the count, and only on this organization's own pending row:
-    # nothing about time, and no column that says whose the row is.
-    assert f"ON CONFLICT (repository) DO UPDATE SET holders = collab_cog_repositories.holders + 1 {OWN_PENDING}" in (
-        insert[0]
+    lock, join, insert, read = conn.calls
+    assert lock == ("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (PENDING_LOCK_CLASS, "org-b"))
+    # A retry of this organization's own pending name: only the count changes, and no bound applies.
+    assert join == (
+        "UPDATE collab_cog_repositories SET holders = holders + 1"
+        " WHERE repository = %s AND NOT committed AND owner_org_id IS NOT DISTINCT FROM %s RETURNING repository",
+        ("cogs/a", "org-b"),
     )
-    assert "now()" not in insert[0] and "owner_org_id =" not in insert[0]
-    assert insert[1] == ("cogs/a", "backing", "org-b", "bob")
+    # A new name: written only while the organization has room, and never over a row that exists.
+    assert insert[0].startswith("INSERT INTO collab_cog_repositories")
+    assert "SELECT %s, %s, %s, %s, false, 1 WHERE ( SELECT count(*) FROM collab_cog_repositories" in insert[0]
+    assert "WHERE NOT committed AND owner_org_id IS NOT DISTINCT FROM %s ) < %s" in insert[0]
+    assert insert[0].endswith("ON CONFLICT (repository) DO NOTHING")
+    assert insert[1] == ("cogs/a", "backing", "org-b", "bob", "org-b", 7)
     assert read == (READ_REPOSITORY, ("cogs/a",))
+    # Nothing about time anywhere, and nothing that says whose an existing row is.
+    assert not any("now()" in sql or "owner_org_id =" in sql for sql, _ in conn.calls)
+
+    joined, conn = _fake(
+        {"SET holders = holders + 1": [{"repository": "cogs/a"}], "SELECT repository": [REPOSITORY_ROW]}
+    )
+    _reserve(joined)
+    assert [sql.split()[0] for sql, _ in conn.calls] == ["SELECT", "UPDATE", "SELECT"], "no insert, no count"
+    full, conn = _fake()
+    with pytest.raises(PendingLimitError):
+        _reserve(full, org=None)
+    assert conn.calls[0][1] == (PENDING_LOCK_CLASS, ""), "the organization-less are bounded together"
 
 
 def test_postgres_commit_release_and_reads_of_repositories():
@@ -652,13 +726,17 @@ def test_postgres_enumeration_takes_committed_rows_and_pending_ones_past_the_gra
             ("backing", PENDING_ENUMERATION_GRACE_SECONDS),
         )
     ]
-    assert store.commit_found("backing", ["b/x", "a/y", "b/x"]) == 2
+    pending, asked = _fake({"AND NOT committed ORDER BY repository": [{**REPOSITORY_ROW, "committed": False}]})
+    assert pending.pending_repositories("backing") == [RepositoryRecord("cogs/a", "backing", "org-a", "alice", False)]
+    assert asked.calls[-1][1] == ("backing",)
+    assert store.commit_found("backing", "b/x", owner_org_id="org-a") is True
     assert conn.calls[-1] == (
         "UPDATE collab_cog_repositories SET committed = true"
-        " WHERE source_id = %s AND repository = ANY(%s) AND NOT committed RETURNING repository",
-        ("backing", ["a/y", "b/x"]),
+        " WHERE source_id = %s AND repository = %s AND NOT committed"
+        " AND owner_org_id IS NOT DISTINCT FROM %s RETURNING repository",
+        ("backing", "b/x", "org-a"),
     )
-    assert store.commit_found("backing", []) == 0 and len(conn.calls) == 2, "nothing to ask the database"
+    assert pending.commit_found("backing", "b/x", owner_org_id="org-a") is False
 
 
 def test_postgres_open_upload_locks_counts_retires_and_inserts_a_leased_slot():
@@ -785,7 +863,8 @@ def test_every_postgres_call_is_bounded_by_the_request_budget():
         lambda: _commit(store),
         lambda: store.release_repository("cogs/a", owner_org_id="org-a"),
         lambda: store.published_repositories("s"),
-        lambda: store.commit_found("s", ["cogs/a"]),
+        lambda: store.pending_repositories("s"),
+        lambda: store.commit_found("s", "cogs/a", owner_org_id="org-a"),
         lambda: _slot(store, upload_id="up-1"),
         lambda: store.attach_upload("up-1", lease=LEASE, upstream_location=LOCATION),
         lambda: store.record_orphan(

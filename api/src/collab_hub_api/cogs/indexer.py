@@ -78,7 +78,7 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
@@ -270,7 +270,7 @@ class CogIndexer:
         drain_deadline_seconds: float = DRAIN_DEADLINE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         published_repositories: Callable[[str], Sequence[str]] | None = None,
-        repositories_found: Callable[[str, Sequence[str]], object] | None = None,
+        repositories_found: Callable[[str, Mapping[str, Sequence[str]]], object] | None = None,
     ) -> None:
         self._store = store
         self._sources = list(sources)
@@ -278,9 +278,10 @@ class CogIndexer:
         # enumerated along with whatever the source itself lists, so the
         # publish target needs no configured repository list.
         self._published_repositories = published_repositories
-        # Told, after each source is swept, which repositories were found to
-        # hold something: a repository whose publish was accepted by the
-        # registry but never recorded as such is settled by this.
+        # Told, after each source is swept, what each repository was found
+        # to hold: a repository whose publish was accepted by the registry
+        # but never recorded as such is settled by this, if what was found
+        # is what was published.
         self._repositories_found = repositories_found
         self._max_artifacts = max_artifacts_per_repository
         self._drain_deadline = drain_deadline_seconds
@@ -637,8 +638,7 @@ class CogIndexer:
             **({"written_before": started} if started is not None else {}),
         )
         if self._repositories_found is not None:
-            holding = sorted(repo for repo, digests in present.items() if digests)
-            await self._on_thread(self._repositories_found, source.id, holding)
+            await self._on_thread(self._repositories_found, source.id, present)
         summary.removed += removed
         if removed:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc(removed)

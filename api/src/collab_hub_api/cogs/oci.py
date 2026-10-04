@@ -786,6 +786,28 @@ class OCIClient:
             path = next_path
         raise OCIProtocolError(f"tag list did not end within {MAX_TAG_PAGES} pages")
 
+    async def has_tags(self, repo: str) -> bool:
+        """Whether the repository holds at least one tag: one request, never paged.
+
+        ``False`` for a repository the registry does not have. Anything the
+        registry says that is not a tag list raises, like :meth:`list_tags`:
+        the caller asked a yes-or-no question and must not read "no" into an
+        answer that was not one.
+        """
+
+        _validate_repo(repo)
+        try:
+            response = await self._send(f"/v2/{repo}/tags/list?n=1", headers={}, scope_hint=_pull_scope(repo))
+        except OCINotFound:
+            return False
+        body = await _read_bounded(response, MAX_TAG_PAGE_BYTES, what="tag list")
+        listed = _parse_json_object(body, what="tag list").get("tags")
+        if listed is None:
+            return False
+        if not isinstance(listed, list):
+            raise OCIProtocolError("tag list has a malformed 'tags' field")
+        return bool(listed)
+
     # -- manifests ----------------------------------------------------------
 
     async def _fetch_manifest(self, repo: str, ref: str) -> Manifest:

@@ -78,9 +78,9 @@ from ..cogs.publishing import (
     PublishDenied,
     Publisher,
     PublishError,
+    PublishLimited,
     RepositoryInvalid,
     UploadInvalid,
-    UploadLimited,
     UploadTooLarge,
     UploadUnknown,
     manifest_accepted,
@@ -901,7 +901,7 @@ def _publish_error(exc: PublishError) -> RegistryError:
         return RegistryError(status.HTTP_400_BAD_REQUEST, "DIGEST_INVALID", message)
     if isinstance(exc, ManifestInvalid):
         return RegistryError(status.HTTP_400_BAD_REQUEST, "MANIFEST_INVALID", message, messages=exc.errors)
-    if isinstance(exc, UploadLimited):
+    if isinstance(exc, PublishLimited):
         return RegistryError(status.HTTP_429_TOO_MANY_REQUESTS, "TOOMANYREQUESTS", message)
     if isinstance(exc, ManifestUnlisted):
         # Not a success, and not a refusal: the registry has the manifest.

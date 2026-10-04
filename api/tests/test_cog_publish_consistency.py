@@ -31,10 +31,14 @@ from test_cog_publishing import (
     COG,
     COG_ID,
     EVERYONE,
+    OPERATOR,
+    OWNER,
     PUSHES,
     REPO,
     CogBundle,
     hub,  # noqa: F401 - fixture
+    member_token,
+    membership_hub,  # noqa: F401 - fixture
     publish_credential,
     pusher,
     refused_everywhere,
@@ -551,7 +555,11 @@ async def test_when_acceptance_cannot_be_recorded_the_publisher_stays_unknown(hu
     status, _code, message = errors(await client.manifest(COG, "1.0.0"))
     assert status == 503 and "stored in the registry" in message
     hub.catalog.accept_publication = accept
+    # The sweep's two steps: it lists the digest, and settles the repository -- the digest is one its
+    # organization attempted to publish there, whoever in it that was.
     hub.catalog.upsert(replace(COG_ROW(hub), tags=("1.0.0",)))
+    publishing.settle_found(store_of(hub), hub.catalog)("backing", {REPO: [COG.digest]})
+    assert store_of(hub).get_repository(REPO).committed is True
     assert hub.catalog.get(COG.digest).published_by is None, "not guessed from an attempt nobody confirmed"
     # Published again, and recorded this time: now it is known.
     assert (await client.manifest(COG, "1.0.0")).status_code == 201
@@ -949,6 +957,45 @@ async def test_an_upload_is_retired_after_every_kind_of_write_whose_outcome_is_u
     assert sha256(b"0123456789abcdef") not in hub.upstream.blobs
 
 
+async def test_a_cancellation_that_times_out_or_cannot_be_recorded_does_not_leave_the_upload_writable(hub: Hub):
+    """Open, DELETE runs out of time at the registry, then PATCH: the session must not take the chunk."""
+
+    client, store = await pusher(hub), store_of(hub)
+    oci, serving = hub.serving.publisher._source.oci(), hub.serving
+    location = (await client.start()).headers["location"]
+    cancel_upload = oci.cancel_upload
+
+    async def slow_once(repository, upstream_location):
+        oci.cancel_upload = cancel_upload
+        await asyncio.sleep(5)
+
+    oci.cancel_upload = slow_once
+    hub.app.state.cog_registry_serving = replace(serving, max_metadata_seconds=0.1)
+    assert (await hub.request("DELETE", location, headers=client.headers)).status_code == 503
+    hub.app.state.cog_registry_serving = serving
+    patched = await hub.request("PATCH", location, headers=client.headers, content=b"after the cancel")
+    assert errors(patched)[:2] == (404, "BLOB_UPLOAD_UNKNOWN")
+    assert not any(bytes(received) for received in hub.upstream.uploads.values()), "the registry took nothing more"
+    assert store._uploads == {} and hub.upstream.uploads == {}, "retired, and cancelled when the registry answered"
+
+    # The registry cancelled it and the Hub could not record that: held, never handed back as usable.
+    location = (await client.start()).headers["location"]
+    close, retire = store.close_upload, store.retire_upload
+
+    def down(*args, **kwargs):
+        raise CogCatalogUnavailableError("the database is away")
+
+    store.close_upload = store.retire_upload = down
+    assert (await hub.request("DELETE", location, headers=client.headers)).status_code == 503
+    store.close_upload, store.retire_upload = close, retire
+    patched = await hub.request("PATCH", location, headers=client.headers, content=b"after the cancel")
+    assert patched.status_code in (400, 404) and patched.status_code != 202
+    now = [datetime.now(UTC) + timedelta(seconds=hub.serving.publisher._lease_seconds + 1)]
+    store.clock = lambda: now[0]
+    late = await hub.request("PATCH", location, headers=client.headers, content=b"after the lease")
+    assert errors(late)[:2] == (404, "BLOB_UPLOAD_UNKNOWN")
+
+
 async def test_a_write_the_registry_definitely_refused_gives_the_session_back_unchanged(hub: Hub, caplog):
     client, store = await pusher(hub), store_of(hub)
     location = (await client.start()).headers["location"]
@@ -1189,23 +1236,147 @@ async def test_a_version_published_again_during_a_sweep_is_not_tombstoned_by_it(
 
 
 async def test_a_sweep_is_never_sent_to_a_repository_whose_publish_was_refused(sweeping_hub: Hub):
-    """Content already in the backing registry is not listed because somebody tried, and failed, to publish there."""
-
     hub, store = sweeping_hub, store_of(sweeping_hub)
     now = [datetime.now(UTC)]
     store.clock = lambda: now[0]
-    behind = CogBundle(extra=b"pushed to the registry directly")
-    hub.upstream.publish_raw(OTHER, MEDIA_TYPE_OCI_MANIFEST, behind.manifest, "0.1.0")
-    hub.upstream.blobs.update(behind.blobs)
     client = await pusher(hub, ALICE, OTHER)
     await upload(client, COG, OTHER)
     hub.upstream.fail[f"/v2/{OTHER}/manifests/1.0.0"] = httpx.Response(400, text="no")
     assert (await client.manifest(COG, "1.0.0", OTHER)).status_code == 400
     now[0] += FOREVER
+    asked = len(hub.upstream.requests)
     summary = await hub.app.state.cog_indexer.sweep()
-    assert summary.errors == [] and hub.catalog.locations(behind.digest) == []
-    assert not hub.catalog.repository_known(OTHER)
-    assert not any(request.url.path == f"/v2/{OTHER}/tags/list" for request in hub.upstream.requests)
+    assert summary.errors == [] and not hub.catalog.repository_known(OTHER)
+    assert not any(OTHER in request.url.path for request in hub.upstream.requests[asked:])
+
+
+# -- content that was not published through the Hub is nobody's to claim -------------------------
+
+
+def out_of_band(hub: Hub, repo: str, tag: str = "1.0.0") -> CogBundle:
+    """A bundle pushed to the backing registry directly, behind the Hub's back."""
+
+    bundle = CogBundle(extra=b"pushed to the registry directly")
+    hub.upstream.publish_raw(repo, MEDIA_TYPE_OCI_MANIFEST, bundle.manifest, tag)
+    hub.upstream.blobs.update(bundle.blobs)
+    return bundle
+
+
+async def test_a_repository_the_registry_already_holds_cannot_be_claimed_before_it_is_indexed(sweeping_hub: Hub):
+    """Pushed to the registry directly, and no sweep has seen it yet: the catalog knows nothing about it."""
+
+    hub, store = sweeping_hub, store_of(sweeping_hub)
+    theirs = out_of_band(hub, REPO)
+    assert not hub.catalog.repository_known(REPO)
+    alice = await pusher(hub, ALICE)
+    await upload(alice, COG)
+    refused = await alice.manifest(COG, "1.0.0")
+    status, code, message = errors(refused)
+    assert (status, code) == (403, "DENIED") and "not published through this Hub" in message
+    # Its tag still points at what was there, nothing was forwarded, and the name is nobody's.
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == theirs.manifest and manifest_puts(hub) == []
+    assert store._repositories == {} and hub.catalog._attempts == {}
+    # One request to the registry decided it, and it asked for one tag.
+    asked = [request for request in hub.upstream.requests if request.url.path == f"/v2/{REPO}/tags/list"]
+    assert [str(request.url.query, "ascii") for request in asked[-1:]] == ["n=1"]
+
+    # When the registry cannot say, the answer is not "new": nothing is reserved and nothing forwarded.
+    hub.upstream.fail[f"/v2/{OTHER}/tags/list"] = httpx.Response(500, text="boom")
+    elsewhere = await pusher(hub, ALICE, OTHER)
+    await upload(elsewhere, COG, OTHER)
+    assert errors(await elsewhere.manifest(COG, "1.0.0", OTHER))[:2] == (503, "UNAVAILABLE")
+    assert store._repositories == {} and manifest_puts(hub) == []
+    # A repository the registry does not have, or has with nothing in it, is new.
+    del hub.upstream.fail[f"/v2/{OTHER}/tags/list"]
+    assert (await elsewhere.manifest(COG, "1.0.0", OTHER)).status_code == 201
+    # Once it is the organization's, publishing to it asks the registry nothing of the kind.
+    asked = len([r for r in hub.upstream.requests if r.url.path.endswith("/tags/list")])
+    assert (await elsewhere.manifest(COG, "1.0.1", OTHER)).status_code == 201
+    assert len([r for r in hub.upstream.requests if r.url.path.endswith("/tags/list")]) == asked
+
+    # No sweep is sent there either (nobody published it through the Hub), so the catalog never learns of
+    # it; the registry is what keeps answering, each time.
+    assert (await hub.app.state.cog_indexer.sweep()).errors == []
+    assert store.get_repository(REPO) is None and not hub.catalog.repository_known(REPO)
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 403
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == theirs.manifest
+
+
+async def test_content_found_in_a_pending_repository_settles_it_only_if_its_organization_published_it(
+    sweeping_hub: Hub, caplog
+):
+    """A's manifest gets a 500 and never lands; somebody pushes unrelated content there directly; a sweep runs."""
+
+    hub, store = sweeping_hub, store_of(sweeping_hub)
+    now = [datetime.now(UTC)]
+    store.clock = lambda: now[0]
+    alice = await pusher(hub, ALICE)
+    await upload(alice, COG)
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(500, text="boom")
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 503
+    del hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"]
+    theirs = out_of_band(hub, REPO)
+
+    now[0] += FOREVER
+    with caplog.at_level(logging.WARNING, logger="frames_server.cogs.publishing"):
+        assert (await hub.app.state.cog_indexer.sweep()).errors == []
+    # What was found is listed as out-of-band content, with no publisher; and it is not proof of ownership.
+    row = hub.catalog.get(theirs.digest)
+    assert (row.status, row.published_by) == (STATUS_INDEXED, None)
+    record = store.get_repository(REPO)
+    assert (record.owner_org_id, record.committed) == ("org-a", False), "still pending: not settled by that"
+    assert "cog_publish_pending_repository_holds_other_content" in [record.message for record in caplog.records]
+    # So the organization cannot write over it: its retry is refused, and nothing reaches the registry.
+    retry = await alice.manifest(COG, "1.0.0")
+    assert errors(retry)[:2] == (403, "DENIED") and "not published through this Hub" in errors(retry)[2]
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == theirs.manifest and manifest_puts(hub) == [
+        f"PUT /v2/{REPO}/manifests/1.0.0"  # the one that got the 500
+    ]
+    assert (await hub.app.state.cog_indexer.sweep()).errors == []
+    assert store.get_repository(REPO).committed is False
+
+
+async def test_a_platform_operator_may_publish_to_a_repository_the_registry_already_holds(membership_hub):
+    hub = membership_hub
+    theirs = out_of_band(hub, REPO, "0.1.0")
+    owner = await pusher(hub, member_token(OWNER))
+    await upload(owner, COG)
+    assert (await owner.manifest(COG, "1.0.0")).status_code == 403
+    operator = await pusher(hub, member_token(OPERATOR))
+    asked = len(hub.upstream.requests)
+    assert (await operator.manifest(COG, "1.0.0")).status_code == 201
+    assert hub.upstream.manifests[(REPO, "0.1.0")][1] == theirs.manifest
+    assert not any(request.url.path.endswith("/tags/list") for request in hub.upstream.requests[asked:])
+
+
+async def test_an_organization_cannot_hold_more_pending_names_than_the_limit(make_hub):
+    """The registry cannot take manifests; a permitted publisher keeps publishing under new names."""
+
+    hub = await make_hub(publish={**EVERYONE, "max_pending_repositories": 2})
+    store = store_of(hub)
+    names = ["cogs/one", "cogs/two", "cogs/three"]
+    alice = await pusher(hub, ALICE, *names)
+    hub.upstream.refuse_writes = None
+    for name in names:
+        await upload(alice, COG, name)
+        hub.upstream.fail[f"/v2/{name}/manifests/1.0.0"] = httpx.Response(500, text="boom")
+    for name in names[:2]:
+        assert (await alice.manifest(COG, "1.0.0", name)).status_code == 503
+    forwarded = len(manifest_puts(hub))
+    refused = await alice.manifest(COG, "1.0.0", names[2])
+    status, code, message = errors(refused)
+    assert (status, code) == (429, "TOOMANYREQUESTS") and "already has 2 repositories" in message
+    assert len(manifest_puts(hub)) == forwarded and store.get_repository(names[2]) is None
+    assert sorted(store._repositories) == names[:2]
+    # Another organization has its own allowance; and a retry of a pending name is never what is refused.
+    bob = await pusher(hub, BOB, "cogs/bobs")
+    await upload(bob, COG, "cogs/bobs")
+    assert (await bob.manifest(COG, "1.0.0", "cogs/bobs")).status_code == 201
+    assert (await alice.manifest(COG, "1.0.0", names[0])).status_code == 503
+    hub.upstream.fail.clear()
+    assert (await alice.manifest(COG, "1.0.0", names[0])).status_code == 201
+    # Settled, it no longer counts: there is room for the third.
+    assert (await alice.manifest(COG, "1.0.0", names[2])).status_code == 201
 
 
 class _HarborLike:
@@ -1234,14 +1405,14 @@ async def test_a_published_repository_the_registry_does_not_have_enumerates_as_e
         InMemoryCogCatalogStore(),
         [_HarborLike(listed=[])],
         published_repositories=lambda source_id: ["cogs/never-landed"],
-        repositories_found=lambda source_id, repositories: found.append((source_id, list(repositories))),
+        repositories_found=lambda source_id, present: found.append((source_id, dict(present))),
     )
     try:
         summary = await indexer.sweep()
     finally:
         indexer.close()
     assert (summary.errors, summary.sources_failed) == ([], 0)
-    assert found == [("backing", [])], "and nothing was found there to settle it by"
+    assert found == [("backing", {"cogs/never-landed": []})], "and nothing was found there to settle it by"
 
     # A repository the source itself lists is another matter: that it then does not exist is an error, as before.
     indexer = CogIndexer(

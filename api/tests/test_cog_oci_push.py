@@ -18,6 +18,7 @@ from collab_hub_api.cogs.oci import (
     BasicCredentials,
     OCIAuthError,
     OCIClient,
+    OCIError,
     OCIInvalidReference,
     OCIProtocolError,
     OCIRejected,
@@ -218,6 +219,33 @@ async def test_blob_size_answers_only_what_the_registry_states():
         assert await client.blob_size(REPO, digest) is None
         with pytest.raises(OCIInvalidReference):
             await client.blob_size(REPO, "latest")
+
+
+async def test_has_tags_is_one_request_and_reads_no_into_nothing_but_a_clear_answer():
+    answers: list[httpx.Response] = []
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return answers.pop(0)
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+        for answer, expected in (
+            (httpx.Response(200, json={"tags": ["v1"]}, headers={"Link": '</v2/x?last=v1>; rel="next"'}), True),
+            (httpx.Response(200, json={"name": REPO, "tags": []}), False),
+            (httpx.Response(200, json={"name": REPO, "tags": None}), False),
+            (httpx.Response(404, json={"errors": [{"code": "NAME_UNKNOWN"}]}), False),
+        ):
+            answers.append(answer)
+            assert await client.has_tags(REPO) is expected
+        assert seen == [f"{REGISTRY}/v2/{REPO}/tags/list?n=1"] * 4, "one request each, never a second page"
+        for unclear in (httpx.Response(500, text="boom"), httpx.Response(200, json={"tags": "v1"}),
+                        httpx.Response(200, text="not json")):
+            answers.append(unclear)
+            with pytest.raises(OCIError):
+                await client.has_tags(REPO)
+        with pytest.raises(OCIInvalidReference):
+            await client.has_tags("Not/Valid")
 
 
 async def test_cancel_says_whether_the_session_is_gone_and_transport_failures_are_wrapped():

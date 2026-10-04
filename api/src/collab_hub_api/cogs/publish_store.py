@@ -41,7 +41,7 @@ from __future__ import annotations
 import secrets
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
@@ -76,6 +76,10 @@ still on its way.
 
 class PublishStoreUnavailableError(RuntimeError):
     """Raised when publishing state is needed but no backend is configured."""
+
+
+class PendingLimitError(RuntimeError):
+    """This organization already has as many unsettled repositories as it may; no new name was taken."""
 
 
 class UploadLimitError(RuntimeError):
@@ -126,7 +130,7 @@ class PublishStore(ABC):
 
     @abstractmethod
     def reserve_repository(
-        self, repository: str, *, source_id: str, owner_org_id: str | None, created_by: str
+        self, repository: str, *, source_id: str, owner_org_id: str | None, created_by: str, max_pending: int
     ) -> RepositoryRecord:
         """Record, before a manifest is forwarded, that this organization is publishing here.
 
@@ -136,6 +140,13 @@ class PublishStore(ABC):
         committed row, and a pending row of **another** organization's, are
         returned untouched -- the caller checks whose the record is, and
         counts as holding an attempt only when it is pending and its own.
+
+        A **new** pending row is written only while the organization has
+        fewer than ``max_pending`` of them; otherwise
+        :class:`PendingLimitError`, and nothing changed. Counted and written
+        under one lock per organization. Another attempt at a name the
+        organization already holds pending is always allowed: the bound is
+        on names, not on retries.
         """
 
         raise NotImplementedError
@@ -176,8 +187,18 @@ class PublishStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def commit_found(self, source_id: str, repositories: Iterable[str]) -> int:
-        """A sweep found content in these repositories: commit those that are still pending. Returns how many."""
+    def pending_repositories(self, source_id: str) -> list[RepositoryRecord]:
+        """This source's repositories that are still pending, for a sweep to settle."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit_found(self, source_id: str, repository: str, *, owner_org_id: str | None) -> bool:
+        """A sweep found, in this repository, a digest this organization published: commit its pending row.
+
+        Bound to the organization the caller checked the digest against.
+        Returns whether a pending row was committed.
+        """
 
         raise NotImplementedError
 
@@ -301,7 +322,7 @@ class UnavailablePublishStore(PublishStore):
     def get_repository(self, repository):
         raise self._refuse()
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, max_pending):
         raise self._refuse()
 
     def commit_repository(self, repository, *, source_id, owner_org_id, created_by):
@@ -313,7 +334,10 @@ class UnavailablePublishStore(PublishStore):
     def published_repositories(self, source_id):
         raise self._refuse()
 
-    def commit_found(self, source_id, repositories):
+    def pending_repositories(self, source_id):
+        raise self._refuse()
+
+    def commit_found(self, source_id, repository, *, owner_org_id):
         raise self._refuse()
 
     def open_upload(self, **_kwargs):
@@ -381,10 +405,16 @@ class InMemoryPublishStore(PublishStore):
             stored = self._repositories.get(repository)
             return stored.record if stored is not None else None
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, max_pending):
         with self._lock:
             stored = self._repositories.get(repository)
             if stored is None:
+                pending = sum(
+                    not other.record.committed and other.record.owner_org_id == owner_org_id
+                    for other in self._repositories.values()
+                )
+                if pending >= max_pending:
+                    raise PendingLimitError(f"{pending} repositories of this organization are already pending")
                 record = RepositoryRecord(repository, source_id, owner_org_id, created_by, committed=False)
                 stored = self._repositories[repository] = _StoredRepository(record, self.clock(), holders=0)
             if not stored.record.committed and stored.record.owner_org_id == owner_org_id:
@@ -419,15 +449,29 @@ class InMemoryPublishStore(PublishStore):
                 if stored.record.source_id == source_id and (stored.record.committed or stored.since <= settled)
             )
 
-    def commit_found(self, source_id, repositories):
-        found = 0
+    def pending_repositories(self, source_id):
         with self._lock:
-            for name in repositories:
-                stored = self._repositories.get(name)
-                if stored is not None and stored.record.source_id == source_id and not stored.record.committed:
-                    stored.record = replace(stored.record, committed=True)
-                    found += 1
-        return found
+            return sorted(
+                (
+                    stored.record
+                    for stored in self._repositories.values()
+                    if stored.record.source_id == source_id and not stored.record.committed
+                ),
+                key=lambda record: record.repository,
+            )
+
+    def commit_found(self, source_id, repository, *, owner_org_id):
+        with self._lock:
+            stored = self._repositories.get(repository)
+            if (
+                stored is None
+                or stored.record.committed
+                or stored.record.source_id != source_id
+                or stored.record.owner_org_id != owner_org_id
+            ):
+                return False
+            stored.record = replace(stored.record, committed=True)
+            return True
 
     # -- upload sessions ---------------------------------------------------------
 
@@ -585,6 +629,9 @@ def _upload_from_row(row) -> UploadSession:
 UPLOAD_OPEN_LOCK_CLASS = int.from_bytes(b"cup1", "big")
 """First key of the advisory lock serializing one user's upload opening and pruning (second: ``hashtext(user)``)."""
 
+PENDING_LOCK_CLASS = int.from_bytes(b"cpr1", "big")
+"""First key of the advisory lock serializing one organization's new pending names (second: ``hashtext(org)``)."""
+
 _REPOSITORY_COLUMNS = "repository, source_id, owner_org_id, created_by, committed"
 _UPLOAD_COLUMNS = "id, user_id, repository, source_id, upstream_location, received, leased_until"
 _USABLE = "expires_at > now() AND upstream_location IS NOT NULL"
@@ -610,25 +657,47 @@ class PostgresPublishStore(PublishStore):
         with bounded_connection(self._db) as conn:
             return self._read_repository(conn, repository)
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, max_pending):
         with bounded_connection(self._db) as conn:
-            # One statement decides: a committed row, and a pending row of
-            # another organization's, are both left exactly as they are; a
-            # pending row of this organization's counts one more attempt.
+            # One organization's new names are counted and written one at a
+            # time, so two requests cannot both see room for the last one.
             conn.execute(
-                """
-                INSERT INTO collab_cog_repositories
-                    (repository, source_id, owner_org_id, created_by, committed, holders)
-                VALUES (%s, %s, %s, %s, false, 1)
-                ON CONFLICT (repository) DO UPDATE SET holders = collab_cog_repositories.holders + 1
-                WHERE NOT collab_cog_repositories.committed
-                  AND collab_cog_repositories.owner_org_id IS NOT DISTINCT FROM EXCLUDED.owner_org_id
-                """,
-                (repository, source_id, owner_org_id, created_by),
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (PENDING_LOCK_CLASS, owner_org_id or ""),
             )
+            # Another attempt at a name this organization already holds
+            # pending: always allowed, and only counted. A committed row, and
+            # a pending row of another organization's, match nothing here.
+            joined = conn.execute(
+                """
+                UPDATE collab_cog_repositories SET holders = holders + 1
+                WHERE repository = %s AND NOT committed AND owner_org_id IS NOT DISTINCT FROM %s
+                RETURNING repository
+                """,
+                (repository, owner_org_id),
+            ).fetchone()
+            if joined is None:
+                # A new name, if the organization has room for one more
+                # pending; a row somebody else holds is left exactly as it is.
+                conn.execute(
+                    """
+                    INSERT INTO collab_cog_repositories
+                        (repository, source_id, owner_org_id, created_by, committed, holders)
+                    SELECT %s, %s, %s, %s, false, 1
+                    WHERE (
+                        SELECT count(*) FROM collab_cog_repositories
+                        WHERE NOT committed AND owner_org_id IS NOT DISTINCT FROM %s
+                    ) < %s
+                    ON CONFLICT (repository) DO NOTHING
+                    """,
+                    (repository, source_id, owner_org_id, created_by, owner_org_id, max_pending),
+                )
             # Read back in the same transaction: whoever holds the name,
             # this is the record that stands, and the caller checks it.
-            return self._read_repository(conn, repository)
+            record = self._read_repository(conn, repository)
+        if record is None:
+            raise PendingLimitError("this organization has no room for another pending repository")
+        return record
 
     def commit_repository(self, repository, *, source_id, owner_org_id, created_by):
         with bounded_connection(self._db) as conn:
@@ -675,20 +744,29 @@ class PostgresPublishStore(PublishStore):
             ).fetchall()
         return sorted(row["repository"] for row in rows)
 
-    def commit_found(self, source_id, repositories):
-        names = sorted(set(repositories))
-        if not names:
-            return 0
+    def pending_repositories(self, source_id):
         with bounded_connection(self._db) as conn:
             rows = conn.execute(
+                f"""
+                SELECT {_REPOSITORY_COLUMNS} FROM collab_cog_repositories
+                WHERE source_id = %s AND NOT committed ORDER BY repository
+                """,
+                (source_id,),
+            ).fetchall()
+        return [_repository_from_row(row) for row in rows]
+
+    def commit_found(self, source_id, repository, *, owner_org_id):
+        with bounded_connection(self._db) as conn:
+            row = conn.execute(
                 """
                 UPDATE collab_cog_repositories SET committed = true
-                WHERE source_id = %s AND repository = ANY(%s) AND NOT committed
+                WHERE source_id = %s AND repository = %s AND NOT committed
+                  AND owner_org_id IS NOT DISTINCT FROM %s
                 RETURNING repository
                 """,
-                (source_id, names),
-            ).fetchall()
-        return len(rows)
+                (source_id, repository, owner_org_id),
+            ).fetchone()
+        return row is not None
 
     # -- upload sessions ---------------------------------------------------------
 
