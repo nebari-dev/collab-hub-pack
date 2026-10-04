@@ -422,7 +422,7 @@ oras pull hub.example.com/cogs/cog-audio-transcriber@sha256:…
 | `GET`/`HEAD /v2/<name>/blobs/<digest>` | The blob, streamed. `HEAD` answers the size from the manifest that references it. |
 | `GET /v2/<name>/tags/list` | `{"name", "tags"}`, sorted. A page is at most 1000 tags (also the default without `n`); `last` continues after a tag, and a `Link: …; rel="next"` is sent while more remain. |
 | `GET /v2/token` | The distribution token endpoint. |
-| any other method under `/v2/` | The [push API](#publishing-through-the-hub) when a source is marked `publish`; otherwise 405 `UNSUPPORTED`. Deleting a manifest or a blob is always 405. |
+| any other method under `/v2/` | The [push API](#publishing-through-the-hub) when a source is marked `publish`; otherwise 405 `UNSUPPORTED` ("this registry is read-only"), before authentication. Deleting a manifest or a blob is always 405. |
 
 Errors are the registry format, `{"errors": [{"code", "message", "detail"}]}`:
 `UNAUTHORIZED` (401), `DENIED` (403: the account has no organization, or a
@@ -450,9 +450,13 @@ All three need an ordinary Hub sign-in and answer 404
   matching `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` (today `crc-` and 24 hex
   digits), and `username` is the same string.
 - **Pull-only, unless exchanged to publish.** A `pull` credential can be
-  turned into pull tokens and nothing else; a token request that asks for
-  `push` with one is granted `pull`. Only a credential exchanged with
-  `{"scope": "publish"}` mints tokens that carry `push`.
+  turned into pull tokens and nothing else: of a token request's scopes it
+  is granted the repositories it asks to `pull`, and `push` adds nothing.
+  Only a credential exchanged with `{"scope": "publish"}` mints tokens that
+  carry `push`, and then **per repository**: a token asked for with
+  `repository:a:pull,push repository:b:pull` may push to `a` and only pull
+  from `b`. On a Hub that accepts no publishes, `push` in a scope names
+  nothing at all, as before publishing existed.
 - **Short-lived.** It stops at `expires_at` (`credentialTtlSeconds`, fifteen
   minutes by default), and so does every token minted from it, whatever
   `tokenTtlSeconds` says. Exchange a fresh one before each install, and size
@@ -649,7 +653,12 @@ lines are filtered: the request log (`httpx`, INFO) loses URL query strings
 and userinfo, so a pre-signed storage URL is not logged with its signature,
 and the transport trace (`httpcore`, DEBUG) loses every header value, so
 neither a redirect's `Location` nor a `Set-Cookie` or `WWW-Authenticate` is
-logged. These two filters are **process-wide**: they are installed when a
+logged. A **write** to a registry (publishing) is logged without its URL
+altogether: the URL is an upload session's, at the backing registry, and its
+path can be the capability to write to that session, so the line carries the
+operation and the source id instead
+(`HTTP Request: PATCH [registry write: upload chunk, source main] "HTTP/1.1 202 Accepted"`).
+These two filters are **process-wide**: they are installed when a
 deployment turns on `cogs.serve.enabled` and then apply to every HTTP client
 in the process, not only the registry's. With serving off, logging is
 exactly what it was. That includes a deployment that only indexes: its
@@ -753,10 +762,18 @@ pull never implies it. An operator grants it in `cogs.publish`:
 Changing either is a values change and a rollout.
 
 **Repository ownership.** A repository first published through the Hub
-belongs to the publisher's organization. The owner is recorded with the
-first manifest the Hub accepts for that repository (an upload alone claims
-nothing; of two organizations publishing a new name at once, one owns it and
-the other's manifest is refused). After that a push to it needs the publish
+belongs to the publisher's organization, from the moment the **registry
+accepts** the first manifest for it. An upload alone claims nothing, and
+neither does a manifest the registry refuses. While a manifest for a new
+name is on its way to the registry the name is only *reserved* for the
+publisher's organization: of two organizations publishing a new name at
+once, one holds it and the other's manifest is refused before anything is
+written. If the registry accepts, the reservation becomes ownership; if it
+definitely refuses, the reservation is released and the name is free; if
+the outcome is unknown (a timeout, a 5xx), the reservation expires after
+five minutes, and until then only the same organization can try again. A
+reservation is never ownership and is never enumerated by the indexer.
+After that a push to the repository needs the publish
 permission *and* membership of the owning organization. Platform operators
 are excepted from the ownership rule, not from the permission. A repository
 the catalog already knows that was **not** published through the Hub, one
@@ -792,8 +809,8 @@ and storage as a pull credential, and may also pull.
 | Route | Answers |
 | --- | --- |
 | `POST /v2/<name>/blobs/uploads/` | 202 with the upload's `Location`, `Range: 0-0` and `Docker-Upload-UUID`. With `?digest=` and a body, the whole blob in one request: 201. A cross-repository mount request (`?mount=&from=`) is answered as an ordinary upload; nothing is mounted. |
-| `PATCH /v2/<name>/blobs/uploads/<id>` | The next chunk, streamed: 202 with the new `Range`. A `Content-Range` that does not start where the upload left off is 416 with the `Range` it is at. |
-| `PUT /v2/<name>/blobs/uploads/<id>?digest=…` | Closes the upload, optionally with the last (or only) bytes: 201. |
+| `PATCH /v2/<name>/blobs/uploads/<id>` | The next chunk, streamed: 202 with the new `Range`. A `Content-Range` is optional and checked in full: one that does not start where the upload left off is 416 with the `Range` it is at; one that is malformed, ends before it starts, or is not as long as the body is 400. |
+| `PUT /v2/<name>/blobs/uploads/<id>?digest=…` | Closes the upload, optionally with the last (or only) bytes: 201. A `Content-Range` on it is checked the same way. |
 | `GET /v2/<name>/blobs/uploads/<id>` | 204 with `Range`: where the upload is. |
 | `DELETE /v2/<name>/blobs/uploads/<id>` | Cancels the upload: 204. |
 | `HEAD /v2/<name>/blobs/<digest>` | For a caller who may push to `<name>`: 200 if the publish source already holds the blob there, so a client can skip an upload. It makes nothing pullable. |
@@ -802,11 +819,20 @@ and storage as a pull credential, and may also pull.
 
 Push errors, in the registry format: `UNAUTHORIZED` (401, with a challenge
 whose scope is `repository:<name>:pull,push`), `DENIED` (403: no publish
-permission, another organization's repository, or a credential that may only
-pull), `BLOB_UPLOAD_UNKNOWN` (404), `BLOB_UPLOAD_INVALID` (400, or 416 for a
-chunk out of order), `DIGEST_INVALID` (400), `SIZE_INVALID` (413: over
-`maxBlobBytes`), `MANIFEST_INVALID` (400, or 413 for a manifest over 5 MiB),
-`UNSUPPORTED` (405), `UNAVAILABLE` (503).
+permission, another organization's repository or one it is publishing right
+now, or a token that does not carry `push` for this repository),
+`BLOB_UPLOAD_UNKNOWN` (404), `BLOB_UPLOAD_INVALID` (400: a `Content-Range`
+that does not fit, or **another request is writing to this upload: retry**;
+416 for a chunk out of order), `DIGEST_INVALID` (400), `SIZE_INVALID` (413:
+over `maxBlobBytes`), `MANIFEST_INVALID` (400, or 413 for a manifest over
+5 MiB), `TOOMANYREQUESTS` (429: too many uploads open or still being cleaned
+up), `UNSUPPORTED` (405), `UNAVAILABLE` (503).
+
+One answer is neither a success nor a refusal: **the registry accepted the
+manifest and the catalog does not list it**. It is 503 `UNAVAILABLE` when the
+catalog write could not be made (put the manifest again, or wait for a
+sweep), and 500 `UNKNOWN` when the catalog refused the row itself; in both
+the message says the manifest is stored. It is never reported as a 201.
 
 ### What happens to a push
 
@@ -821,6 +847,20 @@ Bytes are streamed to the registry as they arrive, counted against
 its digest when the upload is closed. Writes go to the registry's own origin
 only: an upload location on another origin is refused and a write is never
 redirected.
+
+The Hub's record and the registry's session are kept in step. The Hub takes
+its slot *before* it asks the registry to open a session, so the cap holds
+before anything exists upstream. A session the Hub lets go of (past the cap,
+expired, cancelled) is cancelled at the registry *before* its record is
+deleted, a few per request; a record whose cancellation failed is kept and
+tried again, for at most a day, and a user whose slots are all waiting to be
+cleaned up is answered 429. And **one request at a time writes to a
+session**: a `PATCH`, the closing `PUT` and a `DELETE` each take the
+session's lease (a compare-and-set on its row, so it holds across replicas,
+and no database connection is held while bytes move) and give it back when
+their bookkeeping is done. A second write while it is held is refused with
+`BLOB_UPLOAD_INVALID` and told to retry, so two requests cannot both add to
+the same byte count and pass `maxBlobBytes` between them.
 
 **A manifest is validated before it is committed.** The layers were just
 uploaded, so at manifest `PUT` the Hub reads the bundle with the catalog's
@@ -844,6 +884,20 @@ appear on catalog entries only on a Hub that accepts publishes, are omitted
 for anonymous callers, and are null for a version pushed to the registry
 directly. A later sweep reconciles the row like any other (tags moved at the
 registry, removal) and leaves the publisher as recorded.
+
+The row, its tag and its publisher are one transaction, under the request's
+deadline. **A tag put through the Hub is on exactly one digest** of its
+source and repository: putting a manifest under a tag another digest holds
+moves the tag, and putting a manifest by digest adds no tag and brings none
+back. If that transaction fails, the answer says the manifest is stored and
+not listed (above), and the publisher is not lost: who is publishing a
+digest is noted before its manifest is forwarded
+(`collab_cog_pending_publications`), and whichever write lists the digest
+later, a retried push or a sweep, takes the publisher from that note. A
+sweep that is running while a publish lands does not undo it: its removal
+step only touches rows last written before it began enumerating, so a
+version published (or published again after having been removed) since then
+is left for the next sweep to judge.
 
 **Deadlines and limits** are those of pulls: one aggregate deadline per
 request (`maxBlobSeconds` for a request that carries a blob, thirty seconds
