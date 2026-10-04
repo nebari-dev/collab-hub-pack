@@ -663,6 +663,10 @@ altogether: the URL is an upload session's, at the backing registry, and its
 path can be the capability to write to that session, so the line carries the
 operation and the source id instead
 (`HTTP Request: PATCH [registry write: upload chunk, source main] "HTTP/1.1 202 Accepted"`).
+What that protects is the session URL. The backing registry's **host name**
+is configuration, not a secret, and still appears in logs an operator reads:
+in read lines as above, and at DEBUG in the transport's connection trace
+(`connect_tcp`, TLS `server_hostname`) for reads and writes alike.
 These two filters are **process-wide**: they are installed when a
 deployment turns on `cogs.serve.enabled` and then apply to every HTTP client
 in the process, not only the registry's. With serving off, logging is
