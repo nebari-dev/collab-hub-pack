@@ -648,7 +648,12 @@ absent for everyone else, and `source_id` names the source for any
 authenticated caller.
 
 Logs are the operator's, and may name a backing host; they must not carry a
-credential. The Hub's own lines name the source id. The HTTP libraries'
+credential. The rule for the HTTP client's own request lines is the same
+everywhere, publishing included: a **read** from a registry (indexing,
+serving a pull, and in a publish the bundle validation and the check that a
+repository is new) is logged with the backing URL, without its query string
+or userinfo; a **write** is logged with the operation and the source id and
+no URL at all. The Hub's own lines name the source id. The HTTP libraries'
 lines are filtered: the request log (`httpx`, INFO) loses URL query strings
 and userinfo, so a pre-signed storage URL is not logged with its signature,
 and the transport trace (`httpcore`, DEBUG) loses every header value, so

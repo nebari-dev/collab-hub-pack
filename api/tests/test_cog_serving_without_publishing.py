@@ -104,6 +104,58 @@ async def test_publish_is_not_a_scope_the_credential_exchange_knows(hub: Hub):
     assert (await hub.exchange(ALICE))["scope"] == "pull"
 
 
+def literal_error(given) -> dict:
+    return {
+        "type": "literal_error",
+        "loc": ["body", "scope"],
+        "msg": "Input should be 'pull'",
+        "input": given,
+        "ctx": {"expected": "'pull'"},
+    }
+
+
+@pytest.mark.parametrize(
+    "body, details",
+    [
+        # The only scope it advertises is the only one it has.
+        ({"scope": "bogus"}, [literal_error("bogus")]),
+        # Every problem is listed, in the pull-only contract's order: the scope is one of them.
+        (
+            {"scope": "publish", "extra": True},
+            [
+                literal_error("publish"),
+                {"type": "extra_forbidden", "loc": ["body", "extra"], "msg": "Extra inputs are not permitted",
+                 "input": True},
+            ],
+        ),
+        (
+            {"scope": "pull", "extra": 1},
+            [{"type": "extra_forbidden", "loc": ["body", "extra"], "msg": "Extra inputs are not permitted",
+              "input": 1}],
+        ),
+        ({"scope": None}, [literal_error(None)]),
+    ],
+)
+async def test_every_validation_answer_of_the_exchange_is_the_pull_only_contracts(hub: Hub, body, details):
+    refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json=body)
+    assert refused.status_code == 422
+    assert refused.json() == {
+        "error": {"code": "validation_error", "message": "Request validation failed", "details": details}
+    }
+
+
+async def test_a_body_that_is_not_an_object_is_refused_as_it_always_was(hub: Hub):
+    for content in (b"[1]", b'"pull"', b"{not json"):
+        refused = await hub.request(
+            "POST",
+            "/v1/cogs/registry-credentials",
+            headers={**ALICE, "Content-Type": "application/json"},
+            content=content,
+        )
+        assert refused.status_code == 422 and refused.json()["error"]["code"] == "validation_error", content
+        assert "publish" not in refused.text
+
+
 async def test_every_write_is_refused_as_read_only_before_anything_else(hub: Hub):
     hub.seed(REPO, ALPHA, "v1")
     reader = await hub.pull_token(REPO)

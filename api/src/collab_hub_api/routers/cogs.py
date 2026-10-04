@@ -56,6 +56,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 
 from ..cogs.catalog import (
@@ -411,13 +412,44 @@ def catalog_v1(_auth: AuthDep, store: CatalogDep) -> CatalogV1:
 NOT_SERVED = {404: {"model": CogErrorResponse, "description": "This Hub does not serve pulls itself."}}
 
 
-@router.post(
-    "/registry-credentials",
-    response_model=RegistryCredentialResponse,
-    status_code=status.HTTP_201_CREATED,
-    responses={**NOT_SERVED, **UNAVAILABLE},
-    summary="Exchange the Hub session for a registry credential",
-)
+def _pull_only_refusal(body: object) -> RequestValidationError | None:
+    """How the pull-only contract refuses this body, or ``None`` if it accepts it."""
+
+    try:
+        PullOnlyRegistryCredentialRequest.model_validate(body)
+    except ValidationError as exc:
+        return RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)], body=body
+        )
+    return None
+
+
+class _ExchangeRoute(APIRoute):
+    """The exchange route, validating as a Hub that accepts no publishes always has, when it accepts none.
+
+    The request model names ``publish`` as a scope because some Hubs accept
+    it. One with no publish source must answer every malformed request with
+    the pull-only contract's own validation errors -- the scope it
+    advertises, the errors it lists and their order -- so a body the
+    request model refused is validated again against that contract, and its
+    errors are the answer.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def exchange(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                serving = getattr(request.app.state, "cog_registry_serving", None)
+                if serving is None or serving.publisher is not None or not isinstance(exc.body, dict):
+                    raise
+                raise (_pull_only_refusal(exc.body) or exc) from None
+
+        return exchange
+
+
 def create_registry_credential(
     request: Request, auth: HubAuthDep, serving: ServingDep, body: RegistryCredentialRequest | None = None
 ) -> RegistryCredentialResponse:
@@ -447,12 +479,7 @@ def create_registry_credential(
         if serving.publisher is None:
             # No publish source: this Hub's contract is the pull-only one,
             # and the refusal is that contract's own validation error.
-            try:
-                PullOnlyRegistryCredentialRequest.model_validate({"scope": scope})
-            except ValidationError as exc:
-                raise RequestValidationError(
-                    [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)]
-                ) from None
+            raise _pull_only_refusal({"scope": scope})
         if not serving.publisher.policy.permits(auth.user, auth.org_role, auth.platform_role):
             raise CogPublishForbiddenError()
     secret = new_credential_secret()
@@ -475,6 +502,18 @@ def create_registry_credential(
         scope=scope,
         expires_at=credential.expires_at,
     )
+
+
+router.add_api_route(
+    "/registry-credentials",
+    create_registry_credential,
+    methods=["POST"],
+    response_model=RegistryCredentialResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={**NOT_SERVED, **UNAVAILABLE},
+    summary="Exchange the Hub session for a registry credential",
+    route_class_override=_ExchangeRoute,
+)
 
 
 @router.delete(
