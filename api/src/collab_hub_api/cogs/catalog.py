@@ -38,12 +38,13 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .deadline import bounded_connection
@@ -125,11 +126,12 @@ class CogArtifact:
     published_by: str | None = None
     """The Hub user who published this artifact *through the Hub* (issue #180); ``None`` for an out-of-band push.
 
-    Authenticated, unlike the card's self-declared ``publisher``. Written by
-    :meth:`CogCatalogStore.record_published`; an upsert never changes one
-    that is set, so a sweep that rewrites the row keeps it, and fills an
-    unset one only from a publication noted before the manifest was forwarded
-    (:meth:`CogCatalogStore.note_publication`).
+    Authenticated, unlike the card's self-declared ``publisher``. Never
+    taken from the row a writer passes in: every write keeps one that is
+    set, and fills an unset one only from a publication attempt the registry
+    is **known to have accepted** (:meth:`CogCatalogStore.accept_publication`)
+    -- the earliest, if there are several. With no such record the publisher
+    is unknown and stays ``None``.
     """
     published_org: str | None = None
 
@@ -406,42 +408,52 @@ class CogCatalogStore(ABC):
 
     @abstractmethod
     def note_publication(
-        self, source_id: str, repository: str, digest: str, *, user_id: str, org_id: str | None
+        self, attempt_id: str, source_id: str, repository: str, digest: str, *, user_id: str, org_id: str | None
     ) -> None:
-        """Remember who is about to publish this digest, **before** its manifest is forwarded.
+        """Record one attempt to publish this digest, **before** its manifest is forwarded.
 
-        Durable, and independent of the catalog row (which does not exist
-        yet): if the registry accepts the manifest and the request then fails
-        before :meth:`record_published`, the next write that lists the digest
-        -- a retried push, a sweep's :meth:`upsert` -- attributes it from
-        this. Last note wins.
+        One row per attempt, never shared: two users, or one user twice,
+        publishing the same digest each have their own. An attempt
+        attributes nothing until :meth:`accept_publication`. Attempts that
+        never resolved are purged here, by age.
         """
 
         raise NotImplementedError
 
     @abstractmethod
-    def forget_publication(self, source_id: str, repository: str, digest: str, *, user_id: str) -> None:
-        """Drop this user's note: the registry definitely refused the manifest."""
+    def accept_publication(self, attempt_id: str) -> None:
+        """The registry accepted this attempt's manifest: from now on it may attribute the digest.
+
+        If this cannot be recorded, nothing else may stand in for it: the
+        digest's publisher stays unknown.
+        """
 
         raise NotImplementedError
 
     @abstractmethod
-    def record_published(self, artifact: CogArtifact, *, tag: str | None, user_id: str, org_id: str | None) -> None:
+    def forget_publication(self, attempt_id: str) -> None:
+        """The registry definitely refused this attempt's manifest: drop this attempt, and only this one.
+
+        An accepted attempt is never dropped.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_published(self, artifact: CogArtifact, *, tag: str | None) -> None:
         """Write the row of a manifest the registry has just accepted through the Hub. One transaction.
 
         Like :meth:`upsert`, the row is replaced whole and is present again,
-        with two differences that are the point:
-
-        - **Tags are assigned, not replaced.** ``artifact.tags`` is ignored.
-          With ``tag`` (the manifest was put under it), that tag ends up on
-          this digest and on no other digest of the same source and
-          repository: it is added here and taken from wherever else it was,
-          atomically, serialized per repository. A put by digest
-          (``tag=None``) adds nothing. The row's other tags stay as the
-          catalog holds them; a row that was marked removed starts from
-          none, so nothing stale comes back with it.
-        - **The publisher is written with the row**, and the note taken by
-          :meth:`note_publication` is consumed.
+        and its publisher is decided as every write decides it (kept if set,
+        else the earliest accepted attempt). The difference is the tags:
+        **they are assigned, not replaced.** ``artifact.tags`` is ignored.
+        With ``tag`` (the manifest was put under it), that tag ends up on
+        this digest and on no other digest of the same source and
+        repository: it is added here and taken from wherever else it was,
+        atomically, serialized per repository. A put by digest
+        (``tag=None``) adds nothing. The row's other tags stay as the
+        catalog holds them; a row that was marked removed starts from none,
+        so nothing stale comes back with it.
 
         Raises :class:`CogCatalogDataError` for a row the backend cannot
         represent, as :meth:`upsert` does.
@@ -536,18 +548,29 @@ class CogCatalogStore(ABC):
         raise NotImplementedError
 
 
+def new_attempt_id() -> str:
+    """What identifies one attempt to publish a manifest through the Hub."""
+
+    return "pub-" + secrets.token_hex(16)
+
+
+UNACCEPTED_ATTEMPT_MAX_AGE_SECONDS = 24 * 3600
+"""How long an attempt that never resolved is kept. It attributes nothing either way."""
+
+
 def _keep_publication(
-    new: CogArtifact, old: CogArtifact | None, noted: tuple[str, str | None] | None
+    new: CogArtifact, old: CogArtifact | None, accepted: tuple[str, str | None] | None
 ) -> CogArtifact:
-    """An upsert replaces a row whole, except for who published it through the Hub.
+    """A write replaces a row whole, except for who published it through the Hub.
 
     A publisher already on the row stays; one that is not there yet comes
-    from the note taken before the manifest was forwarded, if there is one.
+    from the earliest attempt the registry is known to have accepted, if
+    there is one. Never from the row passed in.
     """
 
     if old is not None and old.published_by is not None:
         return replace(new, published_by=old.published_by, published_org=old.published_org)
-    user_id, org_id = noted or (None, None)
+    user_id, org_id = accepted or (None, None)
     return replace(new, published_by=user_id, published_org=org_id)
 
 
@@ -750,13 +773,16 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         raise self._refuse()
 
-    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
+    def note_publication(self, attempt_id, source_id, repository, digest, *, user_id, org_id) -> None:
         raise self._refuse()
 
-    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+    def accept_publication(self, attempt_id) -> None:
         raise self._refuse()
 
-    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
+    def forget_publication(self, attempt_id) -> None:
+        raise self._refuse()
+
+    def record_published(self, artifact, *, tag) -> None:
         raise self._refuse()
 
     def repository_known(self, repository) -> bool:
@@ -788,7 +814,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
 
     _rows: dict[tuple[str, str, str], CogArtifact] = field(default_factory=dict)
     _blobs: dict[tuple[str, str, str], dict[str, BlobDescriptor]] = field(default_factory=dict)
-    _noted: dict[tuple[str, str, str], tuple[str, str | None]] = field(default_factory=dict)
+    _attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _sweep: threading.Lock = field(default_factory=threading.Lock)
 
@@ -830,21 +856,45 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             removed_at=None,
         )
         with self._lock:
-            # Parity with Postgres: a publisher on the row stays, and a noted one is taken (and the note with it).
+            # Parity with Postgres: a publisher on the row stays; an unset one comes from an accepted attempt.
             key = self._key(stored)
-            self._rows[key] = _keep_publication(stored, self._rows.get(key), self._noted.pop(key, None))
+            self._rows[key] = _keep_publication(stored, self._rows.get(key), self._accepted(key))
 
-    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
+    def _accepted(self, key: tuple[str, str, str]) -> tuple[str, str | None] | None:
+        accepted = sorted(
+            (attempt["accepted_at"], attempt_id, attempt)
+            for attempt_id, attempt in self._attempts.items()
+            if attempt["key"] == key and attempt["accepted_at"] is not None
+        )
+        return (accepted[0][2]["user_id"], accepted[0][2]["org_id"]) if accepted else None
+
+    def note_publication(self, attempt_id, source_id, repository, digest, *, user_id, org_id) -> None:
+        now = datetime.now(UTC)
+        stale = now - timedelta(seconds=UNACCEPTED_ATTEMPT_MAX_AGE_SECONDS)
         with self._lock:
-            self._noted[(source_id, repository, digest)] = (user_id, org_id)
+            for old in [k for k, a in self._attempts.items() if a["accepted_at"] is None and a["created_at"] < stale]:
+                del self._attempts[old]
+            self._attempts[attempt_id] = {
+                "key": (source_id, repository, digest),
+                "user_id": user_id,
+                "org_id": org_id,
+                "created_at": now,
+                "accepted_at": None,
+            }
 
-    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+    def accept_publication(self, attempt_id) -> None:
         with self._lock:
-            noted = self._noted.get((source_id, repository, digest))
-            if noted is not None and noted[0] == user_id:
-                del self._noted[(source_id, repository, digest)]
+            attempt = self._attempts.get(attempt_id)
+            if attempt is not None and attempt["accepted_at"] is None:
+                attempt["accepted_at"] = datetime.now(UTC)
 
-    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
+    def forget_publication(self, attempt_id) -> None:
+        with self._lock:
+            attempt = self._attempts.get(attempt_id)
+            if attempt is not None and attempt["accepted_at"] is None:
+                del self._attempts[attempt_id]
+
+    def record_published(self, artifact, *, tag) -> None:
         self._storable(artifact)
         key = self._key(artifact)
         with self._lock:
@@ -855,16 +905,14 @@ class InMemoryCogCatalogStore(CogCatalogStore):
                 for other_key, other in list(self._rows.items()):
                     if other_key != key and other_key[:2] == key[:2] and tag in other.tags:
                         self._rows[other_key] = replace(other, tags=tuple(t for t in other.tags if t != tag))
-            self._rows[key] = replace(
+            stored = replace(
                 artifact,
                 tags=tuple(sorted(kept)),
                 read_errors=tuple(artifact.read_errors),
                 indexed_at=datetime.now(UTC),
                 removed_at=None,
-                published_by=user_id,
-                published_org=org_id,
             )
-            self._noted.pop(key, None)
+            self._rows[key] = _keep_publication(stored, old, self._accepted(key))
 
     def repository_known(self, repository) -> bool:
         with self._lock:
@@ -1071,8 +1119,27 @@ _REPLACED_COLUMNS = """host = EXCLUDED.host,
                     kind = EXCLUDED.kind,
                     publisher = EXCLUDED.publisher,
                     manifest_schema = EXCLUDED.manifest_schema,
-                    read_errors = EXCLUDED.read_errors"""
-"""What every write of a row replaces; tags, presence and the Hub publisher are each writer's own business."""
+                    read_errors = EXCLUDED.read_errors,
+                    published_org = CASE WHEN collab_cog_artifacts.published_by IS NULL
+                                         THEN EXCLUDED.published_org
+                                         ELSE collab_cog_artifacts.published_org END,
+                    published_by = COALESCE(collab_cog_artifacts.published_by, EXCLUDED.published_by)"""
+"""What every write of a row replaces, and the one thing it keeps: a publisher that is already set."""
+
+_ACCEPTED_ATTEMPT = """FROM collab_cog_publication_attempts
+                         WHERE source_id = %s AND repository = %s AND digest = %s AND accepted_at IS NOT NULL
+                         ORDER BY accepted_at, attempt_id LIMIT 1"""
+_PUBLISHER = f"""(SELECT published_by {_ACCEPTED_ATTEMPT}),
+                        (SELECT published_org {_ACCEPTED_ATTEMPT})"""
+"""A new row's publisher: the earliest attempt the registry is known to have accepted, else nobody.
+
+Two scalar subqueries that only read. Neither write of a row modifies an
+attempt, so the two paths lock the same thing in the same order.
+"""
+
+
+def _key(artifact: CogArtifact) -> tuple[str, str, str]:
+    return (artifact.source_id, artifact.repository, artifact.digest)
 
 
 def _written_values(artifact: CogArtifact, tags: list[str]) -> tuple:
@@ -1224,37 +1291,25 @@ class PostgresCogCatalogStore(CogCatalogStore):
         # webhook's lock-less reindex) takes its own connection rather than a
         # running sweep's lock session -- see _sweep_connection (issue #128).
         #
-        # Who published it through the Hub is not the reader's to say: a
-        # publisher already on the row stays, and one that is not comes from
-        # the note a publish left before forwarding its manifest (issue
-        # #180), consumed here -- in the same statement, so the sweep path
-        # stays one statement on the lock session.
+        # Who published it through the Hub is not the reader's to say: see
+        # _PUBLISHER. Attempts are only read here, never written, so this
+        # statement locks the artifact row and nothing else -- the same, and
+        # in the same order, as the publish write below.
         connection = self._own_connection if targeted else self._sweep_connection
-        key = (artifact.source_id, artifact.repository, artifact.digest)
         try:
             with connection() as conn:
                 conn.execute(
                     f"""
-                WITH noted AS (
-                    DELETE FROM collab_cog_pending_publications
-                    WHERE source_id = %s AND repository = %s AND digest = %s
-                    RETURNING published_by, published_org
-                )
                 INSERT INTO collab_cog_artifacts (
                     {_WRITTEN_COLUMNS}, removed_at, published_by, published_org
                 )
-                VALUES ({_WRITTEN_VALUES}, NULL,
-                        (SELECT published_by FROM noted), (SELECT published_org FROM noted))
+                VALUES ({_WRITTEN_VALUES}, NULL, {_PUBLISHER})
                 ON CONFLICT (source_id, repository, digest) DO UPDATE SET
                     {_REPLACED_COLUMNS},
                     tags = EXCLUDED.tags,
-                    removed_at = NULL,
-                    published_by = COALESCE(collab_cog_artifacts.published_by, EXCLUDED.published_by),
-                    published_org = CASE WHEN collab_cog_artifacts.published_by IS NULL
-                                         THEN EXCLUDED.published_org
-                                         ELSE collab_cog_artifacts.published_org END
+                    removed_at = NULL
                     """,
-                    (*key, *_written_values(artifact, sorted(set(artifact.tags)))),
+                    (*_written_values(artifact, sorted(set(artifact.tags))), *_key(artifact), *_key(artifact)),
                 )
         except psycopg.DataError as exc:
             # This row's *content* is what the server refused (NUL in a jsonb
@@ -1265,36 +1320,45 @@ class PostgresCogCatalogStore(CogCatalogStore):
             # the offending value.
             raise CogCatalogDataError(type(exc).__name__) from exc
 
-    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
+    def note_publication(self, attempt_id, source_id, repository, digest, *, user_id, org_id) -> None:
         with bounded_connection(self._db) as conn:
             conn.execute(
                 """
-                INSERT INTO collab_cog_pending_publications
-                    (source_id, repository, digest, published_by, published_org)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (source_id, repository, digest) DO UPDATE SET
-                    published_by = EXCLUDED.published_by,
-                    published_org = EXCLUDED.published_org,
-                    created_at = now()
+                DELETE FROM collab_cog_publication_attempts
+                WHERE accepted_at IS NULL AND created_at < now() - make_interval(secs => %s)
                 """,
-                (source_id, repository, digest, user_id, org_id),
+                (UNACCEPTED_ATTEMPT_MAX_AGE_SECONDS,),
+            )
+            conn.execute(
+                """
+                INSERT INTO collab_cog_publication_attempts
+                    (attempt_id, source_id, repository, digest, published_by, published_org)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (attempt_id, source_id, repository, digest, user_id, org_id),
             )
 
-    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+    def accept_publication(self, attempt_id) -> None:
         with bounded_connection(self._db) as conn:
             conn.execute(
                 """
-                DELETE FROM collab_cog_pending_publications
-                WHERE source_id = %s AND repository = %s AND digest = %s AND published_by = %s
+                UPDATE collab_cog_publication_attempts SET accepted_at = clock_timestamp()
+                WHERE attempt_id = %s AND accepted_at IS NULL
                 """,
-                (source_id, repository, digest, user_id),
+                (attempt_id,),
             )
 
-    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
+    def forget_publication(self, attempt_id) -> None:
+        with bounded_connection(self._db) as conn:
+            conn.execute(
+                "DELETE FROM collab_cog_publication_attempts WHERE attempt_id = %s AND accepted_at IS NULL",
+                (attempt_id,),
+            )
+
+    def record_published(self, artifact, *, tag) -> None:
         import psycopg
 
         _checked(artifact)
-        key = (artifact.source_id, artifact.repository, artifact.digest)
         try:
             # The request's own budget, not the sweep's: this runs inside a
             # push, and must give its thread and its connection back when the
@@ -1308,23 +1372,38 @@ class PostgresCogCatalogStore(CogCatalogStore):
                     "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
                     (PUBLISH_LOCK_CLASS, f"{artifact.source_id}/{artifact.repository}"),
                 )
+                # Every row this transaction will change, locked first and in
+                # (repository, digest) order: its own digest, and the rows
+                # the tag is taken from. The sweep's removal locks in the
+                # same order.
+                conn.execute(
+                    """
+                    SELECT digest FROM collab_cog_artifacts
+                    WHERE source_id = %s AND repository = %s AND (digest = %s OR %s::text = ANY(tags))
+                    ORDER BY repository, digest
+                    FOR UPDATE
+                    """,
+                    (artifact.source_id, artifact.repository, artifact.digest, tag),
+                )
                 conn.execute(
                     f"""
                 INSERT INTO collab_cog_artifacts (
                     {_WRITTEN_COLUMNS}, removed_at, published_by, published_org
                 )
-                VALUES ({_WRITTEN_VALUES}, NULL, %s, %s)
+                VALUES ({_WRITTEN_VALUES}, NULL, {_PUBLISHER})
                 ON CONFLICT (source_id, repository, digest) DO UPDATE SET
                     {_REPLACED_COLUMNS},
                     tags = CASE WHEN collab_cog_artifacts.removed_at IS NULL THEN ARRAY(
                                SELECT DISTINCT tag FROM unnest(collab_cog_artifacts.tags || EXCLUDED.tags) AS tag
                                ORDER BY tag)
                            ELSE EXCLUDED.tags END,
-                    removed_at = NULL,
-                    published_by = EXCLUDED.published_by,
-                    published_org = EXCLUDED.published_org
+                    removed_at = NULL
                     """,
-                    (*_written_values(artifact, [tag] if tag is not None else []), user_id, org_id),
+                    (
+                        *_written_values(artifact, [tag] if tag is not None else []),
+                        *_key(artifact),
+                        *_key(artifact),
+                    ),
                 )
                 if tag is not None:
                     conn.execute(
@@ -1334,13 +1413,6 @@ class PostgresCogCatalogStore(CogCatalogStore):
                         """,
                         (tag, artifact.source_id, artifact.repository, artifact.digest, tag),
                     )
-                conn.execute(
-                    """
-                    DELETE FROM collab_cog_pending_publications
-                    WHERE source_id = %s AND repository = %s AND digest = %s
-                    """,
-                    key,
-                )
         except psycopg.DataError as exc:
             raise CogCatalogDataError(type(exc).__name__) from exc
 
@@ -1371,6 +1443,12 @@ class PostgresCogCatalogStore(CogCatalogStore):
         # written at or after `written_before`, when it is given: the
         # condition is part of this statement, so no write can slip between a
         # check and the removal.
+        #
+        # The rows are locked in (repository, digest) order before they are
+        # updated -- the conditions are re-checked on each row as its lock is
+        # taken -- which is the order the publish write locks its rows in
+        # (record_published). Two writers that take several row locks in one
+        # order cannot deadlock.
         document = {repo: sorted(set(digests)) for repo, digests in present.items()}
         shielded = sorted(set(excluding))
         with self._sweep_connection() as conn:
@@ -1381,9 +1459,8 @@ class PostgresCogCatalogStore(CogCatalogStore):
                     FROM jsonb_each(%s) AS repo,
                          jsonb_array_elements(repo.value) AS digest
                 ),
-                marked AS (
-                    UPDATE collab_cog_artifacts a
-                    SET removed_at = now()
+                gone AS (
+                    SELECT a.repository, a.digest FROM collab_cog_artifacts a
                     WHERE a.source_id = %s
                       AND a.removed_at IS NULL
                       AND NOT (a.repository = ANY(%s))
@@ -1392,11 +1469,19 @@ class PostgresCogCatalogStore(CogCatalogStore):
                           SELECT 1 FROM present p
                           WHERE p.repository = a.repository AND p.digest = a.digest
                       )
+                    ORDER BY a.repository, a.digest
+                    FOR UPDATE OF a
+                ),
+                marked AS (
+                    UPDATE collab_cog_artifacts a
+                    SET removed_at = now()
+                    FROM gone
+                    WHERE a.source_id = %s AND a.repository = gone.repository AND a.digest = gone.digest
                     RETURNING 1
                 )
                 SELECT count(*) AS n FROM marked
                 """,
-                (Jsonb(document), source_id, shielded, written_before, written_before),
+                (Jsonb(document), source_id, shielded, written_before, written_before, source_id),
             ).fetchone()
         return int(row["n"]) if row else 0
 

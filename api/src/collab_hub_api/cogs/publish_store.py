@@ -1,33 +1,39 @@
-"""What publishing through the Hub keeps in the database (issue #180).
+"""Repository ownership and upload sessions for publishing through the Hub (issue #180).
 
 Two small relations, both created by migration 14 of
 :mod:`..frames.collab_schema` and never by this module:
 
 - ``collab_cog_repositories`` -- **who owns a repository published through
-  the Hub**. One row per repository path. A row starts as a *reservation*,
-  taken just before a manifest is forwarded to the registry, and becomes
-  ownership (``committed``) only once the registry has accepted that
-  manifest; from then on it never changes, and later pushes need membership
-  of the owning organization. A reservation is released when the registry
-  has definitely refused every manifest forwarded under it (publishes of one
-  organization share it, and it counts them); one whose outcome is unknown
-  simply expires, and until then only the same organization can take it
-  again. Only committed rows are ownership, and only committed rows extend
-  the publish source's enumeration.
+  the Hub**. One row per repository path, written *before* the first
+  manifest for it is forwarded to the registry, as ``pending`` and already
+  belonging to the publisher's organization; it becomes ``committed`` once
+  the registry has accepted a manifest. A pending row is deleted only when
+  the registry has **definitely refused** every manifest that organization
+  had in flight for it (the row counts them). An unknown outcome leaves it
+  pending and owned: the registry may hold the manifest, so the name is
+  never handed to another organization automatically. Only the same
+  organization can publish to a pending name; a platform operator can
+  release one that is stuck (``docs/cog-registry.md``). Committed rows
+  extend the publish source's enumeration, and so do pending rows older than
+  a short grace period, so that a sweep can find content whose commit was
+  lost -- and commits the row when it does.
 - ``collab_cog_upload_sessions`` -- **an upload in progress**. A client
   uploads a blob over several requests that may land on different replicas,
   so the session lives here: the Hub's own session id (the only one a client
   ever sees), who opened it, and the backing registry's session URL, which
   never leaves the Hub. The row is written *before* the registry is asked to
-  open its session, so the per-user cap holds before anything exists
-  upstream; one request at a time holds the session's *lease* while it
-  forwards bytes; and a session past its expiry is kept until its registry
-  session has been cancelled (see :meth:`PublishStore.claim_stale_uploads`).
+  open its session, and is held by its opener's *lease* until the registry's
+  location is attached. Afterwards one request at a time holds the lease
+  while it forwards bytes, and gives it back only when the outcome is
+  recorded: a lease that lapses means nobody knows what the registry took,
+  and the session is dead. A dead or expired session is kept until its
+  registry session has been cancelled (see
+  :meth:`PublishStore.claim_stale_uploads`).
 
 Three backends, as for the catalog: Postgres over the shared pool, in memory
 for tests and single-process development, and one that refuses. Every
-Postgres call goes through :func:`~.deadline.bounded_connection`, so it is
-bounded by the request budget.
+Postgres call spends from the request's budget
+(:func:`.deadline.bounded_connection`), like the other serving stores.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from __future__ import annotations
 import secrets
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
@@ -59,7 +65,13 @@ backing registry's own session store) hold.
 MAX_UPLOAD_ROWS_PER_USER = 2 * MAX_UPLOAD_SESSIONS_PER_USER
 """Live sessions plus retired ones still awaiting cancellation at the registry; past it, opening is refused."""
 
-RESERVATION_ID_PREFIX = "rsv-"
+PENDING_ENUMERATION_GRACE_SECONDS = 120.0
+"""How long a repository stays pending before sweeps are sent to it.
+
+Longer than any request that can be forwarding its first manifest, so a
+sweep does not go looking while the publish that will commit the row is
+still on its way.
+"""
 
 
 class PublishStoreUnavailableError(RuntimeError):
@@ -70,12 +82,6 @@ class UploadLimitError(RuntimeError):
     """This user has too many sessions the registry has not let go of yet; nothing was opened."""
 
 
-def new_reservation_id() -> str:
-    """What identifies one reservation of a repository name, so only those who hold it can release it."""
-
-    return RESERVATION_ID_PREFIX + secrets.token_hex(16)
-
-
 def new_upload_id() -> str:
     """An upload session id: one URL-safe path segment, unguessable."""
 
@@ -84,24 +90,18 @@ def new_upload_id() -> str:
 
 @dataclass(frozen=True)
 class RepositoryRecord:
-    """A repository's row: ownership once ``committed``, a reservation of the name until then."""
+    """A repository's row: whose it is, and whether the registry has accepted a manifest for it yet."""
 
     repository: str
     source_id: str
     owner_org_id: str | None
     created_by: str
     committed: bool = True
-    reservation: str | None = None
-    """The reservation a :meth:`PublishStore.reserve_repository` call now holds a share of; ``None`` otherwise.
-
-    A caller holds the name exactly when the record it got back is committed
-    (then ownership decides) or carries a reservation.
-    """
 
 
 @dataclass(frozen=True)
 class UploadSession:
-    """One upload in progress. ``upstream_location`` is the backing registry's and is never sent to a client."""
+    """One upload in progress. ``upstream_location`` is the backing registry's session URL: server-side only."""
 
     id: str
     user_id: str
@@ -120,24 +120,22 @@ class PublishStore(ABC):
 
     @abstractmethod
     def get_repository(self, repository: str) -> RepositoryRecord | None:
-        """The repository's **committed** owner record; a reservation is not ownership."""
+        """The repository's row, pending or committed: either way it says whose the name is."""
 
         raise NotImplementedError
 
     @abstractmethod
     def reserve_repository(
-        self, repository: str, *, source_id: str, owner_org_id: str | None, created_by: str, ttl_seconds: float
+        self, repository: str, *, source_id: str, owner_org_id: str | None, created_by: str
     ) -> RepositoryRecord:
-        """Reserve the name for this organization, and return the record that stands.
+        """Record, before a manifest is forwarded, that this organization is publishing here.
 
-        Atomic. A committed record is returned untouched. With none, the
-        reservation is taken, or taken over once the holder's has expired;
-        an organization that already holds a live one *joins* it (a retry, a
-        colleague publishing at the same moment), which counts one more
-        holder and extends it. Either way the record returned carries the
-        ``reservation``. A live reservation held by another organization is
-        returned as it is, uncommitted and with no ``reservation``: the name
-        is not this caller's to write to yet.
+        Atomic, and durable before anything reaches the registry. With no
+        row, a pending one is written for this organization. A pending row
+        of this organization's counts one more attempt in flight. A
+        committed row, and a pending row of **another** organization's, are
+        returned untouched -- the caller checks whose the record is, and
+        counts as holding an attempt only when it is pending and its own.
         """
 
         raise NotImplementedError
@@ -146,65 +144,85 @@ class PublishStore(ABC):
     def commit_repository(
         self, repository: str, *, source_id: str, owner_org_id: str | None, created_by: str
     ) -> RepositoryRecord:
-        """Make this organization the repository's owner; return the record that stands.
+        """The registry accepted this organization's manifest: its pending row is ownership now.
 
-        Called once the registry has accepted a manifest, and only then.
-        Already committed: untouched, and the caller checks whose it is.
-        Otherwise the row -- this organization's reservation, no row at all,
-        or a reservation that changed hands after this one expired -- becomes
-        this organization's ownership: the registry holds its manifest, so
-        the first accepted manifest decides, and what was accepted is always
-        enumerated.
+        Only this organization's own pending row is changed (or a row
+        written, if an operator released it meanwhile). Any other row is
+        returned as it stands, and the caller checks it.
         """
 
         raise NotImplementedError
 
     @abstractmethod
-    def release_repository(self, repository: str, *, reservation: str) -> None:
-        """Give back one hold on this reservation (the registry refused the manifest); the last one frees the name.
+    def release_repository(self, repository: str, *, owner_org_id: str | None) -> None:
+        """The registry **definitely refused** one of this organization's manifests: one attempt fewer.
 
-        Counted, because publishes of one organization share a reservation:
-        a refused publish must not free the name under a concurrent publish
-        of the same organization that is still waiting for the registry's
-        answer. A hold that is never given back (an unknown outcome) keeps
-        the name until the reservation expires. Nothing happens if the
-        reservation is no longer the one that stands, or was committed.
+        The pending row is deleted when the last attempt in flight has been
+        refused. An attempt whose outcome is unknown is never released, so
+        the row stays, pending and owned. A committed row is not touched.
         """
 
         raise NotImplementedError
 
     @abstractmethod
     def published_repositories(self, source_id: str) -> list[str]:
-        """The repositories published through the Hub into this source -- committed ones only -- sorted."""
+        """The repositories a sweep of this source should also enumerate, sorted.
+
+        Committed ones, and pending ones older than
+        :data:`PENDING_ENUMERATION_GRACE_SECONDS`: content the registry
+        accepted but whose commit was lost is found there.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def commit_found(self, source_id: str, repositories: Iterable[str]) -> int:
+        """A sweep found content in these repositories: commit those that are still pending. Returns how many."""
 
         raise NotImplementedError
 
     # -- upload sessions ---------------------------------------------------------
 
     @abstractmethod
-    def open_upload(self, *, upload_id: str, user_id: str, repository: str, source_id: str) -> UploadSession:
-        """Reserve a session slot, **before** anything is opened at the registry.
+    def open_upload(
+        self, *, upload_id: str, user_id: str, repository: str, source_id: str, lease_seconds: float
+    ) -> UploadSession:
+        """Reserve a session slot, **before** anything is opened at the registry, held by its opener's lease.
 
         Serialized per user. Live sessions past the cap are retired, oldest
         first: retired, not deleted -- they stay until
-        :meth:`claim_stale_uploads` has had them cancelled at the registry.
-        Raises :class:`UploadLimitError` when the user's rows (live and
-        retired) are already at :data:`MAX_UPLOAD_ROWS_PER_USER`. The row has
-        no registry location until :meth:`attach_upload`, and is unknown to
-        :meth:`get_upload` until then.
+        :meth:`claim_stale_uploads` has had them cancelled at the registry --
+        and never a slot that is still opening. Raises
+        :class:`UploadLimitError` when the user's rows (live and retired) are
+        already at :data:`MAX_UPLOAD_ROWS_PER_USER`. The row has no registry
+        location until :meth:`attach_upload`; until then it is unknown to
+        :meth:`get_upload`, and neither the cap nor the cleanup touches it
+        while its lease lasts.
         """
 
         raise NotImplementedError
 
     @abstractmethod
-    def attach_upload(self, upload_id: str, upstream_location: str) -> bool:
-        """Record where the registry opened the session. ``False`` if the row is gone."""
+    def attach_upload(self, upload_id: str, *, lease: datetime, upstream_location: str) -> bool:
+        """Record where the registry opened the session and give the opener's lease back.
+
+        ``False`` if the slot is no longer this opener's (its lease lapsed
+        and it was cleaned up).
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_orphan(
+        self, *, upload_id: str, user_id: str, repository: str, source_id: str, upstream_location: str
+    ) -> None:
+        """Remember a registry session that has no slot and could not be cancelled, for the cleanup to retry."""
 
         raise NotImplementedError
 
     @abstractmethod
     def get_upload(self, upload_id: str, *, user_id: str, repository: str) -> UploadSession | None:
-        """The live session with this id, **if it is this user's and for this repository**."""
+        """The session, if it is this user's, for this repository, attached, unexpired and not dead."""
 
         raise NotImplementedError
 
@@ -216,7 +234,9 @@ class PublishStore(ABC):
 
         The lease is what lets exactly one request, on any replica, forward
         bytes to -- or close, or cancel -- a registry session at a time. It
-        expires by itself, so a holder that died does not strand the session.
+        is never taken over: a lease that runs out without having been given
+        back means its holder forwarded something and never recorded what,
+        so the session is dead from then on.
         """
 
         raise NotImplementedError
@@ -235,13 +255,13 @@ class PublishStore(ABC):
 
     @abstractmethod
     def release_upload(self, upload_id: str, *, lease: datetime) -> None:
-        """Give the lease back, if it is still this holder's. Idempotent."""
+        """Give the lease back **unchanged**: only for a holder that knows the registry took nothing. Idempotent."""
 
         raise NotImplementedError
 
     @abstractmethod
     def retire_upload(self, upload_id: str) -> None:
-        """End a session whose registry session could not be cancelled: unusable from now, kept for cleanup.
+        """End a session whose registry session may still exist: unusable from now, kept for cleanup.
 
         The row expires at once and its lease is dropped, so
         :meth:`claim_stale_uploads` picks it up and the cancellation is tried
@@ -260,11 +280,12 @@ class PublishStore(ABC):
     def claim_stale_uploads(
         self, *, limit: int, lease_seconds: float, user_id: str | None = None
     ) -> list[UploadSession]:
-        """Lease up to ``limit`` expired sessions (of one user, if given) for cancellation at the registry.
+        """Claim up to ``limit`` dead sessions (of one user, if given) for cancellation at the registry.
 
-        The caller cancels each one upstream and only then calls
+        Dead: past its expiry, or holding a lease that has run out. The
+        caller cancels each one upstream and only then calls
         :meth:`close_upload`; one whose cancellation fails is left, and is
-        claimable again when the lease runs out. Sessions older than
+        claimable again when the claim runs out. Sessions older than
         :data:`UPLOAD_HARD_AGE_SECONDS` are dropped here outright.
         """
 
@@ -272,30 +293,36 @@ class PublishStore(ABC):
 
 
 class UnavailablePublishStore(PublishStore):
-    """Used when no shared frames Postgres is configured. Every call raises."""
+    """No backend: every call refuses, which the router answers as 503."""
 
     def _refuse(self) -> PublishStoreUnavailableError:
-        return PublishStoreUnavailableError("Cog publishing storage is not configured")
+        return PublishStoreUnavailableError("publishing storage is not configured")
 
     def get_repository(self, repository):
         raise self._refuse()
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, ttl_seconds):
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
         raise self._refuse()
 
     def commit_repository(self, repository, *, source_id, owner_org_id, created_by):
         raise self._refuse()
 
-    def release_repository(self, repository, *, reservation):
+    def release_repository(self, repository, *, owner_org_id):
         raise self._refuse()
 
     def published_repositories(self, source_id):
         raise self._refuse()
 
+    def commit_found(self, source_id, repositories):
+        raise self._refuse()
+
     def open_upload(self, **_kwargs):
         raise self._refuse()
 
-    def attach_upload(self, upload_id, upstream_location):
+    def attach_upload(self, upload_id, *, lease, upstream_location):
+        raise self._refuse()
+
+    def record_orphan(self, **_kwargs):
         raise self._refuse()
 
     def get_upload(self, upload_id, *, user_id, repository):
@@ -321,11 +348,21 @@ class UnavailablePublishStore(PublishStore):
 
 
 @dataclass
+class _StoredRepository:
+    record: RepositoryRecord
+    since: datetime
+    holders: int = 0
+
+
+@dataclass
 class _StoredUpload:
     session: UploadSession
     created: datetime
     expires: datetime
     leased_until: datetime | None = None
+
+    def dead(self, now: datetime) -> bool:
+        return self.expires <= now or (self.leased_until is not None and self.leased_until <= now)
 
 
 @dataclass
@@ -333,7 +370,7 @@ class InMemoryPublishStore(PublishStore):
     """Process-local store for tests and single-process development; same semantics as Postgres."""
 
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
-    _repositories: dict[str, tuple[RepositoryRecord, datetime, int]] = field(default_factory=dict)
+    _repositories: dict[str, _StoredRepository] = field(default_factory=dict)
     _uploads: dict[str, _StoredUpload] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -342,71 +379,61 @@ class InMemoryPublishStore(PublishStore):
     def get_repository(self, repository):
         with self._lock:
             stored = self._repositories.get(repository)
-            return stored[0] if stored is not None and stored[0].committed else None
+            return stored.record if stored is not None else None
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, ttl_seconds):
-        now = self.clock()
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
         with self._lock:
-            reservation, holders = new_reservation_id(), 1
             stored = self._repositories.get(repository)
-            if stored is not None:
-                record, until, held = stored
-                if record.committed:
-                    return record
-                if until > now:
-                    if record.owner_org_id != owner_org_id:
-                        return replace(record, reservation=None)
-                    reservation, holders = record.reservation, held + 1
-            record = RepositoryRecord(
-                repository=repository,
-                source_id=source_id,
-                owner_org_id=owner_org_id,
-                created_by=created_by,
-                committed=False,
-                reservation=reservation,
-            )
-            self._repositories[repository] = (record, now + timedelta(seconds=ttl_seconds), holders)
-            return record
+            if stored is None:
+                record = RepositoryRecord(repository, source_id, owner_org_id, created_by, committed=False)
+                stored = self._repositories[repository] = _StoredRepository(record, self.clock(), holders=0)
+            if not stored.record.committed and stored.record.owner_org_id == owner_org_id:
+                stored.holders += 1
+            return stored.record
 
     def commit_repository(self, repository, *, source_id, owner_org_id, created_by):
-        now = self.clock()
         with self._lock:
             stored = self._repositories.get(repository)
-            if stored is not None and stored[0].committed:
-                return stored[0]
-            record = RepositoryRecord(
-                repository=repository,
-                source_id=source_id,
-                owner_org_id=owner_org_id,
-                created_by=created_by,
-                committed=True,
-            )
-            self._repositories[repository] = (record, now, 0)
-            return record
+            if stored is None:
+                record = RepositoryRecord(repository, source_id, owner_org_id, created_by, committed=True)
+                stored = self._repositories[repository] = _StoredRepository(record, self.clock())
+            elif not stored.record.committed and stored.record.owner_org_id == owner_org_id:
+                stored.record = replace(stored.record, committed=True)
+            return stored.record
 
-    def release_repository(self, repository, *, reservation):
+    def release_repository(self, repository, *, owner_org_id):
         with self._lock:
             stored = self._repositories.get(repository)
-            if stored is None or stored[0].committed or stored[0].reservation != reservation:
+            if stored is None or stored.record.committed or stored.record.owner_org_id != owner_org_id:
                 return
-            record, until, holders = stored
-            if holders > 1:
-                self._repositories[repository] = (record, until, holders - 1)
-            else:
+            stored.holders -= 1
+            if stored.holders <= 0:
                 del self._repositories[repository]
 
     def published_repositories(self, source_id):
+        settled = self.clock() - timedelta(seconds=PENDING_ENUMERATION_GRACE_SECONDS)
         with self._lock:
             return sorted(
                 name
-                for name, (record, _until, _holders) in self._repositories.items()
-                if record.source_id == source_id and record.committed
+                for name, stored in self._repositories.items()
+                if stored.record.source_id == source_id and (stored.record.committed or stored.since <= settled)
             )
+
+    def commit_found(self, source_id, repositories):
+        found = 0
+        with self._lock:
+            for name in repositories:
+                stored = self._repositories.get(name)
+                if stored is not None and stored.record.source_id == source_id and not stored.record.committed:
+                    stored.record = replace(stored.record, committed=True)
+                    found += 1
+        return found
 
     # -- upload sessions ---------------------------------------------------------
 
-    def open_upload(self, *, upload_id, user_id, repository, source_id):
+    def open_upload(self, *, upload_id, user_id, repository, source_id, lease_seconds):
         now = self.clock()
+        lease = now + timedelta(seconds=lease_seconds)
         session = UploadSession(
             id=upload_id, user_id=user_id, repository=repository, source_id=source_id, upstream_location=None
         )
@@ -414,30 +441,48 @@ class InMemoryPublishStore(PublishStore):
             mine = [stored for stored in self._uploads.values() if stored.session.user_id == user_id]
             if len(mine) >= MAX_UPLOAD_ROWS_PER_USER:
                 raise UploadLimitError("too many upload sessions are still being cleaned up")
-            live = sorted(
-                (stored for stored in mine if stored.expires > now),
+            live = [stored for stored in mine if stored.expires > now]
+            # Never a slot that is still opening: its registry session is on its way.
+            evictable = sorted(
+                (stored for stored in live if stored.session.upstream_location is not None),
                 key=lambda stored: (stored.created, stored.session.id),
             )
-            for stored in live[: max(len(live) - (MAX_UPLOAD_SESSIONS_PER_USER - 1), 0)]:
+            for stored in evictable[: max(len(live) - (MAX_UPLOAD_SESSIONS_PER_USER - 1), 0)]:
                 stored.expires = now
             self._uploads[upload_id] = _StoredUpload(
-                session=session, created=now, expires=now + timedelta(seconds=UPLOAD_SESSION_TTL_SECONDS)
+                session=session,
+                created=now,
+                expires=now + timedelta(seconds=UPLOAD_SESSION_TTL_SECONDS),
+                leased_until=lease,
             )
-        return session
+        return replace(session, lease=lease)
 
-    def attach_upload(self, upload_id, upstream_location):
+    def attach_upload(self, upload_id, *, lease, upstream_location):
         with self._lock:
             stored = self._uploads.get(upload_id)
-            if stored is None:
+            if stored is None or stored.leased_until != lease:
                 return False
             stored.session = replace(stored.session, upstream_location=upstream_location)
+            stored.leased_until = None
             return True
+
+    def record_orphan(self, *, upload_id, user_id, repository, source_id, upstream_location):
+        now = self.clock()
+        session = UploadSession(
+            id=upload_id,
+            user_id=user_id,
+            repository=repository,
+            source_id=source_id,
+            upstream_location=upstream_location,
+        )
+        with self._lock:
+            self._uploads[upload_id] = _StoredUpload(session=session, created=now, expires=now)
 
     def _live(self, upload_id, user_id, repository, now) -> _StoredUpload | None:
         stored = self._uploads.get(upload_id)
         if (
             stored is None
-            or stored.expires <= now
+            or stored.dead(now)
             or stored.session.upstream_location is None
             or stored.session.user_id != user_id
             or stored.session.repository != repository
@@ -454,7 +499,7 @@ class InMemoryPublishStore(PublishStore):
         now = self.clock()
         with self._lock:
             stored = self._live(upload_id, user_id, repository, now)
-            if stored is None or (stored.leased_until is not None and stored.leased_until > now):
+            if stored is None or stored.leased_until is not None:
                 return None
             stored.leased_until = now + timedelta(seconds=lease_seconds)
             return replace(stored.session, lease=stored.leased_until)
@@ -502,14 +547,15 @@ class InMemoryPublishStore(PublishStore):
                 (
                     stored
                     for stored in self._uploads.values()
-                    if stored.expires <= now
-                    and (stored.leased_until is None or stored.leased_until <= now)
-                    and (user_id is None or stored.session.user_id == user_id)
+                    if (stored.leased_until is None and stored.expires <= now)
+                    or (stored.leased_until is not None and stored.leased_until <= now)
+                    if user_id is None or stored.session.user_id == user_id
                 ),
                 key=lambda stored: (stored.expires, stored.session.id),
             )
             for stored in stale[: max(limit, 0)]:
                 stored.leased_until = now + timedelta(seconds=lease_seconds)
+                stored.expires = min(stored.expires, now)
                 claimed.append(replace(stored.session, lease=stored.leased_until))
         return claimed
 
@@ -520,21 +566,8 @@ def _repository_from_row(row) -> RepositoryRecord:
         source_id=row["source_id"],
         owner_org_id=row["owner_org_id"],
         created_by=row["created_by"],
-        reservation=row["reservation"],
         committed=bool(row["committed"]),
     )
-
-
-def _held_by(record: RepositoryRecord, owner_org_id: str | None) -> RepositoryRecord:
-    """The record as the organization that just asked for the name may see it.
-
-    The reservation statement takes or joins every reservation it is allowed
-    to, so an uncommitted row of this organization's is one it now holds;
-    anybody else's reservation id is not theirs to be shown.
-    """
-
-    held = not record.committed and record.owner_org_id == owner_org_id
-    return record if held else replace(record, reservation=None)
 
 
 def _upload_from_row(row) -> UploadSession:
@@ -552,12 +585,14 @@ def _upload_from_row(row) -> UploadSession:
 UPLOAD_OPEN_LOCK_CLASS = int.from_bytes(b"cup1", "big")
 """First key of the advisory lock serializing one user's upload opening and pruning (second: ``hashtext(user)``)."""
 
-_REPOSITORY_COLUMNS = "repository, source_id, owner_org_id, created_by, committed, reservation"
+_REPOSITORY_COLUMNS = "repository, source_id, owner_org_id, created_by, committed"
 _UPLOAD_COLUMNS = "id, user_id, repository, source_id, upstream_location, received, leased_until"
+_USABLE = "expires_at > now() AND upstream_location IS NOT NULL"
+"""A session a client can still use, apart from its lease: unexpired and attached."""
 
 
 class PostgresPublishStore(PublishStore):
-    """The two tables of migration 14, over the shared pool. Carries no DDL."""
+    """Ownership and upload sessions over the shared pool."""
 
     def __init__(self, db):
         self._db = db
@@ -573,91 +608,91 @@ class PostgresPublishStore(PublishStore):
 
     def get_repository(self, repository):
         with bounded_connection(self._db) as conn:
-            row = conn.execute(
-                f"SELECT {_REPOSITORY_COLUMNS} FROM collab_cog_repositories WHERE repository = %s AND committed",
-                (repository,),
-            ).fetchone()
-        return _repository_from_row(row) if row else None
+            return self._read_repository(conn, repository)
 
-    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by, ttl_seconds):
+    def reserve_repository(self, repository, *, source_id, owner_org_id, created_by):
         with bounded_connection(self._db) as conn:
-            # One statement decides: a committed row, and a live reservation
-            # of another organization's, are both left exactly as they are; a
-            # live one of this organization's is joined; anything else is
-            # taken afresh.
+            # One statement decides: a committed row, and a pending row of
+            # another organization's, are both left exactly as they are; a
+            # pending row of this organization's counts one more attempt.
             conn.execute(
                 """
                 INSERT INTO collab_cog_repositories
-                    (repository, source_id, owner_org_id, created_by, committed, reservation, holders, reserved_until)
-                VALUES (%s, %s, %s, %s, false, %s, 1, now() + make_interval(secs => %s))
-                ON CONFLICT (repository) DO UPDATE SET
-                    source_id = EXCLUDED.source_id,
-                    owner_org_id = EXCLUDED.owner_org_id,
-                    created_by = EXCLUDED.created_by,
-                    reservation = CASE WHEN collab_cog_repositories.reserved_until > now()
-                                       THEN collab_cog_repositories.reservation ELSE EXCLUDED.reservation END,
-                    holders = CASE WHEN collab_cog_repositories.reserved_until > now()
-                                   THEN collab_cog_repositories.holders + 1 ELSE 1 END,
-                    reserved_until = EXCLUDED.reserved_until
+                    (repository, source_id, owner_org_id, created_by, committed, holders)
+                VALUES (%s, %s, %s, %s, false, 1)
+                ON CONFLICT (repository) DO UPDATE SET holders = collab_cog_repositories.holders + 1
                 WHERE NOT collab_cog_repositories.committed
-                  AND (collab_cog_repositories.reserved_until <= now()
-                       OR collab_cog_repositories.owner_org_id IS NOT DISTINCT FROM EXCLUDED.owner_org_id)
+                  AND collab_cog_repositories.owner_org_id IS NOT DISTINCT FROM EXCLUDED.owner_org_id
                 """,
-                (repository, source_id, owner_org_id, created_by, new_reservation_id(), ttl_seconds),
+                (repository, source_id, owner_org_id, created_by),
             )
-            # Read back in the same transaction: whoever holds the name now,
+            # Read back in the same transaction: whoever holds the name,
             # this is the record that stands, and the caller checks it.
-            return _held_by(self._read_repository(conn, repository), owner_org_id)
+            return self._read_repository(conn, repository)
 
     def commit_repository(self, repository, *, source_id, owner_org_id, created_by):
         with bounded_connection(self._db) as conn:
             conn.execute(
                 """
                 INSERT INTO collab_cog_repositories
-                    (repository, source_id, owner_org_id, created_by, committed, reserved_until)
-                VALUES (%s, %s, %s, %s, true, now())
-                ON CONFLICT (repository) DO UPDATE SET
-                    source_id = EXCLUDED.source_id,
-                    owner_org_id = EXCLUDED.owner_org_id,
-                    created_by = EXCLUDED.created_by,
-                    committed = true,
-                    reservation = NULL
+                    (repository, source_id, owner_org_id, created_by, committed, holders)
+                VALUES (%s, %s, %s, %s, true, 0)
+                ON CONFLICT (repository) DO UPDATE SET committed = true
                 WHERE NOT collab_cog_repositories.committed
+                  AND collab_cog_repositories.owner_org_id IS NOT DISTINCT FROM EXCLUDED.owner_org_id
                 """,
                 (repository, source_id, owner_org_id, created_by),
             )
             return self._read_repository(conn, repository)
 
-    def release_repository(self, repository, *, reservation):
+    def release_repository(self, repository, *, owner_org_id):
         with bounded_connection(self._db) as conn:
             # Counted down first, under the row's lock, and deleted only at
-            # zero: two releases at once cannot both see "one holder left".
+            # zero: two releases at once cannot both see "one attempt left".
             conn.execute(
                 """
                 UPDATE collab_cog_repositories SET holders = holders - 1
-                WHERE repository = %s AND NOT committed AND reservation = %s
+                WHERE repository = %s AND NOT committed AND owner_org_id IS NOT DISTINCT FROM %s
                 """,
-                (repository, reservation),
+                (repository, owner_org_id),
             )
             conn.execute(
                 """
                 DELETE FROM collab_cog_repositories
-                WHERE repository = %s AND NOT committed AND reservation = %s AND holders <= 0
+                WHERE repository = %s AND NOT committed AND owner_org_id IS NOT DISTINCT FROM %s AND holders <= 0
                 """,
-                (repository, reservation),
+                (repository, owner_org_id),
             )
 
     def published_repositories(self, source_id):
         with bounded_connection(self._db) as conn:
             rows = conn.execute(
-                "SELECT repository FROM collab_cog_repositories WHERE source_id = %s AND committed",
-                (source_id,),
+                """
+                SELECT repository FROM collab_cog_repositories
+                WHERE source_id = %s AND (committed OR created_at <= now() - make_interval(secs => %s))
+                """,
+                (source_id, PENDING_ENUMERATION_GRACE_SECONDS),
             ).fetchall()
         return sorted(row["repository"] for row in rows)
 
+    def commit_found(self, source_id, repositories):
+        names = sorted(set(repositories))
+        if not names:
+            return 0
+        with bounded_connection(self._db) as conn:
+            rows = conn.execute(
+                """
+                UPDATE collab_cog_repositories SET committed = true
+                WHERE source_id = %s AND repository = ANY(%s) AND NOT committed
+                RETURNING repository
+                """,
+                (source_id, names),
+            ).fetchall()
+        return len(rows)
+
     # -- upload sessions ---------------------------------------------------------
 
-    def open_upload(self, *, upload_id, user_id, repository, source_id):
+    def open_upload(self, *, upload_id, user_id, repository, source_id, lease_seconds):
         with bounded_connection(self._db) as conn:
             # One user's opening and retiring are serialized, so concurrent
             # opens cannot each count before the other commits and leave the
@@ -670,44 +705,66 @@ class PostgresPublishStore(PublishStore):
             if int(held["n"]) >= MAX_UPLOAD_ROWS_PER_USER:
                 raise UploadLimitError("too many upload sessions are still being cleaned up")
             # Retired, not deleted: the registry still holds a session for
-            # each, and the row is what remembers where to cancel it.
+            # each, and the row is what remembers where to cancel it. Never
+            # a slot that is still opening (no location yet): its registry
+            # session is on its way, and nobody else knows where it will be.
             conn.execute(
                 """
                 UPDATE collab_cog_upload_sessions SET expires_at = now()
-                WHERE user_id = %s AND expires_at > now() AND id NOT IN (
+                WHERE id IN (
                     SELECT id FROM collab_cog_upload_sessions
-                    WHERE user_id = %s AND expires_at > now()
-                    ORDER BY created_at DESC, id DESC
-                    LIMIT %s
+                    WHERE user_id = %s AND expires_at > now() AND upstream_location IS NOT NULL
+                    ORDER BY created_at, id
+                    LIMIT GREATEST((
+                        SELECT count(*) FROM collab_cog_upload_sessions
+                        WHERE user_id = %s AND expires_at > now()
+                    ) - %s, 0)
                 )
                 """,
                 (user_id, user_id, MAX_UPLOAD_SESSIONS_PER_USER - 1),
             )
             row = conn.execute(
                 f"""
-                INSERT INTO collab_cog_upload_sessions (id, user_id, repository, source_id, expires_at)
-                VALUES (%s, %s, %s, %s, now() + make_interval(secs => %s))
+                INSERT INTO collab_cog_upload_sessions (id, user_id, repository, source_id, leased_until, expires_at)
+                VALUES (%s, %s, %s, %s, clock_timestamp() + make_interval(secs => %s),
+                        now() + make_interval(secs => %s))
                 RETURNING {_UPLOAD_COLUMNS}
                 """,
-                (upload_id, user_id, repository, source_id, UPLOAD_SESSION_TTL_SECONDS),
+                (upload_id, user_id, repository, source_id, lease_seconds, UPLOAD_SESSION_TTL_SECONDS),
             ).fetchone()
         return _upload_from_row(row)
 
-    def attach_upload(self, upload_id, upstream_location):
+    def attach_upload(self, upload_id, *, lease, upstream_location):
         with bounded_connection(self._db) as conn:
             row = conn.execute(
-                "UPDATE collab_cog_upload_sessions SET upstream_location = %s WHERE id = %s RETURNING id",
-                (upstream_location, upload_id),
+                """
+                UPDATE collab_cog_upload_sessions SET upstream_location = %s, leased_until = NULL
+                WHERE id = %s AND leased_until = %s
+                RETURNING id
+                """,
+                (upstream_location, upload_id, lease),
             ).fetchone()
         return row is not None
+
+    def record_orphan(self, *, upload_id, user_id, repository, source_id, upstream_location):
+        with bounded_connection(self._db) as conn:
+            conn.execute(
+                """
+                INSERT INTO collab_cog_upload_sessions
+                    (id, user_id, repository, source_id, upstream_location, expires_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (upload_id, user_id, repository, source_id, upstream_location),
+            )
 
     def get_upload(self, upload_id, *, user_id, repository):
         with bounded_connection(self._db) as conn:
             row = conn.execute(
                 f"""
                 SELECT {_UPLOAD_COLUMNS} FROM collab_cog_upload_sessions
-                WHERE id = %s AND user_id = %s AND repository = %s
-                  AND expires_at > now() AND upstream_location IS NOT NULL
+                WHERE id = %s AND user_id = %s AND repository = %s AND {_USABLE}
+                  AND (leased_until IS NULL OR leased_until > now())
                 """,
                 (upload_id, user_id, repository),
             ).fetchone()
@@ -716,14 +773,14 @@ class PostgresPublishStore(PublishStore):
     def lease_upload(self, upload_id, *, user_id, repository, lease_seconds):
         with bounded_connection(self._db) as conn:
             # Compare-and-set on the row: of two requests for one session, on
-            # any two replicas, exactly one gets it.
+            # any two replicas, exactly one gets it. A lease that has run out
+            # is not free: its holder never said what the registry took.
             row = conn.execute(
                 f"""
                 UPDATE collab_cog_upload_sessions
                 SET leased_until = clock_timestamp() + make_interval(secs => %s)
-                WHERE id = %s AND user_id = %s AND repository = %s
-                  AND expires_at > now() AND upstream_location IS NOT NULL
-                  AND (leased_until IS NULL OR leased_until <= now())
+                WHERE id = %s AND user_id = %s AND repository = %s AND {_USABLE}
+                  AND leased_until IS NULL
                 RETURNING {_UPLOAD_COLUMNS}
                 """,
                 (lease_seconds, upload_id, user_id, repository),
@@ -773,10 +830,11 @@ class PostgresPublishStore(PublishStore):
             rows = conn.execute(
                 f"""
                 UPDATE collab_cog_upload_sessions
-                SET leased_until = clock_timestamp() + make_interval(secs => %s)
+                SET leased_until = clock_timestamp() + make_interval(secs => %s),
+                    expires_at = LEAST(expires_at, now())
                 WHERE id IN (
                     SELECT id FROM collab_cog_upload_sessions
-                    WHERE expires_at <= now() AND (leased_until IS NULL OR leased_until <= now())
+                    WHERE ((leased_until IS NULL AND expires_at <= now()) OR leased_until <= now())
                       AND (%s::text IS NULL OR user_id = %s)
                     ORDER BY expires_at, id
                     LIMIT %s

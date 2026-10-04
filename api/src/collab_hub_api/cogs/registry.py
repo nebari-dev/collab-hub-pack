@@ -75,6 +75,16 @@ class RegistrySourceError(Exception):
     """
 
 
+class RegistryRepositoryNotFound(RegistrySourceError):
+    """The adapter's API says this repository does not exist.
+
+    A :class:`RegistrySourceError` like any other to every caller but one:
+    a sweep that was sent to a repository because of a publish through the
+    Hub (issue #180) reads it as "nothing there", the same answer a generic
+    registry gives with a 404 on the tag listing.
+    """
+
+
 class RegistrySourceAuthError(RegistrySourceError):
     """The registry's listing API refused the configured credential."""
 

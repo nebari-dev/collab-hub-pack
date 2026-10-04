@@ -51,7 +51,7 @@ COLLAB_TABLES = (
     "collab_cog_registry_credentials",
     "collab_cog_manifest_blobs",
     "collab_cog_repositories",
-    "collab_cog_pending_publications",
+    "collab_cog_publication_attempts",
     "collab_cog_upload_sessions",
     "collab_cog_artifacts",
     "collab_service_access_grants",
@@ -415,9 +415,9 @@ def test_migration_creates_the_cog_publishing_schema():
         "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
         "ALTER TABLE collab_cog_registry_tokens"
         " ADD COLUMN IF NOT EXISTS push_repositories text[] NOT NULL DEFAULT '{}'",
-        # Only committed rows are ownership, and only they are enumerated.
-        "CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx ON collab_cog_repositories (source_id)"
-        " WHERE committed",
+        "CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx ON collab_cog_repositories (source_id)",
+        "CREATE INDEX IF NOT EXISTS collab_cog_publication_attempts_digest_idx"
+        " ON collab_cog_publication_attempts (source_id, repository, digest)",
         "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_expiry_idx ON collab_cog_upload_sessions (expires_at)",
         "CREATE INDEX IF NOT EXISTS collab_cog_upload_sessions_user_idx ON collab_cog_upload_sessions (user_id)",
     ):
@@ -426,12 +426,13 @@ def test_migration_creates_the_cog_publishing_schema():
     # One owner per repository path, whatever source it was written through.
     assert "repository text PRIMARY KEY" in repositories and "owner_org_id text," in repositories
     assert "created_by text NOT NULL" in repositories and "source_id text NOT NULL" in repositories
-    # A row is a reservation until the registry accepts a manifest: never ownership by default.
+    # A row is pending until the registry accepts a manifest, and it never expires: no column says when.
     assert "committed boolean NOT NULL DEFAULT false" in repositories
-    assert "reservation text," in repositories and "reserved_until timestamptz NOT NULL" in repositories
-    assert "holders integer NOT NULL DEFAULT 0" in repositories
-    (pending,) = server.ddl_for("collab_cog_pending_publications")
-    assert "PRIMARY KEY (source_id, repository, digest)" in pending and "published_by text NOT NULL" in pending
+    assert "holders integer NOT NULL DEFAULT 0" in repositories and "until" not in repositories
+    (attempts,) = server.ddl_for("collab_cog_publication_attempts")
+    # One row per attempt, and accepted only when it says so.
+    assert "attempt_id text PRIMARY KEY" in attempts and "published_by text NOT NULL" in attempts
+    assert "accepted_at timestamptz" in attempts and "accepted_at timestamptz NOT NULL" not in attempts
     (uploads,) = server.ddl_for("collab_cog_upload_sessions")
     # The slot exists before the registry's session does, so the location starts out unknown.
     assert "id text PRIMARY KEY" in uploads and "upstream_location text," in uploads
@@ -443,7 +444,7 @@ def test_migration_creates_the_cog_publishing_schema():
     )
     for name in (
         "collab_cog_repositories",
-        "collab_cog_pending_publications",
+        "collab_cog_publication_attempts",
         "collab_cog_upload_sessions",
         "published_by",
         "push_repositories",
@@ -496,7 +497,7 @@ PINNED_CHECKSUMS = {
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
     13: "0fdba92b5b894fa4358da5ebada5a33ce23a527e181dce411268df650a71935d",
-    14: "21267a955b8c3322bd783266f78e3ae6fa60f50f1915851a3d141de0e2301d6b",
+    14: "3609122830be48e9ad31631ce5a7d03992f3f3d8732ab417c0a7cdeff6f530e1",
 }
 
 

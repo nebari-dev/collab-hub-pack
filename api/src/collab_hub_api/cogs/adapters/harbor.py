@@ -36,6 +36,7 @@ from ..registry import (
     CogRegistrySourceConfig,
     OCIClientFactory,
     RegistryEvent,
+    RegistryRepositoryNotFound,
     RegistrySourceAuthError,
     RegistrySourceError,
     RegistrySourceProtocolError,
@@ -247,7 +248,8 @@ class HarborRegistrySource:
                 f"source {self.id!r}: the registry API refused the configured credential for {path} (HTTP {status})"
             )
         if status == 404:
-            raise RegistrySourceError(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
+            kind = RegistryRepositoryNotFound if path.endswith("/artifacts") else RegistrySourceError
+            raise kind(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
         raise RegistrySourceProtocolError(f"source {self.id!r}: {path} answered HTTP {status}")
 
     # -- webhooks --------------------------------------------------------------

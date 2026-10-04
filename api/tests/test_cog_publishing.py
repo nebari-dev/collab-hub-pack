@@ -403,10 +403,13 @@ async def test_publishing_is_off_without_a_publish_source(make_hub):
         response = await hub.request(method, path.format(repo=REPO, upload="up-1"), headers=token, content=body)
         assert response.status_code == 405 and response.json()["errors"][0]["code"] == "UNSUPPORTED", (method, path)
     off = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json={"scope": "publish"})
-    assert off.status_code == 404 and off.json()["error"]["code"] == "cog_publishing_not_enabled"
+    assert off.status_code == 422 and off.json()["error"]["code"] == "validation_error"
     assert hub.upstream.requests == []
     # And the catalog's answers have no publication keys at all: what they were before publishing existed.
-    hub.catalog.record_published(catalog_row(REPO, COG.digest), tag="latest", user_id="alice", org_id="org-a")
+    hub.catalog.note_publication("pub-1", "backing", REPO, COG.digest, user_id="alice", org_id="org-a")
+    hub.catalog.accept_publication("pub-1")
+    hub.catalog.record_published(catalog_row(REPO, COG.digest), tag="latest")
+    assert hub.catalog.get(COG.digest).published_by == "alice"
     cog = "example/cog-audio-transcriber"
     for url in ("/v1/cogs", f"/v1/cogs/{cog}", f"/v1/cogs/{cog}/versions/{COG.digest}"):
         assert "published_by" not in (await hub.get(url, headers=ALICE)).text, url

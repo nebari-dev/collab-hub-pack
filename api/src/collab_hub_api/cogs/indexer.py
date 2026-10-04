@@ -110,7 +110,7 @@ from .oci import (
     select_bundle_layers,
 )
 from .profile import PIXI_MANIFEST, PROFILE_PARSED
-from .registry import ArtifactRef, RegistrySource
+from .registry import ArtifactRef, RegistryRepositoryNotFound, RegistrySource
 
 logger = logging.getLogger("frames_server.cogs.indexer")
 
@@ -270,6 +270,7 @@ class CogIndexer:
         drain_deadline_seconds: float = DRAIN_DEADLINE_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         published_repositories: Callable[[str], Sequence[str]] | None = None,
+        repositories_found: Callable[[str, Sequence[str]], object] | None = None,
     ) -> None:
         self._store = store
         self._sources = list(sources)
@@ -277,6 +278,10 @@ class CogIndexer:
         # enumerated along with whatever the source itself lists, so the
         # publish target needs no configured repository list.
         self._published_repositories = published_repositories
+        # Told, after each source is swept, which repositories were found to
+        # hold something: a repository whose publish was accepted by the
+        # registry but never recorded as such is settled by this.
+        self._repositories_found = repositories_found
         self._max_artifacts = max_artifacts_per_repository
         self._drain_deadline = drain_deadline_seconds
         self._max_new_fetches = max_new_fetches_per_sweep
@@ -631,6 +636,9 @@ class CogIndexer:
             excluding=enumeration.failed_repositories,
             **({"written_before": started} if started is not None else {}),
         )
+        if self._repositories_found is not None:
+            holding = sorted(repo for repo, digests in present.items() if digests)
+            await self._on_thread(self._repositories_found, source.id, holding)
         summary.removed += removed
         if removed:
             COG_INDEX_ARTIFACTS.labels(outcome=OUTCOME_REMOVED).inc(removed)
@@ -710,11 +718,12 @@ class CogIndexer:
             result.complete = False
             result.errors.append(f"list_repositories: {_describe(exc)}")
             return result
+        published: set[str] = set()
         if self._published_repositories is not None:
             # A store read, outside the guard above on purpose: like every
             # other store error, a database outage here aborts the sweep.
-            published = await self._on_thread(self._published_repositories, source.id)
-            repositories = sorted(set(repositories) | set(published))
+            published = set(await self._on_thread(self._published_repositories, source.id)) - set(repositories)
+            repositories = sorted(set(repositories) | published)
         for repository in repositories:
             try:
                 artifacts = await source.list_artifacts(repository)
@@ -722,6 +731,15 @@ class CogIndexer:
                 # A configured repository that does not exist (yet) has no
                 # artifacts; that is an answer, not a failure, and its rows
                 # -- if it ever had any -- are correctly marked removed.
+                artifacts = []
+            except RegistryRepositoryNotFound as exc:
+                if repository not in published:
+                    result.failed_repositories.append(repository)
+                    result.errors.append(f"list_artifacts {repository}: {_describe(exc)}; removal skipped for it")
+                    continue
+                # Enumerated only because a publish through the Hub named
+                # it, and the registry has no such repository: the publish
+                # never landed. Empty, like the generic registry's 404.
                 artifacts = []
             except Exception as exc:
                 result.failed_repositories.append(repository)
@@ -828,21 +846,18 @@ class CogIndexer:
 
         return await self._read_artifact(source, repository, artifact)
 
-    async def record_published(
-        self, row: CogArtifact, *, tag: str | None, user_id: str, org_id: str | None
-    ) -> CogArtifact:
+    async def record_published(self, row: CogArtifact, *, tag: str | None) -> CogArtifact:
         """Store a row obtained from :meth:`inspect` for a manifest the registry has accepted; return what was stored.
 
         The catalog's publish write (:meth:`.catalog.CogCatalogStore.record_published`:
-        tag assignment and publisher in one transaction), lock-less like
+        the row and its tag assignment in one transaction), lock-less like
         :meth:`reindex`, with the same second line as every other write: a
         card the database refuses is stored as a ``failed`` row -- still
-        carrying the tag and the publisher, so a later sweep that manages to
-        index it attributes it correctly -- and that row is what is
+        carrying the tag and the publisher -- and that row is what is
         returned. The caller must look at its status.
         """
 
-        write = partial(self._store.record_published, tag=tag, user_id=user_id, org_id=org_id)
+        write = partial(self._store.record_published, tag=tag)
         try:
             await self._on_thread(write, row)
             return row

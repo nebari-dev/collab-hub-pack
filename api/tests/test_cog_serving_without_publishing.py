@@ -81,6 +81,29 @@ async def test_an_upload_path_is_a_blob_path_like_any_other(hub: Hub, method):
     assert hub.upstream.requests == [], "nothing was asked of the backing registry"
 
 
+async def test_publish_is_not_a_scope_the_credential_exchange_knows(hub: Hub):
+    """Refused by validation, like any scope that does not exist: the same status, code and details."""
+
+    refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json={"scope": "publish"})
+    assert refused.status_code == 422
+    assert refused.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Request validation failed",
+            "details": [
+                {
+                    "type": "literal_error",
+                    "loc": ["body", "scope"],
+                    "msg": "Input should be 'pull'",
+                    "input": "publish",
+                    "ctx": {"expected": "'pull'"},
+                }
+            ],
+        }
+    }
+    assert (await hub.exchange(ALICE))["scope"] == "pull"
+
+
 async def test_every_write_is_refused_as_read_only_before_anything_else(hub: Hub):
     hub.seed(REPO, ALPHA, "v1")
     reader = await hub.pull_token(REPO)

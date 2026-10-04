@@ -12,10 +12,10 @@ before a byte is forwarded (:meth:`CogPublisher.authorize`):
    role or a user id the deployment's configuration names. Nobody by
    default, and being able to pull never implies it;
 2. the repository is one the caller's **organization owns**, or a new one. A
-   repository first published through the Hub belongs to the publisher's
-   organization, from the moment the registry accepts the first manifest for
-   it; later pushes need membership of that organization. A platform
-   operator may push to any;
+   repository belongs to the organization that first publishes to it
+   through the Hub, from *before* its first manifest is forwarded (see
+   below); later pushes need membership of that organization. A platform
+   operator may push to any that is settled;
 3. a repository the catalog already knows but that was **not** published
    through the Hub (it has no owner record) accepts pushes from platform
    operators only.
@@ -27,14 +27,17 @@ buffered. The backing registry verifies each blob against its digest when
 the upload is closed. Three rules keep the two sides in step:
 
 - the Hub's slot is taken **before** the registry is asked to open its
-  session, so the per-user cap holds before anything exists upstream;
-- a session the Hub lets go of -- past the cap, expired, cancelled -- is
-  cancelled at the registry **before** its record is deleted, a few per
+  session, so the per-user cap holds before anything exists upstream, and
+  is held by its opener until the registry's session is attached to it;
+- a session the Hub lets go of -- past the cap, expired, cancelled, dead --
+  is cancelled at the registry **before** its record is deleted, a few per
   request, and a record whose cancellation failed is kept until it succeeds;
 - one request at a time may write to a session: each takes the session's
-  **lease** before it forwards anything and gives it back when its
-  bookkeeping is done, so two requests cannot both read the same byte count
-  and both add to it.
+  **lease** before it forwards anything, and gives it back only when it
+  knows what the registry took. After any write whose outcome is not known
+  -- a timeout, a lost response, a failure to record it -- the session is
+  **retired**: the Hub's byte count can no longer be trusted, so the client
+  is told the upload is unknown and starts again.
 
 **A manifest is validated before it is committed**
 (:meth:`CogPublisher.put_manifest`). The blobs it names were just uploaded,
@@ -43,12 +46,18 @@ indexer's code path, *before* forwarding the manifest. A bundle the catalog
 would not list -- not a Cog, no id, or a reader error -- is refused with the
 reader's errors, nothing is written to the registry and nothing is listed.
 
-**Nothing is owned or listed until the registry has accepted the
-manifest.** Before forwarding it the Hub only *reserves* the repository name
-and *notes* who is publishing the digest. The registry's answer decides: on
-acceptance the reservation becomes ownership and the row is written; on a
-definite refusal both are withdrawn; when the outcome is unknown the
-reservation expires and the note waits for whichever write lists the digest.
+**The name is its publisher's organization's before the manifest is
+forwarded, and nothing is listed until the registry has accepted it.** The
+Hub first writes the repository's row, *pending* and owned by the
+publisher's organization, and a record of the attempt. The registry's
+answer then decides: on acceptance the row is committed, the attempt is
+marked accepted and the catalog row is written; on a definite refusal the
+attempt is dropped and, if it was the organization's last one in flight,
+so is the pending row. When the outcome is unknown nothing is withdrawn:
+the registry may hold the manifest, so the name stays that organization's
+-- no other organization can take it, only the same one can try again, and
+after a grace period sweeps look there and settle it if they find content.
+Only an attempt known to be accepted ever says who published a digest.
 
 **An accepted manifest is indexed in the request**: the row the validation
 produced is stored through the indexer's lock-less targeted path, in one
@@ -77,7 +86,7 @@ import anyio
 from starlette.concurrency import run_in_threadpool
 
 from ..frames.orgs import PLATFORM_ROLE_OPERATOR
-from .catalog import STATUS_INDEXED, CogCatalogStore
+from .catalog import STATUS_INDEXED, CogCatalogStore, new_attempt_id
 from .deadline import renew as renew_budget
 from .indexer import CogIndexer
 from .oci import (
@@ -101,14 +110,6 @@ logger = logging.getLogger("frames_server.cogs.publishing")
 
 PUBLISH_ROLES = ("operator", "owner", "member")
 """The roles ``cogs.publish.allowed_roles`` may name: the platform role, then the two organization roles."""
-
-RESERVATION_TTL_SECONDS = 300.0
-"""How long a repository name stays reserved for a manifest whose outcome at the registry is unknown.
-
-Several times the deadline of the request that forwards the manifest, so a
-reservation cannot run out under a request that is still waiting for the
-registry's answer.
-"""
 
 LEASE_MARGIN_SECONDS = 60.0
 """A session's lease outlasts the longest request that can hold it (``max_blob_seconds``) by this much."""
@@ -350,19 +351,38 @@ class CogPublisher:
             if isinstance(exc, OCIError):
                 raise self._unavailable("upload start", exc) from None
             raise
+        # The slot is still this request's: its lease has kept the cap and
+        # the cleanup away from it while the registry was opening.
         try:
-            attached = await run_in_threadpool(self._store.attach_upload, session.id, location)
+            attached = await run_in_threadpool(
+                lambda: self._store.attach_upload(session.id, lease=session.lease, upstream_location=location)
+            )
         except BaseException:
-            # The registry has a session the Hub could not record: drop it
-            # there rather than leave it for the registry's own expiry.
-            with anyio.CancelScope(shield=True):
-                await self._source.oci().cancel_upload(repository, location)
+            await self._drop_unattached(publisher, repository, location)
             raise
         if not attached:
-            await self._source.oci().cancel_upload(repository, location)
+            await self._drop_unattached(publisher, repository, location)
             raise PublishUnavailable("the upload could not be opened; try again")
         await self._retire_stale()
-        return replace(session, upstream_location=location)
+        return replace(session, upstream_location=location, lease=None)
+
+    async def _drop_unattached(self, publisher: Publisher, repository: str, location: str) -> None:
+        """The registry opened a session the Hub has no slot for: cancel it there, or remember where it is."""
+
+        with anyio.CancelScope(shield=True):
+            if await self._source.oci().cancel_upload(repository, location):
+                return
+        # Not known to be gone. Its location is all that can ever cancel it,
+        # so it is kept, as a dead session for the cleanup to retry.
+        await self._settle(
+            lambda: self._store.record_orphan(
+                upload_id=new_upload_id(),
+                user_id=publisher.user_id,
+                repository=repository,
+                source_id=self._source.id,
+                upstream_location=location,
+            )
+        )
 
     async def _open(self, publisher: Publisher, repository: str) -> UploadSession:
         def open_slot() -> UploadSession:
@@ -371,6 +391,7 @@ class CogPublisher:
                 user_id=publisher.user_id,
                 repository=repository,
                 source_id=self._source.id,
+                lease_seconds=self._lease_seconds,
             )
 
         try:
@@ -388,8 +409,8 @@ class CogPublisher:
     async def _retire_stale(self, *, user_id: str | None = None) -> None:
         """Cancel, at the registry, a few sessions the Hub has let go of; then forget them. Best effort, bounded.
 
-        Sessions past their expiry -- timed out, or retired by the per-user
-        cap -- are claimed a few at a time. Each is cancelled at the registry
+        Dead sessions -- timed out, retired by the per-user cap, or left by a
+        write whose outcome nobody recorded -- are claimed a few at a time. Each is cancelled at the registry
         *first* and its record deleted only once the registry says the
         session is gone; one that could not be cancelled keeps its record and
         is claimed again later. Nothing here fails the request that runs it.
@@ -429,9 +450,16 @@ class CogPublisher:
         Taken before anything is sent to the registry's session, so of two
         requests for one upload -- on any two replicas -- one forwards and
         the other is told to retry. Only the row is held, never a database
-        connection. The lease is given back when the block ends unless the
-        session's own bookkeeping already let it go, and runs out by itself
-        if this process dies holding it.
+        connection.
+
+        How the block ends decides what becomes of the session. Bookkeeping
+        that recorded the outcome has already let the lease go. A block that
+        ends knowing the registry took nothing gives the lease back,
+        unchanged. A block that ends *not knowing* -- ``held.uncertain``,
+        set before anything is forwarded and cleared only on a definite
+        answer -- retires the session: its byte count may be wrong, and a
+        later write must not build on it. If even that cannot be recorded,
+        the lease simply runs out, which the store reads the same way.
         """
 
         session = await run_in_threadpool(
@@ -447,8 +475,22 @@ class CogPublisher:
         try:
             yield held
         finally:
-            if held.leased:
+            if held.leased and held.uncertain:
+                await self._retire(held)
+            elif held.leased:
                 await self._settle(lambda: self._store.release_upload(upload_id, lease=session.lease))
+
+    async def _retire(self, held: _Held) -> None:
+        """End a session after a write whose outcome is unknown. Never raises."""
+
+        logger.warning("cog_publish_upload_retired", extra={"source_id": self._source.id})
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._abandon(held)
+            except Exception as exc:
+                logger.warning(
+                    "cog_publish_bookkeeping_failed", extra={"source_id": self._source.id, "error": type(exc).__name__}
+                )
 
     async def _settle(self, call, /, *args) -> None:
         """Run a piece of session bookkeeping that must happen however the request is ending. Never raises."""
@@ -479,6 +521,7 @@ class CogPublisher:
             span = self._check_range(session, content_range, length)
             self._check_size(session.received + (length or 0))
             counter = _Counted(content, limit=self._max_blob_bytes - session.received, expect=span)
+            held.uncertain = True
             try:
                 location = await self._source.oci().upload_chunk(
                     repository, session.upstream_location, counter.chunks(), offset=session.received, length=length
@@ -489,8 +532,18 @@ class CogPublisher:
             except _LengthMismatch:
                 await self._abandon(held)
                 raise UploadInvalid(_RANGE_LENGTH) from None
-            except OCIError as exc:
+            except OCIRejected as exc:
+                # A definite no: the registry took nothing.
+                if exc.status == 404:
+                    await self._abandon(held, cancel=False)
+                held.uncertain = False
                 raise self._write_failed("upload chunk", exc, session) from None
+            except OCIAuthError as exc:
+                held.uncertain = False
+                raise self._unavailable("upload chunk", exc) from None
+            except OCIError as exc:
+                # Sent, and no usable answer: it may have taken all of it, some, or none.
+                raise self._unavailable("upload chunk", exc) from None
             renew_budget()
             received = session.received + counter.count
             moved = await run_in_threadpool(
@@ -535,6 +588,7 @@ class CogPublisher:
                 if content is not None
                 else None
             )
+            held.uncertain = True
             try:
                 await self._source.oci().finish_upload(
                     repository,
@@ -555,6 +609,9 @@ class CogPublisher:
                     raise UploadUnknown("blob upload unknown to registry") from None
                 # The registry checked the bytes against the digest and they did not match.
                 raise DigestInvalid("the uploaded content does not match the digest") from None
+            except OCIAuthError as exc:
+                held.uncertain = False
+                raise self._unavailable("upload finish", exc) from None
             except OCIError as exc:
                 raise self._unavailable("upload finish", exc) from None
             renew_budget()
@@ -600,12 +657,10 @@ class CogPublisher:
     def _too_large(self) -> str:
         return f"the blob is over this registry's {self._max_blob_bytes}-byte limit"
 
-    def _write_failed(self, what: str, exc: OCIError, session: UploadSession) -> PublishError:
-        if isinstance(exc, OCIRejected):
-            if exc.status == 404:
-                return UploadUnknown("blob upload unknown to registry")
-            return UploadInvalid("the registry refused the chunk", received=session.received)
-        return self._unavailable(what, exc)
+    def _write_failed(self, what: str, exc: OCIRejected, session: UploadSession) -> PublishError:
+        if exc.status == 404:
+            return UploadUnknown("blob upload unknown to registry")
+        return UploadInvalid("the registry refused the chunk", received=session.received)
 
     # -- manifests -------------------------------------------------------------
 
@@ -634,67 +689,69 @@ class CogPublisher:
 
         row = await self._validate(repository, manifest, (tag,) if tag is not None else ())
 
-        # The name is reserved, not owned: of two organizations publishing a
-        # new name at once, one holds it and the other is refused here,
-        # before the write. Whether anybody *owns* it is the registry's
-        # answer to decide.
+        # The name is this organization's from here, durably and before the
+        # registry can have anything: pending until the registry answers.
+        # Of two organizations publishing a new name at once, one holds it
+        # and the other is refused here, before the write.
         record = await run_in_threadpool(
             lambda: self._store.reserve_repository(
-                repository,
-                source_id=self._source.id,
-                owner_org_id=publisher.org_id,
-                created_by=publisher.user_id,
-                ttl_seconds=RESERVATION_TTL_SECONDS,
+                repository, source_id=self._source.id, owner_org_id=publisher.org_id, created_by=publisher.user_id
             )
         )
+        holding = not record.committed and record.owner_org_id == publisher.org_id
         if record.committed:
             self._require_owner(publisher, record.owner_org_id, repository)
-        elif record.reservation is None:
+        elif not holding:
             raise PublishDenied(f"{repository} is being published by another organization")
-        # Who is publishing this digest, on record before the registry can
-        # have it: whatever happens to this request after the registry
-        # accepts, the write that lists the digest knows whose it is.
-        await run_in_threadpool(
-            lambda: self._catalog.note_publication(
-                self._source.id, repository, digest, user_id=publisher.user_id, org_id=publisher.org_id
+        # This attempt, on record before the registry can have the manifest.
+        # It says who published the digest only once it is marked accepted.
+        attempt = new_attempt_id()
+        try:
+            await run_in_threadpool(
+                lambda: self._catalog.note_publication(
+                    attempt, self._source.id, repository, digest, user_id=publisher.user_id, org_id=publisher.org_id
+                )
             )
-        )
+        except BaseException:
+            # Nothing was forwarded: as definite as a refusal.
+            await self._withdraw(publisher, repository, None, holding)
+            raise
 
         try:
             await self._source.oci().put_manifest(repository, reference, body, manifest.media_type or content_type)
         except (OCIRejected, OCIAuthError) as exc:
-            # A definite no: nothing was stored, so nothing is reserved or noted.
-            await self._withdraw(publisher, repository, digest, record.reservation)
+            # A definite no: nothing was stored, so this attempt is withdrawn.
+            await self._withdraw(publisher, repository, attempt, holding)
             if isinstance(exc, OCIRejected):
                 raise ManifestInvalid("the registry refused the manifest") from None
             raise self._unavailable("manifest put", exc) from None
         except OCIError as exc:
-            # Unknown: the registry may hold the manifest. The reservation
-            # runs out by itself and the note stays for whichever write
-            # lists the digest.
+            # Unknown: the registry may hold the manifest. Nothing is
+            # withdrawn -- the name stays this organization's, pending, and
+            # the attempt stays unaccepted, attributing nothing.
             raise self._unavailable("manifest put", exc) from None
 
-        # Accepted. The repository is its publisher's organization's from
-        # here on, and the row is written now -- from the row the validation
-        # produced -- so the catalog lists it without waiting for a sweep.
+        # Accepted. The attempt may now say who published the digest, the
+        # repository is settled, and the row is written now -- from the row
+        # the validation produced -- so the catalog lists it without waiting
+        # for a sweep.
         manifest_accepted.set(True)
         try:
+            await run_in_threadpool(self._catalog.accept_publication, attempt)
             owner = await run_in_threadpool(
                 lambda: self._store.commit_repository(
                     repository, source_id=self._source.id, owner_org_id=publisher.org_id, created_by=publisher.user_id
                 )
             )
             self._require_owner(publisher, owner.owner_org_id, repository)
-            stored = await self._indexer.record_published(
-                row, tag=tag, user_id=publisher.user_id, org_id=publisher.org_id
-            )
+            stored = await self._indexer.record_published(row, tag=tag)
             if stored.status == STATUS_INDEXED:
                 await run_in_threadpool(
                     self._catalog.record_manifest_blobs, self._source.id, repository, digest, manifest_blobs(manifest)
                 )
         except PublishDenied:
-            # Only if the reservation ran out under this request and another
-            # organization's manifest was accepted first.
+            # Only if an operator released the pending row under this
+            # request and another organization then took the name.
             logger.error("cog_publish_ownership_lost", extra={"repository": repository, "digest": digest})
             raise
         except Exception as exc:
@@ -715,11 +772,12 @@ class CogPublisher:
         )
         return digest
 
-    async def _withdraw(self, publisher: Publisher, repository: str, digest: str, reservation: str | None) -> None:
+    async def _withdraw(self, publisher: Publisher, repository: str, attempt: str | None, holding: bool) -> None:
         def withdraw() -> None:
-            if reservation is not None:
-                self._store.release_repository(repository, reservation=reservation)
-            self._catalog.forget_publication(self._source.id, repository, digest, user_id=publisher.user_id)
+            if attempt is not None:
+                self._catalog.forget_publication(attempt)
+            if holding:
+                self._store.release_repository(repository, owner_org_id=publisher.org_id)
 
         await self._settle(withdraw)
 
@@ -767,6 +825,8 @@ class _Held:
 
     session: UploadSession
     leased: bool = True
+    uncertain: bool = False
+    """Something was forwarded to the registry session and what it took has not been established."""
 
 
 class _LimitExceeded(Exception):

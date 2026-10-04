@@ -56,7 +56,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ..cogs.catalog import (
     STATUS_INDEXED,
@@ -76,6 +76,7 @@ from ..cogs.models import (
     CogLocation,
     CogReference,
     CogVersion,
+    PullOnlyRegistryCredentialRequest,
     RegistryCredentialRequest,
     RegistryCredentialResponse,
     client_reference,
@@ -284,10 +285,6 @@ class CogVersionNotFoundError(LookupError):
     """This digest is not indexed as a version of this Cog."""
 
 
-class CogPublishingNotEnabledError(LookupError):
-    """This Hub accepts no publishes (no registry source is marked ``publish: true``)."""
-
-
 class CogPublishForbiddenError(PermissionError):
     """The caller does not hold the publish permission."""
 
@@ -437,9 +434,10 @@ def create_registry_credential(
     gives, with whatever credential that registry takes.
 
     `{"scope": "publish"}` asks for a credential that may also push
-    (`nebi publish`, `oras push`). 404 `cog_publishing_not_enabled` when
-    this Hub accepts no publishes, and 403 `cog_publish_forbidden` when the
-    caller does not hold the publish permission. Holding the credential is
+    (`nebi publish`, `oras push`). On a Hub that accepts no publishes
+    `publish` is not a scope at all: 422, exactly as any unknown scope. 403
+    `cog_publish_forbidden` when the caller does not hold the publish
+    permission. Holding the credential is
     not the permission: it is checked again, with the repository's
     ownership, on every push.
     """
@@ -447,7 +445,14 @@ def create_registry_credential(
     scope = (body or RegistryCredentialRequest()).scope
     if scope == SCOPE_PUBLISH:
         if serving.publisher is None:
-            raise CogPublishingNotEnabledError()
+            # No publish source: this Hub's contract is the pull-only one,
+            # and the refusal is that contract's own validation error.
+            try:
+                PullOnlyRegistryCredentialRequest.model_validate({"scope": scope})
+            except ValidationError as exc:
+                raise RequestValidationError(
+                    [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)]
+                ) from None
         if not serving.publisher.policy.permits(auth.user, auth.org_role, auth.platform_role):
             raise CogPublishForbiddenError()
     secret = new_credential_secret()
@@ -636,12 +641,6 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def cog_registry_not_served_handler(_request: Request, _exc: CogRegistryNotServedError):
         return error_response(
             status.HTTP_404_NOT_FOUND, "cog_registry_not_served", "This Hub does not serve Cog pulls itself"
-        )
-
-    @app.exception_handler(CogPublishingNotEnabledError)
-    async def cog_publishing_not_enabled_handler(_request: Request, _exc: CogPublishingNotEnabledError):
-        return error_response(
-            status.HTTP_404_NOT_FOUND, "cog_publishing_not_enabled", "This Hub does not accept Cog publishes"
         )
 
     @app.exception_handler(CogPublishForbiddenError)

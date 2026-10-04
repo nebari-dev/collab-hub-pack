@@ -303,6 +303,14 @@ class RegistryCredentialRequest(BaseModel):
     scope: Literal["pull", "publish"] = "pull"
 
 
+class PullOnlyRegistryCredentialRequest(BaseModel):
+    """The request as a Hub that accepts no publishes validates it: `pull` is the only scope there is."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["pull"] = "pull"
+
+
 class RegistryCredentialResponse(BaseModel):
     """A registry credential, shown once: the Hub keeps only a digest of `secret`."""
 

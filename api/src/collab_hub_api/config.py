@@ -1514,17 +1514,17 @@ def build_cog_indexing(
     # serving clients are: a source the Hub could not serve a pull from
     # should not index as healthy.
     sources = build_registry_sources(list(cogs.registry_sources), restrict_redirects=cogs.serve.enabled)
+    publishing = publish_store is not None and publish_source_id(config) is not None
     return CogIndexing(
         # With a publish source, the repositories published through the Hub
-        # are enumerated too: that source needs no configured list.
+        # are enumerated too: that source needs no configured list. And a
+        # repository a sweep finds content in is settled as published, which
+        # is how a publish whose commit was lost is recovered.
         CogIndexer(
             store,
             sources,
-            published_repositories=(
-                publish_store.published_repositories
-                if publish_store is not None and publish_source_id(config) is not None
-                else None
-            ),
+            published_repositories=publish_store.published_repositories if publishing else None,
+            repositories_found=publish_store.commit_found if publishing else None,
         ),
         interval_seconds=float(index.interval_seconds),
         run_on_startup=index.run_on_startup,

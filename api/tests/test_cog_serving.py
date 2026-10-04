@@ -459,13 +459,10 @@ async def test_exchange_answers_the_documented_contract(hub: Hub):
 
 
 async def test_exchange_refuses_unknown_scopes_and_requires_a_hub_session(hub: Hub):
-    for body in ({"scope": "admin"}, {"scope": "pull", "extra": 1}):
+    for body in ({"scope": "publish"}, {"scope": "pull", "extra": 1}):
         refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json=body)
         assert refused.status_code == 422, body
         assert refused.json()["error"]["code"] == "validation_error"
-    # A known scope this Hub does not offer: it accepts no publishes.
-    off = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json={"scope": "publish"})
-    assert off.status_code == 404 and off.json()["error"]["code"] == "cog_publishing_not_enabled"
     anonymous = await hub.request("POST", "/v1/cogs/registry-credentials")
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "unauthorized"
