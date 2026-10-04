@@ -70,9 +70,12 @@ INDEX_DEFAULTS = {"enabled": False, "interval_seconds": 300, "run_on_startup": T
 
 # cogs.serve (issue #179). The chart renders the block only when serving is
 # on, so everything but `enabled` falls back to the API's own defaults here.
-# cogs.publish (issue #180): two JSON lists, each rendered only when non-empty.
+# cogs.publish (issue #180): two JSON lists, each rendered only when non-empty,
+# and one number, rendered only when it is not the API's default.
 PUBLISH_PREFIX = "COLLAB_HUB_API__COGS__PUBLISH__"
 PUBLISH_KEYS = ("allowed_roles", "allowed_users")
+PUBLISH_MAX_PENDING = "max_pending_repositories"
+PUBLISH_MAX_PENDING_DEFAULT = 20
 SERVE_PREFIX = "COLLAB_HUB_API__COGS__SERVE__"
 SERVE_DEFAULTS = {
     "enabled": False,
@@ -138,6 +141,9 @@ def rendered_cogs(manifests: str) -> dict[str, Any]:
         else:
             serve[key] = value
     publish = {key: json.loads(env.get(PUBLISH_PREFIX + key.upper()) or "[]") for key in PUBLISH_KEYS}
+    publish[PUBLISH_MAX_PENDING] = int(
+        env.get(PUBLISH_PREFIX + PUBLISH_MAX_PENDING.upper()) or PUBLISH_MAX_PENDING_DEFAULT
+    )
     return {"registry_sources": sources, "index": index, "serve": serve, "publish": publish}
 
 
@@ -147,6 +153,7 @@ def normalized_settings(settings: dict[str, Any]) -> dict[str, Any]:
     index = {**INDEX_DEFAULTS, **settings.get("index", {})}
     serve = {**SERVE_DEFAULTS, **settings.get("serve", {})}
     publish = {key: settings.get("publish", {}).get(key, []) for key in PUBLISH_KEYS}
+    publish[PUBLISH_MAX_PENDING] = settings.get("publish", {}).get(PUBLISH_MAX_PENDING, PUBLISH_MAX_PENDING_DEFAULT)
     return {
         "registry_sources": settings.get("registry_sources", []),
         "index": index,

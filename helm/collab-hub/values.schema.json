@@ -1035,6 +1035,11 @@
                 "type": "string",
                 "pattern": "\\S"
               }
+            },
+            "maxPendingRepositories": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
             }
           },
           "additionalProperties": false

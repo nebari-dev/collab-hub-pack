@@ -780,6 +780,12 @@ cogs:
     # -- User ids (the Hub's ACL principal) that hold the publish permission
     # whatever their role. The only way to grant it under claims-sourced auth.
     allowedUsers: []
+    # -- How many repositories one organization may have pending at once. A
+    # repository is pending from its first publish until the registry is
+    # known to have accepted a manifest for it, and nothing pending expires,
+    # so this bounds the names an organization can hold through a registry
+    # outage. Publishing again to a pending name is never refused by it.
+    maxPendingRepositories: 20
 
 # Feature flags for work in progress that is on main but not yet exposed. Every
 # flag is off until it is listed here and set to true; each entry becomes

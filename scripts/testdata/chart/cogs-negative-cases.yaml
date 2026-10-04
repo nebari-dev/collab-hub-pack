@@ -523,6 +523,26 @@ cases:
       publish: {allowed_users: [8f2c1d7e-user-id, 8f2c1d7e-user-id]}
     app_error: "allowed_users lists '8f2c1d7e-user-id' twice"
 
+  - name: no room for a single pending repository
+    layers: [schema]
+    values:
+      cogs:
+        publish: {maxPendingRepositories: 0}
+    chart_error: 'maxPendingRepositories.*(minimum|greater than or equal)'
+    settings:
+      publish: {max_pending_repositories: 0}
+    app_error: 'max_pending_repositories\s+Input should be greater than or equal to 1'
+
+  - name: more pending repositories than the bound allows
+    layers: [schema]
+    values:
+      cogs:
+        publish: {maxPendingRepositories: 1001}
+    chart_error: 'maxPendingRepositories.*(maximum|less than or equal)'
+    settings:
+      publish: {max_pending_repositories: 1001}
+    app_error: 'max_pending_repositories\s+Input should be less than or equal to 1000'
+
   - name: unknown publish key
     layers: [schema]
     values:
@@ -1140,10 +1160,10 @@ accepted:
             - {id: public, kind: static, url: https://registry.example.com, publish: true}
             - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
         serve: {enabled: true, publicUrl: 'https://hub.example.com'}
-        publish: {allowedRoles: [owner, operator], allowedUsers: [8f2c1d7e-user-id]}
+        publish: {allowedRoles: [owner, operator], allowedUsers: [8f2c1d7e-user-id], maxPendingRepositories: 1000}
     settings:
       registry_sources:
         - {id: public, kind: static, url: https://registry.example.com, publish: true}
         - {id: mirror, kind: static, url: https://mirror.example.com, repositories: [cogs/alpha]}
       serve: {enabled: true, public_url: 'https://hub.example.com'}
-      publish: {allowed_roles: [owner, operator], allowed_users: [8f2c1d7e-user-id]}
+      publish: {allowed_roles: [owner, operator], allowed_users: [8f2c1d7e-user-id], max_pending_repositories: 1000}

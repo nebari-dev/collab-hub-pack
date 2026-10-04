@@ -411,6 +411,11 @@ spec:
             - name: COLLAB_HUB_API__COGS__PUBLISH__ALLOWED_USERS
               value: {{ toJson . | quote }}
             {{- end }}
+            {{- /* Rendered only when it is not the API's own default. */}}
+            {{- if ne (.Values.cogs.publish.maxPendingRepositories | int64) 20 }}
+            - name: COLLAB_HUB_API__COGS__PUBLISH__MAX_PENDING_REPOSITORIES
+              value: {{ .Values.cogs.publish.maxPendingRepositories | int64 | quote }}
+            {{- end }}
             {{- if .Values.cogs.registry.sources }}
             - name: COLLAB_HUB_API__COGS__REGISTRY_SOURCES
               value: {{ include "collab-hub.cogs-registry-sources" . | quote }}
