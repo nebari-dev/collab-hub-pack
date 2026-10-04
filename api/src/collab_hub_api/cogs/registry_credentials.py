@@ -48,10 +48,6 @@ SCOPE_PUBLISH = "publish"
 CREDENTIAL_SCOPES = frozenset({SCOPE_PULL, SCOPE_PUBLISH})
 """The scopes a credential may be exchanged for. ``publish`` may also pull; ``pull`` can never push."""
 
-ACTIONS_PULL = "pull"
-ACTIONS_PUSH = "pull,push"
-"""What a token may do on the repositories it names, as stored: pull, or pull and push."""
-
 CREDENTIAL_ID_PREFIX = "crc-"
 CREDENTIAL_SECRET_PREFIX = "chrs_"
 PULL_TOKEN_PREFIX = "chrt_"
@@ -132,7 +128,8 @@ class TokenGrant:
     expires_at: datetime
     issued_at: datetime
     credential_id: str | None = None
-    actions: str = ACTIONS_PULL
+    push_repositories: tuple[str, ...] = ()
+    """The repositories it may push to: each one asked for by name, never inferred from another."""
     org_id: str | None = None
     """The ``org_id`` of the credential it was minted from, if any."""
 
@@ -146,7 +143,10 @@ class TokenGrant:
         repository's ownership are checked on every push request as well.
         """
 
-        return repository in self.repositories and self.actions == ACTIONS_PUSH
+        return repository in self.push_repositories
+
+    def names(self, repository: str) -> bool:
+        return repository in self.repositories or repository in self.push_repositories
 
 
 class RegistryCredentialStore(ABC):
@@ -203,14 +203,16 @@ class RegistryCredentialStore(ABC):
         credential_id: str | None,
         repositories: Iterable[str],
         ttl_seconds: int,
-        push: bool = False,
+        push_repositories: Iterable[str] = (),
     ) -> TokenGrant | None:
         """Store a token and return what it grants.
 
-        ``push`` asks for the push action as well. It is granted only when
-        the token comes from a credential whose scope is ``publish`` -- the
-        decision is made in the same statement that reads the credential --
-        and never for a token minted straight from a Hub access token.
+        ``repositories`` are the ones it may pull; ``push_repositories`` the
+        ones push was asked for, repository by repository. Push is granted
+        only when the token comes from a credential whose scope is
+        ``publish`` -- the decision is made in the same statement that reads
+        the credential -- and never for a token minted straight from a Hub
+        access token.
 
         With a ``credential_id`` the token expires no later than that
         credential, and ``None`` is returned when the credential is gone or
@@ -321,27 +323,28 @@ class InMemoryRegistryCredentialStore(RegistryCredentialStore):
                 del self._tokens[key]
             return len(mine)
 
-    def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds, push=False):
+    def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds, push_repositories=()):
         now = self.clock()
         expires_at = now + timedelta(seconds=ttl_seconds)
         with self._lock:
             self._purge(now)
-            actions, org_id = ACTIONS_PULL, None
+            pushable: tuple[str, ...] = ()
+            org_id = None
             if credential_id is not None:
                 stored = self._credentials.get(credential_id)
                 if stored is None or stored[0].user_id != user_id:
                     return None
                 expires_at = min(expires_at, stored[0].expires_at)
                 org_id = stored[0].org_id
-                if push and stored[0].scope == SCOPE_PUBLISH:
-                    actions = ACTIONS_PUSH
+                if stored[0].scope == SCOPE_PUBLISH:
+                    pushable = tuple(push_repositories)
             grant = TokenGrant(
                 user_id=user_id,
                 credential_id=credential_id,
                 repositories=tuple(repositories),
                 issued_at=now,
                 expires_at=expires_at,
-                actions=actions,
+                push_repositories=pushable,
                 org_id=org_id,
             )
             self._tokens[token_hash] = grant
@@ -379,7 +382,7 @@ def _grant_from_row(row) -> TokenGrant:
         repositories=tuple(row["repositories"] or ()),
         issued_at=row["created_at"],
         expires_at=row["expires_at"],
-        actions=row["actions"],
+        push_repositories=tuple(row["push_repositories"] or ()),
         org_id=row["org_id"],
     )
 
@@ -481,8 +484,9 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
             conn.execute("DELETE FROM collab_cog_registry_tokens WHERE user_id = %s", (user_id,))
         return len(rows)
 
-    def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds, push=False):
+    def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds, push_repositories=()):
         names = list(repositories)
+        pushable = list(push_repositories)
         with bounded_connection(self._db) as conn:
             # Tokens minted from a Hub access token have no credential whose
             # expiry would sweep them, so the mint sweeps.
@@ -491,9 +495,9 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
                 row = conn.execute(
                     """
                     INSERT INTO collab_cog_registry_tokens
-                        (token_hash, user_id, credential_id, repositories, actions, expires_at)
-                    VALUES (%s, %s, NULL, %s, 'pull', now() + make_interval(secs => %s))
-                    RETURNING user_id, credential_id, repositories, actions,
+                        (token_hash, user_id, credential_id, repositories, expires_at)
+                    VALUES (%s, %s, NULL, %s, now() + make_interval(secs => %s))
+                    RETURNING user_id, credential_id, repositories, push_repositories,
                               NULL::text AS org_id, created_at, expires_at
                     """,
                     (token_hash, user_id, names, ttl_seconds),
@@ -501,21 +505,22 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
             else:
                 # One statement: the token exists only if the credential is
                 # live at the instant it is written, cannot outlive it, and
-                # carries push only if that credential's scope is publish.
+                # may push -- to exactly the repositories push was asked for
+                # -- only if that credential's scope is publish.
                 row = conn.execute(
                     """
                     INSERT INTO collab_cog_registry_tokens
-                        (token_hash, user_id, credential_id, repositories, actions, expires_at)
+                        (token_hash, user_id, credential_id, repositories, push_repositories, expires_at)
                     SELECT %s, c.user_id, c.id, %s,
-                           CASE WHEN %s AND c.scope = 'publish' THEN 'pull,push' ELSE 'pull' END,
+                           CASE WHEN c.scope = 'publish' THEN %s::text[] ELSE '{}'::text[] END,
                            LEAST(now() + make_interval(secs => %s), c.expires_at)
                     FROM collab_cog_registry_credentials c
                     WHERE c.id = %s AND c.user_id = %s AND c.expires_at > now()
-                    RETURNING user_id, credential_id, repositories, actions,
+                    RETURNING user_id, credential_id, repositories, push_repositories,
                               (SELECT org_id FROM collab_cog_registry_credentials WHERE id = credential_id) AS org_id,
                               created_at, expires_at
                     """,
-                    (token_hash, names, bool(push), ttl_seconds, credential_id, user_id),
+                    (token_hash, names, pushable, ttl_seconds, credential_id, user_id),
                 ).fetchone()
         return _grant_from_row(row) if row else None
 
@@ -524,7 +529,8 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
             self._sweep_if_due(conn)
             row = conn.execute(
                 """
-                SELECT t.user_id, t.credential_id, t.repositories, t.actions, c.org_id, t.created_at, t.expires_at
+                SELECT t.user_id, t.credential_id, t.repositories, t.push_repositories, c.org_id,
+                       t.created_at, t.expires_at
                 FROM collab_cog_registry_tokens t
                 LEFT JOIN collab_cog_registry_credentials c ON c.id = t.credential_id
                 WHERE t.token_hash = %s

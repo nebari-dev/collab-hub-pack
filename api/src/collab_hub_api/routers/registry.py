@@ -59,6 +59,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import UTC
 
 import anyio
@@ -73,13 +74,16 @@ from ..cogs.publish_store import PublishStoreUnavailableError
 from ..cogs.publishing import (
     DigestInvalid,
     ManifestInvalid,
+    ManifestUnlisted,
     PublishDenied,
     Publisher,
     PublishError,
     RepositoryInvalid,
     UploadInvalid,
+    UploadLimited,
     UploadTooLarge,
     UploadUnknown,
+    manifest_accepted,
 )
 from ..cogs.registry import is_repository_path
 from ..cogs.registry_credentials import (
@@ -288,41 +292,61 @@ async def _grant(request: Request, repository: str | None) -> TokenGrant:
 # -- the token endpoint ---------------------------------------------------------
 
 
-def requested_scope(scopes: list[str]) -> tuple[list[str], bool]:
-    """The repositories a token request names, and whether it asks to push to any of them.
+def _scope_entries(scopes: list[str]):
+    """``(repository, actions)`` for each well-formed ``repository:<name>:<actions>`` entry, within the input bounds."""
 
-    ``scope`` may repeat and may carry several space-separated entries. Only
-    ``repository:<name>:<actions>`` with ``pull`` or ``push`` among the
-    actions names a repository; every other action (``delete``) and resource
-    type is dropped rather than refused, which is how the token spec says a
-    server narrows a request -- the client finds out when it uses the token.
-    Asking for ``push`` is only asking: whether the token carries it is
-    decided from the credential it is minted from.
-    """
-
-    names: dict[str, None] = {}
-    push = False
     examined = 0
     for scope in scopes[:MAX_SCOPE_ENTRIES]:
         for entry in scope[:MAX_SCOPE_LENGTH].split():
             examined += 1
-            if examined > MAX_SCOPE_ENTRIES or len(names) >= MAX_TOKEN_SCOPES:
-                return list(names), push
+            if examined > MAX_SCOPE_ENTRIES:
+                return
             kind, _, rest = entry.partition(":")
             name, _, actions = rest.rpartition(":")
-            wanted = actions.split(",")
-            if kind != "repository" or not ("pull" in wanted or "push" in wanted):
-                continue
-            if is_repository_path(name):
-                names.setdefault(name)
-                push = push or "push" in wanted
-    return list(names), push
+            if kind == "repository" and is_repository_path(name):
+                yield name, actions.split(",")
 
 
 def requested_repositories(scopes: list[str]) -> list[str]:
-    """The repositories of :func:`requested_scope`."""
+    """The repositories a token request may be granted ``pull`` on.
 
-    return requested_scope(scopes)[0]
+    ``scope`` may repeat and may carry several space-separated entries. Only
+    ``repository:<name>:<actions>`` with ``pull`` among the actions grants
+    anything; every other action (``push``, ``delete``) and resource type is
+    dropped rather than refused, which is how the token spec says a server
+    narrows a request -- the client finds out when it uses the token.
+    """
+
+    return requested_scope(scopes, pushing=False)[0]
+
+
+def requested_scope(scopes: list[str], *, pushing: bool = True) -> tuple[list[str], list[str]]:
+    """What a token request asks for, **per repository**: the ones to pull from, and the ones to push to.
+
+    Each entry stands for itself: ``repository:a:pull,push repository:b:pull``
+    asks to push to ``a`` and only to pull from ``b``, and no action asked of
+    one repository is ever carried over to another. Asking for ``push`` is
+    only asking: whether the token carries it is decided from the credential
+    it is minted from.
+
+    With ``pushing`` false -- a Hub that accepts no publishes -- ``push`` is
+    one more action that names nothing, exactly as before publishing existed.
+    """
+
+    pull: dict[str, None] = {}
+    push: dict[str, None] = {}
+    for name, actions in _scope_entries(scopes):
+        wants_pull = "pull" in actions
+        wants_push = pushing and "push" in actions
+        if not (wants_pull or wants_push):
+            continue
+        if name not in pull and name not in push and len(pull.keys() | push.keys()) >= MAX_TOKEN_SCOPES:
+            break
+        if wants_pull:
+            pull.setdefault(name)
+        if wants_push:
+            push.setdefault(name)
+    return list(pull), list(push)
 
 
 def _basic_credential(header: str) -> tuple[str, str] | None:
@@ -385,18 +409,20 @@ def _mint(request: Request) -> JSONResponse:
     else:
         user, credential_id = _hub_principal(request), None
     token = new_pull_token()
-    repositories, push = requested_scope(request.query_params.getlist("scope"))
+    repositories, push_repositories = requested_scope(
+        request.query_params.getlist("scope"), pushing=serving.publisher is not None
+    )
     grant = serving.credentials.create_token(
         token_hash=secret_digest(token),
         user_id=user,
         credential_id=credential_id,
         repositories=repositories,
         ttl_seconds=serving.token_ttl_seconds,
-        # Only asked for here. The store grants it when, and only when, the
-        # credential's scope is publish; and holding it is still not enough:
-        # every push request checks the publish permission and the
-        # repository's ownership again.
-        push=push and serving.publisher is not None,
+        # Only asked for here, repository by repository. The store grants
+        # them when, and only when, the credential's scope is publish; and
+        # holding push is still not enough: every push request checks the
+        # publish permission and the repository's ownership again.
+        push_repositories=push_repositories,
     )
     if grant is None:
         # The credential was revoked or expired between the check and the mint.
@@ -516,8 +542,9 @@ async def _serve(request: Request, rest: str) -> Response:
                 await _grant(request, None)
                 raise RegistryError(status.HTTP_404_NOT_FOUND, "NAME_UNKNOWN", "repository name not known to registry")
             _kind, name, reference = parsed
-            if kind == "blobs" and reference.startswith("uploads/"):
-                # The status of an upload in progress: part of the push API.
+            if serving.publisher is not None and kind == "blobs" and reference.startswith("uploads/"):
+                # The status of an upload in progress: part of the push API,
+                # on a Hub that has one. Otherwise it is one more blob read.
                 return await _push(request, name, "uploads", reference[len("uploads/") :])
             grant = await _grant(request, name)
 
@@ -622,6 +649,12 @@ _CONTENT_RANGE = re.compile(r"(?:bytes )?([0-9]{1,19})-([0-9]{1,19})")
 _LENGTH = re.compile(r"[0-9]{1,19}")
 
 
+def _read_only() -> RegistryError:
+    """What every write is answered with by a Hub that accepts no publishes: what it was before publishing existed."""
+
+    return RegistryError(status.HTTP_405_METHOD_NOT_ALLOWED, "UNSUPPORTED", "this registry is read-only")
+
+
 def _unsupported() -> RegistryError:
     return RegistryError(status.HTTP_405_METHOD_NOT_ALLOWED, "UNSUPPORTED", "this registry does not accept that")
 
@@ -655,20 +688,25 @@ def _resolve_publisher(request: Request, grant: TokenGrant) -> Publisher:
 def _authorize_push(request: Request, token: str, repository: str) -> Publisher:
     """Everything a push must pass, in one blocking hop and before any byte goes upstream.
 
-    A live token naming this repository; the push action on it; the caller's
-    current standing; the publish permission; and the repository's ownership.
+    A live token naming this repository; the push action on **this**
+    repository; the caller's current standing; the publish permission; and
+    the repository's ownership.
     """
 
     serving = _serving(request)
     grant = serving.credentials.find_token(secret_digest(token)) if token else None
     if grant is None:
         raise _unauthorized(serving, repository, push=True)
-    if not grant.allows_pull(repository):
+    if not grant.names(repository):
         raise _unauthorized(serving, repository, insufficient=True, push=True)
     if not grant.allows_push(repository):
-        # Not a challenge: asking again would mint the same token. Only a
-        # credential exchanged with the publish scope carries push.
-        raise _denied("this credential may pull but not publish; exchange one with the publish scope")
+        # The token names this repository without push on it: it was asked
+        # for with pull alone here (push on another repository grants
+        # nothing here), or minted from a credential that cannot publish.
+        raise _denied(
+            "this token may not push to this repository: ask for push on it, "
+            "with a credential exchanged with the publish scope"
+        )
     publisher = _resolve_publisher(request, grant)
     serving.publisher.authorize(publisher, repository)
     return publisher
@@ -699,6 +737,22 @@ async def _pusher_blob_size(request: Request, grant: TokenGrant, name: str, dige
 def _declared_length(request: Request) -> int | None:
     raw = request.headers.get("content-length")
     return int(raw) if raw is not None and _LENGTH.fullmatch(raw) else None
+
+
+def _content_range(request: Request) -> tuple[int, int] | None:
+    """``(first, last)`` from ``Content-Range``, if the request carries one; malformed is refused, not ignored.
+
+    Both ends are kept: the publisher checks their order, that the range
+    starts where the upload left off, and that it is as long as the body.
+    """
+
+    raw = request.headers.get("content-range")
+    if raw is None:
+        return None
+    matched = _CONTENT_RANGE.fullmatch(raw.strip())
+    if matched is None:
+        raise RegistryError(status.HTTP_400_BAD_REQUEST, "BLOB_UPLOAD_INVALID", "the Content-Range header is malformed")
+    return int(matched.group(1)), int(matched.group(2))
 
 
 def _upload_headers(name: str, upload_id: str, received: int) -> dict[str, str]:
@@ -741,8 +795,6 @@ async def _push(request: Request, name: str, kind: str, reference: str) -> Respo
 
     serving = _serving(request)
     publisher_front = serving.publisher
-    if publisher_front is None:
-        raise _unsupported()
     method = request.method
     publisher = await run_in_threadpool(_authorize_push, request, _bearer(request), name)
 
@@ -762,10 +814,19 @@ async def _push(request: Request, name: str, kind: str, reference: str) -> Respo
             raise _unsupported()
         # A cross-repository mount request (?mount=&from=) is answered as an
         # ordinary upload: nothing is mounted, the client uploads the blob.
+        content_range = _content_range(request) if digest is not None else None
         session = await publisher_front.start(publisher, name)
         if digest is not None:
-            # The whole blob in the opening request.
-            await publisher_front.finish(publisher, name, session.id, digest, request.stream(), length=length)
+            # The whole blob in the opening request. The client never learns
+            # this session's id, so a refusal must not leave it open.
+            try:
+                await publisher_front.finish(
+                    publisher, name, session.id, digest, request.stream(), length=length, content_range=content_range
+                )
+            except PublishError:
+                with suppress(PublishError):
+                    await publisher_front.cancel(publisher, name, session.id)
+                raise
             return _created(name, "blobs", digest)
         return Response(status_code=status.HTTP_202_ACCEPTED, headers=_upload_headers(name, session.id, 0))
     if not _UPLOAD_ID.fullmatch(reference):
@@ -776,17 +837,8 @@ async def _push(request: Request, name: str, kind: str, reference: str) -> Respo
             status_code=status.HTTP_204_NO_CONTENT, headers=_upload_headers(name, session.id, session.received)
         )
     if method == "PATCH":
-        start = None
-        raw_range = request.headers.get("content-range")
-        if raw_range is not None:
-            matched = _CONTENT_RANGE.fullmatch(raw_range.strip())
-            if matched is None:
-                raise RegistryError(
-                    status.HTTP_400_BAD_REQUEST, "BLOB_UPLOAD_INVALID", "the Content-Range header is malformed"
-                )
-            start = int(matched.group(1))
         session = await publisher_front.append(
-            publisher, name, reference, request.stream(), start=start, length=length
+            publisher, name, reference, request.stream(), content_range=_content_range(request), length=length
         )
         return Response(
             status_code=status.HTTP_202_ACCEPTED, headers=_upload_headers(name, session.id, session.received)
@@ -795,7 +847,9 @@ async def _push(request: Request, name: str, kind: str, reference: str) -> Respo
         if digest is None:
             raise RegistryError(status.HTTP_400_BAD_REQUEST, "DIGEST_INVALID", "the digest parameter is required")
         content = request.stream() if length != 0 else None
-        await publisher_front.finish(publisher, name, reference, digest, content, length=length)
+        await publisher_front.finish(
+            publisher, name, reference, digest, content, length=length, content_range=_content_range(request)
+        )
         return _created(name, "blobs", digest)
     if method == "DELETE":
         await publisher_front.cancel(publisher, name, reference)
@@ -847,13 +901,22 @@ def _publish_error(exc: PublishError) -> RegistryError:
         return RegistryError(status.HTTP_400_BAD_REQUEST, "DIGEST_INVALID", message)
     if isinstance(exc, ManifestInvalid):
         return RegistryError(status.HTTP_400_BAD_REQUEST, "MANIFEST_INVALID", message, messages=exc.errors)
+    if isinstance(exc, UploadLimited):
+        return RegistryError(status.HTTP_429_TOO_MANY_REQUESTS, "TOOMANYREQUESTS", message)
+    if isinstance(exc, ManifestUnlisted):
+        # Not a success, and not a refusal: the registry has the manifest.
+        # The message says so, because a client told "unavailable" would
+        # assume nothing was stored.
+        if exc.retryable:
+            return RegistryError(status.HTTP_503_SERVICE_UNAVAILABLE, "UNAVAILABLE", message)
+        return RegistryError(status.HTTP_500_INTERNAL_SERVER_ERROR, "UNKNOWN", message)
     return _unavailable()
 
 
 async def _answer_push(request: Request, rest: str) -> Response:
     serving = _serving(request)
     if serving.publisher is None:
-        return error_response(_unsupported())
+        return error_response(_read_only())
     parsed = parse_push_path(rest)
     if parsed is None:
         return error_response(_unsupported())
@@ -863,6 +926,7 @@ async def _answer_push(request: Request, rest: str) -> Response:
     carries_blob = kind == "uploads" and request.method in ("PATCH", "PUT", "POST")
     budget = serving.max_blob_seconds if carries_blob else serving.max_metadata_seconds
     _start_budget(min(budget, serving.max_metadata_seconds))
+    manifest_accepted.set(False)
     try:
         async with asyncio.timeout(budget):
             return await _push(request, name, kind, reference)
@@ -871,6 +935,10 @@ async def _answer_push(request: Request, rest: str) -> Response:
     except PublishError as exc:
         return error_response(_publish_error(exc))
     except TimeoutError:
+        if manifest_accepted.get():
+            # Out of time after the registry said yes: the manifest is
+            # stored, and the client must not be told that nothing happened.
+            return error_response(_publish_error(ManifestUnlisted.not_yet()))
         return error_response(_unavailable())
     except _storage_errors():
         return error_response(_unavailable())

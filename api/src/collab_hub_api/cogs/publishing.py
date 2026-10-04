@@ -13,9 +13,9 @@ before a byte is forwarded (:meth:`CogPublisher.authorize`):
    default, and being able to pull never implies it;
 2. the repository is one the caller's **organization owns**, or a new one. A
    repository first published through the Hub belongs to the publisher's
-   organization, recorded with the first manifest the Hub accepts for it;
-   later pushes need membership of that organization. A platform operator
-   may push to any;
+   organization, from the moment the registry accepts the first manifest for
+   it; later pushes need membership of that organization. A platform
+   operator may push to any;
 3. a repository the catalog already knows but that was **not** published
    through the Hub (it has no owner record) accepts pushes from platform
    operators only.
@@ -24,7 +24,17 @@ before a byte is forwarded (:meth:`CogPublisher.authorize`):
 own session id, the backing registry's session URL stays in the database,
 and bytes are streamed through -- counted against ``max_blob_bytes``, never
 buffered. The backing registry verifies each blob against its digest when
-the upload is closed.
+the upload is closed. Three rules keep the two sides in step:
+
+- the Hub's slot is taken **before** the registry is asked to open its
+  session, so the per-user cap holds before anything exists upstream;
+- a session the Hub lets go of -- past the cap, expired, cancelled -- is
+  cancelled at the registry **before** its record is deleted, a few per
+  request, and a record whose cancellation failed is kept until it succeeds;
+- one request at a time may write to a session: each takes the session's
+  **lease** before it forwards anything and gives it back when its
+  bookkeeping is done, so two requests cannot both read the same byte count
+  and both add to it.
 
 **A manifest is validated before it is committed**
 (:meth:`CogPublisher.put_manifest`). The blobs it names were just uploaded,
@@ -33,10 +43,20 @@ indexer's code path, *before* forwarding the manifest. A bundle the catalog
 would not list -- not a Cog, no id, or a reader error -- is refused with the
 reader's errors, nothing is written to the registry and nothing is listed.
 
+**Nothing is owned or listed until the registry has accepted the
+manifest.** Before forwarding it the Hub only *reserves* the repository name
+and *notes* who is publishing the digest. The registry's answer decides: on
+acceptance the reservation becomes ownership and the row is written; on a
+definite refusal both are withdrawn; when the outcome is unknown the
+reservation expires and the note waits for whichever write lists the digest.
+
 **An accepted manifest is indexed in the request**: the row the validation
-produced is stored through the indexer's lock-less targeted path, and the
-authenticated publisher (Hub user and organization) is recorded on it. A
-later sweep reconciles the row like any other and leaves the publisher alone.
+produced is stored through the indexer's lock-less targeted path, in one
+transaction with its tag assignment and the authenticated publisher (Hub
+user and organization), under the request's own deadline. If that write
+fails, the answer says so -- the manifest is stored, and not listed -- rather
+than reporting a publish that the catalog does not show. A later sweep
+reconciles the row like any other and leaves the publisher alone.
 
 Failures are :class:`PublishError` subclasses whose messages are written for
 the client and name no backing host, URL or credential.
@@ -44,12 +64,16 @@ the client and name no backing host, URL or credential.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
+import anyio
 from starlette.concurrency import run_in_threadpool
 
 from ..frames.orgs import PLATFORM_ROLE_OPERATOR
@@ -69,7 +93,7 @@ from .oci import (
     is_sha256_digest,
     is_tag,
 )
-from .publish_store import PublishStore, UploadSession, new_upload_id
+from .publish_store import PublishStore, UploadLimitError, UploadSession, new_upload_id
 from .registry import ArtifactRef, RegistrySource, is_repository_path
 from .serving import manifest_blobs
 
@@ -77,6 +101,22 @@ logger = logging.getLogger("frames_server.cogs.publishing")
 
 PUBLISH_ROLES = ("operator", "owner", "member")
 """The roles ``cogs.publish.allowed_roles`` may name: the platform role, then the two organization roles."""
+
+RESERVATION_TTL_SECONDS = 300.0
+"""How long a repository name stays reserved for a manifest whose outcome at the registry is unknown.
+
+Several times the deadline of the request that forwards the manifest, so a
+reservation cannot run out under a request that is still waiting for the
+registry's answer.
+"""
+
+LEASE_MARGIN_SECONDS = 60.0
+"""A session's lease outlasts the longest request that can hold it (``max_blob_seconds``) by this much."""
+
+STALE_UPLOADS_PER_REQUEST = 4
+STALE_CLEANUP_SECONDS = 5.0
+STALE_LEASE_SECONDS = 60.0
+"""Cleaning up after sessions the Hub let go of: how many per request, within how long, each claimed how long."""
 
 
 class PublishError(Exception):
@@ -96,7 +136,7 @@ class UploadUnknown(PublishError):
 
 
 class UploadInvalid(PublishError):
-    """The upload request does not fit the session: a chunk out of order, a malformed range."""
+    """The upload request does not fit the session: a chunk out of order, a range that disagrees, a session in use."""
 
     def __init__(self, message: str, *, received: int | None = None) -> None:
         super().__init__(message)
@@ -119,8 +159,43 @@ class ManifestInvalid(PublishError):
         self.errors = errors or (message,)
 
 
+class UploadLimited(PublishError):
+    """The caller holds too many sessions the registry has not let go of yet."""
+
+
 class PublishUnavailable(PublishError):
     """The publish source could not take the write right now."""
+
+
+class ManifestUnlisted(PublishError):
+    """The registry accepted the manifest, and the catalog does not list it.
+
+    ``retryable`` says whether putting the manifest again can help: it can
+    when the write could not be made, and cannot when the catalog refused
+    the row itself.
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+    @classmethod
+    def not_yet(cls) -> ManifestUnlisted:
+        return cls(
+            "the manifest was stored in the registry but could not be listed in the catalog yet; "
+            "put it again, or wait for the catalog to index it",
+            retryable=True,
+        )
+
+
+manifest_accepted: ContextVar[bool] = ContextVar("cog_publish_manifest_accepted", default=False)
+"""Whether this request's manifest has been accepted by the registry.
+
+Set by :meth:`CogPublisher.put_manifest` the moment the registry says yes,
+for the one failure that method cannot report itself: the request running
+out of time during the bookkeeping that follows. The router reads it, so
+the answer can still say the manifest is stored.
+"""
 
 
 @dataclass(frozen=True)
@@ -201,6 +276,7 @@ class CogPublisher:
         indexer: CogIndexer,
         policy: PublishPolicy,
         max_blob_bytes: int,
+        max_blob_seconds: float = 900.0,
     ) -> None:
         self._catalog = catalog
         self._store = store
@@ -208,6 +284,7 @@ class CogPublisher:
         self._indexer = indexer
         self.policy = policy
         self._max_blob_bytes = max_blob_bytes
+        self._lease_seconds = max_blob_seconds + LEASE_MARGIN_SECONDS
 
     @property
     def source_id(self) -> str:
@@ -261,19 +338,81 @@ class CogPublisher:
             return None
 
     async def start(self, publisher: Publisher, repository: str) -> UploadSession:
+        """Open an upload: the Hub's slot first, then the registry's session, then the two are tied together."""
+
+        session = await self._open(publisher, repository)
         try:
             location = await self._source.oci().start_upload(repository)
-        except OCIError as exc:
-            raise self._unavailable("upload start", exc) from None
-        return await run_in_threadpool(
-            lambda: self._store.open_upload(
+        except BaseException as exc:
+            # Nothing was opened at the registry (or nothing the Hub was told
+            # of): the slot is given back, whatever ended the attempt.
+            await self._settle(self._store.close_upload, session.id)
+            if isinstance(exc, OCIError):
+                raise self._unavailable("upload start", exc) from None
+            raise
+        try:
+            attached = await run_in_threadpool(self._store.attach_upload, session.id, location)
+        except BaseException:
+            # The registry has a session the Hub could not record: drop it
+            # there rather than leave it for the registry's own expiry.
+            with anyio.CancelScope(shield=True):
+                await self._source.oci().cancel_upload(repository, location)
+            raise
+        if not attached:
+            await self._source.oci().cancel_upload(repository, location)
+            raise PublishUnavailable("the upload could not be opened; try again")
+        await self._retire_stale()
+        return replace(session, upstream_location=location)
+
+    async def _open(self, publisher: Publisher, repository: str) -> UploadSession:
+        def open_slot() -> UploadSession:
+            return self._store.open_upload(
                 upload_id=new_upload_id(),
                 user_id=publisher.user_id,
                 repository=repository,
                 source_id=self._source.id,
-                upstream_location=location,
             )
-        )
+
+        try:
+            return await run_in_threadpool(open_slot)
+        except UploadLimitError:
+            pass
+        # Every slot this caller has is taken by sessions still waiting to be
+        # cancelled at the registry. Work on those, then ask once more.
+        await self._retire_stale(user_id=publisher.user_id)
+        try:
+            return await run_in_threadpool(open_slot)
+        except UploadLimitError:
+            raise UploadLimited("too many uploads are open or still being cleaned up; try again shortly") from None
+
+    async def _retire_stale(self, *, user_id: str | None = None) -> None:
+        """Cancel, at the registry, a few sessions the Hub has let go of; then forget them. Best effort, bounded.
+
+        Sessions past their expiry -- timed out, or retired by the per-user
+        cap -- are claimed a few at a time. Each is cancelled at the registry
+        *first* and its record deleted only once the registry says the
+        session is gone; one that could not be cancelled keeps its record and
+        is claimed again later. Nothing here fails the request that runs it.
+        """
+
+        try:
+            async with asyncio.timeout(STALE_CLEANUP_SECONDS):
+                stale = await run_in_threadpool(
+                    lambda: self._store.claim_stale_uploads(
+                        limit=STALE_UPLOADS_PER_REQUEST, lease_seconds=STALE_LEASE_SECONDS, user_id=user_id
+                    )
+                )
+                for session in stale:
+                    if session.upstream_location is not None and not await self._source.oci().cancel_upload(
+                        session.repository, session.upstream_location
+                    ):
+                        logger.warning("cog_publish_stale_upload_kept", extra={"source_id": self._source.id})
+                        continue
+                    await run_in_threadpool(self._store.close_upload, session.id)
+        except Exception as exc:
+            logger.warning(
+                "cog_publish_stale_cleanup_failed", extra={"source_id": self._source.id, "error": type(exc).__name__}
+            )
 
     async def status(self, publisher: Publisher, repository: str, upload_id: str) -> UploadSession:
         session = await run_in_threadpool(
@@ -283,6 +422,46 @@ class CogPublisher:
             raise UploadUnknown("blob upload unknown to registry")
         return session
 
+    @asynccontextmanager
+    async def _leased(self, publisher: Publisher, repository: str, upload_id: str) -> AsyncIterator[_Held]:
+        """The session, held by this request alone until the block ends.
+
+        Taken before anything is sent to the registry's session, so of two
+        requests for one upload -- on any two replicas -- one forwards and
+        the other is told to retry. Only the row is held, never a database
+        connection. The lease is given back when the block ends unless the
+        session's own bookkeeping already let it go, and runs out by itself
+        if this process dies holding it.
+        """
+
+        session = await run_in_threadpool(
+            lambda: self._store.lease_upload(
+                upload_id, user_id=publisher.user_id, repository=repository, lease_seconds=self._lease_seconds
+            )
+        )
+        if session is None:
+            # Not there, or in use: the status read says which.
+            await self.status(publisher, repository, upload_id)
+            raise UploadInvalid("another request is writing to this upload; retry when it has finished")
+        held = _Held(session)
+        try:
+            yield held
+        finally:
+            if held.leased:
+                await self._settle(lambda: self._store.release_upload(upload_id, lease=session.lease))
+
+    async def _settle(self, call, /, *args) -> None:
+        """Run a piece of session bookkeeping that must happen however the request is ending. Never raises."""
+
+        with anyio.CancelScope(shield=True):
+            renew_budget()
+            try:
+                await run_in_threadpool(call, *args)
+            except Exception as exc:
+                logger.warning(
+                    "cog_publish_bookkeeping_failed", extra={"source_id": self._source.id, "error": type(exc).__name__}
+                )
+
     async def append(
         self,
         publisher: Publisher,
@@ -290,39 +469,47 @@ class CogPublisher:
         upload_id: str,
         content: AsyncIterable[bytes],
         *,
-        start: int | None,
+        content_range: tuple[int, int] | None,
         length: int | None,
     ) -> UploadSession:
-        """Forward the next chunk. ``start`` is the offset the client claims (from ``Content-Range``), if it said."""
+        """Forward the next chunk. ``content_range`` is the ``(first, last)`` byte the client claims, if it said."""
 
-        session = await self.status(publisher, repository, upload_id)
-        if start is not None and start != session.received:
-            raise UploadInvalid("the chunk does not start where the upload left off", received=session.received)
-        self._check_size(session.received + (length or 0))
-        counter = _Counted(content, limit=self._max_blob_bytes - session.received)
-        try:
-            location = await self._source.oci().upload_chunk(
-                repository, session.upstream_location, counter.chunks(), offset=session.received, length=length
+        async with self._leased(publisher, repository, upload_id) as held:
+            session = held.session
+            span = self._check_range(session, content_range, length)
+            self._check_size(session.received + (length or 0))
+            counter = _Counted(content, limit=self._max_blob_bytes - session.received, expect=span)
+            try:
+                location = await self._source.oci().upload_chunk(
+                    repository, session.upstream_location, counter.chunks(), offset=session.received, length=length
+                )
+            except _LimitExceeded:
+                await self._abandon(held)
+                raise UploadTooLarge(self._too_large()) from None
+            except _LengthMismatch:
+                await self._abandon(held)
+                raise UploadInvalid(_RANGE_LENGTH) from None
+            except OCIError as exc:
+                raise self._write_failed("upload chunk", exc, session) from None
+            renew_budget()
+            received = session.received + counter.count
+            moved = await run_in_threadpool(
+                lambda: self._store.advance_upload(
+                    upload_id,
+                    lease=session.lease,
+                    expected_received=session.received,
+                    received=received,
+                    upstream_location=location,
+                )
             )
-        except _LimitExceeded:
-            await self._abandon(session)
-            raise UploadTooLarge(self._too_large()) from None
-        except OCIError as exc:
-            raise self._write_failed("upload chunk", exc, session) from None
-        renew_budget()
-        received = session.received + counter.count
-        moved = await run_in_threadpool(
-            lambda: self._store.advance_upload(
-                upload_id, expected_received=session.received, received=received, upstream_location=location
-            )
-        )
-        if not moved:
-            # Two requests wrote to one session at once; the registry has
-            # bytes this record does not account for. Nothing can be trusted
-            # about the session's position any more.
-            await self._abandon(session)
-            raise UploadInvalid("the upload was written to concurrently and has been cancelled")
-        return replace(session, received=received, upstream_location=location)
+            if not moved:
+                # The session expired, or this request held it past its
+                # lease: the registry has bytes the record does not account
+                # for, and nothing can be trusted about its position.
+                await self._abandon(held)
+                raise UploadInvalid("the upload expired while it was being written to and has been cancelled")
+            held.leased = False
+            return replace(session, received=received, upstream_location=location)
 
     async def finish(
         self,
@@ -333,45 +520,78 @@ class CogPublisher:
         content: AsyncIterable[bytes] | None,
         *,
         length: int | None,
+        content_range: tuple[int, int] | None = None,
     ) -> None:
         """Close an upload as ``digest`` (optionally with its last bytes); the registry verifies the digest."""
 
         if not is_sha256_digest(digest):
             raise DigestInvalid("the digest must be sha256: followed by 64 lowercase hex digits")
-        session = await self.status(publisher, repository, upload_id)
-        self._check_size(session.received + (length or 0))
-        counter = _Counted(content, limit=self._max_blob_bytes - session.received) if content is not None else None
-        try:
-            await self._source.oci().finish_upload(
-                repository,
-                session.upstream_location,
-                digest,
-                counter.chunks() if counter is not None else None,
-                length=length,
+        async with self._leased(publisher, repository, upload_id) as held:
+            session = held.session
+            span = self._check_range(session, content_range, length if content is not None else 0)
+            self._check_size(session.received + (length or 0))
+            counter = (
+                _Counted(content, limit=self._max_blob_bytes - session.received, expect=span)
+                if content is not None
+                else None
             )
-        except _LimitExceeded:
-            await self._abandon(session)
-            raise UploadTooLarge(self._too_large()) from None
-        except OCIRejected as exc:
-            await self._abandon(session, cancel=exc.status != 404)
-            if exc.status == 404:
-                raise UploadUnknown("blob upload unknown to registry") from None
-            # The registry checked the bytes against the digest and they did not match.
-            raise DigestInvalid("the uploaded content does not match the digest") from None
-        except OCIError as exc:
-            raise self._unavailable("upload finish", exc) from None
-        renew_budget()
-        await run_in_threadpool(self._store.close_upload, upload_id)
+            try:
+                await self._source.oci().finish_upload(
+                    repository,
+                    session.upstream_location,
+                    digest,
+                    counter.chunks() if counter is not None else None,
+                    length=length,
+                )
+            except _LimitExceeded:
+                await self._abandon(held)
+                raise UploadTooLarge(self._too_large()) from None
+            except _LengthMismatch:
+                await self._abandon(held)
+                raise UploadInvalid(_RANGE_LENGTH) from None
+            except OCIRejected as exc:
+                await self._abandon(held, cancel=exc.status != 404)
+                if exc.status == 404:
+                    raise UploadUnknown("blob upload unknown to registry") from None
+                # The registry checked the bytes against the digest and they did not match.
+                raise DigestInvalid("the uploaded content does not match the digest") from None
+            except OCIError as exc:
+                raise self._unavailable("upload finish", exc) from None
+            renew_budget()
+            await run_in_threadpool(self._store.close_upload, upload_id)
+            held.leased = False
 
     async def cancel(self, publisher: Publisher, repository: str, upload_id: str) -> None:
-        session = await self.status(publisher, repository, upload_id)
-        await self._abandon(session)
+        async with self._leased(publisher, repository, upload_id) as held:
+            await self._abandon(held)
 
-    async def _abandon(self, session: UploadSession, *, cancel: bool = True) -> None:
+    async def _abandon(self, held: _Held, *, cancel: bool = True) -> None:
+        """End a session this request holds: cancelled at the registry first, and only then forgotten."""
+
         renew_budget()
+        session = held.session
+        gone = True
         if cancel:
-            await self._source.oci().cancel_upload(session.repository, session.upstream_location)
-        await run_in_threadpool(self._store.close_upload, session.id)
+            gone = await self._source.oci().cancel_upload(session.repository, session.upstream_location)
+        # A session the registry may still hold keeps its record, expired,
+        # for the cleanup to try again; either way it is no longer writable.
+        await run_in_threadpool(self._store.close_upload if gone else self._store.retire_upload, session.id)
+        held.leased = False
+
+    def _check_range(self, session: UploadSession, content_range: tuple[int, int] | None, length: int | None):
+        """The number of bytes a ``Content-Range`` promises, once it has been checked; ``None`` without one."""
+
+        if content_range is None:
+            return None
+        first, last = content_range
+        if last < first:
+            raise UploadInvalid("the Content-Range ends before it starts")
+        if first != session.received:
+            raise UploadInvalid("the chunk does not start where the upload left off", received=session.received)
+        span = last - first + 1
+        if length is not None and length != span:
+            raise UploadInvalid(_RANGE_LENGTH)
+        return span
 
     def _check_size(self, total: int) -> None:
         if total > self._max_blob_bytes:
@@ -398,9 +618,9 @@ class CogPublisher:
         if is_sha256_digest(reference):
             if reference != digest:
                 raise DigestInvalid("the manifest does not hash to the digest it was put under")
-            tags: tuple[str, ...] = ()
+            tag = None
         elif is_tag(reference):
-            tags = (reference,)
+            tag = reference
         else:
             raise ManifestInvalid("the reference is neither a tag nor a sha256 digest")
         try:
@@ -412,46 +632,96 @@ class CogPublisher:
         if any(layer.size > self._max_blob_bytes for layer in manifest.layers):
             raise ManifestInvalid(f"a layer is over this registry's {self._max_blob_bytes}-byte limit")
 
-        row = await self._validate(repository, manifest, tags)
+        row = await self._validate(repository, manifest, (tag,) if tag is not None else ())
 
-        # The repository's owner is settled by the first manifest accepted
-        # for it, atomically: of two organizations publishing a new name at
-        # once, one owns it and the other is refused here, before the write.
+        # The name is reserved, not owned: of two organizations publishing a
+        # new name at once, one holds it and the other is refused here,
+        # before the write. Whether anybody *owns* it is the registry's
+        # answer to decide.
         record = await run_in_threadpool(
-            lambda: self._store.claim_repository(
-                repository, source_id=self._source.id, owner_org_id=publisher.org_id, created_by=publisher.user_id
+            lambda: self._store.reserve_repository(
+                repository,
+                source_id=self._source.id,
+                owner_org_id=publisher.org_id,
+                created_by=publisher.user_id,
+                ttl_seconds=RESERVATION_TTL_SECONDS,
             )
         )
-        self._require_owner(publisher, record.owner_org_id, repository)
-
-        try:
-            await self._source.oci().put_manifest(repository, reference, body, manifest.media_type or content_type)
-        except OCIRejected:
-            raise ManifestInvalid("the registry refused the manifest") from None
-        except OCIError as exc:
-            raise self._unavailable("manifest put", exc) from None
-
-        # Committed. Index it now, from the row the validation produced, so
-        # the catalog lists it without waiting for a sweep.
-        known = await run_in_threadpool(
-            lambda: self._catalog.get(digest, source_id=self._source.id, repository=repository)
-        )
-        if known is not None:
-            row = replace(row, tags=tuple(sorted({*row.tags, *known.tags})))
-        await self._indexer.record(row)
+        if record.committed:
+            self._require_owner(publisher, record.owner_org_id, repository)
+        elif record.reservation is None:
+            raise PublishDenied(f"{repository} is being published by another organization")
+        # Who is publishing this digest, on record before the registry can
+        # have it: whatever happens to this request after the registry
+        # accepts, the write that lists the digest knows whose it is.
         await run_in_threadpool(
-            lambda: self._catalog.record_publication(
+            lambda: self._catalog.note_publication(
                 self._source.id, repository, digest, user_id=publisher.user_id, org_id=publisher.org_id
             )
         )
-        await run_in_threadpool(
-            self._catalog.record_manifest_blobs, self._source.id, repository, digest, manifest_blobs(manifest)
-        )
+
+        try:
+            await self._source.oci().put_manifest(repository, reference, body, manifest.media_type or content_type)
+        except (OCIRejected, OCIAuthError) as exc:
+            # A definite no: nothing was stored, so nothing is reserved or noted.
+            await self._withdraw(publisher, repository, digest, record.reservation)
+            if isinstance(exc, OCIRejected):
+                raise ManifestInvalid("the registry refused the manifest") from None
+            raise self._unavailable("manifest put", exc) from None
+        except OCIError as exc:
+            # Unknown: the registry may hold the manifest. The reservation
+            # runs out by itself and the note stays for whichever write
+            # lists the digest.
+            raise self._unavailable("manifest put", exc) from None
+
+        # Accepted. The repository is its publisher's organization's from
+        # here on, and the row is written now -- from the row the validation
+        # produced -- so the catalog lists it without waiting for a sweep.
+        manifest_accepted.set(True)
+        try:
+            owner = await run_in_threadpool(
+                lambda: self._store.commit_repository(
+                    repository, source_id=self._source.id, owner_org_id=publisher.org_id, created_by=publisher.user_id
+                )
+            )
+            self._require_owner(publisher, owner.owner_org_id, repository)
+            stored = await self._indexer.record_published(
+                row, tag=tag, user_id=publisher.user_id, org_id=publisher.org_id
+            )
+            if stored.status == STATUS_INDEXED:
+                await run_in_threadpool(
+                    self._catalog.record_manifest_blobs, self._source.id, repository, digest, manifest_blobs(manifest)
+                )
+        except PublishDenied:
+            # Only if the reservation ran out under this request and another
+            # organization's manifest was accepted first.
+            logger.error("cog_publish_ownership_lost", extra={"repository": repository, "digest": digest})
+            raise
+        except Exception as exc:
+            logger.error(
+                "cog_publish_unlisted",
+                extra={"repository": repository, "digest": digest, "error": type(exc).__name__},
+            )
+            raise ManifestUnlisted.not_yet() from None
+        if stored.status != STATUS_INDEXED:
+            logger.error("cog_publish_unlisted", extra={"repository": repository, "digest": digest, "error": "data"})
+            raise ManifestUnlisted(
+                "the manifest was stored in the registry, but the catalog could not index it and does not list it",
+                retryable=False,
+            )
         logger.info(
             "cog_published",
             extra={"repository": repository, "digest": digest, "cog_id": row.cog_id, "user": publisher.user_id},
         )
         return digest
+
+    async def _withdraw(self, publisher: Publisher, repository: str, digest: str, reservation: str | None) -> None:
+        def withdraw() -> None:
+            if reservation is not None:
+                self._store.release_repository(repository, reservation=reservation)
+            self._catalog.forget_publication(self._source.id, repository, digest, user_id=publisher.user_id)
+
+        await self._settle(withdraw)
 
     async def _validate(self, repository: str, manifest: Manifest, tags: tuple[str, ...]):
         """Read the bundle with the catalog's reader; refuse what the catalog would not list."""
@@ -488,16 +758,32 @@ class CogPublisher:
         )
 
 
+_RANGE_LENGTH = "the Content-Range does not match the number of bytes sent"
+
+
+@dataclass
+class _Held:
+    """A session this request holds the lease of; ``leased`` goes false once bookkeeping has let it go."""
+
+    session: UploadSession
+    leased: bool = True
+
+
 class _LimitExceeded(Exception):
     """Raised inside a request body stream once it has carried more than the limit allows."""
 
 
-class _Counted:
-    """A request body, counted as it is forwarded and cut off at ``limit`` bytes."""
+class _LengthMismatch(Exception):
+    """Raised inside a request body stream that is not the length its ``Content-Range`` promised."""
 
-    def __init__(self, content: AsyncIterable[bytes], *, limit: int) -> None:
+
+class _Counted:
+    """A request body, counted as it is forwarded: cut off at ``limit`` bytes, and held to ``expect`` if given."""
+
+    def __init__(self, content: AsyncIterable[bytes], *, limit: int, expect: int | None = None) -> None:
         self._content = content
         self._limit = limit
+        self._expect = expect
         self.count = 0
 
     async def chunks(self) -> AsyncIterator[bytes]:
@@ -505,4 +791,8 @@ class _Counted:
             self.count += len(chunk)
             if self.count > self._limit:
                 raise _LimitExceeded()
+            if self._expect is not None and self.count > self._expect:
+                raise _LengthMismatch()
             yield chunk
+        if self._expect is not None and self.count != self._expect:
+            raise _LengthMismatch()

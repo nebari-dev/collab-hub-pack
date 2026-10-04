@@ -278,6 +278,39 @@ async def test_a_pusher_may_ask_whether_a_blob_is_already_there(hub: Hub):
     assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(data)}", headers=client.headers)).status_code == 404
     reader = await hub.pull_token(REPO)
     assert (await hub.request("HEAD", f"/v2/{REPO}/blobs/{sha256(data)}", headers=reader)).status_code == 404
+    # The registry is asked about this repository and no other: what another repository holds is not disclosed.
+    asked = [request.url.path for request in hub.upstream.requests if request.method == "HEAD"]
+    assert asked and all(path.startswith(f"/v2/{REPO}/blobs/sha256:") for path in asked)
+    elsewhere = await pusher(hub, ALICE, "cogs/elsewhere")
+    head = await hub.request("HEAD", f"/v2/cogs/elsewhere/blobs/{sha256(data)}", headers=elsewhere.headers)
+    assert head.status_code == 200, "the fake registry keeps one blob store; a real one answers per repository"
+    assert hub.upstream.requests[-1].url.path == f"/v2/cogs/elsewhere/blobs/{sha256(data)}"
+
+
+async def test_push_paths_that_are_not_repository_names_reach_nothing(hub: Hub):
+    """Encoded separators, traversal, uppercase and over-long names: refused, and never forwarded."""
+
+    client = await pusher(hub)
+    writes = len(hub.upstream.writes())
+    for name in (
+        "Cogs/Upper",
+        "cogs/..",
+        "cogs/%2e%2e/secret",
+        "cogs//double",
+        "cogs/" + "a" * 256,
+        "cogs/trailing-",
+        "cogs%00/nul",
+    ):
+        for method, path, body in PUSHES:
+            url = path.format(repo=name, upload="up-" + "0" * 32)
+            response = await hub.request(method, url, headers=client.headers, content=body)
+            assert response.status_code in (400, 401, 404, 405), (method, url, response.status_code)
+    # A separator that arrives encoded is the same repository, and passes the same checks.
+    encoded = await hub.request("POST", f"/v2/{REPO.replace('/', '%2F')}/blobs/uploads/", headers=client.headers)
+    assert encoded.status_code == 202 and encoded.headers["location"].startswith(f"/v2/{REPO}/blobs/uploads/")
+    other = await hub.request("POST", "/v2/cogs%2Fnot-on-the-token/blobs/uploads/", headers=client.headers)
+    assert other.status_code == 401
+    assert [write for write in hub.upstream.writes()[writes:]] == [f"POST /v2/{REPO}/blobs/uploads/"]
 
 
 # -- who may push ---------------------------------------------------------------------
@@ -291,19 +324,31 @@ PUSHES = (
     ("GET", "/v2/{repo}/blobs/uploads/{upload}", None),
     ("DELETE", "/v2/{repo}/blobs/uploads/{upload}", None),
     ("PUT", "/v2/{repo}/manifests/1.0.0", COG.manifest),
+    ("PUT", "/v2/{repo}/manifests/" + COG.digest, COG.manifest),
 )
 
 
 async def refused_everywhere(hub: Hub, headers: dict[str, str], status: int, code: str, repo: str = REPO) -> None:
-    """Every push request is refused the same way, and none of them reaches the backing registry."""
+    """Every push request is refused the same way, and none of them reaches the backing registry.
 
-    writes = len(hub.upstream.writes())
+    The pusher's ``HEAD`` of a blob is the one push-side request that is a
+    read: refused, it is the ordinary answer about a blob nobody may pull,
+    and it too asks the backing registry nothing.
+    """
+
+    writes, asked = len(hub.upstream.writes()), len(hub.upstream.requests)
     for method, path, body in PUSHES:
         url = path.format(repo=repo, upload="up-" + "0" * 32)
         response = await hub.request(method, url, headers=headers, content=body)
         assert response.status_code == status, (method, url, response.status_code, response.text)
         assert response.json()["errors"][0]["code"] == code, (method, url)
     assert len(hub.upstream.writes()) == writes, "a refused push sent nothing upstream"
+    unlisted = sha256(b"a blob no manifest in the catalog lists")
+    hub.upstream.blobs[unlisted] = b"a blob no manifest in the catalog lists"
+    head = await hub.request("HEAD", f"/v2/{repo}/blobs/{unlisted}", headers=headers)
+    # 401 without a usable token; otherwise 404 -- or 403 for an account that may not read at all any more.
+    assert head.status_code in ((401,) if status == 401 else (403, 404)), head.status_code
+    assert len(hub.upstream.requests) == asked, "nor was the registry asked whether it holds a blob"
 
 
 async def test_push_needs_a_token_and_the_challenge_asks_for_push(hub: Hub):
@@ -361,8 +406,7 @@ async def test_publishing_is_off_without_a_publish_source(make_hub):
     assert off.status_code == 404 and off.json()["error"]["code"] == "cog_publishing_not_enabled"
     assert hub.upstream.requests == []
     # And the catalog's answers have no publication keys at all: what they were before publishing existed.
-    hub.catalog.upsert(catalog_row(REPO, COG.digest))
-    hub.catalog.record_publication("backing", REPO, COG.digest, user_id="alice", org_id="org-a")
+    hub.catalog.record_published(catalog_row(REPO, COG.digest), tag="latest", user_id="alice", org_id="org-a")
     cog = "example/cog-audio-transcriber"
     for url in ("/v1/cogs", f"/v1/cogs/{cog}", f"/v1/cogs/{cog}/versions/{COG.digest}"):
         assert "published_by" not in (await hub.get(url, headers=ALICE)).text, url
@@ -630,12 +674,17 @@ async def test_an_upload_session_is_its_owners_and_its_repositorys(hub: Hub):
     location = (await alice.start()).headers["location"]
     upload_id = location.rsplit("/", 1)[-1]
     # Another member of the same organization, and the same user under another repository name.
+    writes = len(hub.upstream.writes())
     for client, url in ((carol, location), (alice, f"/v2/cogs/other/blobs/uploads/{upload_id}")):
         for method in ("GET", "PATCH", "DELETE"):
             response = await hub.request(
                 method, url, headers=client.headers, content=b"x" if method == "PATCH" else None
             )
             assert response.status_code == 404, (method, url)
+        # Nor may either of them close it as a blob of their own.
+        closed = await hub.request("PUT", url, headers=client.headers, params={"digest": sha256(b"x")}, content=b"x")
+        assert closed.status_code == 404 and closed.json()["errors"][0]["code"] == "BLOB_UPLOAD_UNKNOWN", url
+    assert len(hub.upstream.writes()) == writes and sha256(b"x") not in hub.upstream.blobs
     for bad in ("not%20an%20id", "up-" + "f" * 32, "..", "a" * 200):
         assert (await hub.get(f"/v2/{REPO}/blobs/uploads/{bad}", headers=alice.headers)).status_code == 404
     assert (await hub.get(location, headers=alice.headers)).status_code == 204

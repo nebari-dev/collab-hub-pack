@@ -855,6 +855,16 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             # organization is re-read on every push; this is what a publish
             # is attributed to where there is no membership table to re-read.
             "ALTER TABLE collab_cog_registry_credentials ADD COLUMN IF NOT EXISTS org_id text",
+            # Which of a token's repositories it may push to. Per repository,
+            # never per token: asking to push to one repository and pull from
+            # another yields exactly that. Empty for every token that is not
+            # minted from a publish credential. This, not version 13's
+            # `actions` column (which stays 'pull' on every row), is what
+            # decides a push.
+            """
+            ALTER TABLE collab_cog_registry_tokens
+            ADD COLUMN IF NOT EXISTS push_repositories text[] NOT NULL DEFAULT '{}'
+            """,
             # Who published an artifact *through the Hub*: the authenticated
             # Hub user and their organization, as opposed to the `publisher`
             # the bundle declares about itself. NULL for anything the indexer
@@ -865,36 +875,72 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE collab_cog_artifacts ADD COLUMN IF NOT EXISTS published_org text",
             # A repository first published through the Hub belongs to the
             # publisher's organization: later pushes need membership of it.
-            # One row per repository path, created by the first accepted
-            # manifest and never by an upload alone. `source_id` is the source
-            # it was written through, whose enumeration these rows extend, so
-            # a source needs no configured repository list. `owner_org_id` is
-            # NULL when a platform operator with no organization published it.
+            # One row per repository path. A row starts as a *reservation*,
+            # taken just before a manifest is forwarded to the registry
+            # (`committed` false, `reserved_until` a few minutes out), and
+            # becomes ownership only when the registry has accepted that
+            # manifest. Publishes of one organization share a reservation
+            # (`reservation` identifies it, `holders` counts them); it is
+            # deleted when the registry has definitely refused every one of
+            # them, and one whose outcome is unknown expires and can be taken
+            # again. Only committed rows extend their source's enumeration.
+            # `owner_org_id` is NULL when a platform operator with no
+            # organization published it.
             """
             CREATE TABLE IF NOT EXISTS collab_cog_repositories (
-                repository   text PRIMARY KEY,
-                source_id    text NOT NULL,
-                owner_org_id text,
-                created_by   text NOT NULL,
-                created_at   timestamptz NOT NULL DEFAULT now()
+                repository     text PRIMARY KEY,
+                source_id      text NOT NULL,
+                owner_org_id   text,
+                created_by     text NOT NULL,
+                committed      boolean NOT NULL DEFAULT false,
+                reservation    text,
+                holders        integer NOT NULL DEFAULT 0,
+                reserved_until timestamptz NOT NULL,
+                created_at     timestamptz NOT NULL DEFAULT now()
             )
             """,
             """
             CREATE INDEX IF NOT EXISTS collab_cog_repositories_source_idx
-            ON collab_cog_repositories (source_id)
+            ON collab_cog_repositories (source_id) WHERE committed
+            """,
+            # Who is publishing a manifest, written *before* it is forwarded
+            # to the registry and removed when the catalog row is written with
+            # that publisher (or when the registry definitely refused it). It
+            # is what survives a failure between the registry accepting a
+            # manifest and the catalog recording it: whichever write lists the
+            # digest later -- a retry, a sweep -- takes the publisher from
+            # here, so the attribution cannot be lost with the request.
+            """
+            CREATE TABLE IF NOT EXISTS collab_cog_pending_publications (
+                source_id     text NOT NULL,
+                repository    text NOT NULL,
+                digest        text NOT NULL,
+                published_by  text NOT NULL,
+                published_org text,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (source_id, repository, digest)
+            )
             """,
             # An upload in progress. The client only ever sees `id`; the
             # backing registry's own session URL stays here, so any replica
             # can continue an upload and no response names the backing host.
-            # `received` is the number of bytes forwarded so far.
+            # The row is written *before* the registry is asked to open its
+            # session (`upstream_location` NULL until it has), so the per-user
+            # cap is enforced before anything exists upstream. `received` is
+            # the number of bytes forwarded so far. `leased_until` is the
+            # mutation lease: one request at a time, across replicas, may
+            # forward bytes to (or close, or cancel) a session. A row past
+            # `expires_at` is kept until its registry session has been
+            # cancelled, or a day has passed.
             """
             CREATE TABLE IF NOT EXISTS collab_cog_upload_sessions (
                 id                text PRIMARY KEY,
                 user_id           text NOT NULL,
                 repository        text NOT NULL,
                 source_id         text NOT NULL,
-                upstream_location text NOT NULL,
+                upstream_location text,
                 received          bigint NOT NULL DEFAULT 0 CHECK (received >= 0),
+                leased_until      timestamptz,
                 created_at        timestamptz NOT NULL DEFAULT now(),
                 expires_at        timestamptz NOT NULL
             )

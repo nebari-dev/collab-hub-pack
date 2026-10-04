@@ -125,9 +125,11 @@ class CogArtifact:
     published_by: str | None = None
     """The Hub user who published this artifact *through the Hub* (issue #180); ``None`` for an out-of-band push.
 
-    Authenticated, unlike the card's self-declared ``publisher``. Written
-    only by :meth:`CogCatalogStore.record_publication`: an upsert never sets
-    or clears it, so a sweep that rewrites the row keeps it.
+    Authenticated, unlike the card's self-declared ``publisher``. Written by
+    :meth:`CogCatalogStore.record_published`; an upsert never changes one
+    that is set, so a sweep that rewrites the row keeps it, and fills an
+    unset one only from a publication noted before the manifest was forwarded
+    (:meth:`CogCatalogStore.note_publication`).
     """
     published_org: str | None = None
 
@@ -294,7 +296,12 @@ class CogCatalogStore(ABC):
 
     @abstractmethod
     def mark_removed(
-        self, source_id: str, present: Mapping[str, Iterable[str]], *, excluding: Iterable[str] = ()
+        self,
+        source_id: str,
+        present: Mapping[str, Iterable[str]],
+        *,
+        excluding: Iterable[str] = (),
+        written_before: datetime | None = None,
     ) -> int:
         """Set ``removed_at = now()`` on this source's present rows whose digest is not in ``present``.
 
@@ -303,7 +310,19 @@ class CogCatalogStore(ABC):
         this sweep) are left untouched, because what was not enumerated
         cannot be declared gone. Returns the number of rows newly marked.
         Never deletes.
+
+        ``written_before`` -- a :meth:`clock` reading taken before the
+        registry was enumerated -- limits removal to rows last written
+        (``indexed_at``) before it, in the removal statement itself: a row a
+        publish wrote, or brought back, after that reading is not declared
+        gone by a listing that may predate it (issue #180).
         """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def clock(self) -> datetime:
+        """The time by the clock that stamps ``indexed_at``: the database's, where there is one."""
 
         raise NotImplementedError
 
@@ -386,13 +405,46 @@ class CogCatalogStore(ABC):
     # -- what publishing through the Hub needs (issue #180) --------------------
 
     @abstractmethod
-    def record_publication(
+    def note_publication(
         self, source_id: str, repository: str, digest: str, *, user_id: str, org_id: str | None
-    ) -> bool:
-        """Record who published this artifact through the Hub. Returns whether the row exists.
+    ) -> None:
+        """Remember who is about to publish this digest, **before** its manifest is forwarded.
 
-        The only writer of ``published_by``/``published_org``; called right
-        after the targeted reindex that follows an accepted manifest.
+        Durable, and independent of the catalog row (which does not exist
+        yet): if the registry accepts the manifest and the request then fails
+        before :meth:`record_published`, the next write that lists the digest
+        -- a retried push, a sweep's :meth:`upsert` -- attributes it from
+        this. Last note wins.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def forget_publication(self, source_id: str, repository: str, digest: str, *, user_id: str) -> None:
+        """Drop this user's note: the registry definitely refused the manifest."""
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_published(self, artifact: CogArtifact, *, tag: str | None, user_id: str, org_id: str | None) -> None:
+        """Write the row of a manifest the registry has just accepted through the Hub. One transaction.
+
+        Like :meth:`upsert`, the row is replaced whole and is present again,
+        with two differences that are the point:
+
+        - **Tags are assigned, not replaced.** ``artifact.tags`` is ignored.
+          With ``tag`` (the manifest was put under it), that tag ends up on
+          this digest and on no other digest of the same source and
+          repository: it is added here and taken from wherever else it was,
+          atomically, serialized per repository. A put by digest
+          (``tag=None``) adds nothing. The row's other tags stay as the
+          catalog holds them; a row that was marked removed starts from
+          none, so nothing stale comes back with it.
+        - **The publisher is written with the row**, and the note taken by
+          :meth:`note_publication` is consumed.
+
+        Raises :class:`CogCatalogDataError` for a row the backend cannot
+        represent, as :meth:`upsert` does.
         """
 
         raise NotImplementedError
@@ -484,12 +536,26 @@ class CogCatalogStore(ABC):
         raise NotImplementedError
 
 
-def _keep_publication(new: CogArtifact, old: CogArtifact | None) -> CogArtifact:
-    """An upsert replaces a row whole, except for who published it through the Hub."""
+def _keep_publication(
+    new: CogArtifact, old: CogArtifact | None, noted: tuple[str, str | None] | None
+) -> CogArtifact:
+    """An upsert replaces a row whole, except for who published it through the Hub.
 
-    if old is None:
-        return replace(new, published_by=None, published_org=None)
-    return replace(new, published_by=old.published_by, published_org=old.published_org)
+    A publisher already on the row stays; one that is not there yet comes
+    from the note taken before the manifest was forwarded, if there is one.
+    """
+
+    if old is not None and old.published_by is not None:
+        return replace(new, published_by=old.published_by, published_org=old.published_org)
+    user_id, org_id = noted or (None, None)
+    return replace(new, published_by=user_id, published_org=org_id)
+
+
+def _checked(artifact: CogArtifact) -> None:
+    if artifact.status not in STATUSES:
+        raise ValueError(f"unknown catalog status {artifact.status!r}")
+    require_aware(artifact.pushed_at, "pushed_at")
+    require_aware(artifact.indexed_at, "indexed_at")
 
 
 def _one_of(digest: str | None, tag: str | None) -> None:
@@ -657,7 +723,10 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
         raise self._refuse()
 
-    def mark_removed(self, source_id, present, *, excluding=()) -> int:
+    def mark_removed(self, source_id, present, *, excluding=(), written_before=None) -> int:
+        raise self._refuse()
+
+    def clock(self) -> datetime:
         raise self._refuse()
 
     def mark_removed_one(self, source_id, repository, digest) -> bool:
@@ -681,7 +750,13 @@ class UnavailableCogCatalogStore(CogCatalogStore):
     def list_versions(self, cog_id, *, include_removed=False) -> list[CogArtifact]:
         raise self._refuse()
 
-    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
+    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
+        raise self._refuse()
+
+    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+        raise self._refuse()
+
+    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
         raise self._refuse()
 
     def repository_known(self, repository) -> bool:
@@ -713,6 +788,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
 
     _rows: dict[tuple[str, str, str], CogArtifact] = field(default_factory=dict)
     _blobs: dict[tuple[str, str, str], dict[str, BlobDescriptor]] = field(default_factory=dict)
+    _noted: dict[tuple[str, str, str], tuple[str, str | None]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _sweep: threading.Lock = field(default_factory=threading.Lock)
 
@@ -733,19 +809,19 @@ class InMemoryCogCatalogStore(CogCatalogStore):
                 if row.source_id == source_id
             ]
 
-    def upsert(self, artifact: CogArtifact, *, targeted: bool = False) -> None:
-        # ``targeted`` is about connection routing and this store has no
-        # connections; accepted for signature parity with the Postgres store.
-        if artifact.status not in STATUSES:
-            raise ValueError(f"unknown catalog status {artifact.status!r}")
-        require_aware(artifact.pushed_at, "pushed_at")
-        require_aware(artifact.indexed_at, "indexed_at")
+    def _storable(self, artifact: CogArtifact) -> None:
+        _checked(artifact)
         if artifact.card is not None and contains_nul(artifact.card):
             # Parity with Postgres, where jsonb refuses NUL: a card this store
             # silently accepted would be a test passing on content production
             # rejects. contains_nul walks the parsed values, so a literal
             # backslash-u0000 in documentation text is (correctly) accepted.
             raise CogCatalogDataError("card contains NUL (\\u0000), which jsonb cannot store")
+
+    def upsert(self, artifact: CogArtifact, *, targeted: bool = False) -> None:
+        # ``targeted`` is about connection routing and this store has no
+        # connections; accepted for signature parity with the Postgres store.
+        self._storable(artifact)
         stored = replace(
             artifact,
             tags=tuple(sorted(set(artifact.tags))),
@@ -754,16 +830,41 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             removed_at=None,
         )
         with self._lock:
-            # Parity with Postgres, whose upsert does not name these columns.
-            self._rows[self._key(stored)] = _keep_publication(stored, self._rows.get(self._key(stored)))
+            # Parity with Postgres: a publisher on the row stays, and a noted one is taken (and the note with it).
+            key = self._key(stored)
+            self._rows[key] = _keep_publication(stored, self._rows.get(key), self._noted.pop(key, None))
 
-    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
+    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
         with self._lock:
-            row = self._rows.get((source_id, repository, digest))
-            if row is None:
-                return False
-            self._rows[(source_id, repository, digest)] = replace(row, published_by=user_id, published_org=org_id)
-            return True
+            self._noted[(source_id, repository, digest)] = (user_id, org_id)
+
+    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+        with self._lock:
+            noted = self._noted.get((source_id, repository, digest))
+            if noted is not None and noted[0] == user_id:
+                del self._noted[(source_id, repository, digest)]
+
+    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
+        self._storable(artifact)
+        key = self._key(artifact)
+        with self._lock:
+            old = self._rows.get(key)
+            kept = set(old.tags) if old is not None and old.removed_at is None else set()
+            if tag is not None:
+                kept.add(tag)
+                for other_key, other in list(self._rows.items()):
+                    if other_key != key and other_key[:2] == key[:2] and tag in other.tags:
+                        self._rows[other_key] = replace(other, tags=tuple(t for t in other.tags if t != tag))
+            self._rows[key] = replace(
+                artifact,
+                tags=tuple(sorted(kept)),
+                read_errors=tuple(artifact.read_errors),
+                indexed_at=datetime.now(UTC),
+                removed_at=None,
+                published_by=user_id,
+                published_org=org_id,
+            )
+            self._noted.pop(key, None)
 
     def repository_known(self, repository) -> bool:
         with self._lock:
@@ -783,7 +884,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             )
             return True
 
-    def mark_removed(self, source_id, present, *, excluding=()) -> int:
+    def mark_removed(self, source_id, present, *, excluding=(), written_before=None) -> int:
         wanted = {repo: set(digests) for repo, digests in present.items()}
         shielded = set(excluding)
         now = datetime.now(UTC)
@@ -793,6 +894,8 @@ class InMemoryCogCatalogStore(CogCatalogStore):
                 if row.source_id != source_id or row.removed_at is not None:
                     continue
                 if row.repository in shielded or row.digest in wanted.get(row.repository, ()):
+                    continue
+                if written_before is not None and row.indexed_at is not None and row.indexed_at >= written_before:
                     continue
                 self._rows[key] = replace(row, removed_at=now)
                 marked += 1
@@ -805,6 +908,9 @@ class InMemoryCogCatalogStore(CogCatalogStore):
                 return False
             self._rows[(source_id, repository, digest)] = replace(row, removed_at=datetime.now(UTC))
             return True
+
+    def clock(self) -> datetime:
+        return datetime.now(UTC)
 
     @contextmanager
     def sweep_lock(self):
@@ -945,6 +1051,53 @@ _PULLABLE = f"removed_at IS NULL AND status = '{STATUS_INDEXED}' AND cog_id IS N
 _PULLABLE_A = f"a.removed_at IS NULL AND a.status = '{STATUS_INDEXED}' AND a.cog_id IS NOT NULL"
 
 
+PUBLISH_LOCK_CLASS = int.from_bytes(b"cpb1", "big")
+"""First key of the advisory lock serializing one repository's publishes (second: ``hashtext(source/repository)``)."""
+
+_WRITTEN_COLUMNS = (
+    "source_id, host, repository, digest, tags, pushed_at, indexed_at, manifest_media_type, "
+    "status, card, cog_id, name, version, kind, publisher, manifest_schema, read_errors"
+)
+_WRITTEN_VALUES = "%s, %s, %s, %s, %s, %s, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s"
+_REPLACED_COLUMNS = """host = EXCLUDED.host,
+                    pushed_at = EXCLUDED.pushed_at,
+                    indexed_at = now(),
+                    manifest_media_type = EXCLUDED.manifest_media_type,
+                    status = EXCLUDED.status,
+                    card = EXCLUDED.card,
+                    cog_id = EXCLUDED.cog_id,
+                    name = EXCLUDED.name,
+                    version = EXCLUDED.version,
+                    kind = EXCLUDED.kind,
+                    publisher = EXCLUDED.publisher,
+                    manifest_schema = EXCLUDED.manifest_schema,
+                    read_errors = EXCLUDED.read_errors"""
+"""What every write of a row replaces; tags, presence and the Hub publisher are each writer's own business."""
+
+
+def _written_values(artifact: CogArtifact, tags: list[str]) -> tuple:
+    from psycopg.types.json import Jsonb
+
+    return (
+        artifact.source_id,
+        artifact.host,
+        artifact.repository,
+        artifact.digest,
+        tags,
+        artifact.pushed_at,
+        artifact.manifest_media_type,
+        artifact.status,
+        Jsonb(artifact.card) if artifact.card is not None else None,
+        artifact.cog_id,
+        artifact.name,
+        artifact.version,
+        artifact.kind,
+        artifact.publisher,
+        artifact.manifest_schema,
+        Jsonb(list(artifact.read_errors)),
+    )
+
+
 def _row_to_artifact(row: Mapping[str, Any]) -> CogArtifact:
     card = row["card"]
     errors = row["read_errors"]
@@ -1062,63 +1215,46 @@ class PostgresCogCatalogStore(CogCatalogStore):
 
     def upsert(self, artifact: CogArtifact, *, targeted: bool = False) -> None:
         import psycopg
-        from psycopg.types.json import Jsonb
 
-        if artifact.status not in STATUSES:
-            raise ValueError(f"unknown catalog status {artifact.status!r}")
-        require_aware(artifact.pushed_at, "pushed_at")
-        require_aware(artifact.indexed_at, "indexed_at")
+        _checked(artifact)
         # `indexed_at` is the server's clock: rows compare across replicas.
         # The card goes in as jsonb verbatim -- the reader's dict, structure
         # preserved -- and `removed_at` is cleared because a row being
         # (re)written was just seen in the registry. A targeted upsert (the
         # webhook's lock-less reindex) takes its own connection rather than a
         # running sweep's lock session -- see _sweep_connection (issue #128).
+        #
+        # Who published it through the Hub is not the reader's to say: a
+        # publisher already on the row stays, and one that is not comes from
+        # the note a publish left before forwarding its manifest (issue
+        # #180), consumed here -- in the same statement, so the sweep path
+        # stays one statement on the lock session.
         connection = self._own_connection if targeted else self._sweep_connection
+        key = (artifact.source_id, artifact.repository, artifact.digest)
         try:
             with connection() as conn:
                 conn.execute(
-                    """
-                INSERT INTO collab_cog_artifacts (
-                    source_id, host, repository, digest, tags, pushed_at, indexed_at, manifest_media_type,
-                    status, card, cog_id, name, version, kind, publisher, manifest_schema, read_errors, removed_at
+                    f"""
+                WITH noted AS (
+                    DELETE FROM collab_cog_pending_publications
+                    WHERE source_id = %s AND repository = %s AND digest = %s
+                    RETURNING published_by, published_org
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                INSERT INTO collab_cog_artifacts (
+                    {_WRITTEN_COLUMNS}, removed_at, published_by, published_org
+                )
+                VALUES ({_WRITTEN_VALUES}, NULL,
+                        (SELECT published_by FROM noted), (SELECT published_org FROM noted))
                 ON CONFLICT (source_id, repository, digest) DO UPDATE SET
-                    host = EXCLUDED.host,
+                    {_REPLACED_COLUMNS},
                     tags = EXCLUDED.tags,
-                    pushed_at = EXCLUDED.pushed_at,
-                    indexed_at = now(),
-                    manifest_media_type = EXCLUDED.manifest_media_type,
-                    status = EXCLUDED.status,
-                    card = EXCLUDED.card,
-                    cog_id = EXCLUDED.cog_id,
-                    name = EXCLUDED.name,
-                    version = EXCLUDED.version,
-                    kind = EXCLUDED.kind,
-                    publisher = EXCLUDED.publisher,
-                    manifest_schema = EXCLUDED.manifest_schema,
-                    read_errors = EXCLUDED.read_errors,
-                    removed_at = NULL
+                    removed_at = NULL,
+                    published_by = COALESCE(collab_cog_artifacts.published_by, EXCLUDED.published_by),
+                    published_org = CASE WHEN collab_cog_artifacts.published_by IS NULL
+                                         THEN EXCLUDED.published_org
+                                         ELSE collab_cog_artifacts.published_org END
                     """,
-                    (
-                        artifact.source_id,
-                        artifact.host,
-                        artifact.repository,
-                        artifact.digest,
-                        sorted(set(artifact.tags)),
-                        artifact.pushed_at,
-                        artifact.manifest_media_type,
-                        artifact.status,
-                        Jsonb(artifact.card) if artifact.card is not None else None,
-                        artifact.cog_id,
-                        artifact.name,
-                        artifact.version,
-                        artifact.kind,
-                        artifact.publisher,
-                        artifact.manifest_schema,
-                        Jsonb(list(artifact.read_errors)),
-                    ),
+                    (*key, *_written_values(artifact, sorted(set(artifact.tags)))),
                 )
         except psycopg.DataError as exc:
             # This row's *content* is what the server refused (NUL in a jsonb
@@ -1127,6 +1263,85 @@ class PostgresCogCatalogStore(CogCatalogStore):
             # error against the artifact and continues, while an outage
             # aborts its sweep. Class name only; the server's message quotes
             # the offending value.
+            raise CogCatalogDataError(type(exc).__name__) from exc
+
+    def note_publication(self, source_id, repository, digest, *, user_id, org_id) -> None:
+        with bounded_connection(self._db) as conn:
+            conn.execute(
+                """
+                INSERT INTO collab_cog_pending_publications
+                    (source_id, repository, digest, published_by, published_org)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (source_id, repository, digest) DO UPDATE SET
+                    published_by = EXCLUDED.published_by,
+                    published_org = EXCLUDED.published_org,
+                    created_at = now()
+                """,
+                (source_id, repository, digest, user_id, org_id),
+            )
+
+    def forget_publication(self, source_id, repository, digest, *, user_id) -> None:
+        with bounded_connection(self._db) as conn:
+            conn.execute(
+                """
+                DELETE FROM collab_cog_pending_publications
+                WHERE source_id = %s AND repository = %s AND digest = %s AND published_by = %s
+                """,
+                (source_id, repository, digest, user_id),
+            )
+
+    def record_published(self, artifact, *, tag, user_id, org_id) -> None:
+        import psycopg
+
+        _checked(artifact)
+        key = (artifact.source_id, artifact.repository, artifact.digest)
+        try:
+            # The request's own budget, not the sweep's: this runs inside a
+            # push, and must give its thread and its connection back when the
+            # request's time is up.
+            with bounded_connection(self._db) as conn:
+                # One repository's tag assignments are serialized: two
+                # publishes moving one tag at once must not each strip it
+                # from rows the other has not written yet and leave it on
+                # both. Released with the transaction.
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (PUBLISH_LOCK_CLASS, f"{artifact.source_id}/{artifact.repository}"),
+                )
+                conn.execute(
+                    f"""
+                INSERT INTO collab_cog_artifacts (
+                    {_WRITTEN_COLUMNS}, removed_at, published_by, published_org
+                )
+                VALUES ({_WRITTEN_VALUES}, NULL, %s, %s)
+                ON CONFLICT (source_id, repository, digest) DO UPDATE SET
+                    {_REPLACED_COLUMNS},
+                    tags = CASE WHEN collab_cog_artifacts.removed_at IS NULL THEN ARRAY(
+                               SELECT DISTINCT tag FROM unnest(collab_cog_artifacts.tags || EXCLUDED.tags) AS tag
+                               ORDER BY tag)
+                           ELSE EXCLUDED.tags END,
+                    removed_at = NULL,
+                    published_by = EXCLUDED.published_by,
+                    published_org = EXCLUDED.published_org
+                    """,
+                    (*_written_values(artifact, [tag] if tag is not None else []), user_id, org_id),
+                )
+                if tag is not None:
+                    conn.execute(
+                        """
+                        UPDATE collab_cog_artifacts SET tags = array_remove(tags, %s)
+                        WHERE source_id = %s AND repository = %s AND digest <> %s AND %s = ANY(tags)
+                        """,
+                        (tag, artifact.source_id, artifact.repository, artifact.digest, tag),
+                    )
+                conn.execute(
+                    """
+                    DELETE FROM collab_cog_pending_publications
+                    WHERE source_id = %s AND repository = %s AND digest = %s
+                    """,
+                    key,
+                )
+        except psycopg.DataError as exc:
             raise CogCatalogDataError(type(exc).__name__) from exc
 
     def update_tags(self, source_id, repository, digest, tags, *, pushed_at=None) -> bool:
@@ -1145,14 +1360,17 @@ class PostgresCogCatalogStore(CogCatalogStore):
             ).fetchone()
         return row is not None
 
-    def mark_removed(self, source_id, present, *, excluding=()) -> int:
+    def mark_removed(self, source_id, present, *, excluding=(), written_before=None) -> int:
         from psycopg.types.json import Jsonb
 
         # The present set travels as one jsonb document ({repo: [digest, ...]})
         # and is unnested server-side, so a source with thousands of artifacts
         # is one statement rather than one per repository, and the whole
         # decision is one snapshot. Repositories whose listing failed travel
-        # as an array and are excluded from the UPDATE outright.
+        # as an array and are excluded from the UPDATE outright. So are rows
+        # written at or after `written_before`, when it is given: the
+        # condition is part of this statement, so no write can slip between a
+        # check and the removal.
         document = {repo: sorted(set(digests)) for repo, digests in present.items()}
         shielded = sorted(set(excluding))
         with self._sweep_connection() as conn:
@@ -1169,6 +1387,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
                     WHERE a.source_id = %s
                       AND a.removed_at IS NULL
                       AND NOT (a.repository = ANY(%s))
+                      AND (%s::timestamptz IS NULL OR a.indexed_at < %s)
                       AND NOT EXISTS (
                           SELECT 1 FROM present p
                           WHERE p.repository = a.repository AND p.digest = a.digest
@@ -1177,9 +1396,14 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 )
                 SELECT count(*) AS n FROM marked
                 """,
-                (Jsonb(document), source_id, shielded),
+                (Jsonb(document), source_id, shielded, written_before, written_before),
             ).fetchone()
         return int(row["n"]) if row else 0
+
+    def clock(self) -> datetime:
+        with self._sweep_connection() as conn:
+            row = conn.execute("SELECT clock_timestamp() AS now").fetchone()
+        return row["now"]
 
     def mark_removed_one(self, source_id, repository, digest) -> bool:
         # A targeted entry point (webhook delete), never the sweep's: it takes
@@ -1315,18 +1539,6 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 (cog_id, include_removed),
             ).fetchall()
         return [_row_to_artifact(row) for row in rows]
-
-    def record_publication(self, source_id, repository, digest, *, user_id, org_id) -> bool:
-        with bounded_connection(self._db) as conn:
-            row = conn.execute(
-                """
-                UPDATE collab_cog_artifacts SET published_by = %s, published_org = %s
-                WHERE source_id = %s AND repository = %s AND digest = %s
-                RETURNING digest
-                """,
-                (user_id, org_id, source_id, repository, digest),
-            ).fetchone()
-        return row is not None
 
     def repository_known(self, repository) -> bool:
         with bounded_connection(self._db) as conn:

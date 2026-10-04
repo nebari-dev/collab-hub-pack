@@ -217,6 +217,19 @@ if push_cog "$(printf '%s' "$foreign" | jq -r .username)" "$(printf '%s' "$forei
 fi
 pass "a repository published through the Hub is its organization's: another organization is refused"
 
+# One token, push on this repository and pull on another: it pushes to this one only.
+mixed="$(curl -sS -u "$PUB_USER:$PUB_SECRET" \
+  "$HUB/v2/token?service=$HUB_REGISTRY&scope=repository:$REPO:pull,push&scope=repository:cogs/elsewhere:pull" | jq -r .token)"
+code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $mixed" "$HUB/v2/cogs/elsewhere/blobs/uploads/")"
+[ "$code" = "403" ] || die "push on one repository opened an upload in another asked for pull only ($code)"
+session="$(curl -sS -o /dev/null -D - -X POST -H "Authorization: Bearer $mixed" "$HUB/v2/$REPO/blobs/uploads/" | tr -d '\r' | awk 'tolower($1)=="location:"{print $2}')"
+case "$session" in /v2/"$REPO"/blobs/uploads/up-*) ;; *) die "opening an upload answered Location '$session'" ;; esac
+code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $mixed" "$HUB$session")"
+[ "$code" = "204" ] || die "cancelling an upload answered $code"
+code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $mixed" "$HUB$session")"
+[ "$code" = "404" ] || die "a cancelled upload still answers $code"
+pass "push is per repository; an upload is opened and cancelled through the Hub's own session path"
+
 # Pushed straight to the registry, behind the Hub's back, and not a Cog: the Hub must never serve it.
 oras_in "$WORK/plain" push --plain-http -u "$BACKING_USER" -p "$BACKING_PASSWORD" \
   "$BACKING_ADDR/$REPO:plain" README.txt:text/plain >/dev/null
@@ -236,7 +249,7 @@ case "$challenge" in
 esac
 
 echo "== without a Hub sign-in the pull is refused"
-mkdir -p "$WORK/anon" "$WORK/out" "$WORK/bytag"
+mkdir -p "$WORK/anon" "$WORK/out" "$WORK/bytag" "$WORK/latest"
 if oras_in "$WORK/anon" pull "$REFERENCE" >/dev/null 2>&1; then die "an anonymous pull succeeded"; fi
 pass "anonymous pull refused"
 if oras_in "$WORK/anon" pull -u "$BACKING_USER" -p "$BACKING_PASSWORD" "$REFERENCE" >/dev/null 2>&1; then
@@ -293,6 +306,24 @@ if oras_in "$WORK" manifest fetch --plain-http -u "$REG_USER" -p "$REG_SECRET" "
 fi
 pass "refused by the Hub's other APIs and by the backing registry"
 
+echo "== a tag moved to a new version is on that version alone, and a sweep leaves it there"
+push_cog "$PUB_USER" "$PUB_SECRET" latest >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log" >&2; die "tagging the published version failed"; }
+head -c 300000 /dev/urandom > "$WORK/bundle/weights.bin"
+push_cog "$PUB_USER" "$PUB_SECRET" latest >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log" >&2; die "publishing a second version failed"; }
+check_latest() { # <when>
+  local versions
+  versions="$(hub "$HUB/v1/cogs/example/cog-audio-transcriber" | jq -c '[.versions[] | select(.removed_at == null) | {digest, tags, published_by}]')"
+  [ "$(printf '%s' "$versions" | jq -r '[.[] | select(.tags | index("latest"))] | length')" = "1" ] || die "$1: 'latest' is not on exactly one version: $versions"
+  [ "$(printf '%s' "$versions" | jq -r --arg d "$DIGEST" '.[] | select(.digest == $d) | .tags | join(",")')" = "0.1.0" ] || die "$1: the first version's tags are wrong: $versions"
+  [ "$(printf '%s' "$versions" | jq -r '[.[] | select(.published_by != "e2e-user")] | length')" = "0" ] || die "$1: a publisher was lost: $versions"
+}
+check_latest "after the publish"
+oras_in "$WORK/latest" pull -u "$REG_USER" -p "$REG_SECRET" "$HUB_REGISTRY/$REPO:latest" >/dev/null || die "oras pull of the moved tag failed"
+cmp -s "$WORK/bundle/weights.bin" "$WORK/latest/weights.bin" || die "the moved tag does not serve the new version"
+sleep 12   # at least one sweep (every 10 seconds here) has now reconciled the repository
+check_latest "after a sweep"
+pass "a moved tag is on exactly one version, before and after a sweep; publishers kept"
+
 echo "== revocation is immediate"
 [ "$(hub -o /dev/null -w '%{http_code}' -X DELETE "$HUB/v1/cogs/registry-credentials/$CRED_ID")" = "204" ] || die "revoke did not answer 204"
 if oras_in "$WORK/anon" pull -u "$REG_USER" -p "$REG_SECRET" "$REFERENCE" >/dev/null 2>&1; then
@@ -310,6 +341,7 @@ if grep -q -e ":$BACKING_PORT" -e "backing.test" -e "$BACKING_PASSWORD" -e "$BAC
   die "a response names the backing registry or its credential"
 fi
 if grep -q -e "$BACKING_PASSWORD" -e "$REG_SECRET" "$WORK/hub.log"; then die "a secret reached the Hub's log"; fi
-pass "no backing address or credential in any response; no secret in the log"
+if grep -q "localhost:$BACKING_PORT/v2/.*blobs/uploads" "$WORK/hub.log"; then die "an upload session URL reached the Hub's log"; fi
+pass "no backing address or credential in any response; no secret, and no upload session URL, in the log"
 
 echo "== result: PASSED ($BACKING)"

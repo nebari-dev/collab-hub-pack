@@ -1,0 +1,933 @@
+"""Publishing through the Hub (issue #180): what stays true when a push goes wrong, or two happen at once.
+
+The happy paths and the authorization matrix are ``test_cog_publishing``.
+These are the edges between the Hub's records and the backing registry's:
+what a token may push to, repository by repository; what a refused or lost
+manifest leaves behind; where a moved tag ends up; what a client is told
+when the registry has a manifest the catalog could not list; upload sessions
+at the cap, past their expiry and under two requests at once; a sweep racing
+a publish; and what the Hub's HTTP client logs about the registry it writes
+to.
+"""
+
+# ruff: noqa: F811 - the fixtures imported from the sibling suites are used as parameters
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+
+import httpx
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from test_cog_publishing import (
+    BOB,
+    CAROL,
+    COG,
+    COG_ID,
+    EVERYONE,
+    PUSHES,
+    REPO,
+    CogBundle,
+    hub,  # noqa: F401 - fixture
+    publish_credential,
+    pusher,
+    refused_everywhere,
+)
+from test_cog_serving import (
+    ALICE,
+    BACKING_HOST,
+    HUB_HOST,
+    MEDIA_TYPE_OCI_MANIFEST,
+    UPLOAD_STATE,
+    FakeRegistry,
+    Hub,
+    assert_no_backing_details,
+    basic,
+    make_hub,  # noqa: F401 - fixture
+    settings,
+    sha256,
+)
+
+from collab_hub_api import config as config_module
+from collab_hub_api.cogs import deadline, publish_store, publishing
+from collab_hub_api.cogs.catalog import (
+    STATUS_FAILED,
+    STATUS_INDEXED,
+    CogCatalogDataError,
+    CogCatalogUnavailableError,
+    PostgresCogCatalogStore,
+)
+from collab_hub_api.cogs.registry import build_registry_sources
+from collab_hub_api.config import Config
+from collab_hub_api.core import make_app
+from collab_hub_api.routers import registry as registry_router
+
+OTHER = "cogs/another-cog"
+
+
+def store_of(hub: Hub):
+    return hub.serving.publisher._store
+
+
+async def upload(client, bundle, repo: str = REPO) -> None:
+    for data in bundle.blobs.values():
+        assert (await client.blob(data, repo)).status_code == 201
+
+
+def intercept_catalog_write(hub: Hub, make):
+    """Put ``make(original)`` in place of the catalog write a publish makes; returns a function that undoes it.
+
+    That write is ``record_published``. ``upsert`` is replaced the same way
+    so that these tests say the same thing about a publisher that writes its
+    row with the sweep's statement.
+    """
+
+    originals = {name: getattr(hub.catalog, name, None) for name in ("record_published", "upsert")}
+    for name, original in originals.items():
+        setattr(hub.catalog, name, make(original))
+
+    def restore() -> None:
+        for name in originals:
+            vars(hub.catalog).pop(name, None)
+
+    return restore
+
+
+def errors(response: httpx.Response) -> tuple[int, str, str]:
+    """``(status, code, message)`` of a refusal; a response with no error body has neither."""
+
+    if not response.content:
+        return response.status_code, "", ""
+    error = response.json()["errors"][0]
+    return response.status_code, error["code"], error["message"]
+
+
+# -- push is per repository ---------------------------------------------------------------
+
+
+async def scoped(hub: Hub, credential: dict, *scopes: str) -> dict[str, str]:
+    response = await hub.get(
+        "/v2/token",
+        params={"service": HUB_HOST, "scope": list(scopes)},
+        headers=basic(credential["username"], credential["secret"]),
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
+async def test_push_on_one_repository_never_grants_writes_to_another_asked_for_pull_only(hub: Hub):
+    """One token, ``pull,push`` on A and ``pull`` on B: with a publish credential, B is still read-only."""
+
+    credential = await publish_credential(hub)
+    for scopes in (
+        (f"repository:{REPO}:pull,push", f"repository:{OTHER}:pull"),
+        (f"repository:{REPO}:pull,push repository:{OTHER}:pull",),  # one parameter, space-separated
+        (f"repository:{OTHER}:pull", f"repository:{REPO}:push"),  # in either order
+    ):
+        token = await scoped(hub, credential, *scopes)
+        await refused_everywhere(hub, token, 403, "DENIED", OTHER)
+        message = (await hub.request("POST", f"/v2/{OTHER}/blobs/uploads/", headers=token)).json()["errors"][0]
+        assert "may not push to this repository" in message["message"]
+        # It was asked to pull from B, and may: the refusal is the push, not the name.
+        assert (await hub.get(f"/v2/{OTHER}/tags/list", headers=token)).status_code == 404
+        # And it does push to A, the repository push was asked for.
+        assert (await hub.request("POST", f"/v2/{REPO}/blobs/uploads/", headers=token)).status_code == 202
+    assert not any(OTHER in write for write in hub.upstream.writes())
+
+    # Asked for push alone, it pushes -- and does not thereby read.
+    push_only = await scoped(hub, credential, f"repository:{REPO}:push")
+    assert (await hub.request("POST", f"/v2/{REPO}/blobs/uploads/", headers=push_only)).status_code == 202
+    assert (await hub.get(f"/v2/{REPO}/tags/list", headers=push_only)).status_code == 401
+    # A repository the token does not name at all is a matter of scope, and says which to ask for.
+    unnamed = await hub.request("POST", "/v2/cogs/unnamed/blobs/uploads/", headers=push_only)
+    assert unnamed.status_code == 401 and 'error="insufficient_scope"' in unnamed.headers["www-authenticate"]
+
+    # A pull credential asking to push is given nothing for that repository, not pull on it.
+    reader = await hub.exchange(ALICE)
+    asked = await scoped(hub, reader, f"repository:{REPO}:push", f"repository:{OTHER}:pull")
+    assert (await hub.get(f"/v2/{REPO}/tags/list", headers=asked)).status_code == 401
+    assert (await hub.get(f"/v2/{OTHER}/tags/list", headers=asked)).status_code == 404
+
+
+def test_scopes_are_read_repository_by_repository():
+    scopes = [
+        "repository:cogs/a:pull",
+        "repository:cogs/b:pull,push repository:cogs/c:push",
+        "repository:cogs/a:pull",
+        "repository:cogs/d:delete",
+        "registry:catalog:*",
+        "repository:Not/Valid:pull,push",
+        "repository::push",
+        "garbage",
+    ]
+    assert registry_router.requested_scope(scopes) == (["cogs/a", "cogs/b"], ["cogs/b", "cogs/c"])
+    # A repository named twice gets what each entry asks, and nothing leaks between names.
+    assert registry_router.requested_scope(["repository:cogs/a:pull repository:cogs/a:push"]) == (
+        ["cogs/a"],
+        ["cogs/a"],
+    )
+    # On a Hub that accepts no publishes, push names nothing: exactly the parsing it had before.
+    assert registry_router.requested_scope(scopes, pushing=False) == (["cogs/a", "cogs/b"], [])
+    assert registry_router.requested_repositories(scopes) == ["cogs/a", "cogs/b"]
+    # The bound on names counts a repository once, whichever list it is in.
+    many = [f"repository:cogs/r{i}:{'pull' if i % 2 else 'push'}" for i in range(40)]
+    pull, push = registry_router.requested_scope(many)
+    assert len(set(pull) | set(push)) == registry_router.MAX_TOKEN_SCOPES and not set(pull) & set(push)
+    flood = ["repository:cogs/a:delete " * 100_000 + "repository:cogs/z:push"]
+    assert registry_router.requested_scope(flood) == ([], [])
+
+
+# -- a repository is owned only once the registry has accepted a manifest ------------------------
+
+
+async def test_a_manifest_the_registry_refuses_claims_and_enumerates_nothing(hub: Hub):
+    alice, bob = await pusher(hub, ALICE), await pusher(hub, BOB)
+    await upload(alice, COG)
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(400, text="no")
+    assert errors(await alice.manifest(COG, "1.0.0")) == (400, "MANIFEST_INVALID", "the registry refused the manifest")
+    store = store_of(hub)
+    assert store.get_repository(REPO) is None, "a refused manifest owns nothing"
+    assert store.published_repositories("backing") == [], "and adds nothing to what a sweep enumerates"
+    assert store._repositories == {}, "the reservation was released, not left to expire"
+    assert hub.catalog._noted == {}, "and nobody is on record as publishing that digest"
+    # The registry refusing the Hub's own credential is as definite: nothing was stored.
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(403, text="the robot may not push")
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 503
+    assert store._repositories == {} and hub.catalog._noted == {}
+    del hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"]
+
+    # So the name is still anybody's: another organization publishes to it and owns it.
+    theirs = CogBundle(extra=b"bob's bytes")
+    assert (await bob.bundle(theirs, "1.0.0")).status_code == 201
+    assert store.get_repository(REPO).owner_org_id == "org-b"
+    assert store.published_repositories("backing") == [REPO]
+    await refused_everywhere(hub, alice.headers, 403, "DENIED")
+
+
+async def test_an_unknown_outcome_leaves_a_reservation_that_expires_and_is_never_enumerated(hub: Hub):
+    now = [datetime.now(UTC)]
+    store = store_of(hub)
+    store.clock = lambda: now[0]
+    alice, bob, carol = await pusher(hub, ALICE), await pusher(hub, BOB), await pusher(hub, CAROL)
+    theirs = CogBundle(extra=b"bob's bytes")
+    await upload(alice, COG)
+    await upload(bob, theirs)
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(500, text="boom")
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 503
+
+    # The registry may or may not hold the manifest. Nobody owns the name, and no sweep is sent to it.
+    assert store.get_repository(REPO) is None and store.published_repositories("backing") == []
+    # While the reservation lives, another organization cannot take the name...
+    del hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"]
+    writes = len(hub.upstream.writes())
+    refused = await bob.manifest(theirs, "1.0.0")
+    assert errors(refused) == (403, "DENIED", f"{REPO} is being published by another organization")
+    assert len(hub.upstream.writes()) == writes, "refused before the registry was written to"
+    # ...but uploads claim nothing, so they are not refused; and the same organization may try again.
+    assert (await bob.start()).status_code == 202
+    assert (await carol.manifest(COG, "1.0.0")).status_code == 201
+    assert store.get_repository(REPO).owner_org_id == "org-a" and store.published_repositories("backing") == [REPO]
+
+    # A reservation nobody came back for runs out, and the name is free again.
+    await upload(await pusher(hub, ALICE, OTHER), COG, OTHER)
+    hub.upstream.fail[f"/v2/{OTHER}/manifests/1.0.0"] = httpx.Response(500, text="boom")
+    assert (await (await pusher(hub, ALICE, OTHER)).manifest(COG, "1.0.0", OTHER)).status_code == 503
+    del hub.upstream.fail[f"/v2/{OTHER}/manifests/1.0.0"]
+    bobs = await pusher(hub, BOB, OTHER)
+    await upload(bobs, theirs, OTHER)
+    assert (await bobs.manifest(theirs, "1.0.0", OTHER)).status_code == 403
+    now[0] += timedelta(seconds=publishing.RESERVATION_TTL_SECONDS + 1)
+    assert store.published_repositories("backing") == [REPO]
+    assert (await bobs.manifest(theirs, "1.0.0", OTHER)).status_code == 201
+    assert store.get_repository(OTHER).owner_org_id == "org-b"
+
+
+async def test_a_refused_publish_does_not_release_a_concurrent_publish_of_the_same_organization(hub: Hub):
+    """Alice's manifest is refused while Carol's, for the same new name, is on its way to the registry."""
+
+    alice, carol, bob = await pusher(hub, ALICE), await pusher(hub, CAROL), await pusher(hub, BOB)
+    newer, theirs = CogBundle(extra=b"carol's version"), CogBundle(extra=b"bob's bytes")
+    for client, bundle in ((alice, COG), (carol, newer), (bob, theirs)):
+        await upload(client, bundle)
+    oci = hub.serving.publisher._source.oci()
+    forward, arrived, proceed = oci.put_manifest, asyncio.Event(), asyncio.Event()
+
+    async def held(repo, ref, body, media_type):
+        if ref == "2.0.0":
+            arrived.set()
+            await proceed.wait()
+        return await forward(repo, ref, body, media_type)
+
+    oci.put_manifest = held
+    hub.upstream.fail[f"/v2/{REPO}/manifests/1.0.0"] = httpx.Response(400, text="no")
+    carols = asyncio.create_task(carol.manifest(newer, "2.0.0"))
+    await arrived.wait()
+    assert (await alice.manifest(COG, "1.0.0")).status_code == 400
+    # Carol's reservation stands: the name is not free for another organization in between.
+    assert (await bob.manifest(theirs, "3.0.0")).status_code == 403
+    proceed.set()
+    assert (await carols).status_code == 201
+    assert store_of(hub).get_repository(REPO).owner_org_id == "org-a"
+
+
+async def test_ownership_decided_while_a_publish_was_in_flight_is_reported_and_logged(hub: Hub, caplog):
+    """The reservation ran out under a request, and another organization's manifest was accepted first."""
+
+    alice = await pusher(hub, ALICE)
+    await upload(alice, COG)
+    store, oci = store_of(hub), hub.serving.publisher._source.oci()
+    forward = oci.put_manifest
+
+    async def overtaken(repo, ref, body, media_type):
+        store.commit_repository(repo, source_id="backing", owner_org_id="org-b", created_by="bob")
+        return await forward(repo, ref, body, media_type)
+
+    oci.put_manifest = overtaken
+    with caplog.at_level(logging.ERROR, logger="frames_server.cogs.publishing"):
+        assert errors(await alice.manifest(COG, "1.0.0")) == (403, "DENIED", f"{REPO} belongs to another organization")
+    logged = [record.message for record in caplog.records if record.name == "frames_server.cogs.publishing"]
+    assert logged == ["cog_publish_ownership_lost"]
+    assert store.get_repository(REPO).owner_org_id == "org-b" and hub.catalog.locations(COG.digest) == []
+
+
+# -- a tag is on exactly one digest ------------------------------------------------------------
+
+
+async def test_a_moved_tag_leaves_the_digest_it_was_on_and_a_put_by_digest_does_not_bring_it_back(hub: Hub):
+    client = await pusher(hub)
+    older, newer = CogBundle(extra=b"A"), CogBundle(extra=b"B")
+    assert (await client.bundle(older, "latest")).status_code == 201
+    assert (await client.manifest(older, "1.0.0")).status_code == 201
+    assert (await client.bundle(newer, "latest")).status_code == 201
+
+    def tags(bundle) -> tuple[str, ...]:
+        return hub.catalog.get(bundle.digest, source_id="backing", repository=REPO).tags
+
+    assert (tags(older), tags(newer)) == (("1.0.0",), ("latest",))
+    # The older manifest is put again, by digest: the registry's `latest` is still the newer one.
+    assert (await client.manifest(older, older.digest)).status_code == 201
+    assert hub.upstream.manifests[(REPO, "latest")][1] == newer.manifest
+    assert (tags(older), tags(newer)) == (("1.0.0",), ("latest",))
+    served = await hub.get(f"/v2/{REPO}/manifests/latest", headers=client.headers)
+    assert served.headers["docker-content-digest"] == newer.digest and served.content == newer.manifest
+    listed = (await hub.get(f"/v2/{REPO}/tags/list", headers=client.headers)).json()["tags"]
+    assert listed == ["1.0.0", "latest"]
+    by_tag = {tag: v["digest"] for v in (await hub.get(f"/v1/cogs/{COG_ID}", headers=ALICE)).json()["versions"]
+              for tag in v["tags"]}
+    assert by_tag == {"1.0.0": older.digest, "latest": newer.digest}
+    # Moved back by tag, it is on the older digest alone again.
+    assert (await client.manifest(older, "latest")).status_code == 201
+    assert (tags(older), tags(newer)) == (("1.0.0", "latest"), ())
+
+
+# -- accepted by the registry, not listed by the catalog ----------------------------------------
+
+
+async def test_a_manifest_the_catalog_cannot_store_is_not_reported_as_published(hub: Hub, caplog):
+    client = await pusher(hub)
+    await upload(client, COG)
+    refusals = iter([CogCatalogDataError("DataError")])
+
+    def refusing_the_card(write):
+        def refuse_once(artifact, **kwargs):
+            for refusal in refusals:
+                raise refusal
+            return write(artifact, **kwargs)
+
+        return refuse_once
+
+    restore = intercept_catalog_write(hub, refusing_the_card)
+    caplog.set_level(logging.INFO, logger="frames_server.cogs.publishing")
+    answer = await client.manifest(COG, "1.0.0")
+    status, code, message = errors(answer)
+    assert (status, code) == (500, "UNKNOWN")
+    assert "stored in the registry" in message and "does not list it" in message
+    assert "docker-content-digest" not in answer.headers and "location" not in answer.headers
+    logged = [record.message for record in caplog.records]
+    assert "cog_publish_unlisted" in logged and "cog_published" not in logged
+    # The registry has it; the catalog shows nobody a Cog; and the failed row carries who published it.
+    assert hub.upstream.manifests[(REPO, "1.0.0")][1] == COG.manifest
+    assert (await hub.get("/v1/cogs", headers=ALICE)).json()["items"] == []
+    assert (await hub.get(f"/v2/{REPO}/manifests/1.0.0", headers=client.headers)).status_code == 404
+    row = hub.catalog.get(COG.digest)
+    assert (row.status, row.published_by, row.published_org, row.tags) == (STATUS_FAILED, "alice", "org-a", ("1.0.0",))
+    assert store_of(hub).get_repository(REPO).owner_org_id == "org-a", "the registry accepted it: the name is owned"
+    # A sweep that later manages to index the digest keeps that attribution.
+    restore()
+    hub.catalog.upsert(replace(row, status=STATUS_INDEXED, card={}, cog_id=COG_ID, read_errors=()))
+    assert hub.catalog.get(COG.digest).published_by == "alice"
+    assert_no_backing_details(hub.responses)
+
+
+async def test_an_outage_after_acceptance_says_the_manifest_is_stored_and_keeps_the_publisher(hub: Hub):
+    client = await pusher(hub)
+    await upload(client, COG)
+    def down(_write):
+        def unavailable(artifact, **kwargs):
+            raise CogCatalogUnavailableError("the database is away")
+
+        return unavailable
+
+    restore = intercept_catalog_write(hub, down)
+    status, code, message = errors(await client.manifest(COG, "1.0.0"))
+    assert (status, code) == (503, "UNAVAILABLE")
+    assert "stored in the registry but could not be listed" in message and "database" not in message
+    assert hub.catalog.locations(COG.digest) == [], "no row at all"
+    assert (REPO, "1.0.0") in hub.upstream.manifests
+    assert store_of(hub).published_repositories("backing") == [REPO], "so a sweep is sent to it"
+    # The publisher was noted before the manifest was forwarded: whichever write lists the digest takes it.
+    # Here, the sweep's.
+    restore()
+    hub.catalog.upsert(
+        replace(COG_ROW(hub), tags=("1.0.0",))  # what a sweep reads from the registry and stores
+    )
+    row = hub.catalog.get(COG.digest)
+    assert (row.published_by, row.published_org) == ("alice", "org-a")
+
+    # Or the client's own retry, once the catalog is back.
+    newer = CogBundle(extra=b"second")
+    await upload(client, newer)
+    restore = intercept_catalog_write(hub, down)
+    assert (await client.manifest(newer, "2.0.0")).status_code == 503
+    restore()
+    assert (await client.manifest(newer, "2.0.0")).status_code == 201
+    assert hub.catalog.get(newer.digest).published_by == "alice" and hub.catalog._noted == {}
+
+
+def COG_ROW(hub: Hub):
+    from test_cog_serving import catalog_row
+
+    return catalog_row(REPO, COG.digest)
+
+
+async def test_the_publish_write_runs_on_the_indexers_worker_under_the_requests_deadline(hub: Hub):
+    client = await pusher(hub)
+    await upload(client, COG)
+    seen = []
+
+    def watching(write):
+        def watched(artifact, **kwargs):
+            seen.append((threading.current_thread().name, deadline.request_deadline.get()))
+            return write(artifact, **kwargs)
+
+        return watched
+
+    intercept_catalog_write(hub, watching)
+    before = time.monotonic()
+    assert (await client.manifest(COG, "1.0.0")).status_code == 201
+    ((thread, budget),) = seen
+    assert thread.startswith("cog-index-store"), "the lock-less targeted path, on the indexer's own executor"
+    assert budget is not None and before < budget <= time.monotonic() + hub.serving.max_metadata_seconds
+
+
+async def test_a_blocked_catalog_after_acceptance_is_bounded_by_the_request_and_says_what_happened(hub: Hub):
+    """The publish write spends the request's budget in the database, not the sweep's."""
+
+    import psycopg
+
+    state = {"timeouts": [], "checked_out": 0}
+    released = threading.Event()
+
+    class Blocked:
+        def execute(self, sql, params=None):
+            if "set_config('statement_timeout'" in sql:
+                state["timeouts"].append(int(params[0]))
+                return self
+            time.sleep(min(state["timeouts"][-1] / 1000, 3.0))
+            raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    class Database:
+        @contextmanager
+        def connection(self, timeout=None):
+            state["checked_out"] += 1
+            try:
+                yield Blocked()
+            finally:
+                state["checked_out"] -= 1
+                released.set()
+
+    client = await pusher(hub)
+    await upload(client, COG)
+    blocked = PostgresCogCatalogStore(Database())
+    for name in ("record_published", "upsert"):
+        setattr(hub.catalog, name, getattr(blocked, name, None))
+    hub.app.state.cog_registry_serving = replace(hub.serving, max_metadata_seconds=0.4)
+    started = time.monotonic()
+    status, code, message = errors(await client.manifest(COG, "1.0.0"))
+    assert (status, code) == (503, "UNAVAILABLE") and "stored in the registry" in message
+    assert time.monotonic() - started < 2.0
+    assert await asyncio.to_thread(released.wait, 2.0) and state["checked_out"] == 0
+    assert state["timeouts"] and all(1 <= ms <= 400 for ms in state["timeouts"])
+
+
+# -- upload sessions: the cap, expiry, and the registry's side of each ---------------------------
+
+
+async def test_the_slot_is_taken_first_and_a_session_past_the_cap_is_cancelled_at_the_registry(hub: Hub, monkeypatch):
+    monkeypatch.setattr(publish_store, "MAX_UPLOAD_SESSIONS_PER_USER", 3)
+    monkeypatch.setattr(publish_store, "MAX_UPLOAD_ROWS_PER_USER", 5, raising=False)
+    now = [datetime.now(UTC)]
+    client, store = await pusher(hub), store_of(hub)
+    store.clock = lambda: now[0]
+    async def start() -> httpx.Response:
+        now[0] += timedelta(seconds=1)
+        return await client.start()
+
+    locations = [(await start()).headers["location"] for _ in range(4)]
+    assert len(hub.upstream.uploads) == 3, "the fourth pushed the first out, at the registry too"
+    assert "upstream-1" not in hub.upstream.uploads and len(store._uploads) == 3
+    assert (await hub.get(locations[0], headers=client.headers)).status_code == 404
+    assert (await hub.get(locations[1], headers=client.headers)).status_code == 204
+
+    # The registry will not cancel: the Hub keeps the record -- it is what remembers where to cancel.
+    for upload_id in ("upstream-2", "upstream-3"):
+        hub.upstream.fail[f"/v2/{REPO}/blobs/uploads/{upload_id}"] = httpx.Response(500, text="boom")
+    assert (await start()).status_code == 202 and (await start()).status_code == 202
+    assert len(store._uploads) == 5 and len(hub.upstream.uploads) == 5
+    assert (await hub.get(locations[1], headers=client.headers)).status_code == 404, "retired all the same"
+    # Now every slot is taken by a session that is live or still waiting to be cancelled: nothing more is opened.
+    writes = len(hub.upstream.writes())
+    full = await client.start()
+    assert errors(full)[:2] == (429, "TOOMANYREQUESTS")
+    opened = [write for write in hub.upstream.writes()[writes:] if write.startswith("POST")]
+    assert opened == [] and len(hub.upstream.uploads) == 5, "refused before the registry opened anything"
+    assert (await pusher(hub, BOB)) is not None and (await (await pusher(hub, BOB)).start()).status_code == 202
+
+    # The registry answers again. A cancellation that failed is not retried at once (the claim is its backoff);
+    # once it is due, the next open cancels what was waiting, and then has its slot.
+    hub.upstream.fail.clear()
+    assert (await client.start()).status_code == 429
+    now[0] += timedelta(seconds=publishing.STALE_LEASE_SECONDS + 1)
+    assert (await client.start()).status_code == 202
+    assert "upstream-2" not in hub.upstream.uploads and "upstream-3" not in hub.upstream.uploads
+    live = [key for key, stored in store._uploads.items() if stored.session.user_id == "alice"]
+    assert len(live) == 3 and len(hub.upstream.uploads) == 4  # alice's three and bob's one
+    assert_no_backing_details(hub.responses)
+
+
+async def test_an_expired_session_is_cancelled_at_the_registry_before_it_is_forgotten(hub: Hub):
+    now = [datetime.now(UTC)]
+    store = store_of(hub)
+    store.clock = lambda: now[0]
+    alice, bob = await pusher(hub, ALICE), await pusher(hub, BOB)
+    location = (await alice.start()).headers["location"]
+    assert (await hub.request("PATCH", location, headers=alice.headers, content=b"partial")).status_code == 202
+    now[0] += timedelta(seconds=publish_store.UPLOAD_SESSION_TTL_SECONDS + 1)
+    for method in ("GET", "PATCH", "DELETE"):
+        gone = await hub.request(method, location, headers=alice.headers, content=b"x" if method == "PATCH" else None)
+        assert gone.status_code == 404, method
+    assert list(hub.upstream.uploads) == ["upstream-1"], "expired here, still open there"
+    hub.upstream.fail[f"/v2/{REPO}/blobs/uploads/upstream-1"] = httpx.Response(503, text="later")
+    assert (await bob.start()).status_code == 202
+    assert len(store._uploads) == 2 and "upstream-1" in hub.upstream.uploads, "kept until the registry lets go"
+    hub.upstream.fail.clear()
+    now[0] += timedelta(seconds=publishing.STALE_LEASE_SECONDS + 1)
+    assert (await bob.start()).status_code == 202
+    assert "upstream-1" not in hub.upstream.uploads and len(store._uploads) == 2
+
+
+async def test_an_upload_the_registry_would_not_open_or_the_hub_could_not_record_leaves_nothing(hub: Hub, caplog):
+    client, store = await pusher(hub), store_of(hub)
+    hub.upstream.refuse_writes = httpx.Response(500, text="boom")
+    assert (await client.start()).status_code == 503
+    assert store._uploads == {}, "the slot was given back"
+    hub.upstream.refuse_writes = None
+
+    # The registry opened a session and the Hub then lost its slot (or its database): cancelled there.
+    attach = store.attach_upload
+    store.attach_upload = lambda upload_id, location: False
+    assert errors(await client.start())[:2] == (503, "UNAVAILABLE")
+    assert hub.upstream.uploads == {}
+
+    def broken(upload_id, location):
+        raise CogCatalogUnavailableError("the database is away")
+
+    store.attach_upload = broken
+    assert (await client.start()).status_code == 503
+    assert hub.upstream.uploads == {}
+    store.attach_upload = attach
+
+    # Cleaning up after other sessions never fails the request that does it.
+    def failing(**kwargs):
+        raise CogCatalogUnavailableError("the database is away")
+
+    claim, store.claim_stale_uploads = store.claim_stale_uploads, failing
+    with caplog.at_level(logging.WARNING, logger="frames_server.cogs.publishing"):
+        assert (await client.start()).status_code == 202
+    assert "cog_publish_stale_cleanup_failed" in [record.message for record in caplog.records]
+    store.claim_stale_uploads = claim
+    assert_no_backing_details(hub.responses)
+
+
+async def test_a_cancel_the_registry_refuses_keeps_the_session_for_cleanup(hub: Hub):
+    client, store = await pusher(hub), store_of(hub)
+    location = (await client.start()).headers["location"]
+    hub.upstream.fail[f"/v2/{REPO}/blobs/uploads/upstream-1"] = httpx.Response(500, text="boom")
+    assert (await hub.request("DELETE", location, headers=client.headers)).status_code == 204
+    assert (await hub.get(location, headers=client.headers)).status_code == 404, "gone for the client"
+    assert len(store._uploads) == 1 and "upstream-1" in hub.upstream.uploads, "remembered for the cleanup"
+    hub.upstream.fail.clear()
+    assert (await client.start()).status_code == 202
+    assert "upstream-1" not in hub.upstream.uploads and len(store._uploads) == 1
+
+
+# -- one request at a time writes to a session ---------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def small_hub(make_hub) -> Hub:
+    return await make_hub(
+        publish=EVERYONE, serve={"enabled": True, "public_url": "https://hub.example", "max_blob_bytes": 1000}
+    )
+
+
+async def test_a_chunk_and_a_completion_sent_at_once_cannot_exceed_the_blob_limit(small_hub: Hub):
+    """PATCH 600 bytes; while the registry is taking them, PUT 600 more with the digest of all 1,200."""
+
+    hub = small_hub
+    client = await pusher(hub)
+    location = (await client.start()).headers["location"]
+    first, second = b"a" * 600, b"b" * 600
+    hub.upstream.upload_gate = asyncio.Event()
+    patch = asyncio.create_task(hub.request("PATCH", location, headers=client.headers, content=first))
+    async with asyncio.timeout(10):
+        while not any(request.method == "PATCH" for request in hub.upstream.requests):
+            await asyncio.sleep(0.01)  # until the chunk is at the registry; the Hub has not recorded it yet
+    for method, kwargs in (
+        ("PUT", {"params": {"digest": sha256(first + second)}, "content": second}),
+        ("PATCH", {"content": second}),
+        ("DELETE", {}),
+    ):
+        request = asyncio.create_task(hub.request(method, location, headers=client.headers, **kwargs))
+        answered, _ = await asyncio.wait({request}, timeout=5)
+        if not answered:
+            hub.upstream.upload_gate.set()  # it was forwarded alongside the chunk, and is waiting at the registry
+        status, code, message = errors(await request)
+        assert (status, code) == (400, "BLOB_UPLOAD_INVALID") and "retry" in message, method
+    assert (await hub.get(location, headers=client.headers)).status_code == 204, "reading the status is not a write"
+    hub.upstream.upload_gate.set()
+    assert (await patch).status_code == 202
+    assert sha256(first + second) not in hub.upstream.blobs
+    assert bytes(hub.upstream.uploads["upstream-1"]) == first, "only the holder's bytes reached the session"
+
+    # The retry, now that the chunk is accounted for, meets the limit like any other.
+    over = await hub.request(
+        "PUT", location, headers=client.headers, params={"digest": sha256(first + second)}, content=second
+    )
+    assert errors(over)[:2] == (413, "SIZE_INVALID")
+    closed = await hub.request(
+        "PUT", location, headers=client.headers, params={"digest": sha256(first + b"c" * 400)}, content=b"c" * 400
+    )
+    assert closed.status_code == 201
+
+
+async def test_a_request_that_fails_or_times_out_gives_the_session_back(hub: Hub):
+    client, store = await pusher(hub), store_of(hub)
+    location = (await client.start()).headers["location"]
+    upload_id = location.rsplit("/", 1)[-1]
+
+    def leased() -> bool:
+        return store._uploads[upload_id].leased_until is not None
+
+    hub.upstream.refuse_writes = httpx.Response(500, text="boom")
+    assert (await hub.request("PATCH", location, headers=client.headers, content=b"x")).status_code == 503
+    assert not leased()
+    hub.upstream.refuse_writes = None
+    serving = hub.serving
+    hub.app.state.cog_registry_serving = replace(serving, max_blob_seconds=0.1, max_metadata_seconds=0.1)
+    hub.upstream.upload_delay = 1.0
+    assert (await hub.request("PATCH", location, headers=client.headers, content=b"x")).status_code == 503
+    assert not leased(), "a request cut off by its deadline does not strand the session until the lease runs out"
+    hub.app.state.cog_registry_serving = serving
+    hub.upstream.upload_delay = 0.0
+    # A lease that outlives its holder ends the write: the session's position can no longer be trusted.
+    advance = store.advance_upload
+    store.advance_upload = lambda *args, **kwargs: False
+    lost = await hub.request("PATCH", location, headers=client.headers, content=b"y")
+    assert errors(lost)[:2] == (400, "BLOB_UPLOAD_INVALID") and "expired" in errors(lost)[2]
+    store.advance_upload = advance
+    assert upload_id not in store._uploads and hub.upstream.uploads == {}
+
+
+async def test_closing_an_upload_the_registry_lost_or_cannot_take_right_now(hub: Hub, caplog):
+    client, store = await pusher(hub), store_of(hub)
+    location = (await client.start()).headers["location"]
+    upload_id = location.rsplit("/", 1)[-1]
+    # The registry cannot take the write right now: 503, and the session is still there to close later.
+    hub.upstream.refuse_writes = httpx.Response(500, text="boom")
+    closing = await hub.request("PUT", location, headers=client.headers, params={"digest": sha256(b"")})
+    assert errors(closing)[:2] == (503, "UNAVAILABLE") and store._uploads[upload_id].leased_until is None
+    hub.upstream.refuse_writes = None
+    # Giving the lease back is bookkeeping: if it fails, the answer is still the answer, and the failure is logged.
+    release = store.release_upload
+
+    def failing(upload_id, *, lease):
+        raise CogCatalogUnavailableError("the database is away")
+
+    store.release_upload = failing
+    hub.upstream.refuse_writes = httpx.Response(500, text="boom")
+    with caplog.at_level(logging.WARNING, logger="frames_server.cogs.publishing"):
+        assert (await hub.request("PATCH", location, headers=client.headers, content=b"x")).status_code == 503
+    assert "cog_publish_bookkeeping_failed" in [record.message for record in caplog.records]
+    store.release_upload = release
+    hub.upstream.refuse_writes = None
+    store._uploads[upload_id].leased_until = None
+    # The registry no longer knows the session: unknown here too, and forgotten without asking it to cancel.
+    hub.upstream.uploads.clear()
+    writes = len(hub.upstream.writes())
+    lost = await hub.request("PUT", location, headers=client.headers, params={"digest": sha256(b"")})
+    assert errors(lost)[:2] == (404, "BLOB_UPLOAD_UNKNOWN") and upload_id not in store._uploads
+    assert [write.split()[0] for write in hub.upstream.writes()[writes:]] == ["PUT"]
+
+
+async def test_an_opening_cut_off_by_its_deadline_gives_the_slot_back(hub: Hub):
+    client, store = await pusher(hub), store_of(hub)
+    oci = hub.serving.publisher._source.oci()
+
+    async def never(repository):
+        await asyncio.sleep(5)
+
+    oci.start_upload = never
+    hub.app.state.cog_registry_serving = replace(hub.serving, max_blob_seconds=0.1, max_metadata_seconds=0.1)
+    assert (await client.start()).status_code == 503
+    assert store._uploads == {}
+
+
+async def test_the_lease_outlasts_the_longest_request_that_can_hold_it(make_hub):
+    hub = await make_hub(
+        publish=EVERYONE, serve={"enabled": True, "public_url": "https://hub.example", "max_blob_seconds": 120}
+    )
+    assert hub.serving.publisher._lease_seconds == 120 + publishing.LEASE_MARGIN_SECONDS
+    assert publishing.RESERVATION_TTL_SECONDS > 2 * hub.serving.max_metadata_seconds
+
+
+# -- Content-Range --------------------------------------------------------------------------------
+
+
+async def chunked(data: bytes):
+    """A body with no declared length."""
+
+    for offset in range(0, len(data), 4):
+        yield data[offset : offset + 4]
+
+
+async def test_a_content_range_is_checked_at_both_ends_and_against_the_bytes(hub: Hub):
+    client = await pusher(hub)
+    location = (await client.start()).headers["location"]
+
+    async def patch(content_range: str, content) -> httpx.Response:
+        return await hub.request(
+            "PATCH", location, headers={**client.headers, "Content-Range": content_range}, content=content
+        )
+
+    writes = len(hub.upstream.writes())
+    for content_range, body, why in (
+        ("0-0", b"0123456789", "does not match the number of bytes"),
+        ("0-99", b"0123456789", "does not match the number of bytes"),
+        ("9-0", b"0123456789", "ends before it starts"),
+        ("0-", b"0123456789", "malformed"),
+        ("bytes=0-9", b"0123456789", "malformed"),
+    ):
+        refused = await patch(content_range, body)
+        status, code, message = errors(refused)
+        assert (status, code) == (400, "BLOB_UPLOAD_INVALID") and why in message, content_range
+    assert len(hub.upstream.writes()) == writes, "none of those was forwarded"
+    assert (await hub.get(location, headers=client.headers)).headers["range"] == "0-0", "the session has not moved"
+    assert (await patch("0-9", b"0123456789")).status_code == 202
+    assert (await patch("bytes 10-13", chunked(b"abcd"))).status_code == 202, "a body of no declared length, in step"
+
+    # Closing with an offset: it must be where the upload is, and as long as the bytes sent.
+    async def close(content_range: str, content, digest_of: bytes) -> httpx.Response:
+        return await hub.request(
+            "PUT",
+            location,
+            headers={**client.headers, "Content-Range": content_range},
+            params={"digest": sha256(digest_of)},
+            content=content,
+        )
+
+    whole = b"0123456789abcdXYZ"
+    wrong_offset = await close("0-2", b"XYZ", whole)
+    assert wrong_offset.status_code == 416 and wrong_offset.headers["range"] == "0-13"
+    assert errors(await close("14-20", b"XYZ", whole))[:2] == (400, "BLOB_UPLOAD_INVALID")
+    assert errors(await close("14-16", None, whole))[:2] == (400, "BLOB_UPLOAD_INVALID"), "a range with no bytes"
+    assert (await close("14-16", b"XYZ", whole)).status_code == 201
+    assert hub.upstream.blobs[sha256(whole)] == whole
+
+    # The whole blob in the opening request states its range from zero.
+    opening = await hub.request(
+        "POST",
+        f"/v2/{REPO}/blobs/uploads/",
+        headers={**client.headers, "Content-Range": "5-9"},
+        params={"digest": sha256(b"01234")},
+        content=b"01234",
+    )
+    assert opening.status_code == 416 and hub.upstream.uploads == {}
+
+
+async def test_a_streamed_body_that_is_not_the_length_its_range_states_ends_the_upload(hub: Hub):
+    """With no Content-Length the mismatch is only known as the bytes pass: the session cannot be trusted after."""
+
+    client = await pusher(hub)
+    for body, content_range in ((b"0123456789ab", "0-7"), (b"0123", "0-7")):
+        location = (await client.start()).headers["location"]
+        refused = await hub.request(
+            "PATCH", location, headers={**client.headers, "Content-Range": content_range}, content=chunked(body)
+        )
+        assert errors(refused)[:2] == (400, "BLOB_UPLOAD_INVALID"), content_range
+        assert (await hub.get(location, headers=client.headers)).status_code == 404
+        assert hub.upstream.uploads == {}, "cancelled at the registry too"
+    location = (await client.start()).headers["location"]
+    closing = await hub.request(
+        "PUT",
+        location,
+        headers={**client.headers, "Content-Range": "0-7"},
+        params={"digest": sha256(b"0123")},
+        content=chunked(b"0123"),
+    )
+    assert errors(closing)[:2] == (400, "BLOB_UPLOAD_INVALID") and sha256(b"0123") not in hub.upstream.blobs
+
+
+# -- a sweep racing a publish ----------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def sweeping_hub(tmp_path, monkeypatch):
+    """A Hub that publishes and indexes, whose publish source has no configured repository list."""
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+    upstream = FakeRegistry()
+    transport = httpx.MockTransport(upstream)
+    monkeypatch.setattr(
+        config_module,
+        "build_registry_sources",
+        lambda configs, **kwargs: build_registry_sources(configs, http_transport=transport, **kwargs),
+    )
+    values = settings(tmp_path, publish=EVERYONE)
+    del values["cogs"]["registry_sources"][0]["repositories"]
+    values["cogs"]["index"] = {"enabled": True, "run_on_startup": False, "interval_seconds": 3600}
+    app = make_app(Config.parse(values))
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+            yield Hub(app, http, upstream)
+
+
+def gone_from(upstream: FakeRegistry, bundle, *tags: str) -> None:
+    for key in [key for key in upstream.manifests if key[1] in (bundle.digest, *tags)]:
+        del upstream.manifests[key]
+
+
+async def test_a_version_published_again_during_a_sweep_is_not_tombstoned_by_it(sweeping_hub: Hub):
+    """The digest was in the catalog before the sweep (removed); it is republished after the registry was listed."""
+
+    hub, indexer = sweeping_hub, sweeping_hub.app.state.cog_indexer
+    client = await pusher(hub)
+    older = CogBundle(extra=b"published, deleted, and published again")
+    assert (await client.bundle(older, "0.9.0")).status_code == 201
+    assert (await client.bundle(COG, "1.0.0")).status_code == 201
+    gone_from(hub.upstream, older, "0.9.0")
+    assert (await indexer.sweep()).removed == 1
+    assert hub.catalog.get(older.digest).removed_at is not None
+
+    enumerate_source = indexer._enumerate
+
+    async def enumerate_then_publish(source):
+        listing = await enumerate_source(source)  # the registry without it...
+        assert (await client.manifest(older, "0.9.0")).status_code == 201  # ...and then it is published again
+        return listing
+
+    indexer._enumerate = enumerate_then_publish
+    summary = await indexer.sweep()
+    assert summary.errors == [] and summary.removed == 0
+    row = hub.catalog.get(older.digest)
+    assert row.removed_at is None and row.tags == ("0.9.0",), "a successful publish is not undone by a stale listing"
+    assert (await hub.get(f"/v2/{REPO}/manifests/0.9.0", headers=client.headers)).status_code == 200
+
+    # The condition is the removal's own: a publish that lands after everything else the sweep does is safe too.
+    newest = CogBundle(extra=b"lands between the sweep's last read and its removal")
+    await upload(client, newest)
+    indexer._enumerate = enumerate_source
+    mark_removed = hub.catalog.mark_removed
+
+    def publish_then_remove(source_id, present, **kwargs):
+        published = asyncio.run_coroutine_threadsafe(client.manifest(newest, "2.0.0"), loop).result(10)
+        assert published.status_code == 201
+        return mark_removed(source_id, present, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    hub.catalog.mark_removed = publish_then_remove
+    assert (await indexer.sweep()).removed == 0
+    hub.catalog.mark_removed = mark_removed
+    assert hub.catalog.get(newest.digest).removed_at is None
+
+    # What really is gone is still removed -- by the next sweep, whose listing can speak for it.
+    gone_from(hub.upstream, older, "0.9.0")
+    assert (await indexer.sweep()).removed == 1
+    assert hub.catalog.get(older.digest).removed_at is not None and hub.catalog.get(COG.digest).removed_at is None
+
+
+async def test_a_sweep_is_never_sent_to_a_repository_whose_publish_was_refused(sweeping_hub: Hub):
+    """Content already in the backing registry is not listed because somebody tried, and failed, to publish there."""
+
+    hub = sweeping_hub
+    behind = CogBundle(extra=b"pushed to the registry directly")
+    hub.upstream.publish_raw(OTHER, MEDIA_TYPE_OCI_MANIFEST, behind.manifest, "0.1.0")
+    hub.upstream.blobs.update(behind.blobs)
+    client = await pusher(hub, ALICE, OTHER)
+    await upload(client, COG, OTHER)
+    for refusal in (httpx.Response(400, text="no"), httpx.Response(500, text="boom")):
+        hub.upstream.fail[f"/v2/{OTHER}/manifests/1.0.0"] = refusal
+        assert (await client.manifest(COG, "1.0.0", OTHER)).status_code in (400, 503)
+        summary = await hub.app.state.cog_indexer.sweep()
+        assert summary.errors == [] and hub.catalog.locations(behind.digest) == []
+        assert not hub.catalog.repository_known(OTHER)
+    assert not any(request.url.path == f"/v2/{OTHER}/tags/list" for request in hub.upstream.requests)
+
+
+# -- what the Hub's HTTP client logs about a write ------------------------------------------------
+
+
+async def test_writes_to_the_registry_are_logged_by_operation_and_source_never_by_url(hub: Hub, caplog):
+    caplog.set_level(logging.INFO, logger="httpx")
+    client = await pusher(hub)
+    assert (await client.bundle(COG, "1.0.0", chunks=2)).status_code == 201
+    location = (await client.start()).headers["location"]
+    assert (await hub.request("DELETE", location, headers=client.headers)).status_code == 204
+
+    lines = [record.getMessage() for record in caplog.records if record.name == "httpx"]
+    upstream = [line for line in lines if "http://test" not in line]  # the rest are this test's own client
+    writes = [line for line in upstream if "[registry write: " in line]
+    operations = {line.split("[registry write: ")[1].split(",")[0] for line in writes}
+    assert operations == {"upload start", "upload chunk", "upload finish", "upload cancel", "manifest put"}
+    assert all("source backing]" in line for line in writes)
+    assert 'HTTP Request: PATCH [registry write: upload chunk, source backing] "HTTP/1.1 202 Accepted"' in writes
+    for line in upstream:
+        # No session URL in any form: not its path (which may be the capability), not its state, not its host.
+        assert "/blobs/uploads" not in line and "upstream-" not in line and UPLOAD_STATE not in line, line
+        if line.split()[2] in ("POST", "PATCH", "PUT", "DELETE"):
+            assert BACKING_HOST not in line and "[registry write: " in line, line
+    # Reads are logged as they always were: the path says which blob.
+    read = f"HTTP Request: GET https://{BACKING_HOST}/v2/{REPO}/blobs/sha256:"
+    assert any(line.startswith(read) for line in upstream)
+
+
+# -- with no publish source, nothing about this surface exists -------------------------------------
+
+
+async def test_the_matrix_on_a_hub_that_accepts_no_publishes(make_hub):
+    hub = await make_hub()
+    token = await hub.pull_token(REPO)
+    for method, path, body in PUSHES:
+        if method == "GET":
+            continue
+        for headers in ({}, token):
+            response = await hub.request(method, path.format(repo=REPO, upload="up-1"), headers=headers, content=body)
+            assert errors(response) == (405, "UNSUPPORTED", "this registry is read-only"), (method, path)
+    assert hub.upstream.requests == []

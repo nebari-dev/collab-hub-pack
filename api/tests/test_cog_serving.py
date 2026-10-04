@@ -126,7 +126,9 @@ class FakeRegistry:
         self.storage_scheme = "https"
         # The push half: upload sessions by id, and switches for the failures a registry can answer with.
         self.uploads: dict[str, bytearray] = {}
+        self.opened = 0
         self.upload_delay = 0.0
+        self.upload_gate: asyncio.Event | None = None
         self.refuse_writes: httpx.Response | None = None
         self.storage_saw_authorization = False
 
@@ -167,7 +169,8 @@ class FakeRegistry:
             upload = upload.strip("/")
             location = f"{BACKING_URL}/v2/{repo}/blobs/uploads/{{}}?_state={UPLOAD_STATE}"
             if request.method == "POST":
-                upload = f"upstream-{len(self.uploads) + 1}"
+                self.opened += 1
+                upload = f"upstream-{self.opened}"
                 self.uploads[upload] = bytearray()
                 return httpx.Response(202, headers={"Location": location.format(upload), "Range": "0-0"})
             if upload not in self.uploads or request.url.params.get("_state") != UPLOAD_STATE:
@@ -180,6 +183,9 @@ class FakeRegistry:
                 return httpx.Response(204)
             if self.upload_delay:
                 await asyncio.sleep(self.upload_delay)
+            if self.upload_gate is not None:
+                # Held at the registry until the test lets it through.
+                await self.upload_gate.wait()
             content_range = request.headers.get("content-range")
             if content_range is not None and int(content_range.split("-")[0]) != len(received):
                 return httpx.Response(416, text=f"{BACKING_HOST}: out of order")
@@ -529,25 +535,22 @@ async def test_a_token_is_scoped_to_the_repositories_it_was_minted_for(hub: Hub)
     assert (await hub.get(f"/v2/{REPO}/tags/list", headers=bare)).status_code == 401
 
 
-def test_only_repository_pull_and_push_scopes_name_anything():
-    scopes = [
-        "repository:cogs/a:pull",
-        "repository:cogs/b:pull,push repository:cogs/c:push",
-        "repository:cogs/a:pull",
-        "repository:cogs/d:delete",
-        "registry:catalog:*",
-        "repository:Not/Valid:pull",
-        "repository::pull",
-        "garbage",
-    ]
-    assert requested_repositories(scopes) == ["cogs/a", "cogs/b", "cogs/c"]
-    # Whether push was asked for is reported separately; whether it is granted is the credential's to decide.
-    assert registry_router.requested_scope(scopes) == (["cogs/a", "cogs/b", "cogs/c"], True)
-    assert registry_router.requested_scope(["repository:cogs/a:pull"]) == (["cogs/a"], False)
+def test_only_pull_on_a_repository_is_ever_granted():
+    assert requested_repositories(
+        [
+            "repository:cogs/a:pull",
+            "repository:cogs/b:pull,push repository:cogs/c:push",
+            "repository:cogs/a:pull",
+            "registry:catalog:*",
+            "repository:Not/Valid:pull",
+            "repository::pull",
+            "garbage",
+        ]
+    ) == ["cogs/a", "cogs/b"]
     many = [f"repository:cogs/r{i}:pull" for i in range(40)]
     assert len(requested_repositories(many)) == registry_router.MAX_TOKEN_SCOPES
     # The input is bounded before it is parsed: a huge scope list is not walked to its end.
-    flood = ["repository:cogs/a:delete " * 100_000 + "repository:cogs/z:pull"]
+    flood = ["repository:cogs/a:push " * 100_000 + "repository:cogs/z:pull"]
     assert requested_repositories(flood) == []
     assert requested_repositories(["garbage"] * 10_000 + ["repository:cogs/z:pull"]) == []
     assert requested_repositories(["x " * 70 + "repository:cogs/z:pull"]) == []

@@ -23,12 +23,14 @@ from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
+from collab_hub_api.cogs import deadline
 from collab_hub_api.cogs.catalog import (
     COG_INDEX_LOCK_KEY,
     DEFAULT_TAGS_PAGE,
     MAX_LIST_LIMIT,
     MAX_PULL_CANDIDATES,
     MAX_TAGS_PAGE,
+    PUBLISH_LOCK_CLASS,
     STATUS_FAILED,
     STATUS_INDEXED,
     STATUS_NON_COG,
@@ -408,7 +410,10 @@ def test_unavailable_store_refuses_every_call():
         lambda: store.list_current(),
         lambda: store.list_repositories(),
         lambda: store.list_versions("x"),
-        lambda: store.record_publication(SOURCE, "cogs/a", digest("a"), user_id="u", org_id=None),
+        lambda: store.clock(),
+        lambda: store.note_publication(SOURCE, "cogs/a", digest("a"), user_id="u", org_id=None),
+        lambda: store.forget_publication(SOURCE, "cogs/a", digest("a"), user_id="u"),
+        lambda: store.record_published(artifact("a"), tag=None, user_id="u", org_id=None),
         lambda: store.repository_known("cogs/a"),
         lambda: store.find_pullable("cogs/a", (SOURCE,), digest=digest("a")),
         lambda: store.has_pullable("cogs/a", (SOURCE,)),
@@ -881,14 +886,17 @@ def _exercise_blobs(store) -> None:
 
 
 def _exercise_publication(store) -> None:
-    """Who published a version through the Hub (#180): written once, and left alone by everything else."""
+    """Who published a version through the Hub (#180): written with the row, and left alone by everything else."""
+
+    def published(seed, tag, user="alice", org="org-a", **kwargs):
+        store.record_published(artifact(seed, repository="cogs/a", **kwargs), tag=tag, user_id=user, org_id=org)
 
     store.upsert(artifact("1", repository="cogs/a", tags=("v1",)))
     assert store.get(digest("1")).published_by is None, "an out-of-band artifact has no publisher"
-    assert store.record_publication(SOURCE, "cogs/a", digest("1"), user_id="alice", org_id="org-a") is True
-    assert store.record_publication(SOURCE, "cogs/a", digest("9"), user_id="alice", org_id="org-a") is False
+    # Published over an existing row: the publisher is written, the tag added, the row's other tags kept.
+    published("1", "v2", tags=("ignored",))
     row = store.get(digest("1"))
-    assert (row.published_by, row.published_org) == ("alice", "org-a")
+    assert (row.published_by, row.published_org, row.tags) == ("alice", "org-a", ("v1", "v2"))
     # A sweep that rewrites the row, retags it, removes it and brings it back leaves the publisher alone.
     store.upsert(artifact("1", repository="cogs/a", tags=("v1", "latest"), document=card(version="2.0.0")))
     store.update_tags(SOURCE, "cogs/a", digest("1"), ("v2",))
@@ -899,13 +907,17 @@ def _exercise_publication(store) -> None:
     assert (row.published_by, row.published_org, row.tags) == ("alice", "org-a", ("v3",))
     for listed in (store.list_current()[0], store.list_versions("example/cog-a")[0], store.locations(digest("1"))[0]):
         assert (listed.published_by, listed.published_org) == ("alice", "org-a")
-    # An upsert cannot set it either: only record_publication does.
+    # An upsert cannot set it: what the row passed in says about its publisher is not the reader's to say.
     forged = replace(artifact("2", repository="cogs/a"), published_by="mallory", published_org="org-m")
     store.upsert(forged)
     assert store.get(digest("2")).published_by is None
-    # An operator with no organization.
-    store.record_publication(SOURCE, "cogs/a", digest("2"), user_id="op", org_id=None)
-    assert (store.get(digest("2")).published_by, store.get(digest("2")).published_org) == ("op", None)
+    # A new row, by an operator with no organization, under no tag at all (a put by digest).
+    published("5", None, user="op", org=None)
+    row = store.get(digest("5"))
+    assert (row.published_by, row.published_org, row.tags, row.removed_at) == ("op", None, (), None)
+    # Published again by someone else: the row says who published it last.
+    published("5", None, user="carol")
+    assert store.get(digest("5")).published_by == "carol"
 
     # "Known" means the path has ever held a row, in any source and any state.
     assert store.repository_known("cogs/a") and not store.repository_known("cogs") and not store.repository_known("x/y")
@@ -915,14 +927,151 @@ def _exercise_publication(store) -> None:
     assert store.repository_known("img/nginx") and store.repository_known("cogs/gone")
 
 
-def test_publication_in_memory(store):
-    _exercise_publication(store)
+def _exercise_tag_assignment(store) -> None:
+    """A tag put through the Hub is on exactly one digest of its source and repository (#180)."""
+
+    def published(seed, tag, repository="cogs/a", source_id=SOURCE):
+        row = artifact(seed, repository=repository, source_id=source_id)
+        store.record_published(row, tag=tag, user_id="alice", org_id="org-a")
+
+    def tags(seed, repository="cogs/a", source_id=SOURCE):
+        return store.get(digest(seed), source_id=source_id, repository=repository).tags
+
+    published("a", "latest")
+    published("a", "v1")
+    # The same tag in another repository, and in another source, is another tag.
+    published("c", "latest", repository="cogs/other")
+    store.upsert(artifact("d", repository="cogs/a", source_id="mirror", tags=("latest",)))
+    assert tags("a") == ("latest", "v1")
+
+    # The tag moves: it is taken from the digest that had it, and nothing else of that digest's changes.
+    published("b", "latest")
+    assert tags("b") == ("latest",) and tags("a") == ("v1",)
+    assert tags("c", "cogs/other") == ("latest",) and tags("d", source_id="mirror") == ("latest",)
+    # A put by digest adds no tag, and cannot bring back the one that moved away.
+    published("a", None)
+    assert tags("a") == ("v1",) and tags("b") == ("latest",)
+    assert [row.digest for row in store.locations(digest("a")) if "latest" in row.tags] == []
+
+    # A removed row keeps the tags it had; published again by digest, it comes back with none of them --
+    # the registry may have given them to something else, or dropped them, while it was gone.
+    store.mark_removed_one(SOURCE, "cogs/a", digest("a"))
+    published("a", None)
+    row = store.get(digest("a"), source_id=SOURCE, repository="cogs/a")
+    assert (row.tags, row.removed_at) == ((), None)
+    # A tag is taken from a removed row as well, so it cannot come back with it later.
+    store.mark_removed_one(SOURCE, "cogs/a", digest("b"))
+    published("a", "latest")
+    assert tags("a") == ("latest",) and tags("b") == ()
+
+
+def _exercise_noted_publication(store) -> None:
+    """A publisher noted before the manifest is forwarded reaches the row whoever writes it (#180)."""
+
+    def note(seed, user="alice", org="org-a"):
+        store.note_publication(SOURCE, "cogs/a", digest(seed), user_id=user, org_id=org)
+
+    def publisher(seed):
+        row = store.get(digest(seed), source_id=SOURCE, repository="cogs/a")
+        return (row.published_by, row.published_org)
+
+    # Noted, and the request died after the registry accepted: the sweep's upsert attributes the row.
+    note("1")
+    note("1", user="carol", org="org-a")  # the last note stands
+    assert store.locations(digest("1")) == [], "a note is not a row: nothing is listed, nothing is known"
+    assert not store.repository_known("cogs/a")
+    store.upsert(artifact("1", repository="cogs/a"))
+    assert publisher("1") == ("carol", "org-a")
+    # Consumed: it does not attribute anything a second time, and never replaces a publisher that is set.
+    store.record_published(artifact("1", repository="cogs/a"), tag=None, user_id="dave", org_id=None)
+    note("1", user="erin")
+    store.upsert(artifact("1", repository="cogs/a", tags=("v2",)))
+    assert publisher("1") == ("dave", None)
+
+    # The registry definitely refused the manifest: the note is withdrawn, by the user who left it only.
+    note("2")
+    store.forget_publication(SOURCE, "cogs/a", digest("2"), user_id="mallory")
+    store.forget_publication(SOURCE, "cogs/a", digest("9"), user_id="alice")
+    store.upsert(artifact("2", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
+    assert publisher("2") == ("alice", "org-a"), "a failed row is attributed too: a later retry keeps it"
+    note("3")
+    store.forget_publication(SOURCE, "cogs/a", digest("3"), user_id="alice")
+    store.upsert(artifact("3", repository="cogs/a"))
+    assert publisher("3") == (None, None)
+    # The publish write consumes the note of its own digest.
+    note("4", user="frank")
+    store.record_published(artifact("4", repository="cogs/a"), tag="v4", user_id="alice", org_id="org-a")
+    store.mark_removed_one(SOURCE, "cogs/a", digest("4"))
+    store.upsert(artifact("4", repository="cogs/a"))
+    assert publisher("4") == ("alice", "org-a")
+
+
+def _exercise_guarded_removal(store) -> None:
+    """Removal limited to rows written before a clock reading: what protects a publish from a stale listing."""
+
+    store.upsert(artifact("1", repository="cogs/a"))
+    store.upsert(artifact("2", repository="cogs/a"))
+    store.mark_removed_one(SOURCE, "cogs/a", digest("2"))
+    time.sleep(0.01)
+    started = store.clock()
+    assert started.tzinfo is not None
+    time.sleep(0.01)
+    # After the reading: a new version, and one that had been removed and is published again.
+    store.record_published(artifact("3", repository="cogs/a"), tag="v3", user_id="alice", org_id="org-a")
+    store.record_published(artifact("2", repository="cogs/a"), tag=None, user_id="alice", org_id="org-a")
+    # A listing taken before either: it names neither, and only the row written before the reading goes.
+    assert store.mark_removed(SOURCE, {}, written_before=started) == 1
+    present = {row.digest for row in store.list_versions("example/cog-a")}
+    assert present == {digest("2"), digest("3")}
+    # The next sweep's reading is later than both writes, and judges them like any other row.
+    time.sleep(0.01)
+    assert store.mark_removed(SOURCE, {"cogs/a": [digest("3")]}, written_before=store.clock()) == 1
+    assert {row.digest for row in store.list_versions("example/cog-a")} == {digest("3")}
+    # Without a reading, removal is what it always was.
+    assert store.mark_removed(SOURCE, {}) == 1
+
+
+PUBLISHING_CONTRACT = (
+    _exercise_publication,
+    _exercise_tag_assignment,
+    _exercise_noted_publication,
+    _exercise_guarded_removal,
+)
+
+
+@pytest.mark.parametrize("exercise", PUBLISHING_CONTRACT)
+def test_publication_in_memory(store, exercise):
+    exercise(store)
 
 
 @live_postgres
-def test_live_publication(live_store):
+@pytest.mark.parametrize("exercise", PUBLISHING_CONTRACT)
+def test_live_publication(live_store, exercise):
     store, _ = live_store
-    _exercise_publication(store)
+    exercise(store)
+
+
+@live_postgres
+def test_live_concurrent_publishes_leave_a_tag_on_exactly_one_digest(live_store):
+    """Two publishes moving one tag at once: serialized per repository, so it never ends on both."""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    store, database = live_store
+    seeds = [f"{index:x}" for index in range(1, 13)]
+
+    def publish(seed: str) -> None:
+        store.record_published(artifact(seed, repository="cogs/a"), tag="latest", user_id="alice", org_id="org-a")
+
+    for _ in range(3):
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(publish, seeds))
+        with database.connection() as conn:
+            holders = conn.execute(
+                "SELECT count(*) AS n FROM collab_cog_artifacts WHERE 'latest' = ANY(tags)"
+            ).fetchone()["n"]
+            rows = conn.execute("SELECT count(*) AS n FROM collab_cog_artifacts").fetchone()["n"]
+        assert (holders, rows) == (1, len(seeds))
 
 
 def test_pullable_lookups_in_memory(store):
@@ -1255,11 +1404,15 @@ def test_known_maps_rows_to_known_artifacts():
 
 def test_upsert_sends_sorted_tags_and_clears_removed_at():
     store, conn = _fake_store()
-    store.upsert(artifact("a", tags=("v2", "v1", "v2")))
+    row = artifact("a", tags=("v2", "v1", "v2"))
+    store.upsert(row)
     sql, params = conn.calls[1]
-    assert sql.startswith("INSERT INTO collab_cog_artifacts")
-    assert "removed_at = NULL" in sql and "indexed_at = now()" in sql
-    assert params[4] == ["v1", "v2"], "tags are deduplicated and sorted"
+    assert "INSERT INTO collab_cog_artifacts" in sql
+    assert "tags = EXCLUDED.tags, removed_at = NULL" in sql and "indexed_at = now()" in sql
+    assert params[:3] == (row.source_id, row.repository, row.digest), "the note it consumes is this digest's"
+    assert params[3:7] == (row.source_id, row.host, row.repository, row.digest)
+    assert params[7] == ["v1", "v2"], "tags are deduplicated and sorted"
+    assert len(conn.calls) == 2, "one statement: the sweep path stays a single statement on the lock session"
 
 
 def test_upsert_refuses_an_unknown_status_before_touching_the_database():
@@ -1275,17 +1428,20 @@ def test_upsert_translates_a_psycopg_data_error():
     class _Refusing(_FakeConnection):
         def execute(self, sql, params=None):
             super().execute(sql, params)
-            if sql.strip().startswith("INSERT"):
+            if "INSERT INTO collab_cog_artifacts" in sql:
                 raise psycopg.DataError("unsupported Unicode escape sequence")
             return _FakeResult([])
 
-    conn = _Refusing()
-    store = PostgresCogCatalogStore(_FakeDb(conn))
-    with pytest.raises(CogCatalogDataError) as info:
-        store.upsert(artifact("a"))
-    # Class name only: the server's own message quotes the offending value.
-    assert str(info.value) == "DataError"
-    assert "unsupported" not in str(info.value)
+    for write in (
+        lambda store: store.upsert(artifact("a")),
+        lambda store: store.record_published(artifact("a"), tag="v1", user_id="alice", org_id=None),
+    ):
+        conn = _Refusing()
+        with pytest.raises(CogCatalogDataError) as info:
+            write(PostgresCogCatalogStore(_FakeDb(conn)))
+        # Class name only: the server's own message quotes the offending value.
+        assert str(info.value) == "DataError"
+        assert "unsupported" not in str(info.value)
 
 
 def test_update_tags_reports_whether_a_row_existed():
@@ -1383,7 +1539,7 @@ def test_sweep_writes_ride_the_lock_holding_session():
         assert not any(s.startswith("SELECT set_config") for s in lock_conn.statements), (
             "the lock session's timeout is session-set; a transaction-local set would be an autocommit no-op"
         )
-        assert any(s.startswith("INSERT INTO collab_cog_artifacts") for s in lock_conn.statements)
+        assert any("INSERT INTO collab_cog_artifacts" in s for s in lock_conn.statements)
         assert any(s.startswith("UPDATE collab_cog_artifacts") for s in lock_conn.statements)
     assert store._lock_conn is None, "publication is withdrawn with the lock"
     store.known(SOURCE)
@@ -1499,23 +1655,90 @@ def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order()
 PULLABLE_SQL = "removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL"
 
 
-def test_record_publication_updates_two_columns_and_nothing_else():
-    store, conn = _fake_store([[{"digest": DIGEST_A}], []])
-    assert store.record_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice", org_id="org-a") is True
-    sql, params = conn.queries[0]
-    assert sql.startswith("UPDATE collab_cog_artifacts SET published_by = %s, published_org = %s WHERE")
-    assert params == ("alice", "org-a", SOURCE, "cogs/a", DIGEST_A)
-    assert store.record_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice", org_id=None) is False
+def test_record_published_is_one_bounded_transaction_that_assigns_the_tag_and_the_publisher():
+    store, conn = _fake_store()
+    row = artifact("a", repository="cogs/a", tags=("not", "these"))
+    token = deadline.request_deadline.set(deadline.time.monotonic() + 0.5)
+    try:
+        store.record_published(row, tag="latest", user_id="alice", org_id="org-a")
+    finally:
+        deadline.request_deadline.reset(token)
+    budgets = [params for sql, params in conn.calls if sql.startswith("SELECT set_config('statement_timeout'")]
+    assert len(budgets) == 4 and all(1 <= int(ms) <= 500 for (ms,) in budgets), "the request's budget, per statement"
+    lock, insert, strip, consume = conn.queries
+    # Serialized per repository, so two publishes cannot each strip the tag from rows the other has not written.
+    assert lock == ("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (PUBLISH_LOCK_CLASS, f"{SOURCE}/cogs/a"))
+    assert insert[0].startswith("INSERT INTO collab_cog_artifacts")
+    assert insert[1][4] == ["latest"], "the tag it was put under, never the tags the reader carried"
+    assert insert[1][-2:] == ("alice", "org-a")
+    # An existing row keeps its tags and gains this one; a removed row starts from this one alone.
+    assert "tags = CASE WHEN collab_cog_artifacts.removed_at IS NULL THEN ARRAY(" in insert[0]
+    assert "unnest(collab_cog_artifacts.tags || EXCLUDED.tags)" in insert[0] and "ELSE EXCLUDED.tags END" in insert[0]
+    assert "removed_at = NULL, published_by = EXCLUDED.published_by" in insert[0]
+    # ... and no other digest of this source and repository keeps it.
+    assert strip == (
+        "UPDATE collab_cog_artifacts SET tags = array_remove(tags, %s)"
+        " WHERE source_id = %s AND repository = %s AND digest <> %s AND %s = ANY(tags)",
+        ("latest", SOURCE, "cogs/a", row.digest, "latest"),
+    )
+    assert consume[0].startswith("DELETE FROM collab_cog_pending_publications") and consume[1] == (
+        SOURCE,
+        "cogs/a",
+        row.digest,
+    )
+
+    by_digest, conn = _fake_store()
+    by_digest.record_published(row, tag=None, user_id="op", org_id=None)
+    _lock, insert, consume = conn.queries
+    assert insert[1][4] == [] and insert[1][-2:] == ("op", None), "a put by digest adds no tag and strips none"
+    assert consume[0].startswith("DELETE FROM collab_cog_pending_publications")
+    with pytest.raises(ValueError, match="unknown catalog status"):
+        by_digest.record_published(replace(row, status="invented"), tag=None, user_id="op", org_id=None)
 
 
-def test_the_upsert_never_names_the_publication_columns():
-    """What keeps a sweep from clobbering the publisher on Postgres: the columns are not in its statement."""
+def test_noting_and_forgetting_a_publication_are_bounded_single_statements():
+    store, conn = _fake_store()
+    token = deadline.request_deadline.set(deadline.time.monotonic() + 0.5)
+    try:
+        store.note_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice", org_id="org-a")
+        store.forget_publication(SOURCE, "cogs/a", DIGEST_A, user_id="alice")
+    finally:
+        deadline.request_deadline.reset(token)
+    note, forget = conn.queries
+    assert note[0].startswith("INSERT INTO collab_cog_pending_publications")
+    assert "ON CONFLICT (source_id, repository, digest) DO UPDATE SET" in note[0], "the last note stands"
+    assert note[1] == (SOURCE, "cogs/a", DIGEST_A, "alice", "org-a")
+    assert forget == (
+        "DELETE FROM collab_cog_pending_publications"
+        " WHERE source_id = %s AND repository = %s AND digest = %s AND published_by = %s",
+        (SOURCE, "cogs/a", DIGEST_A, "alice"),
+    )
+    assert len(conn.calls) == 4, "each under the request's statement timeout"
+
+
+def test_the_upsert_takes_the_publisher_from_a_note_and_never_from_the_row_it_is_given():
+    """What keeps a sweep from clobbering, or forging, the publisher on Postgres."""
 
     store, conn = _fake_store()
     store.upsert(replace(_artifact_for_upsert(), published_by="mallory", published_org="org-m"))
     sql, params = conn.queries[0]
-    assert "published_by" not in sql and "published_org" not in sql
+    assert sql.startswith("WITH noted AS ( DELETE FROM collab_cog_pending_publications")
+    assert "(SELECT published_by FROM noted), (SELECT published_org FROM noted)" in sql
+    assert "published_by = COALESCE(collab_cog_artifacts.published_by, EXCLUDED.published_by)" in sql
     assert "mallory" not in params and "org-m" not in params
+
+
+def test_removal_can_be_limited_to_rows_written_before_a_clock_reading():
+    store, conn = _fake_store([[{"n": 0}], [{"now": T0}], [{"n": 2}]])
+    assert store.mark_removed(SOURCE, {}) == 0
+    sql, params = conn.queries[0]
+    # In the removal statement itself: nothing can be written between a check and the removal.
+    assert "AND (%s::timestamptz IS NULL OR a.indexed_at < %s)" in sql
+    assert params[-2:] == (None, None)
+    assert store.clock() == T0
+    assert conn.queries[1][0] == "SELECT clock_timestamp() AS now"
+    assert store.mark_removed(SOURCE, {}, written_before=T0) == 2
+    assert conn.queries[2][1][-2:] == (T0, T0)
 
 
 def _artifact_for_upsert() -> CogArtifact:

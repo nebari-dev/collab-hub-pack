@@ -1588,6 +1588,7 @@ def build_cog_registry_serving(
                 allowed_users=frozenset(cogs.publish.allowed_users),
             ),
             max_blob_bytes=serve.max_blob_bytes,
+            max_blob_seconds=serve.max_blob_seconds,
         )
     return CogRegistryServing(
         front=CogRegistryFront(store, sources, max_blob_bytes=serve.max_blob_bytes),

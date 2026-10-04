@@ -267,24 +267,55 @@ def test_push_is_granted_only_to_tokens_of_a_publish_credential(backend):
     assert publish.org_id == "org-a" and pull.org_id is None
     assert store.find_credential(publish.id, secret_digest("s3cret")).org_id == "org-a"
 
-    def mint(credential, push):
+    def mint(credential, push, repositories=("cogs/a",)):
         token = new_pull_token()
         grant = store.create_token(
             token_hash=secret_digest(token),
             user_id="alice",
             credential_id=credential.id if credential else None,
-            repositories=("cogs/a",),
+            repositories=repositories,
             ttl_seconds=300,
-            push=push,
+            push_repositories=push,
         )
         assert store.find_token(secret_digest(token)) == grant
         return grant
 
-    assert mint(publish, True).allows_push("cogs/a") and mint(publish, True).org_id == "org-a"
-    assert not mint(publish, False).allows_push("cogs/a"), "not asked for, not given"
-    assert not mint(pull, True).allows_push("cogs/a"), "a pull credential never pushes"
-    assert not mint(None, True).allows_push("cogs/a"), "nor does a token minted from a Hub session"
-    assert mint(pull, True).allows_pull("cogs/a") and mint(None, True).org_id is None
+    asked = ("cogs/a",)
+    assert mint(publish, asked).allows_push("cogs/a") and mint(publish, asked).org_id == "org-a"
+    assert not mint(publish, ()).allows_push("cogs/a"), "not asked for, not given"
+    assert not mint(pull, asked).allows_push("cogs/a"), "a pull credential never pushes"
+    assert not mint(None, asked).allows_push("cogs/a"), "nor does a token minted from a Hub session"
+    assert mint(pull, asked).allows_pull("cogs/a") and mint(None, asked).org_id is None
+
+
+def test_push_is_stored_and_checked_per_repository(backend):
+    """Push on one repository is never push on another the same token only pulls from."""
+
+    store, _clock = backend
+    publish = store.create_credential(
+        credential_id=new_credential_id(),
+        user_id="alice",
+        secret_hash=secret_digest("s3cret"),
+        scope="publish",
+        session_id=None,
+        ttl_seconds=900,
+        org_id="org-a",
+    )
+    token = new_pull_token()
+    store.create_token(
+        token_hash=secret_digest(token),
+        user_id="alice",
+        credential_id=publish.id,
+        repositories=("cogs/a", "cogs/b"),
+        ttl_seconds=300,
+        push_repositories=("cogs/a", "cogs/push-only"),
+    )
+    grant = store.find_token(secret_digest(token))
+    assert grant.repositories == ("cogs/a", "cogs/b") and grant.push_repositories == ("cogs/a", "cogs/push-only")
+    assert grant.allows_push("cogs/a") and grant.allows_pull("cogs/b")
+    assert not grant.allows_push("cogs/b"), "asked for pull only: push on cogs/a grants nothing here"
+    assert grant.allows_push("cogs/push-only") and not grant.allows_pull("cogs/push-only")
+    assert grant.names("cogs/push-only") and grant.names("cogs/b") and not grant.names("cogs/c")
 
 
 def test_exchanging_past_the_cap_drops_the_oldest(backend):
@@ -432,7 +463,7 @@ TOKEN_ROW = {
     "user_id": "alice",
     "credential_id": "crc-1",
     "repositories": ["cogs/a"],
-    "actions": "pull",
+    "push_repositories": None,
     "org_id": "org-a",
     "created_at": T0,
     "expires_at": T0 + timedelta(minutes=5),
@@ -507,7 +538,6 @@ def test_postgres_create_token_is_one_statement_with_the_liveness_check():
         repositories=("cogs/a",),
         issued_at=T0,
         expires_at=T0 + timedelta(minutes=5),
-        actions="pull",
         org_id="org-a",
     )
     assert not grant.allows_push("cogs/a")
@@ -515,15 +545,23 @@ def test_postgres_create_token_is_one_statement_with_the_liveness_check():
     assert sweep[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
     assert "LEAST(now() + make_interval(secs => %s), c.expires_at)" in insert[0]
     assert "WHERE c.id = %s AND c.user_id = %s AND c.expires_at > now()" in insert[0]
-    assert insert[1] == ("thash", ["cogs/a"], False, 300, "crc-1", "alice")
-    # Push is decided where the credential is read: asked for, and granted only to a publish credential.
-    assert "CASE WHEN %s AND c.scope = 'publish' THEN 'pull,push' ELSE 'pull' END" in insert[0]
-    pushing, conn = _fake({"INSERT INTO collab_cog_registry_tokens": [{**TOKEN_ROW, "actions": "pull,push"}]})
-    granted = pushing.create_token(
-        token_hash="t", user_id="alice", credential_id="crc-1", repositories=("cogs/a",), ttl_seconds=300, push=True
+    assert insert[1] == ("thash", ["cogs/a"], [], 300, "crc-1", "alice")
+    # Push is decided where the credential is read: the repositories asked for, and only for a publish credential.
+    assert "CASE WHEN c.scope = 'publish' THEN %s::text[] ELSE '{}'::text[] END" in insert[0]
+    pushing, conn = _fake(
+        {"INSERT INTO collab_cog_registry_tokens": [{**TOKEN_ROW, "repositories": ["cogs/a", "cogs/b"],
+                                                     "push_repositories": ["cogs/a"]}]}
     )
-    assert conn.calls[-1][1][2] is True
-    assert granted.allows_push("cogs/a") and granted.allows_pull("cogs/a") and not granted.allows_push("cogs/b")
+    granted = pushing.create_token(
+        token_hash="t",
+        user_id="alice",
+        credential_id="crc-1",
+        repositories=("cogs/a", "cogs/b"),
+        ttl_seconds=300,
+        push_repositories=iter(("cogs/a",)),
+    )
+    assert conn.calls[-1][1][1:3] == (["cogs/a", "cogs/b"], ["cogs/a"])
+    assert granted.allows_push("cogs/a") and granted.allows_pull("cogs/b") and not granted.allows_push("cogs/b")
     # The credential went away between the caller's check and the insert.
     gone, _ = _fake()
     assert (
@@ -536,12 +574,19 @@ def test_postgres_create_token_without_a_credential():
     row = {**TOKEN_ROW, "credential_id": None, "repositories": None, "org_id": None}
     store, conn = _fake({"INSERT INTO collab_cog_registry_tokens": [row]})
     grant = store.create_token(
-        token_hash="thash", user_id="alice", credential_id=None, repositories=iter(()), ttl_seconds=300, push=True
+        token_hash="thash",
+        user_id="alice",
+        credential_id=None,
+        repositories=iter(()),
+        ttl_seconds=300,
+        push_repositories=("cogs/a",),
     )
     assert grant.credential_id is None and grant.repositories == () and grant.org_id is None
+    assert grant.push_repositories == ()
     _sweep, insert = conn.calls
-    # A token minted straight from a Hub session is pull-only, whatever was asked.
-    assert "VALUES (%s, %s, NULL, %s, 'pull', now() + make_interval(secs => %s))" in insert[0]
+    # A token minted straight from a Hub session is pull-only, whatever was asked: the column is not even named.
+    assert "(token_hash, user_id, credential_id, repositories, expires_at)" in insert[0]
+    assert "VALUES (%s, %s, NULL, %s, now() + make_interval(secs => %s))" in insert[0]
     assert insert[1] == ("thash", "alice", [], 300)
 
 

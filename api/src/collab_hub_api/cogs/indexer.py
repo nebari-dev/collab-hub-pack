@@ -72,6 +72,7 @@ their own pooled connections, so they land concurrently with a sweep.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import random
@@ -82,6 +83,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from functools import partial
 
 from ..frames.observability import COG_INDEX_ARTIFACTS, COG_INDEX_SWEEP_DURATION, COG_INDEX_SWEEPS
 from .bundle import COG_ENTRY_FILE, PROG_KIND, CogCard, read_cog_bundle
@@ -350,9 +352,15 @@ class CogIndexer:
         exception to the loop's exception handler -- for a store call, an
         exception whose text can name the database URL this module is careful
         never to log. A future that never fails has nothing to report.
+
+        The call runs in a copy of the caller's context, as
+        ``asyncio.to_thread`` would run it. For a sweep that changes nothing.
+        For the write a publish makes inside a ``/v2/`` request (issue #180)
+        it is what carries the request's deadline (:mod:`.deadline`) to the
+        worker, so that write is bounded by the request's budget.
         """
 
-        worker = self._executor.submit(_capture, func, args, kwargs)
+        worker = self._executor.submit(contextvars.copy_context().run, _capture, func, args, kwargs)
         future = asyncio.wrap_future(worker)
         try:
             failed, value = await asyncio.shield(future)
@@ -560,15 +568,15 @@ class CogIndexer:
 
     async def _sweep_source(self, source: RegistrySource, summary: SweepSummary) -> None:
         # With publishing through the Hub, rows are also written outside the
-        # sweep, at any moment. What the catalog held before this source was
-        # enumerated is remembered, so that a row which appears while the
-        # sweep runs -- published after the registry was listed -- is not
-        # declared gone by a listing that predates it (see the removal below).
-        held_before: set[tuple[str, str]] | None = None
+        # sweep, at any moment: a new version, or one that had been removed
+        # and is published again. The store's clock is read before this
+        # source is enumerated, and the removal below is limited -- in its own
+        # statement -- to rows last written before that reading, so a row
+        # written since is not declared gone by a listing that may predate
+        # it. The next sweep, whose listing can include it, judges it.
+        started: datetime | None = None
         if self._published_repositories is not None:
-            held_before = {
-                (row.repository, row.digest) for row in await self._on_thread(self._store.known, source.id)
-            }
+            started = await self._on_thread(self._store.clock)
         enumeration = await self._enumerate(source)
         if enumeration.errors:
             summary.sources_failed += 1
@@ -616,14 +624,12 @@ class CogIndexer:
         # reconciled. Deferred fetches do NOT skip removal: those artifacts
         # were enumerated and stand in the present set.
         present = {repo: [artifact.digest for artifact in artifacts] for repo, artifacts in enumeration.present.items()}
-        if held_before is not None:
-            for row in await self._on_thread(self._store.known, source.id):
-                if (row.repository, row.digest) not in held_before and not row.removed:
-                    # Written since this sweep began: the next sweep, whose
-                    # listing can include it, is the one to judge it.
-                    present.setdefault(row.repository, []).append(row.digest)
         removed = await self._on_thread(
-            self._store.mark_removed, source.id, present, excluding=enumeration.failed_repositories
+            self._store.mark_removed,
+            source.id,
+            present,
+            excluding=enumeration.failed_repositories,
+            **({"written_before": started} if started is not None else {}),
         )
         summary.removed += removed
         if removed:
@@ -822,10 +828,28 @@ class CogIndexer:
 
         return await self._read_artifact(source, repository, artifact)
 
-    async def record(self, row: CogArtifact) -> CogArtifact:
-        """Store a row obtained from :meth:`inspect`, on the lock-less targeted path :meth:`reindex` uses."""
+    async def record_published(
+        self, row: CogArtifact, *, tag: str | None, user_id: str, org_id: str | None
+    ) -> CogArtifact:
+        """Store a row obtained from :meth:`inspect` for a manifest the registry has accepted; return what was stored.
 
-        return await self._store_row(row, targeted=True)
+        The catalog's publish write (:meth:`.catalog.CogCatalogStore.record_published`:
+        tag assignment and publisher in one transaction), lock-less like
+        :meth:`reindex`, with the same second line as every other write: a
+        card the database refuses is stored as a ``failed`` row -- still
+        carrying the tag and the publisher, so a later sweep that manages to
+        index it attributes it correctly -- and that row is what is
+        returned. The caller must look at its status.
+        """
+
+        write = partial(self._store.record_published, tag=tag, user_id=user_id, org_id=org_id)
+        try:
+            await self._on_thread(write, row)
+            return row
+        except CogCatalogDataError as exc:
+            fallback = _with(row, status=STATUS_FAILED, card=None, read_errors=_errors(f"store: {type(exc).__name__}"))
+            await self._on_thread(write, fallback)
+            return fallback
 
     async def mark_removed(self, source_id: str, repository: str, digest: str) -> bool:
         """Mark one artifact removed (a delete event). Returns whether a present row was marked."""
