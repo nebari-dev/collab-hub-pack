@@ -437,7 +437,7 @@ registry login. It exchanges its session for a **registry credential**:
 
 | Route | Answers |
 | --- | --- |
-| `POST /v1/cogs/registry-credentials` | 201 `{"id", "registry", "username", "secret", "scope", "expires_at"}`. Optional body `{"scope": "pull"}` (the default) or `{"scope": "publish"}` ([publishing](#publishing-through-the-hub)); any other scope is 422. |
+| `POST /v1/cogs/registry-credentials` | 201 `{"id", "registry", "username", "secret", "scope", "expires_at"}`. Optional body `{"scope": "pull"}` (the default) or, on a Hub that accepts publishes, `{"scope": "publish"}` ([publishing](#publishing-through-the-hub)); any other scope is 422, and so is `publish` on a Hub that accepts none. |
 | `DELETE /v1/cogs/registry-credentials/{id}` | 204. 404 `cog_registry_credential_not_found` for an id that is unknown, expired or someone else's. |
 | `DELETE /v1/cogs/registry-credentials` | 204: every credential and pull token of the caller. Idempotent. |
 
@@ -761,18 +761,45 @@ pull never implies it. An operator grants it in `cogs.publish`:
 
 Changing either is a values change and a rollout.
 
-**Repository ownership.** A repository first published through the Hub
-belongs to the publisher's organization, from the moment the **registry
-accepts** the first manifest for it. An upload alone claims nothing, and
-neither does a manifest the registry refuses. While a manifest for a new
-name is on its way to the registry the name is only *reserved* for the
-publisher's organization: of two organizations publishing a new name at
-once, one holds it and the other's manifest is refused before anything is
-written. If the registry accepts, the reservation becomes ownership; if it
-definitely refuses, the reservation is released and the name is free; if
-the outcome is unknown (a timeout, a 5xx), the reservation expires after
-five minutes, and until then only the same organization can try again. A
-reservation is never ownership and is never enumerated by the indexer.
+**Repository ownership.** A repository belongs to the organization that
+first publishes to it through the Hub, and **is never reassigned to another
+organization automatically**. The Hub writes the repository's row before it
+forwards the first manifest: *pending*, and already owned by the publisher's
+organization. What the registry answers decides what becomes of it:
+
+- **accepted**: the row is committed. The repository is that organization's.
+- **definitely refused** (a 4xx, or the registry refusing the Hub's own
+  credential): nothing was stored. The pending row is deleted once every
+  manifest that organization had in flight for the name has been refused,
+  and the name is free again.
+- **unknown** (a timeout, a 5xx, a failure to record the outcome): the
+  registry may hold the manifest, so the row stays, pending and owned, for
+  as long as it takes. No other organization can publish to the name, or
+  open an upload in it, including a platform operator; the same organization
+  can simply publish again, which settles it.
+
+A pending repository is not ownership a sweep relies on at once: two minutes
+after it was written, sweeps start looking there. If they find content, it
+is listed and the row is committed (this is how a publish the registry
+accepted but the Hub failed to record is recovered); if the registry has no
+such repository, that is an empty answer, not an error, and the row stays
+pending. An upload alone never creates a row. Of two organizations
+publishing a new name at once, one holds it and the other's manifest is
+refused before anything is written.
+
+A name that is stuck pending, with nothing in the registry and nobody coming
+back for it, is released by a platform operator with database access. There
+is deliberately no API for it:
+
+```sql
+-- what is pending, whose, and since when
+SELECT repository, owner_org_id, created_by, created_at
+FROM collab_cog_repositories WHERE NOT committed;
+
+-- release one name, after checking the registry holds nothing under it
+DELETE FROM collab_cog_repositories WHERE repository = 'cogs/example' AND NOT committed;
+```
+
 After that a push to the repository needs the publish
 permission *and* membership of the owning organization. Platform operators
 are excepted from the ownership rule, not from the permission. A repository
@@ -801,9 +828,10 @@ PUT   /v2/<name>/blobs/uploads/<id>?digest=sha256:…  201  Location: /v2/<name>
 PUT   /v2/<name>/manifests/<tag|digest>            201  Docker-Content-Digest: sha256:…
 ```
 
-The exchange answers 404 `cog_publishing_not_enabled` when no source is
-marked `publish`, and 403 `cog_publish_forbidden` when the caller does not
-hold the permission. A publish credential has the same lifetime, revocation
+The exchange answers 403 `cog_publish_forbidden` when the caller does not
+hold the permission. When no source is marked `publish`, `publish` is not a
+scope at all: the exchange answers the same 422 `validation_error` it
+answers for any unknown scope, exactly as before publishing existed. A publish credential has the same lifetime, revocation
 and storage as a pull credential, and may also pull.
 
 | Route | Answers |
@@ -819,9 +847,10 @@ and storage as a pull credential, and may also pull.
 
 Push errors, in the registry format: `UNAUTHORIZED` (401, with a challenge
 whose scope is `repository:<name>:pull,push`), `DENIED` (403: no publish
-permission, another organization's repository or one it is publishing right
-now, or a token that does not carry `push` for this repository),
-`BLOB_UPLOAD_UNKNOWN` (404), `BLOB_UPLOAD_INVALID` (400: a `Content-Range`
+permission, another organization's repository, settled or still pending, or
+a token that does not carry `push` for this repository),
+`BLOB_UPLOAD_UNKNOWN` (404: no such upload, or one that ended after a write
+whose outcome was unknown; start the blob again), `BLOB_UPLOAD_INVALID` (400: a `Content-Range`
 that does not fit, or **another request is writing to this upload: retry**;
 416 for a chunk out of order), `DIGEST_INVALID` (400), `SIZE_INVALID` (413:
 over `maxBlobBytes`), `MANIFEST_INVALID` (400, or 413 for a manifest over
@@ -850,17 +879,30 @@ redirected.
 
 The Hub's record and the registry's session are kept in step. The Hub takes
 its slot *before* it asks the registry to open a session, so the cap holds
-before anything exists upstream. A session the Hub lets go of (past the cap,
-expired, cancelled) is cancelled at the registry *before* its record is
-deleted, a few per request; a record whose cancellation failed is kept and
-tried again, for at most a day, and a user whose slots are all waiting to be
-cleaned up is answered 429. And **one request at a time writes to a
-session**: a `PATCH`, the closing `PUT` and a `DELETE` each take the
-session's lease (a compare-and-set on its row, so it holds across replicas,
-and no database connection is held while bytes move) and give it back when
-their bookkeeping is done. A second write while it is held is refused with
+before anything exists upstream, and the slot stays its opener's until the
+registry's session is attached: neither the cap nor the cleanup touches a
+slot that is still opening. A session the Hub lets go of (past the cap,
+expired, cancelled, or dead, below) is cancelled at the registry *before*
+its record is deleted, a few per request; a record whose cancellation failed
+is kept and tried again, for at most a day, and a user whose slots are all
+waiting to be cleaned up is answered 429. A registry session the Hub has no
+slot for and could not cancel is recorded all the same, so its location is
+not lost.
+
+**One request at a time writes to a session.** A `PATCH`, the closing `PUT`
+and a `DELETE` each take the session's lease (a compare-and-set on its row,
+so it holds across replicas, and no database connection is held while bytes
+move). A second write while it is held is refused with
 `BLOB_UPLOAD_INVALID` and told to retry, so two requests cannot both add to
-the same byte count and pass `maxBlobBytes` between them.
+the same byte count and pass `maxBlobBytes` between them. The lease is given
+back only when the Hub knows what the registry took: after a write it
+recorded, or after a definite refusal. **After any write whose outcome is
+unknown** (a timeout, a lost response, a 5xx, a failure to record the
+result) **the upload is over**: the Hub's byte count can no longer be
+trusted, so the session is cancelled at the registry and every later request
+for it is `BLOB_UPLOAD_UNKNOWN` (404). The client starts the blob again. A
+lease is never taken over by another request; if the Hub cannot even record
+that a session is dead, the lease running out says so.
 
 **A manifest is validated before it is committed.** The layers were just
 uploaded, so at manifest `PUT` the Hub reads the bundle with the catalog's
@@ -885,19 +927,32 @@ for anonymous callers, and are null for a version pushed to the registry
 directly. A later sweep reconciles the row like any other (tags moved at the
 registry, removal) and leaves the publisher as recorded.
 
-The row, its tag and its publisher are one transaction, under the request's
-deadline. **A tag put through the Hub is on exactly one digest** of its
-source and repository: putting a manifest under a tag another digest holds
-moves the tag, and putting a manifest by digest adds no tag and brings none
-back. If that transaction fails, the answer says the manifest is stored and
-not listed (above), and the publisher is not lost: who is publishing a
-digest is noted before its manifest is forwarded
-(`collab_cog_pending_publications`), and whichever write lists the digest
-later, a retried push or a sweep, takes the publisher from that note. A
-sweep that is running while a publish lands does not undo it: its removal
+The row and its tag are one transaction, under the request's deadline. **A
+tag put through the Hub is on exactly one digest** of its source and
+repository: putting a manifest under a tag another digest holds moves the
+tag, and putting a manifest by digest adds no tag and brings none back. If
+that transaction fails, the answer says the manifest is stored and not
+listed (above).
+
+**Who published a digest is only ever taken from an attempt the registry is
+known to have accepted.** Each manifest `PUT` is recorded as an attempt of
+its own (`collab_cog_publication_attempts`) before it is forwarded, and
+marked accepted only after the registry has accepted that attempt's
+manifest. Whichever write then lists the digest (the request itself, a
+retried push, a later sweep) takes the publisher from the earliest accepted
+attempt, and a publisher that is on a row stays there. An attempt that was
+refused is deleted by its own request and no other; one whose outcome was
+never known attributes nothing, to anyone, and is purged after a day. The
+consequence is stated plainly: **if the registry accepted a manifest and the
+Hub could not record that it had, the publisher of that digest is unknown**
+(`published_by` is null, as for a version pushed to the registry directly)
+until somebody publishes it through the Hub again. The Hub does not guess.
+
+A sweep that is running while a publish lands does not undo it: its removal
 step only touches rows last written before it began enumerating, so a
 version published (or published again after having been removed) since then
-is left for the next sweep to judge.
+is left for the next sweep to judge. The sweep's writes and the publish
+write take their database locks in the same order.
 
 **Deadlines and limits** are those of pulls: one aggregate deadline per
 request (`maxBlobSeconds` for a request that carries a blob, thirty seconds
