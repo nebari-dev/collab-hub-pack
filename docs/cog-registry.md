@@ -50,7 +50,7 @@ and the external `url`; the rest depends on the kind.
 | `indexUrl` | static | URL of a `catalog.v1.json` listing repositories. A static source needs `repositories`, `indexUrl`, or both. |
 | `caBundlePath` | all | Per-source CA bundle path inside the pod. Defaults to the shared bundle below when that is configured. |
 | `requestTimeoutSeconds` | all | HTTP timeout, default 10, at most 60. |
-| `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. Setting it turns the [redirect rules](#redirects) on for this source. |
+| `blobRedirectHosts` | all | Hosts a blob redirect from this registry may point at (its object storage): exact names or IPv4 addresses, or leading-dot suffixes such as `.s3.amazonaws.com`. Empty means no allowlist. Setting it turns the [redirect rules](#redirects) on for this source. |
 | `credentials` | all | Where the robot/service credential lives — see the next section. Omit for anonymous access. |
 | `webhook` | harbor | Where the shared webhook secret lives. A static source has no webhook and the render refuses the block. |
 
@@ -360,7 +360,7 @@ cogs:
 | `tokenTtlSeconds` | `TOKEN_TTL_SECONDS` | Lifetime of a pull token. |
 | `maxBlobBytes` | `MAX_BLOB_BYTES` | Largest blob the Hub relays. |
 | `maxBlobSeconds` | `MAX_BLOB_SECONDS` | Wall-clock limit on one blob response. |
-| `routeTimeout` | (chart only) | Give the HTTPRoute's `/v2` rule a matching request timeout. |
+| `routeTimeout` | (chart only) | Give the route carrying `/v2` a matching request timeout: the HTTPRoute's own rule, or a `BackendTrafficPolicy` on the NebariApp's public route. |
 
 **Off changes nothing.** No route exists under `/v2/`, the exchange answers
 404 `cog_registry_not_served`, and every `reference` names the backing
@@ -539,11 +539,14 @@ pullable rule:
   held to its own recorded size and to the digest as it streams, so the
   wrong one fails verification rather than being served.
 
-The record is written on the manifest read, which every OCI client makes
+The record is written on the first manifest read (for every source that
+holds the digest; later reads of it write nothing), which every OCI client makes
 before it asks for a blob, and it lives in the shared database, so the blob
 requests may land on any replica. A client that asks for a blob of a manifest
 nobody has yet pulled through the Hub gets `BLOB_UNKNOWN` until the manifest
-is read.
+is read. The record of a version is deleted when the indexer marks that
+version removed, so the table holds rows for present versions only; a version
+that comes back is recorded again by its next manifest read.
 
 **Multi-platform indexes are not traversed.** An index whose own digest is a
 pullable row is served as the bytes it is. Its child manifests are served
@@ -600,8 +603,8 @@ working.
 **Enabling serving turns the rules below on for every source, for the
 indexer as well as for pulls.** That is a consequence of enabling serving
 worth checking before you do: a registry that redirects layers from `https`
-to plain-`http` storage, or to a loopback address, indexes today and will
-stop indexing (its artifacts are recorded as failed and leave the catalog)
+to plain-`http` storage, to a loopback address, or to a private IP literal
+the source does not list, indexes today and will stop indexing (its artifacts are recorded as failed and leave the catalog)
 once serving is on. That is deliberate: a source the Hub could not serve a
 pull from should not look healthy in the catalog. A source that sets
 `blobRedirectHosts` has the rules on regardless of serving.
@@ -609,15 +612,26 @@ pull from should not look healthy in the catalog. A source that sets
 - `https` is never downgraded to `http`, on any hop, including one that
   leads back to an `http` registry;
 - otherwise a redirect within the registry's own origin is followed;
-- a loopback, link-local or unspecified address is never a destination.
-  That covers `127.0.0.0/8`, `::1`, `169.254.0.0/16` (the cloud metadata
-  address), `fe80::/10`, their IPv4-mapped IPv6 forms, and `localhost`;
+- a loopback, link-local, multicast or unspecified address is never a
+  destination. That covers `127.0.0.0/8`, `::1`, `169.254.0.0/16` (the cloud
+  metadata address), `fe80::/10` and `localhost`;
+- neither is an instance-metadata endpoint that sits outside those ranges:
+  `fd00:ec2::254` (AWS over IPv6), `100.100.100.200` (Alibaba Cloud),
+  `168.63.129.16` (Azure) and `192.0.0.192` (Oracle Cloud). An IPv6 literal
+  that carries any refused IPv4 address inside it (IPv4-mapped, NAT64, 6to4,
+  Teredo) is refused with it. `blobRedirectHosts` cannot re-admit any of
+  the addresses in this item or the one above;
 - a host must be either a canonical IP literal or a name with at least one
   non-numeric label. `2130706433`, `127.1`, `0x7f000001` and the like, which
   a resolver reads as addresses, are refused rather than interpreted; a
   trailing dot is ignored before every check;
-- private (RFC 1918) addresses and cluster-internal names **are** allowed:
-  object storage inside the cluster is normal;
+- cluster-internal **names** are allowed: object storage inside the cluster
+  is normal. A redirect to a private **address literal** (RFC 1918, IPv6
+  unique-local `fc00::/7`, carrier-grade NAT `100.64.0.0/10`, or any other
+  address that is not globally routable) is followed only when that address
+  is listed in the source's `blobRedirectHosts`. Storage reached by IPv4
+  literal needs an entry; `blobRedirectHosts` does not take IPv6 literals,
+  so storage on a private IPv6 address must be given a name;
 - when a source sets `blobRedirectHosts`, a redirect off the registry's
   origin must name a listed host, and nothing else is followed.
 
@@ -678,8 +692,22 @@ same host as the API:
   and raise the gateway's own request timeout for the route. With an
   Ingress, set the controller's read and send timeouts (for ingress-nginx,
   `proxy-read-timeout` and `proxy-send-timeout`) to at least
-  `maxBlobSeconds`. Behind the Nebari gateway the route is the operator's;
-  check its request timeout before serving large blobs.
+  `maxBlobSeconds`. Behind the Nebari gateway (`api.nebariapp.enabled`) the
+  route is the operator's and NebariApp has no timeout field, so the chart
+  attaches an Envoy Gateway `BackendTrafficPolicy` with the same
+  `requestTimeout` (a field of Envoy Gateway v1.2 and later) to the
+  NebariApp's public route
+  (`<api name>-public-route`). Without it the route has Envoy's 15 second
+  default and a larger layer is cut off mid-body. Three things to know
+  about that policy: it applies to the whole public route, so `/v1`, `/mcp`
+  and `/health` get the same gateway ceiling (the app's own timeouts on them
+  do not change); a policy on a route replaces a `BackendTrafficPolicy`
+  attached to the Gateway for that route rather than merging with it, so
+  carry over anything the Gateway-level one sets that the route still
+  needs; and it names the route by the operator's naming convention, so
+  check `kubectl get backendtrafficpolicy <api name>-cog-pulls -o yaml`
+  reports the route as accepted after the first deploy. `routeTimeout:
+  false` leaves the policy out.
 - **Buffering.** Responses are streamed with a `Content-Length`; a proxy
   that buffers responses to disk (ingress-nginx's `proxy-buffering`, with
   `proxy-max-temp-file-size`) should have that turned off for `/v2`, or its
@@ -687,7 +715,8 @@ same host as the API:
 - **Load.** Every byte of every install goes through the API pods. Size
   their network and replica count for it, and `frames.postgres.pool` for
   a handful of short queries per `/v2` request (the token, the owner's
-  membership, the catalog lookup, and one insert per manifest read).
+  membership, the catalog lookup, and one insert the first time a manifest
+  is read).
 
 ### Trying it
 
