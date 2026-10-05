@@ -699,15 +699,22 @@ class OCIClient:
         - ``https`` never downgrades to ``http``, on any hop, including one
           that returns to the registry;
         - otherwise a hop that stays on the registry's own origin is allowed;
-        - a loopback, link-local or unspecified address is never a
-          destination (that covers the cloud metadata address and its IPv6
-          and IPv4-mapped forms), and neither is a host written as a bare
-          number or a short or hex/octal dotted form, which a resolver would
-          read as an address (see :func:`_redirect_host_kind`). Private
-          (RFC 1918) addresses are allowed: in-cluster object storage is
-          normal;
+        - a loopback, link-local, multicast or unspecified address is never
+          a destination, and neither is an instance-metadata endpoint,
+          including the ones outside those ranges (AWS's IPv6 address is
+          unique-local, Alibaba's is carrier-grade NAT space) and any of
+          them written inside an IPv6 literal. Nor is a host written as a
+          bare number or a short or hex/octal dotted form, which a resolver
+          would read as an address (see :func:`_redirect_host_kind`). No
+          allowlist entry lifts any of these;
+        - any other address literal that is not globally routable (RFC 1918,
+          IPv6 unique-local, carrier-grade NAT) is followed only when the
+          operator has listed that address in ``redirect_hosts``: in-cluster
+          object storage is normal, but it is the operator who says where it
+          is, not the registry's ``Location`` header;
         - with ``redirect_hosts`` configured, the host must be on it: an
-          exact name, or a ``.suffix`` any subdomain of which matches.
+          exact name or address, or a ``.suffix`` any subdomain of which
+          matches.
 
         A hostname that *resolves* to a refused address is not caught here;
         the allowlist is what closes that.
@@ -723,9 +730,14 @@ class OCIClient:
         host = target.host.lower().rstrip(".")
         kind = _redirect_host_kind(host)
         if kind == "forbidden":
-            raise OCIProtocolError(f"{what}: refusing a redirect to a loopback or link-local address")
+            raise OCIProtocolError(f"{what}: refusing a redirect to a loopback, link-local or metadata address")
         if kind == "ambiguous":
             raise OCIProtocolError(f"{what}: refusing a redirect to a host that is neither an IP address nor a name")
+        if kind == "private" and host not in self._redirect_hosts:
+            # The address itself must be listed; a ``.suffix`` entry is for names.
+            raise OCIProtocolError(
+                f"{what}: refusing a redirect to a private address that is not in blob_redirect_hosts"
+            )
         if self._redirect_hosts and not any(_host_allowed(host, allowed) for allowed in self._redirect_hosts):
             raise OCIProtocolError(f"{what}: refusing a redirect to a host that is not in blob_redirect_hosts")
 
@@ -1054,14 +1066,53 @@ def _same_origin(a: httpx.URL, b: httpx.URL) -> bool:
 
 _NUMERIC_LABEL = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)")
 
+_METADATA_ADDRESSES = frozenset(
+    ipaddress.ip_address(address)
+    for address in (
+        "169.254.169.254",  # AWS, GCP, Azure, OpenStack and most others (link-local, listed for the embedded forms)
+        "fd00:ec2::254",  # AWS IMDS over IPv6: a unique-local address, so no range check names it
+        "100.100.100.200",  # Alibaba Cloud: carrier-grade NAT space
+        "168.63.129.16",  # Azure's platform endpoint (WireServer): a public address
+        "192.0.0.192",  # Oracle Cloud's secondary endpoint
+    )
+)
+"""Instance-metadata endpoints that are refused by address, wherever their range would otherwise put them."""
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _addresses_named(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> list:
+    """``address`` and every IPv4 address it carries inside it.
+
+    An IPv6 literal can be another way of writing an IPv4 destination
+    (IPv4-mapped, NAT64, 6to4, Teredo); each one is judged as that
+    destination as well as as itself.
+    """
+
+    named = [address]
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = [address.ipv4_mapped, address.sixtofour]
+        if address.teredo is not None:
+            embedded.extend(address.teredo)
+        if address in _NAT64:
+            embedded.append(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
+        named.extend(inner for inner in embedded if inner is not None)
+    return named
+
 
 def _redirect_host_kind(host: str) -> str:
-    """Classify a redirect host (lowercase, no trailing dot): ``"ok"``, ``"forbidden"`` or ``"ambiguous"``.
+    """Classify a redirect host (lowercase, no trailing dot).
+
+    One of ``"ok"``, ``"private"``, ``"forbidden"`` or ``"ambiguous"``:
 
     - A **canonical IP literal** (what :mod:`ipaddress` parses strictly:
-      dotted-quad IPv4 without leading zeros, or IPv6) is range-checked:
-      loopback, link-local and unspecified addresses, and their IPv4-mapped
-      IPv6 forms, are forbidden.
+      dotted-quad IPv4 without leading zeros, or IPv6) is range-checked, as
+      itself and as any IPv4 address it embeds (:func:`_addresses_named`).
+      Loopback, link-local, multicast and unspecified addresses, and the
+      instance-metadata endpoints in :data:`_METADATA_ADDRESSES`, are
+      forbidden. Any other address that is not globally routable (RFC 1918,
+      IPv6 unique-local, carrier-grade NAT, reserved) is private: the caller
+      follows it only to a host the operator has listed.
     - Anything else must be a **name with at least one label that is not a
       number**. ``2130706433``, ``127.1``, ``0x7f000001`` and ``0177.0.0.1``
       are not names: the resolver reads them as addresses (here, loopback),
@@ -1081,11 +1132,18 @@ def _redirect_host_kind(host: str) -> str:
         if ":" in host or all(_NUMERIC_LABEL.fullmatch(label) for label in host.split(".")):
             return "ambiguous"
         return "ok"
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        address = mapped
-    if address.is_loopback or address.is_link_local or address.is_unspecified:
+    named = _addresses_named(address)
+    if any(
+        each in _METADATA_ADDRESSES
+        or each.is_loopback
+        or each.is_link_local
+        or each.is_multicast
+        or each.is_unspecified
+        for each in named
+    ):
         return "forbidden"
+    if any(not each.is_global for each in named):
+        return "private"
     return "ok"
 
 
