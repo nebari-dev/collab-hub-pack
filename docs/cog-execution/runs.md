@@ -153,7 +153,11 @@ The `collab-hub` CLI is a client of these routes (`cog launch`, `cog list
 --launchable`, `run list`, `run show`, `run watch`, `run say`, `run connect`,
 `run terminate`); `run connect` serves a run as an
 [ACP](https://agentclientprotocol.com) agent, so an ACP client such as Toad
-talks to the Cog turn by turn.
+talks to the Cog turn by turn. `run list` gives, in its `CONNECT` column, the
+command such a client starts for each run that has not ended: ACP is spoken on
+a command's stdin and stdout, so a command, naming the CLI by its path, its
+configuration directory when one was chosen, and the hub, is what a client
+connects with, from any shell.
 [`examples/cog-local`](../../examples/cog-local/README.md) walks through all of
 it on one machine.
 

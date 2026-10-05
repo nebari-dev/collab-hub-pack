@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import shlex
+import shutil
 import sys
 import time
 import webbrowser
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import wraps
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -104,6 +108,36 @@ def handled(command: Callable) -> Callable:
 
 def _target() -> config.Target:
     return config.resolve(state.hub, state.profile, insecure=state.insecure)
+
+
+def _program() -> str:
+    """This CLI as another shell finds it: the path it was run from.
+
+    Not `collab-hub` by name: a PATH that finds it here may be one only this
+    shell has (`uv run` puts its environment first), not the client's.
+    """
+
+    own = shutil.which(sys.argv[0])
+    return str(Path(own).absolute()) if own else "collab-hub"
+
+
+def _connect_command(target: config.Target, run_id: str) -> str:
+    """What an ACP client starts as its agent to talk to a run: ACP is a command's stdin and stdout, not a URL.
+
+    It names this CLI, its configuration directory when one was chosen, the
+    hub and the profile, so it works from any shell; the client runs it as
+    given, `toad acp "<it>"` for Toad.
+    """
+
+    command = []
+    if os.environ.get("COLLAB_HUB_CONFIG_DIR"):
+        command += ["env", f"COLLAB_HUB_CONFIG_DIR={target.directory.absolute()}"]
+    command += [_program(), "--hub", target.require_hub()]
+    if target.profile != config.DEFAULT_PROFILE:
+        command += ["--profile", target.profile]
+    if target.insecure:
+        command.append("--insecure")
+    return shlex.join([*command, "run", "connect", run_id])
 
 
 def _print_json(value: Any) -> None:
@@ -524,7 +558,8 @@ def run_list(
     """List the runs your organization launched, newest first."""
 
     params = {"status": status_filter} if status_filter else {}
-    with Hub(_target()) as hub:
+    target = _target()
+    with Hub(target) as hub:
         runs = list(hub.pages("/v1/runs", params))
     if as_json:
         _print_json(runs)
@@ -532,9 +567,10 @@ def run_list(
     if not runs:
         _err("No runs.")
         return
-    _table(["RUN", "NAME", "COG", "STATUS", "AGE", "BY"], [
+    _table(["RUN", "NAME", "COG", "STATUS", "AGE", "BY", "CONNECT"], [
         [run["id"], run.get("name"), ",".join(dict.fromkeys(step["cog"] for step in run["steps"])), run["status"],
-         _age(run["submitted_at"]), run.get("submitted_by_name") or run["submitted_by"]]
+         _age(run["submitted_at"]), run.get("submitted_by_name") or run["submitted_by"],
+         None if run["ended"] else _connect_command(target, run["id"])]
         for run in runs
     ])
 

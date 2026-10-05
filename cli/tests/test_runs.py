@@ -46,6 +46,8 @@ def test_cog_launch_names_the_run_and_run_list_shows_the_name(stub, cli):
     assert json.loads(stub.requests[-1].content)["name"] == "echo-on-claude"
     lines = cli("--hub", HUB, "run", "list").stdout.splitlines()
     assert lines[1].split()[:3] == ["run-000000000001", "echo-on-claude", "echo"]
+    named = cli("--hub", HUB, "--profile", "work", "--insecure", "run", "list").stdout.splitlines()
+    assert named[1].endswith(f" --hub {HUB} --profile work --insecure run connect run-000000000001")
     shown = cli("--hub", HUB, "run", "show", "run-000000000001").stdout
     assert "run        run-000000000001  (echo-on-claude)" in shown
 
@@ -105,9 +107,12 @@ def test_run_list_shows_what_was_launched_and_filters_by_status(stub, cli):
     cli("--hub", HUB, "cog", "launch", "slow")
     stub.runs[1].update(status="COMPLETED", ended=True)
     lines = cli("--hub", HUB, "run", "list").stdout.splitlines()
-    assert lines[0].split() == ["RUN", "NAME", "COG", "STATUS", "AGE", "BY"]
+    assert lines[0].split() == ["RUN", "NAME", "COG", "STATUS", "AGE", "BY", "CONNECT"]
     assert [line.split()[:3] for line in lines[1:]] == [["run-000000000002", "slow", "SUBMITTED"],
                                                         ["run-000000000001", "echo", "COMPLETED"]]
+    # What an ACP client starts to talk to a run that has not ended; an ended one takes no more turns.
+    assert lines[1].endswith(f" --hub {HUB} run connect run-000000000002")
+    assert "run connect" not in lines[2]
     only = json.loads(cli("--hub", HUB, "run", "list", "--status", "completed", "--json").stdout)
     assert [run["id"] for run in only] == ["run-000000000001"]
 
@@ -158,3 +163,28 @@ def test_the_run_commands_need_a_session_on_a_hub_that_asks_for_one(stub, cli):
     for args in (("cog", "launch", "echo"), ("run", "list"), ("run", "show", "x"), ("run", "terminate", "x")):
         result = cli("--hub", HUB, *args)
         assert result.exit_code == 5 and "not signed in" in result.stderr, args
+
+
+def test_the_connect_command_runs_from_any_shell(stub, cli, tmp_path, monkeypatch):
+    import shlex
+
+    from collab_hub_cli import main
+
+    cli("--hub", HUB, "cog", "launch", "echo")
+    program = tmp_path / "bin" / "collab-hub"
+    program.parent.mkdir()
+    program.write_text("#!/bin/sh\n")
+    program.chmod(0o755)
+    monkeypatch.setattr(main.sys, "argv", [str(program)])
+    # The client is given the program's path, even where this shell finds it by name, and the configuration
+    # directory it signed in with.
+    monkeypatch.setenv("PATH", str(program.parent))
+    line = cli("--hub", HUB, "run", "list").stdout.splitlines()[1]
+    command = shlex.split(line[line.index("env "):])
+    assert command == ["env", f"COLLAB_HUB_CONFIG_DIR={tmp_path / 'config'}", str(program), "--hub", HUB,
+                       "run", "connect", "run-000000000001"]
+    # In the default configuration directory, the command needs none.
+    monkeypatch.delenv("COLLAB_HUB_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    line = cli("--hub", HUB, "run", "list").stdout.splitlines()[1]
+    assert line.endswith(f"  {program} --hub {HUB} run connect run-000000000001")

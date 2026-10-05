@@ -113,9 +113,11 @@ make list          # collab-hub run list
 ```
 
 ```text
-RUN               NAME                  COG     STATUS   AGE  BY
-run-d30f9866404b  hermes-on-fake-model  hermes  RUNNING  0s   Dev User
+RUN               NAME                  COG     STATUS   AGE  BY        CONNECT
+run-d30f9866404b  hermes-on-fake-model  hermes  RUNNING  0s   Dev User  env COLLAB_HUB_CONFIG_DIR=.../cog-local/.local/cli .../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 run connect run-d30f9866404b
 ```
+
+`CONNECT` is what an ACP client needs to reach the run. ACP has no URL: the client starts an agent as a command and speaks to it on its stdin and stdout, so this is the command to give it, `toad acp "<CONNECT>"` for Toad, which is what `make connect` does. It names the CLI by its path, the directory where this example signed in, and the hub, so it works from any shell (paths shortened here). A run that has ended takes no more turns and shows none.
 
 ## 5. Talk to Hermes from Toad
 
@@ -142,7 +144,7 @@ make list
 
 ```text
 run-d30f9866404b ended CANCELLED.
-RUN               NAME                  COG     STATUS     AGE  BY
+RUN               NAME                  COG     STATUS     AGE  BY        CONNECT
 run-d30f9866404b  hermes-on-fake-model  hermes  CANCELLED  4s   Dev User
 ```
 

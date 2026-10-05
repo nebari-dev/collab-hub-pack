@@ -81,7 +81,7 @@ collab-hub cog show acme/reviewer          # one Cog's card and every indexed ve
 ```sh
 collab-hub cog launch hello --input '{"name": "Ada"}' --watch   # launch, and follow the run to its end
 collab-hub cog launch hello --entry run --gate never --input -  # the input from stdin
-collab-hub run list                                             # what was launched, newest first
+collab-hub run list                                             # what was launched, newest first, and how to connect
 collab-hub run list --status running
 collab-hub run show run-3eb7ab0eaf43                            # one run, each step, and what it answered
 collab-hub run watch run-3eb7ab0eaf43                           # follow it until it ends or waits at a Gate
