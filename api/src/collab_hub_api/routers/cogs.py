@@ -65,6 +65,7 @@ from ..cogs.catalog import (
     CogCatalogStore,
     CogCatalogUnavailableError,
 )
+from ..cogs.deadline import BudgetExhausted
 from ..cogs.models import (
     CatalogV1,
     CatalogV1Repository,
@@ -89,6 +90,7 @@ from ..cogs.registry_credentials import (
 )
 from ..cogs.serving import CogRegistryServing
 from ..dependencies import get_cog_catalog_store, get_cog_registry_serving
+from ..frames import error_codes
 from ..frames.auth import AuthContext, NoOrganizationError, get_auth_context, session_id_of
 from ..frames.orgs import PLATFORM_ROLE_OPERATOR
 from ..path_protection import request_path, winning_rule
@@ -200,9 +202,29 @@ class Redaction:
     def for_caller(cls, caller: AuthContext | None) -> Redaction:
         return cls(anonymous=caller is None)
 
-    def respond(self, model: BaseModel) -> JSONResponse:
-        exclude = type(model).ANONYMOUS_EXCLUDE if self.anonymous else None
-        return JSONResponse(model.model_dump(mode="json", exclude=exclude))
+    def respond(self, model: BaseModel, *, omit: dict | None = None) -> JSONResponse:
+        """``model`` as this caller may see it, less ``omit``.
+
+        ``omit`` is for a field a route leaves out for a reason of its own (a
+        value that is absent rather than null for callers it is not for). It
+        is added to the anonymous cut, never a substitute for it.
+        """
+
+        exclude = _merged_exclude(type(model).ANONYMOUS_EXCLUDE if self.anonymous else {}, omit or {})
+        return JSONResponse(model.model_dump(mode="json", exclude=exclude or None))
+
+
+def _merged_exclude(first: dict, second: dict) -> dict:
+    """Two pydantic ``exclude`` mappings as one; a field either drops whole is dropped whole."""
+
+    merged = dict(first)
+    for key, cut in second.items():
+        kept = merged.get(key)
+        if isinstance(kept, dict) and isinstance(cut, dict):
+            merged[key] = _merged_exclude(kept, cut)
+        elif kept is not True:
+            merged[key] = cut
+    return merged
 
 
 def get_registry_host(request: Request) -> str | None:
@@ -518,17 +540,9 @@ def get_cog_reference(
         present=preferred.present,
         locations=[CogLocation.of(row, registry_host, backing=backing) for row in others],
     )
-    anonymous = _auth is None
-    exclude: dict = {"source_id": True} if anonymous else {}
-    location_exclude: dict = dict(CogLocation.ANONYMOUS_EXCLUDE) if anonymous else {}
-    if not backing:
-        # Absent rather than null, so the answer of a Hub that does not serve
-        # pulls is byte-for-byte what it was before the field existed.
-        exclude["backing_reference"] = True
-        location_exclude["backing_reference"] = True
-    if location_exclude:
-        exclude["locations"] = {"__all__": location_exclude}
-    return JSONResponse(answer.model_dump(mode="json", exclude=exclude or None))
+    # Absent rather than null, so the answer of a Hub that does not serve
+    # pulls is byte-for-byte what it was before the field existed.
+    return Redaction.for_caller(_auth).respond(answer, omit=None if backing else CogReference.BACKING_EXCLUDE)
 
 
 @router.get(
@@ -592,6 +606,19 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def cog_registry_credential_not_found_handler(_request: Request, _exc: CogRegistryCredentialNotFoundError):
         return error_response(
             status.HTTP_404_NOT_FOUND, "cog_registry_credential_not_found", "Registry credential not found"
+        )
+
+    @app.exception_handler(BudgetExhausted)
+    async def cog_budget_exhausted_handler(_request: Request, _exc: BudgetExhausted):
+        # A store call that ran out of time before it could reach the
+        # database: a TimeoutError of this module's, not a psycopg error, so
+        # the app's database handlers do not match it. The same answer as a
+        # pool timeout, which is what it is. ``/v2`` maps it itself, into the
+        # registry's error format, before it gets here.
+        return error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            error_codes.DATABASE_UNAVAILABLE,
+            "The frames database is currently unavailable",
         )
 
     @app.exception_handler(RegistryCredentialsUnavailableError)

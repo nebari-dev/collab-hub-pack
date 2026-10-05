@@ -266,6 +266,11 @@ class CogReference(BaseModel):
         "source_id": True,
         "locations": {"__all__": CogLocation.ANONYMOUS_EXCLUDE},
     }
+    BACKING_EXCLUDE: ClassVar[dict[str, Any]] = {
+        "backing_reference": True,
+        "locations": {"__all__": {"backing_reference": True}},
+    }
+    """Dropped, on top of the caller's own cut, for everyone the backing location is not for."""
 
     reference: str = Field(description="`<host>/<repository>@<digest>` of the preferred location.")
     backing_reference: str | None = Field(default=None, description=BACKING_REFERENCE_DESCRIPTION)
