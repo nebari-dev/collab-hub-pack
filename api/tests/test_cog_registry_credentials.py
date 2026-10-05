@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -264,7 +266,7 @@ def test_exchanging_past_the_cap_drops_the_oldest(backend):
     assert store.find_credential(other.id, secret_digest("s3cret")) is not None
 
 
-def test_expired_rows_are_swept_by_the_next_write(backend):
+def test_expired_rows_are_swept(backend):
     store, clock = backend
     old = _credential(store, ttl=60)
     old_token, _ = _token(store, old, ttl=30)
@@ -279,11 +281,58 @@ def test_expired_rows_are_swept_by_the_next_write(backend):
     if isinstance(store, InMemoryRegistryCredentialStore):
         assert old.id not in store._credentials
         assert secret_digest(old_token) not in store._tokens and secret_digest(direct) not in store._tokens
-    else:
+        return
+
+    def counts() -> tuple[int, int]:
         with store._db.connection() as conn:
             credentials = conn.execute("SELECT count(*) AS n FROM collab_cog_registry_credentials").fetchone()["n"]
             tokens = conn.execute("SELECT count(*) AS n FROM collab_cog_registry_tokens").fetchone()["n"]
-        assert (credentials, tokens) == (1, 1)
+        return credentials, tokens
+
+    # Another user's writes delete nothing of alice's: no request sweeps the tables.
+    assert counts() == (2, 3)
+    assert store.find_credential(old.id, secret_digest("s3cret")) is None, "expired is not live, swept or not"
+    assert store.find_token(secret_digest(direct)) is None
+    # The sweep is what removes them, on its own connection, once it is due.
+    store._last_sweep = float("-inf")
+    store.find_token(secret_digest(direct))
+    store._sweep_thread.join(timeout=30)
+    assert counts() == (1, 1)
+
+
+def test_live_an_exchange_drops_only_the_callers_own_expired_credentials(backend):
+    store, clock = backend
+    if isinstance(store, InMemoryRegistryCredentialStore):
+        pytest.skip("the in-memory store purges everything under its one lock")
+    mine = _credential(store, user="alice", ttl=60)
+    theirs = _credential(store, user="bob", ttl=60)
+    clock.advance(120)
+    _credential(store, user="alice")
+    with store._db.connection() as conn:
+        left = {row["id"] for row in conn.execute("SELECT id FROM collab_cog_registry_credentials").fetchall()}
+    assert mine.id not in left and theirs.id in left
+
+
+def test_live_a_sweep_does_not_wait_for_a_row_another_transaction_holds(backend, monkeypatch):
+    """A credential locked elsewhere (another replica's sweep) is skipped, not queued behind."""
+
+    from collab_hub_api.cogs import registry_credentials
+
+    store, clock = backend
+    if isinstance(store, InMemoryRegistryCredentialStore):
+        pytest.skip("row locks are Postgres's")
+    monkeypatch.setattr(registry_credentials, "SWEEP_TIMEOUT_SECONDS", 2.0)
+    held = _credential(store, user="alice", ttl=60)
+    free = _credential(store, user="bob", ttl=60)
+    clock.advance(120)
+    with store._db.connection() as holder:
+        holder.execute("SELECT 1 FROM collab_cog_registry_credentials WHERE id = %s FOR UPDATE", (held.id,))
+        started = time.monotonic()
+        store._sweep()
+        assert time.monotonic() - started < 1.5, "the sweep waited on the held row"
+        with store._db.connection() as conn:
+            left = {row["id"] for row in conn.execute("SELECT id FROM collab_cog_registry_credentials").fetchall()}
+        assert left == {held.id}, f"the free row was not swept, or the held one was: {left} (free={free.id})"
 
 
 def test_live_concurrent_exchanges_never_leave_a_user_over_the_cap():
@@ -337,6 +386,8 @@ def test_live_concurrent_exchanges_never_leave_a_user_over_the_cap():
 
 
 class _FakeResult:
+    rowcount = 0
+
     def __init__(self, rows):
         self._rows = rows
 
@@ -414,11 +465,14 @@ def test_postgres_create_credential_sweeps_inserts_and_caps():
         created_at=T0,
         expires_at=T0 + timedelta(minutes=15),
     )
-    lock, sweep_credentials, sweep_tokens, insert, cap = conn.calls
+    lock, own_expired, insert, cap = conn.calls
     # First, before anything is read or written: one user's issuance and pruning are serialized.
     assert lock == ("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (CREDENTIAL_ISSUE_LOCK_CLASS, "alice"))
-    assert sweep_credentials[0] == "DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()"
-    assert sweep_tokens[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
+    # Only the caller's own expired rows: nothing table-wide rides an exchange.
+    assert own_expired == (
+        "DELETE FROM collab_cog_registry_credentials WHERE user_id = %s AND expires_at <= now()",
+        ("alice",),
+    )
     assert "now() + make_interval(secs => %s)" in insert[0]
     assert insert[1] == ("crc-1", "alice", "hash", "pull", "sid-1", 900)
     assert "ORDER BY created_at DESC, id DESC LIMIT %s" in cap[0]
@@ -463,8 +517,7 @@ def test_postgres_create_token_is_one_statement_with_the_liveness_check():
         issued_at=T0,
         expires_at=T0 + timedelta(minutes=5),
     )
-    sweep, insert = conn.calls
-    assert sweep[0] == "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()"
+    (insert,) = conn.calls  # the mint is the insert and nothing else: no delete rides it
     assert "LEAST(now() + make_interval(secs => %s), c.expires_at)" in insert[0]
     assert "WHERE c.id = %s AND c.user_id = %s AND c.expires_at > now()" in insert[0]
     assert insert[1] == ("thash", ["cogs/a"], 300, "crc-1", "alice")
@@ -483,27 +536,104 @@ def test_postgres_create_token_without_a_credential():
         token_hash="thash", user_id="alice", credential_id=None, repositories=iter(()), ttl_seconds=300
     )
     assert grant.credential_id is None and grant.repositories == ()
-    _sweep, insert = conn.calls
+    (insert,) = conn.calls
     assert "VALUES (%s, %s, NULL, %s, now() + make_interval(secs => %s))" in insert[0]
     assert insert[1] == ("thash", "alice", [], 300)
 
 
-def test_postgres_reads_sweep_expired_rows_at_most_once_per_interval(monkeypatch):
+class _SweepDb:
+    """Hands the request's connection to the caller's thread and a separate one to any other thread."""
+
+    def __init__(self, request_conn, sweep_conn):
+        self.request_conn = request_conn
+        self.sweep_conn = sweep_conn
+        self.caller = threading.get_ident()
+        self.sweep_timeouts: list[float | None] = []
+
+    @contextmanager
+    def connection(self, timeout=None):
+        if threading.get_ident() == self.caller:
+            yield self.request_conn
+            return
+        self.sweep_timeouts.append(timeout)
+        yield self.sweep_conn
+
+
+def _sweeping(sweep_conn=None):
+    request_conn, sweep_conn = _FakeConnection(), sweep_conn or _FakeConnection()
+    database = _SweepDb(request_conn, sweep_conn)
+    return PostgresRegistryCredentialStore(database), database
+
+
+def test_postgres_sweeps_at_most_once_per_interval_and_never_on_the_requests_connection(monkeypatch):
     from collab_hub_api.cogs import registry_credentials
 
     clock = [1000.0]
     monkeypatch.setattr(registry_credentials.time, "monotonic", lambda: clock[0])
-    store, conn = _fake()
-    store.find_token("thash")
-    assert len(conn.calls) == 1, "nothing to sweep yet: the store was only just built"
+    store, database = _sweeping()
+
+    def call_everything() -> None:
+        store.find_token("thash")
+        store.create_token(token_hash="t", user_id="alice", credential_id=None, repositories=(), ttl_seconds=1)
+        if store._sweep_thread is not None:
+            store._sweep_thread.join(timeout=10)
+
+    call_everything()
+    assert database.sweep_conn.calls == [], "nothing to sweep yet: the store was only just built"
     clock[0] += registry_credentials.SWEEP_INTERVAL_SECONDS + 1
-    store.find_token("thash")
-    assert [sql for sql, _ in conn.calls[1:3]] == [
-        "DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()",
-        "DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()",
-    ]
-    store.find_token("thash")
-    assert len(conn.calls) == 5, "and not again until the interval has passed"
+    call_everything()
+    swept = database.sweep_conn.calls
+    assert [params for _sql, params in swept] == [(registry_credentials.SWEEP_BATCH_ROWS,)] * 2
+    assert "DELETE FROM collab_cog_registry_credentials WHERE id IN" in swept[0][0]
+    assert "DELETE FROM collab_cog_registry_tokens WHERE token_hash IN" in swept[1][0]
+    for sql, _params in swept:
+        assert "WHERE expires_at <= now() ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED" in sql
+    # Its own checkout and its own statement timeout, neither of them a request's.
+    assert database.sweep_timeouts == [registry_credentials.SWEEP_TIMEOUT_SECONDS]
+    assert database.sweep_conn.budgets == [int(registry_credentials.SWEEP_TIMEOUT_SECONDS * 1000)]
+    call_everything()
+    assert len(database.sweep_conn.calls) == 2, "and not again until the interval has passed"
+    # The request's own connection never ran a delete.
+    assert not [sql for sql, _ in database.request_conn.calls if sql.startswith("DELETE")]
+
+
+def test_postgres_a_failing_sweep_costs_the_request_nothing(monkeypatch, caplog):
+    from collab_hub_api.cogs import registry_credentials
+
+    class _Broken(_FakeConnection):
+        def execute(self, sql, params=None):
+            raise RuntimeError("password=hunter2 host=db.internal")
+
+    clock = [1000.0]
+    monkeypatch.setattr(registry_credentials.time, "monotonic", lambda: clock[0])
+    store, database = _sweeping(_Broken())
+    database.request_conn.answers = {"FROM collab_cog_registry_tokens t": [TOKEN_ROW]}
+    clock[0] += registry_credentials.SWEEP_INTERVAL_SECONDS + 1
+    with caplog.at_level("WARNING", logger="frames_server.cogs.registry_credentials"):
+        assert store.find_token("thash") is not None, "the read answered as if no sweep existed"
+        store._sweep_thread.join(timeout=10)
+    (record,) = [r for r in caplog.records if r.message == "cog_registry_credential_sweep_failed"]
+    assert record.error == "RuntimeError"
+    assert "hunter2" not in caplog.text and "db.internal" not in caplog.text
+
+
+def test_postgres_a_full_batch_makes_the_next_call_sweep_again(monkeypatch):
+    from collab_hub_api.cogs import registry_credentials
+
+    class _Full(_FakeConnection):
+        def execute(self, sql, params=None):
+            result = super().execute(sql, params)
+            result.rowcount = registry_credentials.SWEEP_BATCH_ROWS if "DELETE" in sql else 0
+            return result
+
+    clock = [1000.0]
+    monkeypatch.setattr(registry_credentials.time, "monotonic", lambda: clock[0])
+    store, database = _sweeping(_Full())
+    clock[0] += registry_credentials.SWEEP_INTERVAL_SECONDS + 1
+    for expected in (2, 4):
+        store.find_token("thash")
+        store._sweep_thread.join(timeout=10)
+        assert len(database.sweep_conn.calls) == expected
 
 
 def test_postgres_calls_are_bounded_by_the_request_budget():
