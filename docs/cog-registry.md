@@ -546,7 +546,9 @@ requests may land on any replica. A client that asks for a blob of a manifest
 nobody has yet pulled through the Hub gets `BLOB_UNKNOWN` until the manifest
 is read. The record of a version is deleted when the indexer marks that
 version removed, so the table holds rows for present versions only; a version
-that comes back is recorded again by its next manifest read.
+that comes back is recorded again by its next manifest read. Recording and
+removal take the version's catalog row, so a manifest has all of its
+descriptors or none.
 
 **Multi-platform indexes are not traversed.** An index whose own digest is a
 pullable row is served as the bytes it is. Its child manifests are served
