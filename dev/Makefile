@@ -220,7 +220,7 @@ KC_CONNECTOR_ENV := \
 .DEFAULT_GOAL := help
 .PHONY: help api api-watch api-pg api-oidc api-fakes api-full api-membership \
         api-desktop api-desktop-fakes hosts-check hub-proxy hub-proxy-down desktop-check \
-        services keycloak fakes up down destroy logs ps \
+        postgres services keycloak fakes up down destroy logs ps \
         keycloak-admin realm-import broker-role idp-google idp-github idp-list \
         token sub whoami seed-org psql \
         kind-up kind-cluster kind-image kind-redeploy kind-forward kind-logs \
@@ -299,21 +299,21 @@ fake-model: ## An OpenAI-compatible model that answers without one, for the Herm
 ## Level 2 — API with real datastores
 # ---------------------------------------------------------------------------
 
-api-pg: services | $(LOCAL)/frames ## Starts Postgres+S3, then the API: history, groups, orgs, tasks
+api-pg: postgres | $(LOCAL)/frames ## Starts Postgres, then the API: history, groups, orgs, tasks
 	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(PG_ENV) uv run python -m collab_hub_api
 
 # ---------------------------------------------------------------------------
 ## Level 3 — API with Keycloak (real bearer tokens, web surface, connectors)
 # ---------------------------------------------------------------------------
 
-api-oidc: services keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
+api-oidc: postgres keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
 	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(RUNS_ENV) uv run --group runs python -m collab_hub_api
 
 # Connector routes exchange the CALLER's bearer with the broker, so the
 # dev-auth shortcut cannot reach them -- it authenticates a subject without
 # ever producing a token to forward. This target therefore runs real Keycloak
 # verification and points only the provider APIs at the fakes.
-api-fakes: services keycloak fakes | $(LOCAL)/frames ## API + Keycloak + fake Google/Slack connector providers
+api-fakes: postgres keycloak fakes | $(LOCAL)/frames ## API + Keycloak + fake Google/Slack connector providers
 	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(FAKE_CONNECTOR_ENV) \
 		uv run python -m collab_hub_api
 
@@ -321,7 +321,7 @@ api-full: services keycloak | $(LOCAL)/frames ## Everything: OIDC + Postgres + S
 	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(S3_ENV) $(WEB_ENV) $(KC_CONNECTOR_ENV) \
 		uv run python -m collab_hub_api
 
-api-membership: services keycloak | $(LOCAL)/frames ## API in multi-tenant mode: organization comes from collab_org_members
+api-membership: postgres keycloak | $(LOCAL)/frames ## API in multi-tenant mode: organization comes from collab_org_members
 	cd $(API_DIR) && env $(BASE_ENV) $(MEMBERSHIP_ENV) $(PG_ENV) $(WEB_ENV) uv run python -m collab_hub_api
 
 # ---------------------------------------------------------------------------
@@ -402,6 +402,9 @@ hub-proxy-down: ## Stop the front door (Keycloak stays up on localhost:8080)
 # ---------------------------------------------------------------------------
 ## Supporting services (docker compose)
 # ---------------------------------------------------------------------------
+
+postgres: ## Start Postgres alone: every API target but api-full keeps frames on the local filesystem
+	$(COMPOSE) up -d --wait postgres
 
 services: ## Start Postgres + the S3 frame store
 	$(COMPOSE) up -d --wait postgres s3

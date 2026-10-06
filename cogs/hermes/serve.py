@@ -74,11 +74,16 @@ def hermes_home(root):
         if not base_url:
             raise RuntimeError("no model: the controller delivers COLLAB_MODEL_BASE_URL, or "
                                "COLLAB_MODEL_PROVIDER=anthropic, to this Cog")
-        model = {"provider": "custom", "base_url": base_url, "default": name, "api_key": key or "none"}
+        # Chat completions, always: Hermes would otherwise pick another API from the URL's host (Bedrock's
+        # Converse through boto3 for bedrock-runtime.*.amazonaws.com), which this provider does not promise.
+        model = {"provider": "custom", "base_url": base_url, "default": name, "api_key": key or "none",
+                 "api_mode": "chat_completions"}
     else:
         raise RuntimeError(f"unknown COLLAB_MODEL_PROVIDER {provider!r}: it is openai-compatible or anthropic")
-    # JSON is YAML: Hermes reads this file as its config.yaml.
-    (home / "config.yaml").write_text(json.dumps({"model": model}, indent=2))
+    # JSON is YAML: Hermes reads this file as its config.yaml. No lazy installs: Hermes would otherwise
+    # install a provider's SDK into the package's locked environment, from the network, mid-session.
+    config = {"model": model, "security": {"allow_lazy_installs": False}}
+    (home / "config.yaml").write_text(json.dumps(config, indent=2))
     (home / "config.yaml").chmod(0o600)
     return home
 

@@ -80,8 +80,10 @@ def test_hermes_gets_the_delivered_model_in_a_home_of_its_own_and_never_the_secr
     controller = _controller(tmp_path, track, MODEL)
     intents.submit(track, OpDefinition("r", (OpStep("chat", "hermes", "session"),)), by=BY)
     seen = json.loads(_answer(controller, track, "r", "env"))
+    # Chat completions whatever the URL's host, and nothing installed while it runs.
     assert seen["model"] == {"provider": "custom", "base_url": "http://127.0.0.1:9/v1", "default": "a-model",
-                             "api_key": "the-key"}
+                             "api_key": "the-key", "api_mode": "chat_completions"}
+    assert seen["security"] == {"allow_lazy_installs": False}
     assert seen["run_token"] is False and seen["api_key_env"] is False and seen["anthropic_key"] is None
     assert Path(seen["cwd"]).name.startswith("hermes-r-")  # a workspace of the run's, not the package
     assert seen["home"] == seen["cwd"]  # so no credentials of the machine's own are found under HOME
@@ -237,6 +239,39 @@ def test_hermes_runs_no_command_even_when_its_model_orders_one(tmp_path):
     assert not marker.exists(), "Hermes ran the command its model ordered"
     assert "Tool 'terminal' does not exist" in answer
     assert "offered: []" in (tmp_path / "model.log").read_text()  # no tool was even offered to the model
+
+
+BEDROCK_PROBE = """
+import os, subprocess, sys, tempfile
+sys.path.insert(0, os.getcwd())
+import serve
+root = tempfile.mkdtemp()
+os.environ.update(HERMES_HOME=str(serve.hermes_home(root)), HOME=root)
+installs = []
+run = subprocess.run
+subprocess.run = lambda *a, **k: (installs.append(str(a[0] if a else k.get("args"))), run(*a, **k))[1]
+from hermes_cli.runtime_provider import resolve_runtime_provider
+from run_agent import AIAgent
+from tools import lazy_deps
+rt = resolve_runtime_provider()
+agent = AIAgent(base_url=rt["base_url"], api_key=rt["api_key"], provider=rt["provider"], api_mode=rt["api_mode"],
+                model=os.environ["COLLAB_MODEL_NAME"], quiet_mode=True, skip_context_files=True, enabled_toolsets=[])
+print(rt["api_mode"], agent.api_mode, lazy_deps._allow_lazy_installs(), [c for c in installs if "pip" in c])
+"""
+
+
+@NEEDS_HERMES
+def test_hermes_speaks_chat_completions_to_a_bedrock_url_and_installs_nothing(tmp_path):
+    # Hermes 0.19 would talk to bedrock-runtime.*.amazonaws.com through Bedrock's Converse API and boto3,
+    # installing boto3 into the locked environment on first use. The Cog pins chat completions, and no installs.
+    environment = {**{k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG")},
+                   "COLLAB_MODEL_PROVIDER": "openai-compatible", "COLLAB_MODEL_NAME": "openai.gpt-oss-120b-1:0",
+                   "COLLAB_MODEL_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1",
+                   "COLLAB_MODEL_API_KEY": "not-a-key"}
+    probed = subprocess.run(["pixi", "run", "--locked", "--manifest-path", str(HERMES / "pixi.toml"), "python", "-c",
+                             BEDROCK_PROBE], cwd=HERMES, env=environment, capture_output=True, text=True, timeout=300)
+    assert probed.returncode == 0, probed.stderr[-2000:]
+    assert probed.stdout.strip().splitlines()[-1] == "chat_completions chat_completions False []"
 
 
 @NEEDS_HERMES

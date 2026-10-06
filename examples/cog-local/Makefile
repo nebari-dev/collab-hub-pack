@@ -41,7 +41,8 @@ export COLLAB_MODEL_NAME     := $(CLAUDE_MODEL)
 export COLLAB_MODEL_API_KEY  := $(ANTHROPIC_API_KEY)
 endif
 # The run's name in `run list`: the Cog and the model it talks to, e.g. hermes-on-claude-opus-5-5.
-MODEL_LABEL = $(if $(filter claude,$(MODEL_SOURCE)),$(CLAUDE_MODEL),$(if $(filter fake,$(MODEL_SOURCE)),fake-model,$(or $(COLLAB_MODEL_NAME),your-model)))
+# Characters a run name refuses (a Bedrock id's `:`, an Ollama tag's) become `-`.
+MODEL_LABEL = $(shell printf '%s' '$(if $(filter claude,$(MODEL_SOURCE)),$(CLAUDE_MODEL),$(if $(filter fake,$(MODEL_SOURCE)),fake-model,$(or $(COLLAB_MODEL_NAME),your-model)))' | tr -c 'A-Za-z0-9._-' '-')
 NAME ?= $(COG)-on-$(MODEL_LABEL)
 ifeq ($(MODEL_SOURCE),fake)
 export COLLAB_MODEL_PROVIDER := openai-compatible
@@ -84,7 +85,7 @@ tools: ## Check what the example needs: docker, uv, pixi, and toad for `make con
 # --- 1. the hub, and who signs in to it ---------------------------------------------------------
 
 hub: ## Start Postgres and Keycloak (containers), with the realm and its users
-	$(MAKE) -C $(DEV) services keycloak
+	$(MAKE) -C $(DEV) postgres keycloak
 
 credentials: | $(LOCAL) ## Show who to sign in as, and check the realm issues them a token
 	@echo "  realm    http://localhost:8080/realms/nebari  (client apollo-desktop)"

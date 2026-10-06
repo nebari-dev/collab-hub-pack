@@ -101,16 +101,18 @@ Docker only ever supplies the things around it.
 |---|:--:|:--:|:--:|:--:|:--:|
 | `make api` | – | – | – | – | – |
 | `make api-watch` | – | – | – | – | – |
-| `make api-pg` | ✅ | ✅ | – | – | – |
-| `make api-oidc` | ✅ | ✅ | ✅ | – | – |
-| `make api-fakes` | ✅ | ✅ | ✅ | ✅ | – |
+| `make api-pg` | ✅ | – | – | – | – |
+| `make api-oidc` | ✅ | – | ✅ | – | – |
+| `make api-fakes` | ✅ | – | ✅ | ✅ | – |
 | `make api-full` | ✅ | ✅ | ✅ | – | – |
-| `make api-membership` | ✅ | ✅ | ✅ | – | – |
+| `make api-membership` | ✅ | – | ✅ | – | – |
 | `make api-desktop` | ✅ | ✅ | ✅ | – | ✅ |
 | `make api-desktop-fakes` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-(The S3 store tags along with Postgres because both come from `make services`;
-only `make api-full` actually stores frames in it.)
+Only `make api-full` stores frames in S3, so only it starts the S3 store
+(`make services`); the others start Postgres alone (`make postgres`), and keep
+frames on the local filesystem. The desktop targets start both, through the
+front door.
 
 Containers left running from a previous level are **not** wired in by a lower
 one: `make api-pg` then Ctrl-C then `make api` leaves Postgres up but running
@@ -399,7 +401,7 @@ true` — on a routed host they are an authentication bypass. See
 ## Level 2 — with Postgres
 
 ```sh
-make api-pg      # starts Postgres + the S3 store, then the API
+make api-pg      # starts Postgres, then the API
 ```
 
 Starts the two containers first (skipping any already up), waits for them to be
@@ -429,7 +431,7 @@ curl -s localhost:8000/v1/frame-groups
 ## Level 3 — with Keycloak
 
 ```sh
-make api-oidc    # starts Postgres, the S3 store and Keycloak, then the API
+make api-oidc    # starts Postgres and Keycloak, then the API
 ```
 
 Three containers, started for you and waited on before the API launches. The
