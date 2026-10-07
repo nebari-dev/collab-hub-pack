@@ -146,7 +146,8 @@ def main() -> int:
         return _submit(track, op, budget, args.timeout)
 
     try:
-        hold_id(args.track, MAKE_OP)  # held for as long as this host runs
+        # Held for as long as this host runs: the hold lasts as long as the check it returns is kept.
+        still_held = hold_id(args.track, MAKE_OP)
     except IdTaken:
         print("another `make op` is running on this Track: one at a time, since each is the controller "
               f"{MAKE_OP!r}", file=sys.stderr)
@@ -171,6 +172,7 @@ def main() -> int:
         return 130
     _print_track(track, run_id)
     print(f"status: {state.name}")
+    assert still_held(), "make op lost its hold on its name while it ran"
     escalation = runner.open_escalation(run_id)
     if escalation is not None:
         print(f"waiting at the Gate of step {escalation['step']!r}: {escalation['reason']}")

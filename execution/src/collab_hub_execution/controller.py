@@ -58,6 +58,8 @@ from .track import PostgresTrackStore, SqliteTrackStore, TrackStore
 _log = logging.getLogger("collab_hub_execution.controller")
 
 POSTGRES_SCHEMES = ("postgresql://", "postgres://")
+TRACK_TABLES = ("collab_track_events", "collab_track_payloads")
+"""The Track's tables on Postgres, both from the hub's migrations: events, and payloads too large to keep inline."""
 
 
 class RunController:
@@ -301,11 +303,12 @@ def open_track(spec: str) -> tuple[TrackStore, Any]:
         pool = ConnectionPool(spec, min_size=1, max_size=8, open=True)
         with pool.connection() as connection:
             # On Postgres the Track's tables come from the hub's migration registry, never from here.
-            missing = connection.execute("SELECT to_regclass('collab_track_events') IS NULL").fetchone()[0]
+            missing = [table for table in TRACK_TABLES if connection.execute(
+                "SELECT to_regclass(%s) IS NULL", (table,)).fetchone()[0]]
         if missing:
             pool.close()
-            raise SystemExit("this Postgres has no Track: the hub's migrations create its tables (start the API "
-                             "on it once, e.g. `make -C dev api-pg`)")
+            raise SystemExit(f"this Postgres has no Track, or part of one (missing {', '.join(missing)}): the hub's "
+                             "migrations create its tables (start the API on it once, e.g. `make -C dev api-pg`)")
         return PostgresTrackStore(pool), pool
     path = Path(spec)
     SqliteTrackStore.ensure_schema(path)
@@ -319,6 +322,9 @@ def hold_id(spec: str, controller: str):
     lock on its own connection, released by Postgres when that connection
     ends — which the returned check notices. :class:`IdTaken` when another live
     controller holds it.
+
+    The returned check holds the lock file or the connection: keep it for as
+    long as the id must be held, since dropping it lets the lock go.
     """
     if spec.startswith(POSTGRES_SCHEMES):
         import psycopg
@@ -349,9 +355,19 @@ def hold_id(spec: str, controller: str):
     return lambda: not lock.closed
 
 
-def main(argv: list[str] | None = None) -> int:
+def _listed(name: str, separator: str) -> list[str] | None:
+    """A repeatable option from its variable: ``separator``-separated values, or ``None`` when unset."""
+    value = os.environ.get(name, "")
+    return [item for item in value.split(separator) if item] or None
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """The controller's configuration: its options, each defaulting to its ``COLLAB_CONTROLLER_*`` variable."""
     env = os.environ.get
-    parser = argparse.ArgumentParser(description="The run controller: advances the runs submitted to a Track.")
+    parser = argparse.ArgumentParser(
+        description="The run controller: advances the runs submitted to a Track. Each option also reads the "
+                    "COLLAB_CONTROLLER_ variable named after it (COLLAB_CONTROLLER_HEALTH_PORT for --health-port); "
+                    "--packages takes a os.pathsep-separated list there, and --allow a comma-separated one.")
     parser.add_argument("--track", default=env("COLLAB_CONTROLLER_TRACK"),
                         help="the Track the API writes submissions to: a SQLite file, or a postgresql:// URL")
     parser.add_argument("--id", default=env("COLLAB_CONTROLLER_ID") or socket.gethostname(),
@@ -369,21 +385,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default=env("COLLAB_CONTROLLER_MODELS"), metavar="FILE",
                         help="the hub's models: block, in TOML: the models it offers, and which Cog talks to "
                              "which; each worker gets its Cog's model, and no other")
-    parser.add_argument("--poll-interval", type=float, default=0.25)
-    parser.add_argument("--interaction-timeout", type=float, default=60.0, metavar="SECONDS",
+    parser.add_argument("--poll-interval", type=float, default=float(env("COLLAB_CONTROLLER_POLL_INTERVAL", "0.25")))
+    parser.add_argument("--interaction-timeout", type=float, metavar="SECONDS",
+                        default=float(env("COLLAB_CONTROLLER_INTERACTION_TIMEOUT", "60")),
                         help="how long one interaction with a worker may take; 0 for no limit, which a Cog "
                              "holding a session for as long as someone talks to it needs")
-    parser.add_argument("--environment", default="pixi", choices=("pixi", "host"),
+    parser.add_argument("--environment", default=env("COLLAB_CONTROLLER_ENVIRONMENT", "pixi"), choices=("pixi", "host"),
                         help="how a package's serve task is run: in its own pixi environment, or directly")
     parser.add_argument("--health-port", type=int, default=int(env("COLLAB_CONTROLLER_HEALTH_PORT", "0")),
                         help="serve /healthz and /readyz on this port; none when 0")
     parser.add_argument("--health-host", default=env("COLLAB_CONTROLLER_HEALTH_HOST", "127.0.0.1"))
     args = parser.parse_args(argv)
+    # Repeatable options: the command line's, or else their variables'.
+    args.packages = args.packages or _listed("COLLAB_CONTROLLER_PACKAGES", os.pathsep)
+    args.allow = args.allow or _listed("COLLAB_CONTROLLER_ALLOW", ",")
+    # A default read from a variable is not checked against `choices` by argparse: checked here.
+    if args.environment not in ("pixi", "host"):
+        parser.error(f"--environment is pixi or host, not {args.environment!r}")
+    if args.location not in AGENT_LOCATIONS:
+        parser.error(f"--location is one of {', '.join(AGENT_LOCATIONS)}, not {args.location!r}")
     for required in ("track", "work_dir"):
         if not getattr(args, required):
             parser.error(f"--{required.replace('_', '-')} is required")
     if not args.packages:
         parser.error("--packages is required")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s controller {args.id} %(message)s",
                         datefmt="%H:%M:%S", stream=sys.stderr)
     logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per /healthz poll is noise here

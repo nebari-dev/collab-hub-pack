@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -401,7 +401,7 @@ def pending_decision(events: Iterable[TrackEvent]) -> dict[str, Any] | None:
 
 
 def request_decision(track: TrackStore, run_id: str, *, escalation: str, outcome: str, actor: str,
-                     findings: Iterable[Any] = ()) -> RunView:
+                     findings: Sequence[Any] = ()) -> RunView:
     """Record that ``actor`` decided on the escalation a run waits at: ``approve``, ``send_back`` or ``reject``.
 
     The controller that owns the run delivers it. ``LookupError`` for a run
@@ -414,6 +414,10 @@ def request_decision(track: TrackStore, run_id: str, *, escalation: str, outcome
         raise ValueError(f"a decision is one of {', '.join(sorted(DECISIONS))}, not {outcome!r}")
     if not actor:
         raise ValueError("a decision names its actor")
+    if isinstance(findings, (str, bytes)) or not isinstance(findings, Sequence):
+        # The runner's own rule, checked before the intent is recorded: one string, a mapping or a set
+        # would be recorded as its characters, its keys, or an arbitrary order.
+        raise ValueError("findings are a sequence of findings, not one string, mapping or set")
 
     def open_on_it(events: tuple[TrackEvent, ...]) -> bool:
         events = tuple(upgrade(event) for event in events)

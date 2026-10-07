@@ -405,3 +405,72 @@ def test_a_second_controller_under_a_taken_id_is_refused(tmp_path):
         assert second.returncode == 1 and "a controller named 'one' is running" in second.stderr
     finally:
         controllers.close()
+
+
+# --- configuration -----------------------------------------------------------------------------
+
+
+def test_the_id_is_held_for_as_long_as_its_check_is_kept(tmp_path):
+    import gc
+
+    from collab_hub_execution.controller import IdTaken, hold_id
+
+    track = str(tmp_path / "track.sqlite")
+    still_held = hold_id(track, "make-op")
+    with pytest.raises(IdTaken):
+        hold_id(track, "make-op")
+    assert still_held()
+    del still_held  # dropping the check lets the lock go: callers keep it, as `make op` now does
+    gc.collect()
+    assert hold_id(track, "make-op")()
+
+
+def test_every_option_reads_its_variable_and_the_command_line_wins(monkeypatch, tmp_path):
+    from collab_hub_execution.controller import parse_args
+
+    for name, value in {"TRACK": str(tmp_path / "t.sqlite"), "WORK_DIR": str(tmp_path / "runs"),
+                        "PACKAGES": os.pathsep.join(["/a", "/b"]), "ALLOW": "echo,slow", "ENVIRONMENT": "host",
+                        "POLL_INTERVAL": "0.5", "INTERACTION_TIMEOUT": "0", "HEALTH_PORT": "8770",
+                        "ID": "one"}.items():
+        monkeypatch.setenv(f"COLLAB_CONTROLLER_{name}", value)
+    args = parse_args([])
+    assert (args.packages, args.allow, args.environment, args.poll_interval, args.interaction_timeout,
+            args.health_port, args.id) == (["/a", "/b"], ["echo", "slow"], "host", 0.5, 0.0, 8770, "one")
+    args = parse_args(["--packages", "/c", "--environment", "pixi"])
+    assert args.packages == ["/c"] and args.environment == "pixi"
+    monkeypatch.setenv("COLLAB_CONTROLLER_ENVIRONMENT", "docker")
+    with pytest.raises(SystemExit):
+        parse_args([])  # a variable's value is checked as the option's would be
+
+
+def test_a_decision_with_findings_that_are_not_a_sequence_is_refused_before_it_is_recorded():
+    track = InMemoryTrackStore()
+    one = _named(track, "one", {"echo": lambda e, v: v})
+    escalation = _waiting_at_gate(track, one)
+    for findings in ("shorter", {"tone": "warmer"}, {"a", "b"}, b"x"):
+        with pytest.raises(ValueError, match="sequence of findings"):
+            intents.request_decision(track, "r", escalation=escalation, outcome="send_back", actor="alice",
+                                     findings=findings)
+    assert "decision_requested" not in _types(track, "r")
+    intents.request_decision(track, "r", escalation=escalation, outcome="send_back", actor="alice",
+                             findings=("shorter",))
+
+
+@pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to run the Postgres controller tests")
+def test_a_postgres_with_part_of_a_track_is_refused_naming_what_is_missing():
+    import psycopg
+
+    from collab_hub_execution.controller import open_track
+
+    with psycopg.connect(TEST_PG, autocommit=True) as admin:
+        admin.execute("DROP DATABASE IF EXISTS track_partial")
+        admin.execute("CREATE DATABASE track_partial")
+    partial = TEST_PG.rsplit("/", 1)[0] + "/track_partial"
+    try:
+        with psycopg.connect(partial, autocommit=True) as connection:
+            connection.execute("CREATE TABLE collab_track_events (sequence bigint)")
+        with pytest.raises(SystemExit, match="missing collab_track_payloads"):
+            open_track(partial)
+    finally:
+        with psycopg.connect(TEST_PG, autocommit=True) as admin:
+            admin.execute("DROP DATABASE IF EXISTS track_partial WITH (FORCE)")

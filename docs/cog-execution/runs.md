@@ -180,8 +180,11 @@ run API's later phase.
 | `--models FILE` | The hub's `models:` block, below |
 | `--health-port`, `--health-host` | `GET /healthz`, 200 while the controller passes over the Track, and `GET /readyz`, 200 once it has started and its last pass read the Track; 503 otherwise, with the reason |
 
-Each option also reads a `COLLAB_CONTROLLER_*` variable (`COLLAB_CONTROLLER_TRACK`,
-`COLLAB_CONTROLLER_ID`, `COLLAB_CONTROLLER_MODELS`, ...), for a container.
+Each option also reads the `COLLAB_CONTROLLER_*` variable named after it, for a
+container: `COLLAB_CONTROLLER_TRACK`, `COLLAB_CONTROLLER_ID`,
+`COLLAB_CONTROLLER_ENVIRONMENT`, `COLLAB_CONTROLLER_HEALTH_PORT` and so on;
+`COLLAB_CONTROLLER_PACKAGES` is a path list (`:`-separated) and
+`COLLAB_CONTROLLER_ALLOW` a comma-separated one. The command line wins.
 
 The **`models:` block** is the models the hub offers and which Cog talks to
 which, in TOML, until a Cog's own binding resolves it (Phase 24, whose

@@ -128,8 +128,11 @@ class ModelsBlock:
         unknown = set(document) - {"models", "cogs"}
         if unknown:
             raise BindingResolutionError(f"{where}: unknown tables {sorted(unknown)}; it has [models.*] and [cogs]")
+        for table in ("models", "cogs"):
+            if not isinstance(document.get(table, {}), Mapping):
+                raise BindingResolutionError(f"{where}: [{table}] is a table")
         models: dict[str, ModelCog] = {}
-        for name, spec in dict(document.get("models") or {}).items():
+        for name, spec in dict(document.get("models", {})).items():
             if not isinstance(spec, Mapping):
                 raise BindingResolutionError(f"{where}: [models.{name}] is a table")
             extra = set(spec) - _MODEL_KEYS
@@ -150,7 +153,10 @@ class ModelsBlock:
                 name=name, endpoint=str(spec.get("endpoint", "")), model_identifier=str(spec.get("model", "")),
                 auth_ref=str(spec.get("auth_ref", "")), provider=provider,
                 context_window=spec.get("context_window"), max_output_tokens=spec.get("max_output_tokens"))
-        cogs = {str(cog): str(model) for cog, model in dict(document.get("cogs") or {}).items()}
+        cogs = dict(document.get("cogs", {}))
+        for cog, model in cogs.items():
+            if not isinstance(model, str):
+                raise BindingResolutionError(f"{where}: [cogs] {cog} names a model, as a string")
         for cog, model in cogs.items():
             if model not in models:
                 raise BindingResolutionError(f"{where}: Cog {cog!r} is bound to {model!r}, which [models] does not "

@@ -100,6 +100,10 @@ def test_each_cog_gets_its_own_model_and_no_other_and_the_key_is_read_when_a_wor
     ("[models.m]\nendpoint = 'http://x'\nmodel = 'x'\ncontext_window = 0\n", "positive integer"),
     ("[cogs]\nhermes = 'nope'\n", "which [models] does not name"),
     ("[agents]\n", "unknown tables"),
+    ('models = "bad"\n', "[models] is a table"),
+    ("models = []\n", "[models] is a table"),
+    ("cogs = []\n", "[cogs] is a table"),
+    ("[models.m]\nendpoint = 'http://x'\nmodel = 'x'\n[cogs]\nhermes = 1\n", "names a model, as a string"),
 ])
 def test_a_models_block_that_cannot_be_used_is_refused_when_read(text, message):
     from collab_hub_execution.binding import BindingResolutionError
