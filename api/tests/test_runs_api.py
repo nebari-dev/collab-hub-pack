@@ -261,6 +261,57 @@ def test_the_api_constructs_no_executor_and_reaches_execution_only_from_the_run_
     assert set(importers) == {"runs.py"}
 
 
+RUNTIME_PROBE = """
+import asyncio, json, os, sys
+import collab_hub_execution as execution
+from collab_hub_execution.controller import RunController
+from collab_hub_execution.kubernetes import KubernetesCogExecutor
+from collab_hub_execution.locations.local import LocalProcessCogExecutor
+from httpx import ASGITransport, AsyncClient
+from collab_hub_api.config import Config
+from collab_hub_api.core import make_app
+
+constructed = []
+for cls in (execution.LifecycleRunner, RunController, LocalProcessCogExecutor, KubernetesCogExecutor,
+            execution.InMemoryCogExecutor):
+    def refuse(self, *args, _name=cls.__name__, **kwargs):
+        constructed.append(_name)
+        raise RuntimeError(f"the API constructed a {_name}")
+    cls.__init__ = refuse
+
+async def main():
+    app = make_app(Config.parse(json.loads(sys.argv[1])))
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            run = (await client.post("/v1/runs", json=json.loads(sys.argv[2]))).json()
+            assert (await client.get("/v1/runs")).status_code == 200
+            assert (await client.get("/v1/runs/launchable")).status_code == 200
+            assert (await client.get(f"/v1/runs/{run['id']}")).status_code == 200
+            assert (await client.post(f"/v1/runs/{run['id']}/turns", json={"text": "hi"})).status_code == 202
+            assert (await client.post(f"/v1/runs/{run['id']}/cancel")).status_code == 202
+    print(json.dumps(constructed))
+
+asyncio.run(main())
+"""
+
+
+def test_the_api_process_constructs_no_runner_controller_or_executor_while_serving_runs(runs_config, tmp_path):
+    # The same invariant at run time, in a process of its own: with the run API on, a submission, a
+    # listing, a turn and a cancel construct nothing that advances a run — every such constructor
+    # refuses, and the routes still answer.
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "FRAMES_UNSAFE_AUTH_ENABLED": "true", "DEV_AUTH_ENABLED": "true",
+           "DEV_AUTH_USER": "dev-user", "DEV_AUTH_ORG": "dev-org", "DEV_AUTH_WORKSPACE": "default"}
+    probed = subprocess.run([sys.executable, "-c", RUNTIME_PROBE, json.dumps(runs_config.model_dump(mode="json")),
+                             json.dumps(ECHO)], capture_output=True, text=True, env=env, timeout=120)
+    assert probed.returncode == 0, probed.stderr[-3000:]
+    assert json.loads(probed.stdout.strip().splitlines()[-1]) == []
+
+
 def test_the_flag_without_a_track_stops_startup(tmp_path):
     config = Config.parse({"storage": {"frames_path": str(tmp_path)}, "features": {"cog_runs": True}})
     with pytest.raises(RuntimeError, match="runs.track_path"):

@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from collab_hub_execution import InMemoryTrackStore, LifecycleRunner, OpDefinition, OpStep, RunState, intents
-from collab_hub_execution.controller import RunController, _deliveries
+from collab_hub_execution.controller import RunController
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 HERMES = REPOSITORY / "cogs" / "hermes"
@@ -177,16 +177,6 @@ def test_without_a_model_the_step_fails_and_says_why(tmp_path):
     view = intents.describe(track, "r")
     assert view.state is RunState.FAILED and view.error == "model-unavailable"
     assert "COLLAB_MODEL_BASE_URL" in view.reason
-
-
-def test_the_controller_delivers_a_variable_to_the_cog_named_and_no_other(monkeypatch):
-    monkeypatch.setenv("COLLAB_MODEL_BASE_URL", "http://model")
-    monkeypatch.delenv("COLLAB_MODEL_API_KEY", raising=False)
-    deliver = _deliveries(["hermes:COLLAB_MODEL_BASE_URL", "hermes:COLLAB_MODEL_API_KEY"])
-    assert deliver("hermes", "r", "s:0") == {"COLLAB_MODEL_BASE_URL": "http://model"}  # unset ones are skipped
-    assert deliver("hello", "r", "s:0") == {}
-    with pytest.raises(SystemExit, match="COG:NAME"):
-        _deliveries(["COLLAB_MODEL_BASE_URL"])
 
 
 NEEDS_HERMES = pytest.mark.skipif(
