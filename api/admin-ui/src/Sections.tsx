@@ -315,7 +315,7 @@ export function Users({ csrfToken }: { csrfToken: string }) {
           <tr>
             <th>Person</th>
             <th>Username</th>
-            <th>Granted by</th>
+            <th>Role source</th>
             <th>Role</th>
           </tr>
         </thead>
@@ -324,7 +324,7 @@ export function Users({ csrfToken }: { csrfToken: string }) {
             <tr key={user.id}>
               <td>{user.email ?? user.id}</td>
               <td className="mono">{user.username}</td>
-              <td>{ROLE_SOURCES[user.role_source ?? ""] ?? "Not an administrator"}</td>
+              <td>{ROLE_SOURCES[user.role_source ?? ""] ?? ""}</td>
               <td>
                 {manageable ? (
                   <label className="rolepick">
@@ -358,8 +358,8 @@ export function Users({ csrfToken }: { csrfToken: string }) {
 }
 
 const ROLE_SOURCES: Record<string, string> = {
-  idp: "Identity provider group",
-  manual: "An administrator here",
+  idp: "Keycloak admin group",
+  manual: "Added directly",
 };
 
 interface ConnectorRow {
