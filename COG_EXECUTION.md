@@ -303,7 +303,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 8 | #101 | Run Ops without a durability engine (`none`), and mark interrupted runs honestly | `feat/cog-durability-none` | 7 | L | merged, #163 |
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | merged, #174 |
 | 10 | #177 | Hermes as a Cog, launched from the `collab-hub` CLI on a local hub and talked to from Toad: an example | `feat/cog-local-example` | 6, 9 | M | merged, #178 |
-| 11 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9, 10 | M | in review |
+| 11 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9, 10 | M | in review, #186 |
 | 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | not started |
 | 13 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 9 | M | not started |
 | 14 | #108 | Publish a Hermes harness Cog, launched by the hub as a local process | `feat/hermes-acp-harness` | 9, 12, 13 | M | not started |
@@ -588,7 +588,7 @@ The whole path a user takes, demonstrable now, on a hub that is two plain proces
 - [x] A member of another organization can neither see, cancel nor talk to a run.
 
 #### Phase 11 — Run controller and run pickup
-**Issue** #121 · **Branch** `feat/cog-run-controller` · **Depends on** Phases 8, 9, 10 · **Size** M · **Status** in review
+**Issue** #121 · **Branch** `feat/cog-run-controller` · **Depends on** Phases 8, 9, 10 · **Size** M · **Status** in review, #186
 
 The process that advances runs, separate from the process that accepts them — the shape production has, kept from level 1 up. Phase 10 built its first form: one controller polling a SQLite Track, starting submitted runs and delivering cancels. This phase makes it the controller a deployment runs.
 
