@@ -393,9 +393,3 @@ class HealthResponse(BaseModel):
     """Readiness/liveness response shape."""
 
     status: Literal["ok"]
-
-
-def frame_metadata(frame: Frame) -> FrameMetadata:
-    """Project a full Frame to metadata without the Markdown body."""
-
-    return FrameMetadata(**frame.model_dump(exclude={"body"}))

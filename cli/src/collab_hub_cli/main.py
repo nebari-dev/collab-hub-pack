@@ -1,7 +1,9 @@
 """The ``collab-hub`` command line.
 
 Exit codes: 0 success; 1 the hub refused or failed the request, or could not
-be reached; 2 a usage error; 5 not signed in, or the session cannot be used.
+be reached, or a run that was waited for failed; 2 a usage error; 3 a run that
+was waited for ended interrupted; 4 it is waiting at a Gate; 5 not signed in,
+or the session cannot be used; 6 a run that was waited for was cancelled.
 Messages go to stderr, results to stdout, and ``--json`` makes stdout one JSON
 document a script can hand to ``jq``.
 """
@@ -10,11 +12,16 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import shlex
+import shutil
 import sys
+import time
 import webbrowser
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from functools import wraps
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -26,7 +33,17 @@ from .oidc import AuthError, RealmError
 
 EXIT_HUB = 1
 EXIT_USAGE = 2
+EXIT_INTERRUPTED = 3
+EXIT_AT_GATE = 4
 EXIT_AUTH = 5
+EXIT_CANCELLED = 6
+
+# How a run that was waited for ends the command; a status not listed here is a failure.
+RUN_EXIT = {"COMPLETED": 0, "INTERRUPTED": EXIT_INTERRUPTED, "WAITING_AT_GATE": EXIT_AT_GATE,
+            "CANCELLED": EXIT_CANCELLED}
+GATE_POLICIES = ("never", "error", "warn", "always")
+POLL_SECONDS = 0.5
+TURN_TIMEOUT_SECONDS = 300.0
 
 app = typer.Typer(
     name="collab-hub",
@@ -36,6 +53,9 @@ app = typer.Typer(
 )
 cog_app = typer.Typer(help="The Cogs the hub offers.", no_args_is_help=True)
 app.add_typer(cog_app, name="cog")
+run_app = typer.Typer(help="The runs the hub was asked for: what was launched, and stopping it.",
+                      no_args_is_help=True)
+app.add_typer(run_app, name="run")
 
 HubOption = Annotated[
     str | None, typer.Option("--hub", envvar="COLLAB_HUB_URL", help="The hub's URL; overrides the profile's.")
@@ -88,6 +108,36 @@ def handled(command: Callable) -> Callable:
 
 def _target() -> config.Target:
     return config.resolve(state.hub, state.profile, insecure=state.insecure)
+
+
+def _program() -> str:
+    """This CLI as another shell finds it: the path it was run from.
+
+    Not `collab-hub` by name: a PATH that finds it here may be one only this
+    shell has (`uv run` puts its environment first), not the client's.
+    """
+
+    own = shutil.which(sys.argv[0])
+    return str(Path(own).absolute()) if own else "collab-hub"
+
+
+def _connect_command(target: config.Target, run_id: str) -> str:
+    """What an ACP client starts as its agent to talk to a run: ACP is a command's stdin and stdout, not a URL.
+
+    It names this CLI, its configuration directory when one was chosen, the
+    hub and the profile, so it works from any shell; the client runs it as
+    given, `toad acp "<it>"` for Toad.
+    """
+
+    command = []
+    if os.environ.get("COLLAB_HUB_CONFIG_DIR"):
+        command += ["env", f"COLLAB_HUB_CONFIG_DIR={target.directory.absolute()}"]
+    command += [_program(), "--hub", target.require_hub()]
+    if target.profile != config.DEFAULT_PROFILE:
+        command += ["--profile", target.profile]
+    if target.insecure:
+        command.append("--insecure")
+    return shlex.join([*command, "run", "connect", run_id])
 
 
 def _print_json(value: Any) -> None:
@@ -318,10 +368,26 @@ def cog_list(
     source_id: Annotated[str | None, typer.Option(
         "--source-id", help="Only this registry source; the newest version is chosen within it.")] = None,
     query: Annotated[str | None, typer.Option("--query", "-q", help="Text in the name or description.")] = None,
+    launchable: Annotated[bool, typer.Option(
+        "--launchable", help="The Cogs this hub can launch now, instead of the catalog.")] = False,
     as_json: JsonOption = False,
 ) -> None:
-    """List the Cogs in the hub's catalog, each at its newest version, following every page."""
+    """List the Cogs in the hub's catalog, each at its newest version, following every page.
 
+    With --launchable, the Cog packages the hub's run controller can launch,
+    which is what `cog launch` takes until Cogs are installed from the catalog.
+    """
+
+    if launchable:
+        with Hub(_target()) as hub:
+            names = hub.get_json("/v1/runs/launchable")["items"]
+        if as_json:
+            _print_json(names)
+        elif names:
+            typer.echo("\n".join(names))
+        else:
+            _err("This hub launches no Cogs.")
+        return
     filters = {"kind": kind, "publisher": publisher, "provides": provides, "requires": requires,
                "accepts": accepts, "produces": produces, "source_id": source_id, "q": query}
     with Hub(_target()) as hub:
@@ -371,6 +437,249 @@ def cog_show(cog_id: Annotated[str, typer.Argument(help="The Cog's id, <publishe
          "yes" if version.get("removed_at") else ""]
         for version in cog.get("versions", [])
     ])
+
+
+# --- launching a Cog, and the runs that makes ---------------------------------------------------
+
+
+def _age(timestamp: str) -> str:
+    seconds = max(0, int((datetime.now(UTC) - datetime.fromisoformat(timestamp)).total_seconds()))
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def _print_run(run: dict) -> None:
+    rows = [["run", run["id"] + (f"  ({run['name']})" if run.get("name") else "")], ["status", run["status"]],
+            ["runs on", f"backend {run['backend']}, workers {run['location']}"],
+            ["submitted", f"{run['submitted_at']} by {run.get('submitted_by_name') or run['submitted_by']}"]]
+    if run.get("cancel_requested_by") and not run["ended"]:
+        rows.append(["cancel", f"requested by {run['cancel_requested_by']}"])
+    if run.get("error"):
+        rows.append(["error", f"{run['error']}: {run['reason']}" if run.get("reason") else run["error"]])
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        typer.echo(f"{label.ljust(width)}  {value}")
+    typer.echo("")
+    _table(["STEP", "COG", "ENTRY", "STATE", "ERROR"], [
+        [step["name"], step["cog"], step["entry_point"], step["state"], step.get("error")] for step in run["steps"]])
+    for step in run["steps"]:
+        if step.get("output") is not None:
+            typer.echo(f"\n{step['name']} answered:")
+            typer.echo(json.dumps(step["output"], indent=2, sort_keys=True))
+        elif step.get("output_ref"):
+            typer.echo(f"\n{step['name']} answered with a result too large to show here ({step['output_ref']}).")
+
+
+def _follow(hub: Hub, run: dict, until: Callable[[dict], bool], *, quiet: bool) -> dict:
+    """Ask the hub for the run until ``until`` holds, saying on stderr each status it passes through."""
+
+    said = run["status"]
+    while not until(run):
+        time.sleep(POLL_SECONDS)
+        run = hub.get_json(f"/v1/runs/{run['id']}")
+        if run["status"] != said and not quiet:
+            _err(f"{run['id']}: {run['status']}")
+        said = run["status"]
+    return run
+
+
+def _settled(run: dict) -> bool:
+    """A run that will not move on its own: it has ended, or it waits at a Gate for a decision."""
+
+    return run["ended"] or run["status"] == "WAITING_AT_GATE"
+
+
+def _finish(run: dict, as_json: bool) -> None:
+    """Print a run that was waited for, and exit with the code its status maps to."""
+
+    if as_json:
+        _print_json(run)
+    else:
+        _print_run(run)
+    code = RUN_EXIT.get(run["status"], EXIT_HUB)
+    if code:
+        raise typer.Exit(code)
+
+
+@cog_app.command("launch")
+@handled
+def cog_launch(
+    name: Annotated[str, typer.Argument(help="The Cog to launch: a package the hub's controller can run.")],
+    entry: Annotated[str, typer.Option("--entry", help="The Cog's entry point to invoke.")] = "run",
+    input_json: Annotated[str | None, typer.Option(
+        "--input", help="The step's input, as JSON; `-` reads it from stdin.")] = None,
+    gate: Annotated[str, typer.Option(
+        "--gate", help="When the step's Gate asks a person: never, error (the default), warn or always.")] = "error",
+    watch: Annotated[bool, typer.Option(
+        "--watch", help="Follow the run until it ends or waits at a Gate, and exit with its outcome.")] = False,
+    run_name: Annotated[str | None, typer.Option(
+        "--name", help="What to call the run in `run list`, e.g. hermes-on-claude.")] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """Launch a Cog: submit a one-step Op that invokes one of its entry points.
+
+    The hub records the run and a run controller starts it; the command prints
+    the run and returns, or with --watch follows it to its end.
+    """
+
+    if gate not in GATE_POLICIES:
+        raise config.UsageError(f"--gate is one of {', '.join(GATE_POLICIES)}, not {gate!r}")
+    raw = sys.stdin.read() if input_json == "-" else input_json
+    try:
+        value = None if raw is None or not raw.strip() else json.loads(raw)
+    except ValueError as exc:
+        raise config.UsageError(f"--input is not JSON: {exc}") from None
+    step = {"name": name.split("/")[-1], "cog": name, "entry_point": entry, "input": value,
+            "gate": {"escalate": gate}}
+    with Hub(_target()) as hub:
+        body = {"steps": [step], **({"name": run_name} if run_name else {})}
+        run = hub.request("POST", "/v1/runs", json=body).json()
+        called = f" ({run_name})" if run_name else ""
+        _err(f"Launched {name} as {run['id']}{called} on the {run['backend']} backend, workers {run['location']}.")
+        if not watch:
+            if as_json:
+                _print_json(run)
+            else:
+                typer.echo(run["id"])
+            return
+        run = _follow(hub, run, _settled, quiet=False)
+    _finish(run, as_json)
+
+
+@run_app.command("list")
+@handled
+def run_list(
+    status_filter: Annotated[str | None, typer.Option(
+        "--status", help="Only runs in this status, e.g. running or completed.")] = None,
+    as_json: JsonOption = False,
+) -> None:
+    """List the runs your organization launched, newest first."""
+
+    params = {"status": status_filter} if status_filter else {}
+    target = _target()
+    with Hub(target) as hub:
+        runs = list(hub.pages("/v1/runs", params))
+    if as_json:
+        _print_json(runs)
+        return
+    if not runs:
+        _err("No runs.")
+        return
+    _table(["RUN", "NAME", "COG", "STATUS", "AGE", "BY", "CONNECT"], [
+        [run["id"], run.get("name"), ",".join(dict.fromkeys(step["cog"] for step in run["steps"])), run["status"],
+         _age(run["submitted_at"]), run.get("submitted_by_name") or run["submitted_by"],
+         None if run["ended"] else _connect_command(target, run["id"])]
+        for run in runs
+    ])
+
+
+@run_app.command("show")
+@handled
+def run_show(run_id: Annotated[str, typer.Argument(help="The run's id.")], as_json: JsonOption = False) -> None:
+    """Show one run: its status, what it runs on, and each step's state."""
+
+    with Hub(_target()) as hub:
+        run = hub.get_json(f"/v1/runs/{run_id}")
+    if as_json:
+        _print_json(run)
+    else:
+        _print_run(run)
+
+
+@run_app.command("watch")
+@handled
+def run_watch(run_id: Annotated[str, typer.Argument(help="The run's id.")], as_json: JsonOption = False) -> None:
+    """Follow a run until it ends or waits at a Gate, and exit with its outcome."""
+
+    with Hub(_target()) as hub:
+        run = _follow(hub, hub.get_json(f"/v1/runs/{run_id}"), _settled, quiet=False)
+    _finish(run, as_json)
+
+
+@run_app.command("say")
+@handled
+def run_say(
+    run_id: Annotated[str, typer.Argument(help="The run's id.")],
+    text: Annotated[list[str], typer.Argument(help="What to say: one turn of the Cog's session.")],
+    timeout: Annotated[float, typer.Option(
+        "--timeout", min=1, help="How long to wait for the answer, in seconds.")] = TURN_TIMEOUT_SECONDS,
+    as_json: JsonOption = False,
+) -> None:
+    """Say one thing to a Cog that holds a session, and print what it answered.
+
+    The hub records the turn on the run's Track, the run controller hands it to
+    the Cog's worker, and the answer comes back the same way. With no answer
+    within --timeout, it says what the run is doing and exits; the turn stays
+    on the run, and is still answered if its worker comes up.
+    """
+
+    with Hub(_target()) as hub:
+        turn = hub.request("POST", f"/v1/runs/{run_id}/turns", json={"text": " ".join(text)}).json()
+        deadline = time.monotonic() + timeout
+        while turn["state"] == "pending" and time.monotonic() < deadline:
+            time.sleep(POLL_SECONDS)
+            turn = hub.get_json(f"/v1/runs/{run_id}/turns/{turn['turn']}")
+        if turn["state"] == "pending":
+            status = hub.get_json(f"/v1/runs/{run_id}")["status"]
+            _err(f"error: no answer within {timeout:g} seconds; the run is {status}"
+                 + (" (is a run controller watching the hub?)" if status == "SUBMITTED" else "")
+                 + f". The turn stays on the run: collab-hub run show {run_id}")
+            raise typer.Exit(EXIT_HUB)
+    if as_json:
+        _print_json(turn)
+    elif turn["state"] == "answered":
+        typer.echo(turn["answer"])
+    if turn["state"] != "answered":
+        _err(f"error: the Cog did not answer: {turn['error']}")
+        raise typer.Exit(EXIT_HUB)
+
+
+@run_app.command("connect")
+@handled
+def run_connect(run_id: Annotated[str, typer.Argument(help="The run's id.")]) -> None:
+    """Serve a running Cog as an ACP agent on stdin and stdout, for an ACP client such as Toad.
+
+    Start it from the client, not by hand: `toad acp "collab-hub run connect RUN_ID"`.
+    Each prompt becomes one turn of the run, as with `run say`.
+    """
+
+    from . import acp
+
+    with Hub(_target()) as hub:
+        acp.connect(hub, run_id)
+
+
+@run_app.command("terminate")
+@handled
+def run_terminate(
+    run_id: Annotated[str, typer.Argument(help="The run's id.")],
+    no_wait: Annotated[bool, typer.Option(
+        "--no-wait", help="Return once the hub has recorded the request, without waiting for the run to end.")] = False,
+    as_json: JsonOption = False,
+) -> None:
+    """Terminate a run: ask the hub to cancel it, and wait until it has ended.
+
+    The controller tears the run's worker down and the run ends CANCELLED. A
+    run that has already ended is refused, naming its status.
+    """
+
+    with Hub(_target()) as hub:
+        run = hub.request("POST", f"/v1/runs/{run_id}/cancel").json()
+        if not no_wait:
+            run = _follow(hub, run, lambda current: current["ended"], quiet=True)
+    if run["ended"]:
+        _err(f"{run_id} ended {run['status']}.")
+    else:
+        _err(f"{run_id}: cancel requested; it is still {run['status']}.")
+    if as_json:
+        _print_json(run)
+    elif not run["ended"]:
+        typer.echo(run["status"])
+    if run["ended"] and run["status"] != "CANCELLED":
+        # It ended on its own between the request and the controller acting on it.
+        raise typer.Exit(RUN_EXIT.get(run["status"], EXIT_HUB) or EXIT_HUB)
 
 
 def run() -> None:

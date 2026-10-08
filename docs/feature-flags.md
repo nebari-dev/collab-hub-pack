@@ -22,6 +22,12 @@ Flags are for work in progress: once the feature ships, remove the flag from the
 
 The same rule makes rollback a two-step change. An image that predates a flag doesn't know its name, so a deployment that sets the flag won't start on that image. Before rolling the API back past the release that introduced a flag, drop the flag from the deployment's values.
 
+## The flags
+
+| Flag | What it exposes | Also needs |
+|---|---|---|
+| `cog_runs` | The run API, `/v1/runs`: launch a Cog, list runs, cancel one | `runs.track_path`, the Track file a run controller watches, and the `collab-hub-execution` package installed beside the API, which the image does not ship yet. See [runs](cog-execution/runs.md#the-run-controller-and-the-run-api) |
+
 ## Turning a flag on
 
 With the Helm chart, add the flag to `features` and set it to `true`. The chart accepts only lowercase names made of words joined by single underscores, so every name maps to exactly one environment variable:
