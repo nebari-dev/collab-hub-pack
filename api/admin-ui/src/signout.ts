@@ -12,7 +12,10 @@
  */
 
 export const SIGNOUT_URL = "../web/signout";
-export const SIGNED_OUT_URL = "../web/signed-out";
+// `next` sends "Sign in again" back to the panel. It is app-relative (the
+// server prefixes the deployment's root path) and the server checks it against
+// the same allowlist as the sign-in redirect.
+export const SIGNED_OUT_URL = "../web/signed-out?next=%2Fadmin%2F";
 
 /**
  * Where to go once signed out, or `null` if the server did not confirm it.
