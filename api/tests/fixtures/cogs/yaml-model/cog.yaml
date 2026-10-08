@@ -1,0 +1,31 @@
+# Deliberately minimal.
+schema: openteams/cog-manifest [0.1]
+id: example/cog-small-model
+version: "0.1.0"
+kind: model
+summary: A small instruct model, served over an OpenAI-compatible API.
+owner: cogs@example.org
+license: BSD-3-Clause
+
+model:
+  name: Small-Instruct
+  quantization: Q4_K_M
+  runtime: example-runtime
+  weights:
+    source: https://example.org/models/small-instruct-q4_k_m.gguf
+    sha256: ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12
+
+interfaces:
+  - name: web-api
+    kind: openai-compatible
+    task: serve
+    endpoint: http://127.0.0.1:8080/v1
+    served_model_id: small-instruct-q4_k_m
+    default: true
+  - name: health
+    kind: command
+    task: check
+
+provides:
+  - model-endpoint/openai-compatible
+  - model-artifact/gguf

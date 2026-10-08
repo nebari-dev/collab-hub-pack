@@ -13,7 +13,7 @@ A4 needs to execute Cogs and Ops. The open tension was local vs. hub execution u
 
 ## Decisions
 
-**D1 — Hub-first, placement-agnostic.** Ship hub-side execution — durable, multi-user, history-preserving. Do not bake in hub-only assumptions; the same Cog/Op must be able to run locally later. Local is deferred, not precluded.
+**D1 — Hub-first, placement-agnostic.** Ship hub-side execution — durable, multi-user, history-preserving. Do not bake in hub-only assumptions; the same Cog/Op must be able to run locally later. Local is deferred, not precluded. *Amended by [ADR-0002](0002-lifecycle-runner-durability-and-placement.md) D6–D7: local execution is phased after the hub path, embedding the same package in Collab's local host.*
 
 **D2 — Interact, don't execute.** The runtime interacts with a Cog through its declared entry points; it never runs a Cog as an opaque step. Model and harness Cogs are materialized and reached; context Cogs bind to them. *(Invariant.)*
 
@@ -45,7 +45,7 @@ A4 needs to execute Cogs and Ops. The open tension was local vs. hub execution u
 
 ## Orchestration & storage
 
-The workflow engine and the executor are pluggable behind interfaces; the specific engine and registry are implementation choices recorded with the code, not fixed here. Durable Op state and the Track share one datastore so a run survives a full restart with no manual recovery.
+The workflow engine and the executor are pluggable behind interfaces; the specific engine and registry are implementation choices recorded with the code, not fixed here. Durable Op state and the Track share one datastore so a run survives a full restart with no manual recovery. *Amended by [ADR-0002](0002-lifecycle-runner-durability-and-placement.md) D2: this holds under a durable backend (`dbos`, `temporal`); under `none`, a restart ends in-flight runs `interrupted`.*
 
 ## Out of scope / deferred
 
@@ -53,7 +53,7 @@ The workflow engine and the executor are pluggable behind interfaces; the specif
 - **Usage & cost metering** — observability (token and cost attribution) that rides on Langfuse, tracked separately from Cog execution.
 - **Credential delegation for unattended runs** — request-scoped auth does not survive the request; standing, revocable grants are needed. Top open technical risk.
 - **Full desktop rearchitecture** around Cogs — phased behind a flag.
-- **Local execution implementation** — the architecture stays open (D1); implementation comes later.
+- ~~**Local execution implementation** — the architecture stays open (D1); implementation comes later.~~ *Removed by [ADR-0002](0002-lifecycle-runner-durability-and-placement.md) D6: phased after the hub path.*
 
 [^1]: Hub planning decisions, 2026-08-25 — sensitivity levels agreed as an A4 goal; full enforcement and data-source registration deferred.
 [^2]: [Sensitivity: labels born on data, declared rarely, enforced at the seam](../cog-execution/sensitivity.md) — source of the data-catalog model, the bind/flow-time seams, and the declared-downgrade rule.

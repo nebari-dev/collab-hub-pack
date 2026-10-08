@@ -1,0 +1,13 @@
+{
+  "specversion": "1.0",
+  "id": "9d0a1b2c-3d4e-4f60-8172-8394a5b6c7d8",
+  "source": "/projects/2/webhook/policies/15",
+  "type": "harbor.scan.completed",
+  "datacontenttype": "application/json",
+  "time": "2026-09-01T10:20:00Z",
+  "data": {
+    "resources": [{"digest": "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0", "tag": "latest", "resource_url": "harbor.example.com/cogs/cog-alpha-1a2b3c4d:latest"}],
+    "repository": {"name": "cog-alpha-1a2b3c4d", "namespace": "cogs", "repo_full_name": "cogs/cog-alpha-1a2b3c4d", "repo_type": "private"}
+  },
+  "operator": "auto"
+}

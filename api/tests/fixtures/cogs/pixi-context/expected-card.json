@@ -1,0 +1,174 @@
+{
+  "card": 1,
+  "manifest": "pixi.toml",
+  "audience_inferred": true,
+  "provides": [],
+  "locality": null,
+  "model": null,
+  "id": "example/cog-meeting-notes",
+  "version": "0.1.0",
+  "kind": "context",
+  "summary": "Extracts grounded, cited notes from meeting records for a stated focus.",
+  "owner": "cogs@example.org",
+  "license": "BSD-3-Clause",
+  "io": {
+    "accepts": [
+      "task_request"
+    ],
+    "produces": [
+      "notes"
+    ]
+  },
+  "entry_points": [
+    {
+      "name": "web-api",
+      "kind": "http-json",
+      "task": "serve",
+      "audience": null,
+      "endpoint": "http://127.0.0.1:8093/ask",
+      "default": true
+    },
+    {
+      "name": "cli",
+      "kind": "command",
+      "task": "ask",
+      "audience": null,
+      "endpoint": null,
+      "default": false
+    },
+    {
+      "name": "health",
+      "kind": "command",
+      "task": "check",
+      "audience": null,
+      "endpoint": null,
+      "default": false
+    }
+  ],
+  "ops": {
+    "usage": [
+      "ask"
+    ],
+    "lifecycle": [
+      "check",
+      "eval",
+      "resolve",
+      "serve",
+      "test",
+      "use"
+    ]
+  },
+  "requires": [
+    {
+      "capability": "model-endpoint/openai-compatible",
+      "locality": "any",
+      "satisfiers": [
+        "example/cog-small-model",
+        "example/cog-other-model"
+      ]
+    }
+  ],
+  "prohibits": [
+    "send_external_message",
+    "modify_calendar"
+  ],
+  "input_contract": "context/input-schema.json",
+  "output_contract": "context/output-schema.json",
+  "envelope": 1,
+  "fixtures": [
+    "evals/smoke.fixture.yaml"
+  ],
+  "name": "cog-meeting-notes",
+  "description": "Context Cog. Extracts grounded, cited notes from meeting records for a stated focus. Depends on a Cog providing an OpenAI-compatible model endpoint.",
+  "publisher": "Example Organization",
+  "manifest_schema": "openteams/cog-manifest [0.1]",
+  "profile_status": "parsed",
+  "profile_schema": "openteams/cog-manifest [0.1]",
+  "frontmatter": {
+    "type": "cog [0.1]",
+    "name": "cog-meeting-notes",
+    "description": "Context Cog. Extracts grounded, cited notes from meeting records for a stated focus. Depends on a Cog providing an OpenAI-compatible model endpoint.",
+    "version": "0.1.0",
+    "license": "BSD-3-Clause",
+    "publisher": "Example Organization",
+    "manifest": "pixi.toml",
+    "manifest_schema": "openteams/cog-manifest [0.1]",
+    "metadata": {
+      "category": "meetings",
+      "maturity": "experimental"
+    }
+  },
+  "frontmatter_raw": "type: cog [0.1]\nname: cog-meeting-notes\ndescription: Context Cog. Extracts grounded, cited notes from meeting records for a stated focus. Depends on a Cog providing an OpenAI-compatible model endpoint.\nversion: \"0.1.0\"\nlicense: BSD-3-Clause\npublisher: Example Organization\nmanifest: pixi.toml\nmanifest_schema: openteams/cog-manifest [0.1]\nmetadata:\n  category: meetings\n  maturity: experimental",
+  "profile": {
+    "schema": "openteams/cog-manifest [0.1]",
+    "id": "example/cog-meeting-notes",
+    "license": "BSD-3-Clause",
+    "kind": "context",
+    "owner": "cogs@example.org",
+    "frames": [],
+    "memory": "none",
+    "prohibits": [
+      "send_external_message",
+      "modify_calendar"
+    ],
+    "context": {
+      "instructions": "context/system.md",
+      "input_schema": "context/input-schema.json",
+      "output_schema": "context/output-schema.json",
+      "output_example": "context/output-example.json"
+    },
+    "io": {
+      "accepts": [
+        "task_request"
+      ],
+      "produces": [
+        "notes"
+      ]
+    },
+    "evaluation": {
+      "fixtures": [
+        "evals/smoke.fixture.yaml"
+      ]
+    },
+    "requires": [
+      {
+        "capability": "model-endpoint/openai-compatible",
+        "locality": "any",
+        "satisfied_by": {
+          "cog": "example/cog-small-model",
+          "version": ">=0.1.0"
+        },
+        "also_satisfied_by": [
+          {
+            "cog": "example/cog-other-model"
+          }
+        ]
+      }
+    ],
+    "interfaces": [
+      {
+        "name": "web-api",
+        "kind": "http-json",
+        "task": "serve",
+        "endpoint": "http://127.0.0.1:8093/ask",
+        "default": true
+      },
+      {
+        "name": "cli",
+        "kind": "command",
+        "task": "ask"
+      },
+      {
+        "name": "health",
+        "kind": "command",
+        "task": "check"
+      }
+    ],
+    "version": "0.1.0",
+    "summary": "Extracts grounded, cited notes from meeting records for a stated focus."
+  },
+  "profile_raw": "[workspace]\nname = \"cog-meeting-notes\"\nversion = \"0.1.0\"\ndescription = \"Extracts grounded, cited notes from meeting records for a stated focus.\"\nchannels = [\"conda-forge\"]\nplatforms = [\"osx-arm64\", \"linux-64\"]\n\n[dependencies]\npython = \">=3.11\"\n\n[tasks]\nask = \"python src/cog_cli.py\"\nserve = \"python src/cog_api.py\"\ncheck = \"python src/cog_cli.py --check\"\nresolve = \"python src/cog_resolve.py\"\nuse = \"python src/cog_use.py\"\neval = \"python src/cog_eval.py\"\ntest = \"python -m unittest discover -s tests -v\"\n\n[tool.cog]\nschema = \"openteams/cog-manifest [0.1]\"\nid = \"example/cog-meeting-notes\"\nlicense = \"BSD-3-Clause\"\nkind = \"context\"\nowner = \"cogs@example.org\"\nframes = []\nmemory = \"none\"\nprohibits = [\"send_external_message\", \"modify_calendar\"]\n\n[tool.cog.context]\ninstructions = \"context/system.md\"\ninput_schema = \"context/input-schema.json\"\noutput_schema = \"context/output-schema.json\"\noutput_example = \"context/output-example.json\"\n\n[tool.cog.io]\naccepts = [\"task_request\"]\nproduces = [\"notes\"]\n\n[tool.cog.evaluation]\nfixtures = [\"evals/smoke.fixture.yaml\"]\n\n[[tool.cog.requires]]\ncapability = \"model-endpoint/openai-compatible\"\nlocality = \"any\"\nsatisfied_by = { cog = \"example/cog-small-model\", version = \">=0.1.0\" }\nalso_satisfied_by = [{ cog = \"example/cog-other-model\" }]\n\n[[tool.cog.interfaces]]\nname = \"web-api\"\nkind = \"http-json\"\ntask = \"serve\"\nendpoint = \"http://127.0.0.1:8093/ask\"\ndefault = true\n\n[[tool.cog.interfaces]]\nname = \"cli\"\nkind = \"command\"\ntask = \"ask\"\n\n[[tool.cog.interfaces]]\nname = \"health\"\nkind = \"command\"\ntask = \"check\"\n",
+  "body": "\n# Meeting Notes\n\n## Purpose\n\nExtracts grounded, cited notes from meeting records for a stated focus.\n\n## Using it\n\n```bash\npixi run resolve\npixi run ask -- --bundle examples/sample-bundle.json\n```\n",
+  "errors": [],
+  "warnings": []
+}

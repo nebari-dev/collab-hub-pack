@@ -1,6 +1,6 @@
 [project]
 name = "collab-hub-api"
-version = "0.1.0"
+version = "0.0.0.dev0"
 description = "Collab Hub API"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -8,7 +8,7 @@ authors = [
     { name = "OpenTeams", email = "info@openteams.com" },
 ]
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
     "boto3>=1.35.0",
     "fastapi>=0.136.3",
@@ -19,18 +19,29 @@ dependencies = [
     "psycopg[binary,pool]>=3.2.0",
     "pydantic-settings>=2.14.1",
     "pyjwt[crypto]>=2.10.0",
+    "pyyaml>=6.0",
     "uvicorn>=0.48.0",
     "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
 
 [dependency-groups]
+# The run API (/v1/runs, behind the cog_runs feature flag) uses the execution
+# package. It is a group, not a dependency, until the flag is retired: the
+# image does not ship it, and a deployment without the flag never imports it.
+runs = [
+    "collab-hub-execution",
+]
 test = [
+    { include-group = "runs" },
     "diff-cover>=9.0.0",
     "httpx>=0.28.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
 ]
+
+[tool.uv.sources]
+collab-hub-execution = { path = "../execution", editable = true }
 
 [build-system]
 requires = ["uv_build>=0.9.27,<0.10.0"]
@@ -40,7 +51,9 @@ build-backend = "uv_build"
 Repository = "https://github.com/nebari-dev/collab-hub-pack"
 
 [tool.ruff]
-target-version = "py314"
+# The floor of requires-python, not the newest version: with a newer target,
+# `ruff format` rewrites `except (A, B):` into syntax 3.13 cannot parse.
+target-version = "py313"
 line-length = 120
 
 [tool.ruff.lint]

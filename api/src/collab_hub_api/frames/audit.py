@@ -116,6 +116,22 @@ AUDIT_ACTION_OPERATOR_MANUAL = "operator.manual"
 # effective constraint (create plus every later replacement) back and pins it to
 # AUDIT_ACTIONS, so widening one without the other fails at unit speed.
 AUDIT_ACTION_SERVICE_ACCESS_GRANT = "service_access.grant"
+# Appended by the platform-role sync, and widened the same way v5 was: two
+# constants here, membership in AUDIT_ACTIONS below, and migration **v7**
+# replacing the CHECK. Two actions rather than one because "who gained
+# authority" and "who lost it" are the two questions asked of this log after an
+# incident, and answering either from a single action plus a detail field means
+# parsing JSON in a runbook query.
+AUDIT_ACTION_PLATFORM_ROLE_GRANT = "platform_role.grant"
+AUDIT_ACTION_PLATFORM_ROLE_REVOKE = "platform_role.revoke"
+# The panel can take model access away as well as give it, and #180's
+# `service_access.grant` had no counterpart because nothing could revoke.
+AUDIT_ACTION_SERVICE_ACCESS_REVOKE = "service_access.revoke"
+# Switching a connector on or off from the admin panel. Two actions rather than
+# one with a flag, for the reason the platform-role pair gives: "who turned
+# this off" is asked with a runbook query after an incident.
+AUDIT_ACTION_CONNECTOR_ENABLE = "connector.enable"
+AUDIT_ACTION_CONNECTOR_DISABLE = "connector.disable"
 
 AUDIT_ACTIONS = frozenset(
     {
@@ -127,10 +143,15 @@ AUDIT_ACTIONS = frozenset(
         AUDIT_ACTION_ORG_RENAME,
         AUDIT_ACTION_OPERATOR_MANUAL,
         AUDIT_ACTION_SERVICE_ACCESS_GRANT,
+        AUDIT_ACTION_PLATFORM_ROLE_GRANT,
+        AUDIT_ACTION_PLATFORM_ROLE_REVOKE,
+        AUDIT_ACTION_SERVICE_ACCESS_REVOKE,
+        AUDIT_ACTION_CONNECTOR_ENABLE,
+        AUDIT_ACTION_CONNECTOR_DISABLE,
     }
 )
 
-AUDIT_TARGET_TYPES = frozenset({"org", "user", "invitation"})
+AUDIT_TARGET_TYPES = frozenset({"org", "user", "invitation", "connector"})
 """The target vocabulary of this beta. Closed (and CHECK-constrained) for the
 same reason as the action set: rows are found by exact-match runbook queries."""
 

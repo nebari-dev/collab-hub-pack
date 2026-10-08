@@ -96,7 +96,9 @@ with no protocol mapper, so neither an ordinary user nor a token ever sees them
 
 
 class UserDirectoryClient(Protocol):
-    def search_users(self, query: str | None = None, *, limit: int = 50) -> list[UserDirectoryUser]: ...
+    def search_users(
+        self, query: str | None = None, *, limit: int = 50, first: int = 0
+    ) -> list[UserDirectoryUser]: ...
 
     def search_groups(self, query: str | None = None, *, limit: int = 50) -> list[UserDirectoryGroup]: ...
 
@@ -106,7 +108,9 @@ class UserDirectoryClient(Protocol):
 
 
 class DisabledUserDirectoryClient:
-    def search_users(self, query: str | None = None, *, limit: int = 50) -> list[UserDirectoryUser]:
+    def search_users(
+        self, query: str | None = None, *, limit: int = 50, first: int = 0
+    ) -> list[UserDirectoryUser]:
         raise UserDirectoryUnavailableError("User directory is not configured")
 
     def search_groups(self, query: str | None = None, *, limit: int = 50) -> list[UserDirectoryGroup]:
@@ -143,8 +147,12 @@ class KeycloakUserDirectoryClient:
         self._client = httpx.Client(timeout=timeout, transport=transport)
         self._token: _AccessToken | None = None
 
-    def search_users(self, query: str | None = None, *, limit: int = 50) -> list[UserDirectoryUser]:
-        params: dict[str, str | int | bool] = {"max": limit}
+    def search_users(
+        self, query: str | None = None, *, limit: int = 50, first: int = 0
+    ) -> list[UserDirectoryUser]:
+        """Up to *limit* matching users, starting *first* results in."""
+
+        params: dict[str, str | int | bool] = {"first": first, "max": limit}
         if query:
             params["search"] = query
         payload = self._admin_get("/users", params=params)

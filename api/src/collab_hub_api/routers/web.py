@@ -19,13 +19,16 @@ import logging
 import posixpath
 import secrets
 from collections.abc import Sequence
+from pathlib import Path
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
+from starlette.concurrency import run_in_threadpool
 
 from ..frames.auth import display_identity_from_claims, user_from_claims
+from ..path_protection import request_path
 from ..web import oidc
 from ..web.authz import (
     WebAuthorizationUnavailable,
@@ -51,6 +54,7 @@ from ..web.pages import (
     sign_in_failed_page,
     signed_out_page,
 )
+from ..web.privacy_statement import privacy_statement_page
 from ..web.request_limits import connection_close_headers
 from ..web.session import (
     TRANSIENT_COOKIE,
@@ -68,15 +72,29 @@ from ..web.surface import (
     DATA_STATEMENT_PATH,
     LANDING_PATH,
     ORG_INVITATIONS_PATH,
+    PRIVACY_PATH,
     PUBLIC_WEB_PATHS,
     SIGNED_OUT_PATH,
     SIGNIN_PATH,
     SIGNOUT_PATH,
+    TERMS_PATH,
+    WEB_LOGO_PATH,
     WebSurface,
+    answers_json,
     clamped_session_lifetime,
 )
+from ..web.terms_of_service import terms_of_service_page
 
 logger = logging.getLogger("frames_server.web")
+
+LOGO_BYTES = (Path(__file__).parent.parent / "web" / "collab-logo.png").read_bytes()
+"""The wordmark, read once at import.
+
+At import rather than per request, and from the package rather than from a
+configured path: it is chrome, it is the same for every deployment, and a
+missing file should stop the process at startup where somebody is watching
+rather than render a broken image on the sign-in page.
+"""
 
 MAX_NEXT_LENGTH = 2000
 
@@ -190,11 +208,17 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(WebAuthRequired)
     async def _auth_required(request: Request, exc: WebAuthRequired) -> Response:
+        if answers_json(request_path(request)):
+            return JSONResponse({"error": "authentication required"}, status_code=status.HTTP_401_UNAUTHORIZED)
         return _redirect(signin_redirect_target(_root_path(request), exc.next_path))
 
     @app.exception_handler(WebForbidden)
     async def _forbidden(request: Request, exc: WebForbidden) -> Response:
         logger.info("web_forbidden", extra={"reason": str(exc)})
+        if answers_json(request_path(request)):
+            # The panel is a JSON client; a 403 page would reach it as an
+            # unparseable body and it would have to guess from the status.
+            return JSONResponse({"error": "forbidden"}, status_code=status.HTTP_403_FORBIDDEN)
         return page_response(
             forbidden_page(root_path=_root_path(request)),
             status_code=status.HTTP_403_FORBIDDEN,
@@ -483,6 +507,16 @@ def make_router(
         if not user:
             return _failed_sign_in(request, "id_token carries no acceptable identity claim")
         display = display_identity_from_claims(claims)
+        # The one moment this surface can see the identity provider's answer.
+        # The session that follows carries identity and nothing else, and every
+        # authorization decision is re-resolved from this server's own stores
+        # on the request being authorized -- so if the groups claim is not read
+        # here, it is never read on this axis at all. Failing to reconcile must
+        # not fail the sign-in: the fallback is the role the table already
+        # holds, which is the behaviour every deployment had before this.
+        # On a worker thread: the Postgres sync makes blocking database calls,
+        # and on the event loop they would stall every other request.
+        await run_in_threadpool(_reconcile_platform_role, request, user=user, claims=claims, display=display)
         now = surface.now()
         # One source for both the signed `exp` and the cookie's Max-Age, and
         # it clamps the validated field through a module function rather than
@@ -572,7 +606,16 @@ def make_router(
 
     @public_router.get(SIGNED_OUT_PATH)
     async def signed_out(request: Request) -> Response:
-        return page_response(signed_out_page(root_path=_root_path(request)))
+        # The same allowlist the sign-in redirect applies, so the link can only
+        # ever carry a target sign-in would accept. The overview is sign-in's
+        # own default, so it is left off the link.
+        next_path = sanitize_next_path(request.query_params.get("next"))
+        return page_response(
+            signed_out_page(
+                root_path=_root_path(request),
+                next_path=None if next_path == LANDING_PATH else next_path,
+            )
+        )
 
     @public_router.get(DATA_STATEMENT_PATH)
     async def data_statement(request: Request) -> Response:
@@ -583,6 +626,43 @@ def make_router(
         return page_response(
             data_statement_page(root_path=_root_path(request)),
             path=DATA_STATEMENT_PATH,
+        )
+
+    @public_router.get(TERMS_PATH)
+    async def terms_of_service(request: Request) -> Response:
+        """The Terms of Service (#95) is anonymous by design. The Keycloak
+        acceptance step links here *before* it issues a token so people who
+        have yet to accept can read the text. The argument lives on the path's
+        PUBLIC_WEB_PATHS entry."""
+
+        return page_response(
+            terms_of_service_page(root_path=_root_path(request)),
+            path=TERMS_PATH,
+        )
+
+    @public_router.get(PRIVACY_PATH)
+    async def privacy_statement(request: Request) -> Response:
+        """The Privacy Statement (#95). Anonymous on the same argument as the
+        Terms of Service; the two are linked from the same consent line."""
+
+        return page_response(
+            privacy_statement_page(root_path=_root_path(request)),
+            path=PRIVACY_PATH,
+        )
+
+    @public_router.get(WEB_LOGO_PATH)
+    async def wordmark() -> Response:
+        """The product wordmark, read from the package at import time.
+
+        Read once into memory rather than per request: it is a small, fixed
+        file that never changes for the life of the process, and serving it
+        from bytes keeps this route off the filesystem entirely.
+        """
+
+        return Response(
+            LOGO_BYTES,
+            media_type="image/png",
+            headers=dict(SECURITY_HEADERS),
         )
 
     @public_router.get(STYLE_PATH)
@@ -605,3 +685,38 @@ def make_router(
     # session-gated router must never shadow the route that mints a session.
     public_router.include_router(router)
     return public_router
+
+
+def _reconcile_platform_role(request: Request, *, user: str, claims: dict, display) -> None:
+    """Sync this subject's platform role from the ID token's groups claim.
+
+    Read off ``request.app.state`` rather than a module global, for the same
+    reason every store on this surface is: the mounted MCP app has its own
+    state object and nothing here may hold process-wide state. An app whose
+    state has no sync does nothing, which is what a deployment that never
+    opted in should do.
+
+    Errors are logged and swallowed. That is a deliberate asymmetry with the
+    rest of this surface, where an authorization input that cannot be resolved
+    fails the request closed: here the request being authorized has not started
+    yet, the pre-existing table row is a perfectly good answer, and refusing
+    the sign-in would turn a database blip into "nobody can log in" on a
+    deployment whose roles were already correct. It fails *closed* in the sense
+    that matters -- a failed reconcile grants nothing it would not otherwise
+    have granted.
+    """
+
+    sync = getattr(request.app.state, "platform_role_sync", None)
+    if sync is None or not getattr(sync, "configured", False):
+        return
+    groups = claims.get("groups")
+    if not isinstance(groups, list):
+        # An absent or malformed claim is not "in no groups": a realm that has
+        # not been given a groups mapper would otherwise revoke every synced
+        # operator the first time they signed in after this shipped.
+        logger.warning("platform_role_sync_no_groups_claim", extra={"user": user})
+        return
+    try:
+        sync.reconcile(user_id=user, claim_groups=[g for g in groups if isinstance(g, str)], display=display)
+    except Exception:
+        logger.exception("platform_role_sync_failed", extra={"user": user})

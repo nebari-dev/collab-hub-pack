@@ -1,0 +1,15 @@
+{
+  "//": "Dev credentials for the local S3 frame store (SeaweedFS). Nothing here is a secret.",
+  "identities": [
+    {
+      "name": "dev",
+      "credentials": [
+        {
+          "accessKey": "devaccesskey",
+          "secretKey": "devsecretkey"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

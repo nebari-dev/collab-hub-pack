@@ -10,6 +10,7 @@ against it.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-cog-execution.md) | Cog & Op execution architecture | Proposed |
+| [0002](0002-lifecycle-runner-durability-and-placement.md) | Lifecycle runner, durability backends, and placement — amends 0001 | Proposed |
 
 **Statuses.** *Proposed* — written, under review, already the working basis
 for implementation. *Accepted* — ratified; changes require a superseding

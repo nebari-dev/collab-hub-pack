@@ -6,14 +6,18 @@ authenticates. The tables are created by the versioned runner in
 needs — "which organization does this subject belong to, and in what role" —
 and nothing more.
 
-**Read-only on purpose.** Organization and membership *writes* (create an org,
-invite, accept, remove, transfer ownership) are separate issues with their own
-policy decisions; adding speculative write methods here would bake in guesses
-about them. The store carries exactly the reads the auth choke point performs:
-the membership lookup (issue #63) and the platform-role lookup (issue #87).
-Platform-role *writes* are likewise absent on purpose — the bootstrap operator
-is a documented psql insert, and grant/revoke endpoints are built the second
-time they are needed.
+**Read-only, with one declared exception.** Organization and membership
+*writes* (create an org, invite, accept, remove, transfer ownership) are
+separate issues with their own policy decisions; adding speculative write
+methods here would bake in guesses about them. The one write that does live
+here is :meth:`OrgStore.provision_member` (issue #91): the single-organization
+mode's auto-admission runs *inside* org resolution at the auth choke point —
+the row has to exist before a context can be built from it — so its writer
+belongs next to its readers. It is deliberately the narrowest write that
+works: insert-if-absent, never update, never delete, never resurrect a
+``removed`` row. Platform-role *writes* are likewise absent on purpose — the
+bootstrap operator is a documented psql insert, and grant/revoke endpoints are
+built the second time they are needed.
 
 Backend semantics mirror ``usage.py``/``history.py``: a relational feature
 riding the shared ``frames.postgres`` URL, with ``InMemory`` as a test/dev
@@ -28,6 +32,7 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 orgs_logger = logging.getLogger("frames_server.orgs")
@@ -45,6 +50,12 @@ an operator across the deployment. Never merge them."""
 
 PLATFORM_ROLE_ACTIVE = "active"
 PLATFORM_ROLE_REVOKED = "revoked"
+
+SINGLE_ORG_CREATED_BY = "single-org-configuration"
+"""``collab_orgs.created_by`` for an organization created from the ``single``
+declaration rather than by a person. The column is documented as the OIDC sub
+of the creator; a configuration has none, and this sentinel is greppable where
+a fabricated sub would masquerade as a login."""
 
 
 class OrgsUnavailableError(RuntimeError):
@@ -156,6 +167,40 @@ class OrgStore(ABC):
 
         raise NotImplementedError
 
+    @abstractmethod
+    def provision_member(
+        self,
+        user_id: str,
+        org_id: str,
+        org_name: str,
+        *,
+        email: str | None = None,
+        display_name: str | None = None,
+    ) -> tuple[OrgMembership, bool]:
+        """Admit *user_id* to *org_id* as a ``member``, unless a row already exists.
+
+        The single-organization mode's write (issue #91), and deliberately the
+        narrowest one that works: **insert-if-absent on the membership primary
+        key, never an update**. A caller that already holds a row — active in
+        any organization, or ``removed`` — gets that row back untouched, so
+        auto-admission can never move a member or resurrect a removal; the
+        caller reads ``is_active`` off the result exactly as it does off a
+        lookup. Returns ``(row now standing, whether this call created it)``.
+
+        The declared organization row is created alongside the first admission
+        (same transaction on the Postgres store) rather than at startup:
+        startup tolerates an unreachable database, and a row created on first
+        need cannot be forgotten by an operator or lost to a restore. *org_name*
+        is used only at that creation and never renames an existing row.
+
+        ``email``/``display_name`` are the display/contact columns only — the
+        caller passes an email only when the IdP asserted it verified,
+        mirroring invitation acceptance. Raises rather than degrading when the
+        backend is unavailable: the write is part of an authorization answer.
+        """
+
+        raise NotImplementedError
+
 
 class UnavailableOrgStore(OrgStore):
     """Store used when no shared frames Postgres is configured.
@@ -172,6 +217,17 @@ class UnavailableOrgStore(OrgStore):
     def resolve_principal(self, user_id: str) -> ResolvedPrincipal:
         raise OrgsUnavailableError("Organization storage is not configured")
 
+    def provision_member(
+        self,
+        user_id: str,
+        org_id: str,
+        org_name: str,
+        *,
+        email: str | None = None,
+        display_name: str | None = None,
+    ) -> tuple[OrgMembership, bool]:
+        raise OrgsUnavailableError("Organization storage is not configured")
+
 
 class InMemoryOrgStore(OrgStore):
     """Process-local membership, for tests and single-process development.
@@ -183,7 +239,7 @@ class InMemoryOrgStore(OrgStore):
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._memberships: dict[str, OrgMembership] = {}
-        self._platform_roles: dict[str, tuple[str, str]] = {}
+        self._platform_roles: dict[str, tuple[str, str, str]] = {}
 
     def set_membership(
         self,
@@ -208,11 +264,48 @@ class InMemoryOrgStore(OrgStore):
         user_id: str,
         role: str = PLATFORM_ROLE_OPERATOR,
         status: str = PLATFORM_ROLE_ACTIVE,
+        source: str = "manual",
     ) -> None:
-        """Seed or replace a platform-role row (dev/test only; grants have no API)."""
+        """Seed or replace a platform-role row (dev/test only; grants have no API).
+
+        ``source`` defaults to ``manual`` to match the column default the
+        Postgres table carries: a row put here by hand is hand-administered,
+        and the identity-provider sync must leave it alone. See
+        :mod:`.platform_role_sync`.
+        """
 
         with self._lock:
-            self._platform_roles[user_id] = (role, status)
+            self._platform_roles[user_id] = (role, status, source)
+
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored row, shaped like the Postgres read, or ``None``.
+
+        Exists so the identity-provider sync can take one decision against
+        either backend instead of carrying two copies of the rule.
+        """
+
+        return self.get_platform_role_rows([user_id]).get(user_id)
+
+    def active_operator_ids(self) -> set[str]:
+        """Everyone holding an active operator role."""
+
+        with self._lock:
+            return {
+                user_id
+                for user_id, (role, status, _source) in self._platform_roles.items()
+                if role == PLATFORM_ROLE_OPERATOR and status == PLATFORM_ROLE_ACTIVE
+            }
+
+    def get_platform_role_rows(self, user_ids: Sequence[str]) -> dict[str, dict]:
+        """The stored rows for *user_ids*, keyed by id; absent ids have none."""
+
+        with self._lock:
+            stored = {user_id: self._platform_roles.get(user_id) for user_id in user_ids}
+        return {
+            user_id: {"role": row[0], "status": row[1], "source": row[2]}
+            for user_id, row in stored.items()
+            if row is not None
+        }
 
     def resolve_principal(self, user_id: str) -> ResolvedPrincipal:
         # Through get_membership on purpose, so a test subclass that counts or
@@ -223,6 +316,29 @@ class InMemoryOrgStore(OrgStore):
             granted = self._platform_roles.get(user_id)
         platform_role = granted[0] if granted is not None and granted[1] == PLATFORM_ROLE_ACTIVE else None
         return ResolvedPrincipal(membership=membership, platform_role=platform_role)
+
+    def provision_member(
+        self,
+        user_id: str,
+        org_id: str,
+        org_name: str,
+        *,
+        email: str | None = None,
+        display_name: str | None = None,
+    ) -> tuple[OrgMembership, bool]:
+        # This store has no orgs table and no email/display columns to write —
+        # membership rows are the whole model here, and the contract that
+        # matters (insert-if-absent, never update) is what the lock preserves.
+        del org_name, email, display_name
+        with self._lock:
+            existing = self._memberships.get(user_id)
+            if existing is not None:
+                return existing, False
+            membership = OrgMembership(
+                user_id=user_id, org_id=org_id, role=ROLE_MEMBER, status=MEMBERSHIP_ACTIVE
+            )
+            self._memberships[user_id] = membership
+            return membership, True
 
 
 class PostgresOrgStore(OrgStore):
@@ -305,6 +421,105 @@ class PostgresOrgStore(OrgStore):
             membership=membership,
             platform_role=row["platform_role"] if row is not None else None,
         )
+
+    def provision_member(
+        self,
+        user_id: str,
+        org_id: str,
+        org_name: str,
+        *,
+        email: str | None = None,
+        display_name: str | None = None,
+    ) -> tuple[OrgMembership, bool]:
+        import psycopg
+
+        # One connection checkout, one transaction: the declared organization
+        # row and the membership row land together or not at all, and the FK
+        # from collab_org_members.org_id is satisfied by construction. Both
+        # inserts are ON CONFLICT DO NOTHING rather than catching violations —
+        # a raised UniqueViolation aborts the transaction before this method
+        # can decide what it means, and "someone else got there first" is a
+        # normal answer here (two first requests race on cold caches), not an
+        # error. The org insert deliberately never updates: the configured
+        # name applies only at creation, because renames are the audited
+        # org.rename and a config value must not silently perform one on every
+        # provision.
+        try:
+            with self._db.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO collab_orgs (id, name, created_by)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (org_id, org_name, SINGLE_ORG_CREATED_BY),
+                )
+                row = conn.execute(
+                    """
+                    INSERT INTO collab_org_members (user_id, org_id, role, email, display_name)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                    RETURNING user_id, org_id, role, status
+                    """,
+                    (user_id, org_id, ROLE_MEMBER, email, display_name),
+                ).fetchone()
+                created = row is not None
+                if row is None:
+                    # Lost the race, or a row (removed included) already stood.
+                    # Nothing ever deletes membership rows, so this read cannot
+                    # come back empty.
+                    row = conn.execute(
+                        "SELECT user_id, org_id, role, status FROM collab_org_members WHERE user_id = %s",
+                        (user_id,),
+                    ).fetchone()
+        except psycopg.errors.UndefinedTable as exc:
+            raise self._missing_schema() from exc
+        membership = OrgMembership(
+            user_id=row["user_id"],
+            org_id=row["org_id"],
+            role=row["role"],
+            status=row["status"],
+        )
+        if created:
+            orgs_logger.info(
+                "org_member_auto_provisioned",
+                extra={"user": user_id, "org": org_id},
+            )
+        return membership, created
+    def get_platform_role_row(self, user_id: str) -> dict | None:
+        """The stored role row, or ``None``.
+
+        Separate from :meth:`resolve_principal`, which deliberately collapses a
+        revoked grant to "no role": the admin panel needs the row as written --
+        including where it came from -- to explain what revoking will actually
+        do. Not on the auth path, so it costs nothing there.
+        """
+
+        return self.get_platform_role_rows([user_id]).get(user_id)
+
+    def get_platform_role_rows(self, user_ids: Sequence[str]) -> dict[str, dict]:
+        """The stored rows for *user_ids* in one round trip, keyed by id.
+
+        For the admin panel's user listing, which would otherwise read one row
+        per person on the page.
+        """
+
+        import psycopg
+
+        if not user_ids:
+            return {}
+        try:
+            with self._db.connection() as conn:
+                rows = conn.execute(
+                    "SELECT user_id, role, status, source FROM collab_platform_roles WHERE user_id = ANY(%s)",
+                    (list(user_ids),),
+                ).fetchall()
+        except psycopg.errors.UndefinedTable as exc:
+            raise self._missing_schema() from exc
+        return {
+            row["user_id"]: {"role": row["role"], "status": row["status"], "source": row["source"]}
+            for row in rows
+        }
 
     def _missing_schema(self) -> OrgSchemaMissingError:
         message = (

@@ -56,8 +56,14 @@ from collab_hub_api.web.authz import (
     unwrap_dependency,
     verify_web_route_protection,
 )
-from collab_hub_api.web.data_statement import DATA_STATEMENT_TEXT
+from collab_hub_api.web.data_statement import DATA_STATEMENT_CONTACT, DATA_STATEMENT_TEXT
 from collab_hub_api.web.forms import MAX_FORM_BYTES
+from collab_hub_api.web.legal_documents import PLACEHOLDER_NOTICE
+from collab_hub_api.web.privacy_statement import (
+    PRIVACY_STATEMENT_IS_PLACEHOLDER,
+    PRIVACY_STATEMENT_TEXT,
+    privacy_statement_page,
+)
 from collab_hub_api.web.session import (
     SESSION_COOKIE,
     SESSION_PURPOSE,
@@ -67,13 +73,21 @@ from collab_hub_api.web.session import (
     WebSession,
 )
 from collab_hub_api.web.surface import (
+    PRIVACY_PATH,
     PUBLIC_WEB_PATHS,
+    TERMS_PATH,
+    WEB_LOGO_PATH,
     WEB_SURFACE_PREFIXES,
     WebSurface,
     blocked_web_route_paths,
     build_web_surface,
     clamped_session_lifetime,
     enforce_web_surface_map_access,
+)
+from collab_hub_api.web.terms_of_service import (
+    TERMS_OF_SERVICE_IS_PLACEHOLDER,
+    TERMS_OF_SERVICE_TEXT,
+    terms_of_service_page,
 )
 
 WEB_CLIENT_ID = "collab-web"
@@ -743,6 +757,32 @@ async def test_signout_with_the_rendered_csrf_token_ends_the_session(tmp_path, i
         signed_out = await client.get("/web/signed-out")
         assert signed_out.status_code == 200
         assert (await client.get("/web")).status_code == 303
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_href"),
+    [
+        ("?next=/admin/", "/web/signin?next=%2Fadmin%2F"),
+        ("", "/web/signin"),
+        ("?next=https://evil.example/", "/web/signin"),
+        ("?next=//evil.example/", "/web/signin"),
+        ("?next=/web/signin", "/web/signin"),
+    ],
+)
+async def test_signing_in_again_returns_to_where_the_person_signed_out_from(
+    tmp_path, idp, query, expected_href
+):
+    """The signed-out page passes a safe ``next`` on to sign-in, so leaving the
+    admin panel and signing in again lands back on the panel. Anything the
+    sign-in redirect would refuse is dropped here too."""
+
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        page = await client.get(f"/web/signed-out{query}")
+
+    assert page.status_code == 200
+    links = re.findall(r'<a href="([^"]+)">Sign in again</a>', page.text)
+    assert [html.unescape(link) for link in links] == [expected_href]
 
 
 async def test_the_csrf_token_is_accepted_as_a_header_too(tmp_path, idp):
@@ -2196,6 +2236,111 @@ async def test_the_data_statement_page_is_readable_without_an_account(tmp_path, 
     assert "What we store, and who can see it" in page.text
     assert html.escape(DATA_STATEMENT_TEXT) in page.text
     assert 'href="mailto:collab-support@openteams.com"' in page.text
+    # #95: the short form links to the long-form documents rather than
+    # absorbing them, so an invitee reading this can reach the Terms they are
+    # about to be asked to accept without going back to their email.
+    assert f'href="{TERMS_PATH}"' in page.text
+    assert f'href="{PRIVACY_PATH}"' in page.text
+
+
+async def test_the_legal_documents_are_readable_without_an_account(tmp_path, idp):
+    """#95: the Keycloak acceptance step links here *before* it issues a token.
+
+    This surface's session is minted from that token, so a session gate would
+    mean the documents could only be read by someone who had already accepted
+    them. Served to a browser with no session and no cookies.
+    """
+
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        terms = await client.get(TERMS_PATH)
+        privacy = await client.get(PRIVACY_PATH)
+
+    assert terms.status_code == 200
+    assert "Terms of Service" in terms.text
+    assert privacy.status_code == 200
+    assert "Privacy Statement" in privacy.text
+
+
+async def test_the_legal_documents_carry_the_surface_security_headers(tmp_path, idp):
+    # Anonymous does not mean unpoliced: these answer with the same headers as
+    # every other page of the surface, including the script-free CSP.
+    app = make_web_app(tmp_path, idp)
+    async with web_client(app) as client:
+        for path in (TERMS_PATH, PRIVACY_PATH):
+            response = await client.get(path)
+            assert response.headers["referrer-policy"] == "no-referrer"
+            assert "no-store" in response.headers["cache-control"]
+            assert response.headers["x-frame-options"] == "DENY"
+            policy = response.headers["content-security-policy"]
+            assert "default-src 'none'" in policy
+            # Plain documents. The acceptance page is the surface's only
+            # script budget, and these must not have quietly acquired one.
+            assert "script-src" not in policy
+
+
+def test_the_legal_document_paths_are_allowlisted() -> None:
+    # Anonymity costs the reviewed line in the allowlist; `make_router`
+    # refuses a public page route whose path is not in this set, so these two
+    # assertions are what keep the routes registrable at all.
+    assert TERMS_PATH in PUBLIC_WEB_PATHS
+    assert PRIVACY_PATH in PUBLIC_WEB_PATHS
+
+
+def test_each_document_renders_every_section_of_its_one_constant() -> None:
+    """#95 keeps each document in a *single* module-level constant.
+
+    That is what makes the git history usable as the acceptance record —
+    Keycloak stores only a timestamp, with no document version — and it only
+    holds if the page is rendered from the constant rather than from a second
+    copy of the prose in the template. Every heading and every paragraph of
+    the constant has to appear on the page.
+    """
+
+    pages = (
+        (terms_of_service_page(), TERMS_OF_SERVICE_TEXT),
+        (privacy_statement_page(), PRIVACY_STATEMENT_TEXT),
+    )
+    for page, document in pages:
+        assert document, "a document with no sections would pass vacuously"
+        for heading, paragraphs in document:
+            assert html.escape(heading) in page
+            for paragraph in paragraphs:
+                assert html.escape(paragraph) in page
+
+
+def test_placeholder_copy_is_labelled_as_placeholder() -> None:
+    # Unreviewed legal text is linked from a real consent gate, so it must say
+    # so on its face. The banner is driven by each document's own flag, and
+    # clearing that flag is the act that asserts counsel has seen the copy.
+    assert TERMS_OF_SERVICE_IS_PLACEHOLDER is (
+        html.escape(PLACEHOLDER_NOTICE) in terms_of_service_page()
+    )
+    assert PRIVACY_STATEMENT_IS_PLACEHOLDER is (
+        html.escape(PLACEHOLDER_NOTICE) in privacy_statement_page()
+    )
+
+
+def test_the_documents_publish_the_data_statement_contact() -> None:
+    # One address across all three documents: they are read by the same person
+    # minutes apart, and a second spelling is how they come to disagree.
+    assert DATA_STATEMENT_CONTACT in terms_of_service_page()
+    assert DATA_STATEMENT_CONTACT in privacy_statement_page()
+
+
+def test_the_documents_cross_link_each_other_and_the_data_statement() -> None:
+    assert f'href="{PRIVACY_PATH}"' in terms_of_service_page()
+    assert f'href="{TERMS_PATH}"' in privacy_statement_page()
+    for page in (terms_of_service_page(), privacy_statement_page()):
+        assert 'href="/web/data-statement"' in page
+
+
+def test_the_documents_honour_a_root_path() -> None:
+    # Every link on these pages is app-relative, so a deployment mounted under
+    # a prefix must not emit links that escape it.
+    page = terms_of_service_page(root_path="/hub")
+    assert f'href="/hub{PRIVACY_PATH}"' in page
+    assert f'href="{PRIVACY_PATH}"' not in page.replace(f"/hub{PRIVACY_PATH}", "")
 
 
 async def test_the_guard_leaves_the_public_allowlist_reachable(tmp_path, idp):
@@ -3390,7 +3535,7 @@ def test_an_exemption_on_a_route_with_no_unsafe_method_fails_the_rollout(tmp_pat
 
 def test_an_exemption_naming_an_unmounted_path_is_tolerated(tmp_path, idp):
     # Deliberately not an error. make_app mounts the operator router only when
-    # org_source_is_membership(), so on a claims-sourced deployment #91's
+    # org_source_resolves_membership(), so on a claims-sourced deployment #91's
     # /admin routes are legitimately absent while its entries are correctly
     # present — and failing on absence would refuse every such deployment. It
     # also has to tolerate an entry landing one PR ahead of its route, which is
@@ -3454,7 +3599,7 @@ def test_the_shipped_admin_entries_lead_their_routes_without_failing(tmp_path, i
     # to start this very branch.
     #
     # It stays load-bearing after #91 too, for a different reason: make_app
-    # mounts the operator router only under org_source_is_membership(), so on a
+    # mounts the operator router only under org_source_resolves_membership(), so on a
     # claims-sourced deployment those routes are absent while the entries are
     # correctly present.
     from collab_hub_api.web.surface import CSRF_ENFORCED_IN_ROUTE
@@ -3467,7 +3612,7 @@ def test_the_shipped_admin_entries_lead_their_routes_without_failing(tmp_path, i
     assert unmounted == {
         "/admin/invitations",
         "/admin/invitations/revoke",
-        # #142's owner page mounts under the same org_source_is_membership()
+        # #142's owner page mounts under the same org_source_resolves_membership()
         # gate as #91's, so its entries are likewise correctly present while
         # a claims-sourced deployment serves neither route.
         "/web/org/invitations",
@@ -3490,3 +3635,44 @@ def test_the_admin_entries_will_cover_the_routes_when_they_arrive(tmp_path, idp)
     assert stale_csrf_exemptions(app.routes) == []
     verify_web_route_protection(app.routes)
 
+
+
+# ---------------------------------------------------------------------------
+# The wordmark on the server-rendered pages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_pages_carry_the_wordmark_and_are_allowed_to_show_it(tmp_path, idp):
+    """A logo needs both an asset to fetch and a policy that permits fetching it.
+
+    The surface shipped `img-src 'none'`, which is the right default for pages
+    that had no images. Putting the product wordmark on them means widening
+    that by exactly one source -- this origin -- and it is worth asserting both
+    halves together: a page referencing an image its own policy forbids renders
+    a broken mark and looks like a deploy fault.
+    """
+
+    app = make_web_app(tmp_path, idp)
+
+    async with app.router.lifespan_context(app), web_client(app) as client:
+        # A page that renders rather than redirecting into the OIDC flow.
+        page = await client.get("/web/data-statement")
+        logo = await client.get(WEB_LOGO_PATH)
+
+    assert logo.status_code == 200
+    assert logo.headers["content-type"].startswith("image/")
+    assert WEB_LOGO_PATH in page.text
+
+    csp = page.headers["content-security-policy"]
+    assert "img-src 'self'" in csp
+    assert "default-src 'none'" in csp
+    assert "script-src" not in csp
+
+
+def test_the_surface_stylesheet_shouts_at_nobody():
+    """Nothing in this product is capitalised for emphasis."""
+
+    from collab_hub_api.web.pages import STYLESHEET
+
+    assert "text-transform: uppercase" not in STYLESHEET

@@ -39,6 +39,32 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 # 0 means "unbounded" (psycopg_pool's own default) and is discouraged.
 DEFAULT_MAX_WAITING = 50
 
+TCP_KEEPALIVE_PARAMS = {
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 6,
+}
+"""libpq TCP keepalive settings for every pooled connection.
+
+Without them a connection whose peer silently vanished (a node lost, a NAT
+entry expired, a network partition) blocks its caller in ``recv`` until the
+OS keepalive fires -- two hours by default. A worker thread blocked like that
+cannot be interrupted from Python, and ``statement_timeout`` cannot help
+because the server never sees the statement. With these values a dead peer is
+detected in about ninety seconds (30 s idle + 6 probes 10 s apart), which
+turns the common partition case from "blocked until the process dies" into
+"blocked for a minute and a half".
+
+What this is **not** is a guarantee that every blocked call ends: a peer whose
+kernel still answers TCP probes while the database process is stopped defeats
+both keepalives and ``statement_timeout``, and the settings do not apply to
+Unix-socket connections at all. Nothing in this codebase may promise bounded
+*worker termination* on the strength of these values -- only a bounded wait by
+whoever is waiting. Set through the pool's connection kwargs, so they take
+precedence over any keepalive parameters in the connection string.
+"""
+
 # Sanity bounds, mirrored by the app config validators and the helm schema.
 POOL_SIZE_LIMIT = 500
 TIMEOUT_SECONDS_LIMIT = 60.0
@@ -122,6 +148,48 @@ class _CancelWatchdog:
                 pass
 
 
+# Shared advisory-lock key for the pre-existing `frames_server_*` and
+# `nexus_task_*` startup DDL (issue #42). Bare `CREATE TABLE IF NOT EXISTS` is
+# not concurrency-safe in Postgres: two replicas starting at the same instant
+# can both pass the existence check and then race the catalog insert, so one
+# pod dies at startup with a duplicate-key error on `pg_type`/`pg_class`.
+# `replicaCount: 1` has masked this so far, but the chart supports autoscaling.
+#
+# One shared key serializes all five stores' schema creation against each
+# other, which is deliberately coarse: none of this DDL is large or slow, it
+# only ever runs once per replica at startup, and a single well-known key is
+# simpler to reason about (and to grep for) than a family of near-identical
+# ones. This mirrors `frames.collab_schema.COLLAB_SCHEMA_LOCK_KEY`, which uses
+# the same `int.from_bytes(<8 ASCII bytes>, "big")` derivation so the constant
+# stays readable; any distinct 64-bit value would do, and deriving it from a
+# name just makes a collision with another advisory-lock user of the shared
+# database unlikely.
+FRAMES_SERVER_SCHEMA_LOCK_KEY = int.from_bytes(b"fsvrddl1", "big")
+
+
+@contextmanager
+def locked_schema_connection(db: "PostgresDatabase", lock_key: int = FRAMES_SERVER_SCHEMA_LOCK_KEY):
+    """Check out a pooled connection with the schema advisory lock already held.
+
+    Every Postgres store's ``_ensure_schema`` should open its ``with`` block on
+    this instead of ``db.connection()`` directly. ``pg_advisory_xact_lock`` is
+    taken as the connection's first statement, before any catalog access —
+    including the guarded ``CREATE TABLE IF NOT EXISTS`` itself, which is
+    exactly the statement that races under concurrent replica startup (issue
+    #42). The lock is transaction-scoped (the ``_xact_`` variant), so it
+    releases automatically on commit or rollback when the ``with`` block
+    exits — no unlock bookkeeping, and no leak if the pod dies mid-migration.
+
+    Whichever replica loses the race simply waits: it blocks on the lock, then
+    runs its own ``CREATE TABLE IF NOT EXISTS`` against a catalog that already
+    has the table, which is a no-op.
+    """
+
+    with db.connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+        yield conn
+
+
 def postgres_error_classes() -> tuple[type[Exception], ...]:
     """Exception types that mean "the frames database is unavailable" (→ 503).
 
@@ -173,7 +241,7 @@ class PostgresDatabase:
             max_size=max_size,
             timeout=timeout_seconds,
             max_waiting=max_waiting,
-            kwargs={"row_factory": dict_row},
+            kwargs={"row_factory": dict_row, **TCP_KEEPALIVE_PARAMS},
         )
 
     def connection(self, timeout: float | None = None):

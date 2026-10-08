@@ -1,0 +1,3 @@
+# A step that takes 30 seconds: stop `make op` mid-step, then run it again to see the run recorded interrupted.
+steps:
+  - {name: wait, cog: slow, entry_point: run, input: {seconds: 30}}

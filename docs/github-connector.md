@@ -93,16 +93,34 @@ kcadm.sh add-roles -r <realm> --rname default-roles-<realm> \
 - `POST /v1/connectors/github/search`
 - `POST /v1/connectors/github/items/{number}/read`
 - `POST /v1/connectors/github/files/read`
+- `POST /v1/connectors/github/repos/list`
 - `POST /v1/connectors/github/projects/list`
 - `POST /v1/connectors/github/projects/{number}/read`
+- `POST /v1/connectors/github/api/get`
 
 The two `projects` endpoints read **Projects V2** boards via GitHub's **GraphQL**
 API (`read:project` scope). `projects/list` takes an `owner` (org *or* user
 login) and returns each board's number/title/description/item count.
-`projects/{number}/read` returns the board's items, each with its status column
-and — when the item is a linked issue or PR — the `repo` (owner/name),
-`number`, `assignees`, and `labels`, so a caller can triage by person or label
-and chain `items/{number}/read` to read that issue/PR.
+`projects/{number}/read` returns the board's items, each with its status column,
+`state` (open/closed of the linked issue/PR), and — when the item is a linked
+issue or PR — the `repo` (owner/name), `number`, `assignees`, and `labels`, so a
+caller can triage by person or label and chain `items/{number}/read` to read
+that issue/PR. The item read excludes archived items (`archived_policy:
+"excluded"` on `counts`).
+
+The read also returns a `counts` object with the board's aggregate breakdowns: an
+exact non-archived `total` (scope recorded in `archived_policy`), per-status-column
+counts (`by_status` plus `no_status` for the blank column, which reconcile to the
+total), `by_type` (issue / pull_request / draft / redacted), and `by_state`
+(open / closed of linked issues/PRs). Projects V2 has **no** group-by aggregate,
+so each bucket is a `totalCount`-only count query under one `archivedStates`
+policy — which makes the counts accurate **even when the returned item list is
+truncated**. If those count queries are unavailable the breakdowns fall back to
+sampling the returned items and set `authoritative: false` with
+`counted_items`/`total_items`, so a partial sample is never mistaken for a full
+count. `by_status` + `no_status` and `by_type` are each independent partitions of
+`total` and should not be cross-added; `by_state` covers only linked issues/PRs
+so it need not sum to `total`.
 
 `search` runs against GitHub's issue-and-PR search (`/search/issues`, which
 returns both issues and pull requests) and is **page/`per_page`-paginated with a
@@ -116,9 +134,15 @@ for code search, which this connector does not use) is normalized to `429` with
 
 `items/{number}/read` reads one issue or pull request (body plus recent comments,
 capped at `max_chars`). Both issues and PRs carry their `assignees` and `labels`;
-pull requests additionally carry `requested_reviewers` and submitted `reviews`
-(user + review state), fetched from the pulls endpoint. Changed files and diffs
-are out of scope. `files/read` reads a repository file by `repo`, `path`,
+pull requests additionally carry `requested_reviewers`, `requested_teams`,
+`is_draft`, a `merge_state` (`merged` / `closed_unmerged` / `open`, so a closed PR
+is never ambiguous about whether it landed), and submitted `reviews` (user, review
+state, and the reviewer's sanitized, length-capped `body`), fetched from the pulls
+endpoint. A requested reviewer who has already submitted a review moves from
+`requested_reviewers` into `reviews`, so read both to see everyone involved. For
+changed files and diffs, use `api/get` (below) against `/pulls/{number}` with
+`media_type: "diff"`, or `/pulls/{number}/files`. `files/read` reads a repository
+file by `repo`, `path`,
 and optional `ref` (branch/tag/SHA; default branch when omitted). The contents
 API only returns files up to 1 MB, so larger files come back with `too_large`;
 non-UTF-8 files come back with `binary`; git-lfs pointers and directories come
@@ -126,10 +150,48 @@ back with an `unsupported_reason`. In every case `content` is empty rather than
 garbage. `path` and `ref` are validated against traversal (`..`, absolute paths,
 control characters) before they are ever placed in an upstream URL.
 
-No endpoint returns a GitHub URL of any kind: the Collab chat renderer crashes on
-link-shaped text anywhere in tool output (apollo-desktop#365), so all provider
-text is link-sanitized and `repo`/`number` (not URLs) are what a follow-up read
-needs.
+`repos/list` returns the repositories visible to the linked account for an
+`owner` (org or user login).
+
+`api/get` is the generic long-tail read: a single **GET** against an arbitrary
+GitHub REST `path` (query args via `params`) for the endpoints the curated tools
+don't cover — e.g. `/repos/{o}/{r}/pulls/{n}/files`, `/commits`, `/releases`, or
+`/commits/{ref}/check-runs`. Prefer the curated tools for triage. `path` rejects
+`%`, so a contents path with a space or other percent-encoded character is
+unreachable via `api/get` — use `files/read` for those. The verb is
+always GET and `media_type` (`json`|`diff`|`patch`) selects a fixed `Accept`
+header, so GraphQL (POST-only) and writes are excluded **by construction**, not
+by a denylist. Pages via `params` `per_page`/`page`; `has_more` echoes the
+upstream `Link rel="next"`. `media_type: "diff"`/`"patch"` works only on
+pulls/commits/compare — issues silently return JSON, so check the echoed
+`content_type`. Bodies are size-capped (`max_chars`, default 20k for json / 50k
+for diff, 50k ceiling) with `truncated` set when cut; a `202` with an empty body
+means GitHub is still computing the result — retry. A `204` with an empty body
+is an affirmative result with nothing to return (e.g. a collaborator/following
+membership check). The read is origin-locked
+(GET stays on the API host; archive/binary redirects are refused). It ships
+**off by default** (fail-closed): enable it per hub with `api_get_enabled: true`
+— ideally alongside a set `allowed_orgs` — without affecting the curated reads,
+which stay on regardless.
+
+`api/get` honors the `connectors.github.allowed_orgs` allowlist: when it is set,
+the read is confined to owner-qualified paths (`/repos`, `/orgs`, `/users`) under
+an allowed org, and paths that can read across orgs — `/search/*`, the `/user/*`
+self-endpoints, `/issues`, `/gists`, `/notifications` — are refused (a redirect
+onto a disallowed owner is re-checked and refused too). An empty allowlist (the
+default) means the token's full visibility. Set `allowed_orgs` in real deploys so
+the generic read cannot reach outside your orgs. The curated search reads the
+same key once PR #76 lands; on this branch the allowlist governs `api/get`.
+
+The curated endpoints return no GitHub URL of any kind: all provider text is
+link-sanitized (bare domains included) and `repo`/`number` (not URLs) are what a
+follow-up read needs. This began as a workaround for a chat renderer that crashed
+on link-shaped text (apollo-desktop#365, now fixed) and is retained as
+defense-in-depth against link/markup injection through tool output. `api/get`
+uses a **code-aware** variant of that sanitizer:
+it still masks scheme-, `www.`-, markdown-, and `mailto`-shaped links, but
+preserves code-shaped text (dotted identifiers like `config.py`, SHAs, refs) so
+diffs and file contents come back intact.
 
 ## Runtime Boundary
 

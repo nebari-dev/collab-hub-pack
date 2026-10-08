@@ -1,0 +1,64 @@
+[workspace]
+name = "cog-meeting-notes"
+version = "0.1.0"
+description = "Extracts grounded, cited notes from meeting records for a stated focus."
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = ">=3.11"
+
+[tasks]
+ask = "python src/cog_cli.py"
+serve = "python src/cog_api.py"
+check = "python src/cog_cli.py --check"
+resolve = "python src/cog_resolve.py"
+use = "python src/cog_use.py"
+eval = "python src/cog_eval.py"
+test = "python -m unittest discover -s tests -v"
+
+[tool.cog]
+schema = "openteams/cog-manifest [0.1]"
+id = "example/cog-meeting-notes"
+license = "BSD-3-Clause"
+kind = "context"
+owner = "cogs@example.org"
+frames = []
+memory = "none"
+prohibits = ["send_external_message", "modify_calendar"]
+
+[tool.cog.context]
+instructions = "context/system.md"
+input_schema = "context/input-schema.json"
+output_schema = "context/output-schema.json"
+output_example = "context/output-example.json"
+
+[tool.cog.io]
+accepts = ["task_request"]
+produces = ["notes"]
+
+[tool.cog.evaluation]
+fixtures = ["evals/smoke.fixture.yaml"]
+
+[[tool.cog.requires]]
+capability = "model-endpoint/openai-compatible"
+locality = "any"
+satisfied_by = { cog = "example/cog-small-model", version = ">=0.1.0" }
+also_satisfied_by = [{ cog = "example/cog-other-model" }]
+
+[[tool.cog.interfaces]]
+name = "web-api"
+kind = "http-json"
+task = "serve"
+endpoint = "http://127.0.0.1:8093/ask"
+default = true
+
+[[tool.cog.interfaces]]
+name = "cli"
+kind = "command"
+task = "ask"
+
+[[tool.cog.interfaces]]
+name = "health"
+kind = "command"
+task = "check"
