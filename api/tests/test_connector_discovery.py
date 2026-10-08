@@ -168,16 +168,20 @@ async def test_a_switched_off_provider_leaves_the_list_and_comes_back(hub, provi
     assert await _listed(app) == before
 
 
-async def test_the_status_route_of_an_unlisted_connector_is_unchanged(hub):
-    """The list says what is offered; an unconfigured status route still answers as it always did."""
+async def test_an_unlisted_connector_answers_its_own_status_route_by_why_it_is_unlisted(hub):
+    """Never configured stays 200 ``not_connected``; switched off is 404. The list omits both."""
 
-    app = hub(_brokered("slack"))
+    app = hub(_brokered("slack", "github"), Store(disabled={"github"}))
 
+    assert [item["id"] for item in await _listed(app)] == ["slack"]
     async with _client(app) as client:
-        response = await client.get("/v1/connectors/notion/status", headers=_auth_header())
+        never_configured = await client.get("/v1/connectors/notion/status", headers=_auth_header())
+        switched_off = await client.get("/v1/connectors/github/status", headers=_auth_header())
 
-    assert response.status_code == 200
-    assert response.json()["state"] == "not_connected"
+    assert never_configured.status_code == 200
+    assert never_configured.json()["state"] == "not_connected"
+    assert switched_off.status_code == 404
+    assert switched_off.json() == {"detail": "The github connector is switched off on this hub"}
 
 
 # --- what each entry carries -----------------------------------------------

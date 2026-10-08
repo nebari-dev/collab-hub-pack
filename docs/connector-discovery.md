@@ -83,7 +83,17 @@ re-asks when told to.
 
 ## What this route does not change
 
-The per-connector status, search and read routes answer as before. In
-particular a connector with no credentials still answers `200 not_connected`
-on its own status route; only this list leaves it out. A provider an operator
-switched off answers 404 there.
+The per-connector status, search and read routes answer as before.
+
+A connector missing from this list therefore gets one of two answers on its
+own status route, depending on why it is missing: `404` if an operator switched
+its provider off, and `200` with `state: "not_connected"` if the deployment
+never configured it. Both are deliberate. The 404 is what clients that predate
+this list read as "not offered"; the 200 is unchanged so that a deployment that
+never touched a switch sees no difference. A client that renders from this list
+needs neither: it does not ask about a connector that is not listed.
+
+Because those older clients read the status routes and not this list, a
+connector that was never configured, and Notion in particular (it has no
+switch), still shows them a connect action that cannot succeed. Only a client
+that renders from this list stops showing it.
