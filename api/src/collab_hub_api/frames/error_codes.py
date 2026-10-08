@@ -26,6 +26,16 @@ VALIDATION_ERROR = "validation_error"
 # --- Store/state conditions --------------------------------------------------
 FRAME_UPDATE_CONFLICT = "frame_update_conflict"
 
+FRAME_DECODE_ERROR = "frame_decode_error"
+"""A stored Frame's bytes could not be decoded into a valid model (HTTP 500).
+
+The object exists but is corrupt or schema-incompatible, so this is emphatically
+**not** ``frame_not_found``: surfacing it as a 404 would tell a client the Frame
+is gone when it is actually present and unreadable. The pre-refactor behaviour
+was an unstructured 500 leaking a raw ``JSONDecodeError``/``ValidationError``;
+this code only gives that 500 a structured envelope.
+"""
+
 DATABASE_UNAVAILABLE = "database_unavailable"
 """A configured Postgres backend is unreachable, or its pool is saturated."""
 

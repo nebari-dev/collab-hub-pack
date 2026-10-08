@@ -76,6 +76,35 @@ collab-hub cog show acme/reviewer          # one Cog's card and every indexed ve
 
 `cog list` follows every page of `GET /v1/cogs` and takes every filter the catalog API does: `--kind`, `--publisher`, `--provides`, `--requires`, `--accepts`, `--produces`, `--source-id` and `--query`.
 
+## Launching a Cog, and its runs
+
+```sh
+collab-hub cog launch hello --input '{"name": "Ada"}' --watch   # launch, and follow the run to its end
+collab-hub cog launch hello --entry run --gate never --input -  # the input from stdin
+collab-hub run list                                             # what was launched, newest first, and how to connect
+collab-hub run list --status running
+collab-hub run show run-3eb7ab0eaf43                            # one run, each step, and what it answered
+collab-hub run watch run-3eb7ab0eaf43                           # follow it until it ends or waits at a Gate
+collab-hub run terminate run-3eb7ab0eaf43                       # cancel it, and wait until it has ended
+```
+
+`cog launch NAME` submits a one-step Op through `POST /v1/runs`, and `--name LABEL` names the run in `run list` (`hermes-on-claude`, say): `NAME` is a Cog package the hub's run controller can launch, and a name it cannot is refused with the names it can. `--entry` names the entry point (`run` by default), `--input` its input as JSON, and `--gate` when the step's Gate asks a person (`never`, `error`, `warn` or `always`). Without `--watch` it prints the run's id and returns; the run controller starts the run. It says which durability backend and which location the run is on, since a run on `none` does not survive a controller restart and a `local` worker shares the controller's host.
+
+### Talking to a running Cog
+
+```sh
+collab-hub cog list --launchable                         # the Cogs this hub can launch
+collab-hub cog launch hello --entry session --gate never # a Cog that holds a session
+collab-hub run say run-c42c387d6e23 sum 1 2 3            # one turn: prints what it answered
+toad acp "collab-hub run connect run-c42c387d6e23"       # the same Cog, from an ACP client
+```
+
+`run say` sends one turn and prints the answer; with none within `--timeout` seconds (300 by default) it says what the run is doing and exits 1, and the turn stays on the run. `run connect` serves the run as an agent of the [Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout, so a client such as [Toad](https://github.com/batrachianai/toad) can talk to the Cog: each prompt becomes one turn, sent to the hub and read back, and the answer is streamed to the client. Start it from the client, not by hand; it writes nothing but the protocol to stdout. A cancelled prompt stops waiting, though its turn stays on the run.
+
+`run terminate` asks the hub to cancel the run and waits until the controller has ended it; `--no-wait` returns once the request is recorded. A run that has already ended is refused, naming its status.
+
+These commands need a hub with the run API on (the `cog_runs` feature flag). [`examples/cog-local`](../examples/cog-local/README.md) runs all of them against a hub on your own machine.
+
 ## Output and exit codes
 
 Tables for people by default; `--json`, which every command takes, prints one JSON document for scripts, shaped for `jq`. Results go to stdout, messages to stderr.
@@ -84,13 +113,18 @@ Tables for people by default; `--json`, which every command takes, prints one JS
 - `logout --json`: `{hub, profile, was_signed_in, revoked, warning}`.
 - `whoami --json`: the hub's `GET /v1/me` answer plus `hub`, `profile`, `signed_in` and `token_expires_at`.
 - `cog list --json` and `cog show --json`: the catalog API's items and Cog, as the hub returns them.
+- `run say --json`: the turn, with its `state`, `answer` or `error`. `cog list --launchable --json`: the names.
+- `cog launch --json`, `run show --json`, `run watch --json` and `run terminate --json`: the run, as `GET /v1/runs/{id}` returns it; `run list --json`: the runs.
 
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | the hub or the realm refused or failed the request, or could not be reached; a session is kept |
+| 1 | the hub or the realm refused or failed the request, or could not be reached; a session is kept. Also a run that was waited for and failed, or ran out of budget |
 | 2 | a usage error: a bad option, a missing hub |
+| 3 | a run that was waited for (`--watch`, `run watch`) ended `INTERRUPTED` |
+| 4 | a run that was waited for is waiting at a Gate |
 | 5 | not signed in, or the session has expired and could not be renewed |
+| 6 | a run that was waited for was `CANCELLED` |
 
 ## Development
 

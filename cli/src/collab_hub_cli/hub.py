@@ -41,10 +41,22 @@ def error_message(response: httpx.Response) -> str:
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict) and error.get("message"):
-            return f"{error['message']} (HTTP {response.status_code})"
+            return f"{error['message']}{_refused(error.get('details'))} (HTTP {response.status_code})"
         if isinstance(body.get("detail"), str):
             return f"{body['detail']} (HTTP {response.status_code})"
     return f"HTTP {response.status_code}"
+
+
+def _refused(details: object) -> str:
+    """What a validation error refused, from the envelope's details: ``: name: String should match ...``."""
+
+    if not isinstance(details, list) or not details or not isinstance(details[0], dict):
+        return ""
+    where = [str(part) for part in details[0].get("loc", []) if part not in ("body", "query", "path")]
+    message = details[0].get("msg")
+    if not message:
+        return ""
+    return f": {'.'.join(where)}: {message}" if where else f": {message}"
 
 
 class Hub:

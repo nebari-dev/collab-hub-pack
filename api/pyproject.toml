@@ -25,13 +25,23 @@ dependencies = [
 ]
 
 [dependency-groups]
+# The run API (/v1/runs, behind the cog_runs feature flag) uses the execution
+# package. It is a group, not a dependency, until the flag is retired: the
+# image does not ship it, and a deployment without the flag never imports it.
+runs = [
+    "collab-hub-execution",
+]
 test = [
+    { include-group = "runs" },
     "diff-cover>=9.0.0",
     "httpx>=0.28.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
 ]
+
+[tool.uv.sources]
+collab-hub-execution = { path = "../execution", editable = true }
 
 [build-system]
 requires = ["uv_build>=0.9.27,<0.10.0"]

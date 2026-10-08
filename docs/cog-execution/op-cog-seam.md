@@ -64,6 +64,23 @@ Nothing else crosses the seam. Harness, model, weights, pixi environments,
 binding machinery — all stay inside the Cog, and all remain swappable
 without the Op layer noticing.
 
+## Sessions: an entry point that stays open
+
+An entry point may hold a session instead of answering at once. Its
+`/invoke` stays open for as long as the session lasts, and while it does the
+worker answers **turns**: `POST /turn` with `{"turn": id, "text": ...}`,
+bearing the run token like every request from the controller, answered with
+`{"text": ...}`. The session ends when the entry point's `/invoke` returns its
+envelope — the Cog decides when, `hello` on `bye` — or when the run is
+terminated and the worker torn down. A worker with no session open answers
+`/turn` with 404; the controller retries a turn so answered for a short grace,
+since a worker may be invoked and not yet have opened its session.
+
+Turns come only from the run controller, which takes them from the run's
+Track, so a client never reaches a worker and every turn is recorded. This is
+the first form of talking to a running Cog; how a harness Cog maps turns onto
+its own agent loop is the Worker SDK's to define.
+
 ## The two sides already fit
 
 | Op factory concept | Cog-side implementation |

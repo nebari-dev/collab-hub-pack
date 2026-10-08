@@ -196,7 +196,11 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+runs = [
+    { name = "collab-hub-execution" },
+]
 test = [
+    { name = "collab-hub-execution" },
     { name = "diff-cover" },
     { name = "httpx" },
     { name = "pytest" },
@@ -221,12 +225,31 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+runs = [{ name = "collab-hub-execution", editable = "../execution" }]
 test = [
+    { name = "collab-hub-execution", editable = "../execution" },
     { name = "diff-cover", specifier = ">=9.0.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
+]
+
+[[package]]
+name = "collab-hub-execution"
+version = "0.1.0"
+source = { editable = "../execution" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28.0" }]
+
+[package.metadata.requires-dev]
+test = [
+    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.1" },
+    { name = "pytest", specifier = ">=8.3.0" },
 ]
 
 [[package]]

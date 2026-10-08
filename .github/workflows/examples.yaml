@@ -1,0 +1,68 @@
+name: Examples
+
+# Runs each example under examples/ end to end, the way its README walks through
+# it. examples/cog-local starts Postgres and Keycloak, signs in with the CLI,
+# launches the Hermes Cog against the fake model, talks to it over ACP and from
+# the CLI, and stops it. Hermes's environment is about 400 MB, so this is its
+# own workflow, run when something the example uses changes, rather than a step
+# of dev-env.yaml. Fork-safe: no secrets, read-only checkout.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/**"
+      - "cogs/**"
+      - "cli/**"
+      - "api/**"
+      - "execution/**"
+      - "dev/**"
+      - ".github/workflows/examples.yaml"
+  pull_request:
+    paths:
+      - "examples/**"
+      - "cogs/**"
+      - "cli/**"
+      - "api/**"
+      - "execution/**"
+      - "dev/**"
+      - ".github/workflows/examples.yaml"
+
+concurrency:
+  group: examples-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cog-local:
+    name: examples/cog-local (Hermes, Toad's path over ACP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: Hermes's environment
+        run: pixi install --manifest-path cogs/hermes/pixi.toml
+
+      - name: make demo -- sign in, launch Hermes, list it, talk to it over ACP, stop it
+        run: make -C examples/cog-local demo PORT=8017
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          tail -40 examples/cog-local/.local/*.log || true
+          find dev/.local/runs -name stderr.log -exec tail -20 {} + || true
+
+      - name: Stop the containers
+        if: always()
+        run: make -C dev down || true

@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from .access import can_read
 from .active_state import ActiveFrameStore, ActiveStateUnavailableError
 from .auth import AuthContext, current_auth_context
+from .codec import FrameDecodeError, undecodable_frame_log
 from .models import validate_frame_id
 from .store import FrameNotFoundError, FrameStore
 
@@ -91,6 +92,11 @@ def create_mcp_server(
             try:
                 frame = scoped_frame(frame_id, auth_context)
             except FrameNotFoundError:
+                continue
+            except FrameDecodeError as exc:
+                # A corrupt active frame is undecodable: skip it so one bad
+                # entry cannot break the whole call.
+                undecodable_frame_log.skipped(exc, context="get_active_frames")
                 continue
             frames.append(
                 {

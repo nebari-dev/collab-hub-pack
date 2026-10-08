@@ -990,7 +990,41 @@ class CogsConfig(BaseModel):
         return self
 
 
-FEATURE_FLAGS: dict[str, str] = {}
+class RunsConfig(BaseModel):
+    """Where the run API (``/v1/runs``, behind the ``cog_runs`` feature flag) records and reads runs.
+
+    The API writes intent to the Track and reads a run's status from it; a run
+    controller, a separate process over the same Track, advances the runs
+    (ADR-0002 D4). The API constructs no executor. ``backend`` and ``location``
+    are what the controller beside this API is run with: the API only names
+    them in a submission's response, so a client never assumes a run survives a
+    restart or that its worker is isolated.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True, extra="forbid")
+
+    track_path: str | None = None
+    """The SQLite Track file shared with the run controller. Required when ``cog_runs`` is on."""
+    packages: list[str] | str = Field(default_factory=list)
+    """The directories the controller finds Cog packages under: a step's ``cog`` must name one of them.
+    A list, or from the environment one string of directories joined by ``os.pathsep``."""
+    allow: list[str] | None = None
+    """The package names that may be launched; every package under ``packages`` when unset."""
+    backend: Literal["none", "dbos", "temporal"] = "none"
+    location: Literal["local", "remote"] = "local"
+
+    @field_validator("packages", mode="before")
+    @classmethod
+    def _split_packages(cls, value: Any) -> Any:
+        """Directories as a list, or as one ``os.pathsep``-separated string from the environment."""
+        if isinstance(value, str) and not value.lstrip().startswith("["):
+            return [part for part in value.split(os.pathsep) if part]
+        return value
+
+
+FEATURE_FLAGS: dict[str, str] = {
+    "cog_runs": "The run API (/v1/runs): launch a Cog, list runs, cancel one. Needs the runs section set.",
+}
 """Every feature flag this hub knows: name to one line on what it exposes.
 
 Adding a flag starts here. A name that is not listed is refused wherever it
@@ -1111,6 +1145,7 @@ class BaseConfig(BaseSettings):
     user_directory: UserDirectoryConfig = Field(default_factory=UserDirectoryConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     cogs: CogsConfig = Field(default_factory=CogsConfig)
+    runs: RunsConfig = Field(default_factory=RunsConfig)
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
 
 
