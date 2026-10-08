@@ -1,5 +1,20 @@
 FROM python:3.14-slim-trixie AS python
 FROM ghcr.io/astral-sh/uv:0.12.7 AS uv
+FROM node:24-bookworm-slim AS node
+
+# The admin panel is a built bundle, so it is built here rather than committed.
+# `npm ci --ignore-scripts` installs exactly what package-lock.json pins and
+# runs no package lifecycle script: the panel's dependency set needs none, and
+# a build stage that executes arbitrary install hooks is the step a compromised
+# transitive dependency would aim at.
+FROM node AS admin-ui
+
+WORKDIR /var/admin-ui
+COPY admin-ui/package.json admin-ui/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+COPY admin-ui/ ./
+RUN npm run build
+
 
 FROM python AS builder
 
@@ -28,6 +43,12 @@ USER nonroot
 WORKDIR /var/collab-hub-api
 COPY --from=builder --chown=nonroot:nonroot /var/collab-hub-api/.venv /var/collab-hub-api/.venv
 ENV PATH="/var/collab-hub-api/.venv/bin:${PATH}"
+
+# The built panel, and the setting that makes the app serve it. An image
+# without this directory mounts no panel routes at all, which is what a
+# deployment that predates the panel already does.
+COPY --from=admin-ui --chown=nonroot:nonroot /var/admin-ui/dist /var/collab-hub-api/admin-ui-dist
+ENV COLLAB_HUB_API__WEB__ADMIN_UI_DIST=/var/collab-hub-api/admin-ui-dist
 
 ENV COLLAB_HUB_API__SERVER__HOSTNAME=0.0.0.0
 

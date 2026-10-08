@@ -7,23 +7,23 @@ from datetime import timedelta
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     InMemoryCogExecutor,
     InMemoryTrackStore,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
     ResultEnvelope,
     RunBudget,
-    RunStatus,
+    RunState,
 )
 
 
 @pytest.mark.parametrize(
     "budget,status",
     [
-        (RunBudget(max_duration=timedelta(0)), RunStatus.TIMED_OUT),
-        (RunBudget(max_tokens=10), RunStatus.BUDGET_EXCEEDED),
-        (RunBudget(max_cost=1), RunStatus.BUDGET_EXCEEDED),
+        (RunBudget(max_duration=timedelta(0)), RunState.BUDGET_EXCEEDED),
+        (RunBudget(max_tokens=10), RunState.BUDGET_EXCEEDED),
+        (RunBudget(max_cost=1), RunState.BUDGET_EXCEEDED),
     ],
 )
 def test_exhausted_budget_retry_is_rejected_without_mutating_run(budget, status):
@@ -32,11 +32,11 @@ def test_exhausted_budget_retry_is_rejected_without_mutating_run(budget, status)
         "c": lambda entry, value: calls.append(value) or ResultEnvelope.success(usage={"tokens": 10, "cost": 1}),
     })
     track = InMemoryTrackStore()
-    engine = DurableWorkflowEngine(executor=executor, track=track, budget=budget)
+    engine = LifecycleRunner(executor=executor, track=track, budget=budget)
     op = OpDefinition("budget", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
     assert engine.submit(op) is status
     events, before = track.replay(op.run_id), list(calls)
-    restarted = DurableWorkflowEngine(executor=executor, track=track, budget=budget)
+    restarted = LifecycleRunner(executor=executor, track=track, budget=budget)
     with pytest.raises(ValueError, match="exhausted its budget; start a new run"):
         restarted.retry(op.run_id)
     assert track.replay(op.run_id) == events
@@ -63,17 +63,17 @@ def test_recovery_after_submission_roundtrips_input_and_rejects_changed_op():
     track = CrashAfterSubmission()
     executor = InMemoryCogExecutor({"c": lambda entry, value: calls.append(value) or value})
     op = OpDefinition("recover", (OpStep("s", "c", "run", {"items": ("a", "b")}),))
-    first = DurableWorkflowEngine(executor=executor, track=track)
+    first = LifecycleRunner(executor=executor, track=track)
     with pytest.raises(SystemExit):
         first.submit(op)
-    assert first.observe(op.run_id) is RunStatus.SUBMITTED
+    assert first.observe(op.run_id) is RunState.SUBMITTED
     assert [e.event_type for e in track.replay(op.run_id)] == ["op_submitted"]
     assert calls == []
 
-    restarted = DurableWorkflowEngine(executor=executor, track=track)
+    restarted = LifecycleRunner(executor=executor, track=track)
     changed = OpDefinition("recover", (OpStep("s", "c", "run", {"items": ("a", "other")}),))
     with pytest.raises(ValueError, match="different Op"):
         restarted.submit(changed)
-    assert restarted.submit(op) is RunStatus.COMPLETED
+    assert restarted.submit(op) is RunState.COMPLETED
     assert len(calls) == 1
     assert not any(e.event_type == "submitted" for e in track.replay(op.run_id))

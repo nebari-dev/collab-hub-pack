@@ -27,6 +27,7 @@ one, and only matters once you reach level 3.
 | Docker with Compose v2 | levels 2–4 (**not** level 1) | `docker compose version` |
 | [kind](https://kind.sigs.k8s.io/), `helm`, `kubectl` | level 4 only | `kind version` |
 | [kubeconform](https://github.com/yannh/kubeconform) | `make lint` only | `kubeconform -v` |
+| [pixi](https://pixi.sh) | `make controller` and `make op LOCATION=local` only | `pixi --version` |
 
 You do **not** need a local Python: `uv` provisions the interpreter pinned in
 `api/.python-version` (3.14, the one the image runs) on first run. The API
@@ -96,20 +97,22 @@ idempotent — already-running containers are left alone. You never run
 all**. The API is a plain process on your machine at every level except 4;
 Docker only ever supplies the things around it.
 
-| Command | Postgres | MinIO | Keycloak | Fake providers | Front door |
+| Command | Postgres | S3 | Keycloak | Fake providers | Front door |
 |---|:--:|:--:|:--:|:--:|:--:|
 | `make api` | – | – | – | – | – |
 | `make api-watch` | – | – | – | – | – |
-| `make api-pg` | ✅ | ✅ | – | – | – |
-| `make api-oidc` | ✅ | ✅ | ✅ | – | – |
-| `make api-fakes` | ✅ | ✅ | ✅ | ✅ | – |
+| `make api-pg` | ✅ | – | – | – | – |
+| `make api-oidc` | ✅ | – | ✅ | – | – |
+| `make api-fakes` | ✅ | – | ✅ | ✅ | – |
 | `make api-full` | ✅ | ✅ | ✅ | – | – |
-| `make api-membership` | ✅ | ✅ | ✅ | – | – |
+| `make api-membership` | ✅ | – | ✅ | – | – |
 | `make api-desktop` | ✅ | ✅ | ✅ | – | ✅ |
 | `make api-desktop-fakes` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-(MinIO tags along with Postgres because both come from `make services`; only
-`make api-full` actually stores frames in it.)
+Only `make api-full` stores frames in S3, so only it starts the S3 store
+(`make services`); the others start Postgres alone (`make postgres`), and keep
+frames on the local filesystem. The desktop targets start both, through the
+front door.
 
 Containers left running from a previous level are **not** wired in by a lower
 one: `make api-pg` then Ctrl-C then `make api` leaves Postgres up but running
@@ -190,7 +193,7 @@ flowchart LR
     proxy["<b>front door</b> :9080<br/><i>make hub-proxy</i><br/>routes by Host"]
     kc["<b>Keycloak</b> :8080<br/>realm 'nebari'"]
     pg[("<b>Postgres</b> :5432<br/>orgs · history · tasks")]
-    minio[("<b>MinIO</b> :9000<br/>S3 frame store")]
+    s3[("<b>SeaweedFS</b> :9000<br/>S3 frame store")]
     fg["fake Google :8081"]
     fs["fake Slack :8082"]
     fg2["fake GitHub :8083"]
@@ -201,7 +204,7 @@ flowchart LR
   api -->|"exchange bearer for<br/>the user's provider token"| kc
   api --> pg
   api --> frames
-  api -.->|"frames.storage.backend=s3"| minio
+  api -.->|"frames.storage.backend=s3"| s3
   api -->|"provider API calls"| fg
   api --> fs
   api --> fg2
@@ -256,11 +259,20 @@ tables at startup; the dev targets set it.
 make psql          # a psql shell on the dev database
 ```
 
-### MinIO — the S3 frame store
+### SeaweedFS — the S3 frame store
 
-Frame **bodies** default to the local filesystem (`dev/.local/frames`). MinIO
-is only needed to exercise the S3 code path, which `make api-full` does. The
-console is at <http://localhost:9001> (`minioadmin` / `minioadmin123`).
+Frame **bodies** default to the local filesystem (`dev/.local/frames`). The S3
+store is only needed to exercise the S3 code path, which `make api-full` does.
+Its keys are `devaccesskey` / `devsecretkey` (`dev/s3/s3.json`), the API is on
+<http://localhost:9000>, and the server's status page is at
+<http://localhost:9333>. `make services` creates the `frames` bucket with the
+AWS CLI, which speaks to any S3.
+
+This was MinIO until its images left Docker Hub (#114, #115) and then quay.io,
+which no account can pull; SeaweedFS is maintained, Apache-2.0, and serves the
+part of S3 the frame store uses, conditional writes included. Nothing outside
+`dev/` and `scripts/smoke_frames_s3.sh` knew which server it was: the API
+speaks S3 through boto3 either way.
 
 ### Keycloak
 
@@ -321,7 +333,7 @@ Level 4 builds `api/Dockerfile`, loads it into a kind cluster, and installs
 | | `make down` | `make destroy` | `make clean` |
 |---|:--:|:--:|:--:|
 | Postgres rows — frames, orgs, roles, audit | kept | **erased** | kept |
-| MinIO objects | kept | **erased** | kept |
+| S3 objects | kept | **erased** | kept |
 | Keycloak realm, identity providers, account links | kept | **erased** | kept |
 | Frame bodies on disk (`dev/.local/frames`) | kept | kept | **erased** |
 | The kind cluster | kept | kept | kept |
@@ -375,6 +387,8 @@ Every request is then treated as `dev-user`, with no token:
 ```sh
 curl -s localhost:8000/v1/frames
 curl -s localhost:8000/health
+curl -s localhost:8000/v1/cogs                    # the Cog catalog, empty here
+curl -s localhost:8000/v1/cogs/catalog.v1.json    # {"schemaVersion":1,"repositories":[]}
 ```
 
 These switches are a local-development affordance and nothing else. The Helm
@@ -387,7 +401,7 @@ true` — on a routed host they are an authentication bypass. See
 ## Level 2 — with Postgres
 
 ```sh
-make api-pg      # starts Postgres + MinIO, then the API
+make api-pg      # starts Postgres, then the API
 ```
 
 Starts the two containers first (skipping any already up), waits for them to be
@@ -417,7 +431,7 @@ curl -s localhost:8000/v1/frame-groups
 ## Level 3 — with Keycloak
 
 ```sh
-make api-oidc    # starts Postgres, MinIO and Keycloak, then the API
+make api-oidc    # starts Postgres and Keycloak, then the API
 ```
 
 Three containers, started for you and waited on before the API launches. The
@@ -459,6 +473,37 @@ rows you seed by subject match nobody.
 ```sh
 make sub        # the OIDC subject for the same user
 ```
+
+### Signing in from the CLI
+
+The `collab-hub` CLI signs in the way the Collab desktop does: the realm's
+`apollo-desktop` client, the authorization code flow with PKCE, and a redirect
+back to a listener on `127.0.0.1`. `make cli` installs it into `cli/.venv`.
+
+```sh
+make cli
+../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login
+```
+
+`login` opens the realm's sign-in page in your browser. **Sign in as `dev`,
+password `dev`** — or `owner` / `owner`, the realm's second user (see
+[What is in the realm](#2-what-is-in-the-realm)). The page then sends the
+browser back to the CLI's listener, which says you can close the tab, and the
+CLI prints who the hub signed you in as. Leave `login` running until then: the
+listener lives only as long as the command, so a sign-in finished after it
+stopped lands on a closed port.
+
+```sh
+../cli/.venv/bin/collab-hub whoami           # dev, its organization, and when the token expires
+../cli/.venv/bin/collab-hub cog list         # the Cogs in the catalog
+../cli/.venv/bin/collab-hub logout           # ends the realm session, revokes the token, deletes it here
+```
+
+With no browser on this machine, take a token from `make token` instead:
+`make -s token | ../cli/.venv/bin/collab-hub --hub http://127.0.0.1:8000 login --with-token`.
+At level 1 there is no realm: `login` says the hub runs dev auth, and `whoami`
+says the session is unauthenticated. [`cli/README.md`](../cli/README.md) has
+the rest.
 
 Other level-3 targets:
 
@@ -600,6 +645,16 @@ leaving you guessing at a login screen.
 
 `apollo-desktop` carries an **audience mapper** so its access tokens contain
 `"aud": ["apollo-desktop", …]`, which is what `FRAMES_BEARER_AUDIENCE` checks.
+The `collab-hub` CLI signs in with the same client and the same flow as the
+desktop, so it needs no client of its own.
+
+| User | Password | Email | Used for |
+|---|---|---|---|
+| `dev` | `dev` | `dev@example.com` | Every sign-in in this guide: the desktop, `collab-hub login`, `make token` (`KC_USER`/`KC_PASS` default to it) |
+| `owner` | `owner` | `owner@example.com` | A second person, for sharing and membership: `make token KC_USER=owner KC_PASS=owner` |
+
+These are development credentials, imported with the realm and good only on
+this local Keycloak.
 
 Both clients keep the realm-default client scopes, **including `basic`**. That
 scope carries the `sub` mapper in Keycloak 25+; a client whose default scopes
@@ -1037,9 +1092,10 @@ Frames and the user directory work immediately. Three things do not:
 
 ## Running Cogs and Ops
 
-Nothing here runs a Cog through the hub yet: the API does not import the
-execution package (#35), and there is no run controller or run API to call.
-This section is where they arrive, one target at a time, under the rule
+A Cog runs through the hub at level 1: `make api` serves the run API
+(`/v1/runs`, behind the `cog_runs` feature flag, which this target sets),
+`make controller` advances the runs it accepts, and the `collab-hub` CLI
+launches them. This section is where the rest arrives, one target at a time, under the rule
 [ADR-0002](../docs/adr/0002-lifecycle-runner-durability-and-placement.md) D9
 sets for every Cog execution change. In the same PR, what a change adds is:
 
@@ -1074,6 +1130,130 @@ TEST_POSTGRES_URL=postgresql://collab:collab@127.0.0.1:5432/execution_test \
 `cog-e2e` — not level 4's `collab-hub-dev` — builds and loads the test image,
 runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 
+### A Cog launched from the CLI — `make api`, `make controller`
+
+Level 1, no container. Two processes over one SQLite Track,
+`.local/track.sqlite`:
+
+```sh
+make api          # terminal 1: the API, with /v1/runs on
+make controller   # terminal 2: starts each submitted run's worker as a local process (needs pixi)
+cd ../cli && uv run collab-hub --hub http://localhost:8000 cog launch hello --input '{"name": "Ada"}' --watch
+```
+
+The API records the submission and nothing else; the controller reads it from
+the Track, runs the Cog package's `serve` task in its own pixi environment, and
+records what happened; the CLI reads the run back through the API. `run list`,
+`run show` and `run terminate` are the other commands.
+`make api-oidc` serves the run API too, with real sign-in through Keycloak,
+and `make controller` works beside either. [`examples/cog-local`](../examples/cog-local/README.md)
+walks a Cog through its whole life on them — sign in, launch, list, talk to it
+from Toad over ACP, stop it — and `make -C ../examples/cog-local demo` runs it
+end to end and checks it.
+
+The controller sets no limit on how long an interaction takes, since a Cog
+holding a session stays in one for as long as someone talks to it. A worker
+that hangs is stopped by terminating its run.
+
+Cog packages are found in `COGS`, a `:`-separated list that defaults to
+`dev/cogs` (the fake Cogs), `cogs` at the root (`hermes`, the Hermes harness
+Cog) and `examples/cog-local/cogs` (`hello`); both targets read it, so set it
+on both to add a directory of your own.
+
+**The Hermes Cog's model.** `make controller` hands the Hermes Cog's workers,
+and no other's, the model in `COLLAB_MODEL_PROVIDER` (`openai-compatible`, or
+`anthropic` for Claude), `COLLAB_MODEL_BASE_URL`, `COLLAB_MODEL_NAME` and
+`COLLAB_MODEL_API_KEY`. By default it is `make fake-model`, an OpenAI-compatible
+endpoint on port 8090 that answers `The fake model heard: ...` with no account
+and no network ([`fake-model/fake_model.py`](fake-model/fake_model.py)). Set
+the three in your environment to use a real one. Hermes's environment is about
+400 MB, installed by pixi on its first launch, or ahead of time with
+`make -C ../examples/cog-local env`. A worker's
+output is under `.local/runs/`.
+
+**What persists.** The Track file, until `make clean`. The controller keeps
+nothing else: stop it mid-run and the next `make controller` records that run
+`interrupted`. **One controller at a time**, and not beside a `make op`: each
+holds the same lock next to the Track.
+
+### Fake Ops — `make op`
+
+Level 1, no container. `make op OP=<name>` runs the Op in `ops/<name>.yaml` on
+the lifecycle runner with the `none` durability backend, and prints its Track
+and its status. Each step names a fake Cog under `cogs/`: a Cog package, with a
+`pixi.toml` that declares a `serve` task and a `serve.py` that holds the Cog's
+`handle` function. Without a location, `handle` answers in the same process:
+
+| Op | Fake Cog | Ends |
+|---|---|---|
+| `echo` (the default) | `echo` answers with its input | `COMPLETED`, two steps |
+| `needs-review` | `needs-review` answers with an `error` problem, so the step's default Gate escalates | `WAITING_AT_GATE` |
+| `fails` | `fails` answers `ok: false` | `FAILED`, with the code on `step_failed` |
+| `spender` | `spender` reports 100 tokens per step, under a 150-token budget | `BUDGET_EXCEEDED` after the second step |
+| `slow` | `slow` takes 30 seconds | stop it with Ctrl-C: the next `make op` reports it `interrupted` |
+
+```sh
+make op OP=needs-review
+make op OP=slow        # Ctrl-C during the step
+make op                # "interrupted slow-…: a previous `make op` stopped before it ended"
+```
+
+**As real worker processes — `LOCATION=local`.** With `make op OP=<name>
+LOCATION=local`, each step's worker is a process: the local executor runs the
+package's `serve` task in the package's own pixi environment, on a loopback
+port it chose, waits for `/healthz`, calls `/invoke` with the worker's run
+token, and kills the worker's process group when the step ends. This is the
+`local` agent location ([runs.md](../docs/cog-execution/runs.md#agent-locations));
+it needs [pixi](https://pixi.sh), and nothing else here does. The first run of
+a Cog installs its environment (a Python, a few seconds); later runs reuse it.
+
+```sh
+make op OP=echo LOCATION=local    # worker_started … location=local pid=…, then worker_stopped
+make op OP=slow LOCATION=local &  # then kill -9 the `op.py` process: no worker is left behind
+```
+
+The Track gains `worker_started` and `worker_stopped` around each interaction.
+A worker's stdout and stderr are under `.local/runs/`, in the directory its
+`worker_started` names as `logs` (`<run>-<digest>/<step>_<attempt>-<digest>/`).
+Stopping the host any way at all, `kill -9` included, leaves no worker: the
+launcher that holds each worker kills it when its pipe to the host closes.
+
+**What persists.** The Track is a SQLite file, `.local/track.sqlite`, kept
+across runs until `make clean`. Every `make op` starts the way a host does: a
+run a previous one left running or waiting at a Gate is recorded
+`interrupted`, since `none` keeps nothing across a restart
+([runs.md](../docs/cog-execution/runs.md)). That includes a `needs-review` run
+still waiting at its Gate: nothing here decides it yet (the run API, #103, does).
+
+**One `make op` at a time.** The runner takes every unfinished run on its Track
+as its own when it starts, so `make op` holds a lock beside the Track, and a
+second one refuses to start while the first runs. `BACKEND=dbos` and
+`BACKEND=temporal` are refused until those backends are built, and so is
+`LOCATION=remote` until Phase 21 puts the cluster executor behind the switch.
+The fake Cogs' pixi environments, `cogs/<name>/.pixi/`, are git-ignored and
+survive `make clean`; delete them to install afresh.
+
+### The Cog catalog read API
+
+The read API (`/v1/cogs`, [docs/cog-registry.md](../docs/cog-registry.md#read-api))
+runs at **level 1**: `make api` keeps the catalog in process memory
+(`COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory`), so every route answers,
+over an empty catalog that resets when the process stops. From level 2 up the
+catalog is the `collab_cog_artifacts` table in Postgres and survives restarts
+(`make destroy` clears it). Nothing indexes into it unless a registry source
+and `cogs.index.enabled` are configured — see
+[docs/cog-registry.md](../docs/cog-registry.md#bare-process).
+
+```sh
+make api
+curl -s localhost:8000/v1/cogs                    # {"items":[],"limit":50,"offset":0,"next_offset":null}
+curl -s 'localhost:8000/v1/cogs?kind=model&q=small'
+curl -s localhost:8000/v1/cogs/catalog.v1.json
+```
+
+CI asserts both empty answers at level 1, and at level 2 runs the filtered
+list against Postgres.
+
 ---
 
 ## Troubleshooting
@@ -1084,9 +1264,16 @@ runs the Op, and deletes the cluster afterwards unless `KEEP=1` is set.
 | 401 with a token that looks fine | Issuer mismatch, or the token has no `sub` claim | Check `iss` matches `FRAMES_BEARER_ISSUER` exactly; check the client kept the `basic` client scope |
 | `403 no_organization` | Membership mode with no row for that subject | `make seed-org SUB=$(make -s sub)` |
 | `503` from history / groups / invitations | No Postgres — `make api` starts none | Use `make api-pg` or above |
+| `503 cog_catalog_unavailable` from `/v1/cogs` | The API was started by hand with neither Postgres nor the level-1 memory override | Use `make api`, or set `COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory` |
 | `/web/signin` returns 404 | The web surface is not mounted without a Keycloak client id | Use `make api-full` |
 | `/health/db` says 200 but nothing persists | It answers 200 either way; the body says `not_configured` | Read the body, and use level 2 or above |
 | Connector says `unavailable`, names a missing role | The broker `read-token` role was never granted | `make broker-role` |
+| `make op LOCATION=local` says to install pixi | The `local` location runs each Cog in its own pixi environment | Install [pixi](https://pixi.sh), or drop `LOCATION` to run the fake Cogs in process |
+| `make op LOCATION=local` fails a step with `WorkerStartFailed` | The worker exited or never answered `/healthz`; the reason on the Track ends with its last lines of stderr | Read `stderr.log` in the directory the run's `worker_started` names as `logs`, under `.local/runs/` |
+| `collab-hub cog launch` answers 404 | The hub's run API is off: it is behind the `cog_runs` feature flag | Use `make api`, which sets it; another target needs `COLLAB_HUB_API__FEATURES__COG_RUNS=true` and `COLLAB_HUB_API__RUNS__TRACK_PATH` |
+| A launched run stays `SUBMITTED` | No controller is watching the Track | `make controller` in another terminal |
+| `make controller` says another controller, or `make op`, is running | One host at a time on a Track | Stop the other one |
+| `make op` says another `make op` is running | A previous one is still running on the same Track, possibly in another terminal | Let it finish or stop it; one host per Track until run pickup (#121) |
 | Connector says `reconnect_required` | Stored token cannot make that provider call | Add the scope to the IdP, then **unlink and relink** the user |
 | Connector status needs "a Hub bearer token" | Called with dev auth | Connectors need level 3 — use `make api-fakes` or `make api-oidc` |
 | Keycloak healthy but the realm is missing | Import only runs on first start | `make realm-import`, then `make broker-role` |
@@ -1133,10 +1320,18 @@ that gap.
 
 | Level | Where | What it asserts |
 |---|---|---|
-| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token |
-| 2 | Linux | `/health/db` reports a real database, and `/v1/frame-groups` answers 200 instead of 503 |
+| 1 | Linux **and macOS** | `hosts-check` both ways, then a frame written and read back with no token, and the empty Cog catalog (`/v1/cogs`, `/v1/cogs/catalog.v1.json`); every fake Op of `make op` ends as it should, and a run whose host is killed mid-step is reported `interrupted` by the next; with `LOCATION=local`, `echo` runs as real worker processes in its pixi environment, and a host killed with `SIGKILL` mid-step leaves no worker |
+| 2 | Linux | `/health/db` reports a real database, `/v1/frame-groups` answers 200 instead of 503, and a `/v1/cogs` list with every filter answers 200 from Postgres |
 | 3 | Linux | 401 without a bearer, 200 with one, and the token carries a `sub` |
 | 4 | Linux | Rendered only — the chart, the dev-auth switches, the `IMAGE` override and the port overrides |
+
+The examples have a workflow of their own,
+[`.github/workflows/examples.yaml`](../.github/workflows/examples.yaml), run on
+pull requests that touch what they use: `examples/cog-local`'s `make demo`
+starts Postgres and Keycloak, signs in with the CLI, launches the Hermes Cog
+against the fake model, talks to it over ACP and with `run say`, and
+terminates it with no worker left. It is apart from this one because Hermes's
+environment is about 400 MB.
 
 **Coverage relaxes as the levels get more expensive**, which is how the levels
 are meant to be used in the first place.
@@ -1181,21 +1376,27 @@ works as a set:
 | `KC_USER` / `KC_PASS` | `dev` / `dev` | Whose token `make token` prints |
 | `PG_URL` | `postgresql://collab:collab@127.0.0.1:5432/collab` | Dev database |
 | `KC_ADMIN` / `KC_ADMIN_PW` | `admin` / `admin` | Admin console **and** `kcadm`; only seeded against an empty database |
-| `S3_ENDPOINT` | `http://127.0.0.1:9000` | MinIO, for the S3 frame store |
+| `S3_ENDPOINT` | `http://127.0.0.1:9000` | The S3 frame store |
 | `CLUSTER_NAME` | `collab-hub-dev` | kind cluster name |
 | `NAMESPACE` / `RELEASE` | `collab-hub` | Namespace and Helm release for `make kind-up` |
 | `IMAGE` | `collab-hub-api:dev` | Image `make kind-image` builds and loads, and `make kind-up` deploys |
 | `FORWARD_PORT` | `18080` | Local port for `make kind-forward` |
 | `DESKTOP_PORT` | `9080` | Single-port front door for the Collab client — also its listener and published port |
+| `OP` | `echo` | The Op `make op` runs: a file under `ops/`, without `.yaml` |
+| `BACKEND` | `none` | The durability backend `make op` runs on; only `none` is built |
+| `COGS` | `dev/cogs:cogs:examples/cog-local/cogs` | The directories `make api` and `make controller` find Cog packages in, `:`-separated |
+| `LOCATION` | *(empty)* | Where `make op` runs each step's worker: empty for in process, `local` for a real process per worker (needs pixi) |
 
 ## Files in this directory
 
 | Path | What it is |
 |---|---|
 | `Makefile` | Every target described above |
-| `compose.yaml` | Postgres, MinIO, Keycloak, the two fake providers, and the desktop front door |
+| `compose.yaml` | Postgres, the S3 store, Keycloak, the two fake providers, and the desktop front door |
+| `s3/s3.json` | The dev credentials the S3 store reads |
 | `keycloak/realm-nebari.json` | The `nebari` realm: clients, mappers, users |
 | `sql/bootstrap.sql` | Org + owner membership + operator grant, in one transaction |
 | `proxy/Caddyfile` | Host-routing front door for the desktop client |
 | `values/kind.yaml` | Helm values for the kind install |
-| `.local/` | Frame bodies and scratch state (git-ignored, `make clean` removes it) |
+| `op.py`, `ops/`, `cogs/` | `make op`: the script, the fake Ops, and the fake Cog packages they name (`cogs/fake_worker.py` serves the seam for each) |
+| `.local/` | Frame bodies, the `make op` Track, the output of local workers (`runs/`), and scratch state (git-ignored, `make clean` removes it) |

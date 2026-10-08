@@ -48,6 +48,15 @@ on it (#90–#92) have their own paths (``/invite/accept``, ``/admin/*``,
 
 STYLE_ASSET_PATH = f"{WEB_PATH_PREFIX}/app.css"
 
+WEB_LOGO_PATH = f"{WEB_PATH_PREFIX}/collab-logo.png"
+"""The product wordmark, served to the server-rendered pages.
+
+Public for the same reason the stylesheet is: the sign-in page and the
+invitation acceptance page are reachable before anybody has a session, and a
+page whose chrome 401s renders as a broken image to the very people least able
+to explain it. It carries no information -- it is the same file for everyone.
+"""
+
 WEB_SURFACE_PREFIXES = ("/web", "/admin", "/org", "/invite")
 """Every path prefix the browser surface owns, from the issue #88 route table.
 
@@ -219,6 +228,51 @@ ORG_INVITATIONS_PATHS = (
 """Every path the owner invitation page serves. Read by
 :data:`CSRF_ENFORCED_IN_ROUTE`, same as :data:`ADMIN_PATHS`."""
 
+ADMIN_PANEL_DOCUMENT = "/admin/"
+"""The document the single-page panel boots from.
+
+With the trailing slash, which is the canonical form: the bundle's asset and
+API URLs are document-relative, so ``/admin`` (which redirects here) would
+resolve them against ``/``. See :mod:`..routers.admin_ui`.
+"""
+
+ADMIN_PANEL_REDIRECT = "/admin"
+"""The slashless form, which redirects to the canonical one."""
+
+ADMIN_PANEL_ASSETS_PREFIX = "/admin/assets/"
+"""Where the panel's hashed bundle files live.
+
+A prefix rather than an enumerated tuple because the names carry content
+hashes and change on every build, so nothing in this repository can list them.
+
+Deliberately **not** all of ``/admin``. The panel's policy forbids
+``form-action`` outright, which is correct for a surface that submits no HTML
+forms and wrong for :data:`ADMIN_INVITATIONS_PATH`, which submits two. Scoping
+the policy to the two things the panel actually serves keeps that page's forms
+working and keeps each path under the strictest policy it can bear.
+"""
+
+ADMIN_API_PREFIX = "/admin/api"
+"""Where the admin panel's JSON lives, and the one part of this surface whose
+refusals are JSON rather than pages.
+
+Under ``/admin`` rather than ``/v1`` on purpose. The rule this surface keeps is
+not "JSON belongs to the API"; it is that browser credentials do not work on
+the machine API and machine credentials do not sign a browser in. A panel
+running in a browser is a browser client, so it authenticates the way every
+other browser client here does -- which is also what puts it behind
+:class:`~.guard.WebSessionGuardMiddleware`, a control that authenticates by
+path *before* routing and therefore cannot be defeated by a route that forgets
+a dependency. ``/v1`` has no such middleware; it relies on each route carrying
+its own, which is the arrangement that module was rewritten to stop depending
+on.
+
+A prefix rather than an enumerated tuple, unlike :data:`ADMIN_PATHS`, because
+the refusal shape has to be decided for paths that do not exist: a JSON client
+asking for a mistyped admin endpoint must be told so in JSON, not handed a
+sign-in redirect it will follow into an HTML page with status 200.
+"""
+
 ADMIN_PATHS = (ADMIN_INVITATIONS_PATH, ADMIN_INVITATIONS_REVOKE_PATH)
 """Every ``/admin`` path this surface serves.
 
@@ -236,6 +290,7 @@ PUBLIC_WEB_PATHS = frozenset(
         CALLBACK_PATH,
         SIGNED_OUT_PATH,
         STYLE_ASSET_PATH,
+        WEB_LOGO_PATH,
         ACCEPT_PAGE_PATH,
         DATA_STATEMENT_PATH,
         TERMS_PATH,
@@ -563,6 +618,7 @@ def enforce_web_surface_preconditions(config: BaseConfig) -> None:
         SIGNOUT_PATH,
         SIGNED_OUT_PATH,
         STYLE_ASSET_PATH,
+        WEB_LOGO_PATH,
         # The acceptance page and its redemption endpoint (#90). Both must be
         # map-public for the same reason the rest of the surface is: the map's
         # `authenticated` level runs the API credential check, and an invitee
@@ -657,3 +713,24 @@ def enforce_web_surface_map_access(
         " security.paths — the web routes enforce their own session, CSRF and role"
         " checks in-route."
     )
+
+
+def on_admin_panel(path: str) -> bool:
+    """Whether *path* is the panel's document or one of its bundle files."""
+
+    return (
+        path in (ADMIN_PANEL_DOCUMENT, ADMIN_PANEL_REDIRECT)
+        or path.startswith(ADMIN_PANEL_ASSETS_PREFIX)
+    )
+
+
+def answers_json(path: str) -> bool:
+    """Whether a refusal on *path* should be JSON rather than a page.
+
+    True for the admin API and nothing else. The comparison is prefix-based and
+    segment-aware -- ``/admin/apiary`` is a page path, not an API one -- so a
+    future page whose name begins with the same letters does not silently start
+    refusing in JSON.
+    """
+
+    return path == ADMIN_API_PREFIX or path.startswith(f"{ADMIN_API_PREFIX}/")

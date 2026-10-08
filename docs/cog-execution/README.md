@@ -18,6 +18,12 @@ Contents:
   a Cog, and why nothing else crosses.
 - [The result envelope](result-envelope.md) — the shape a Cog's entry point
   returns; what Guards check, Gates read, and Tracks record.
+- [The Track](track.md) — event schema v1: what each event carries, payloads
+  by reference, the three stores, and how a Track written before v1 is read.
+- [States](states.md) — the four state machines (install, worker, step
+  attempt, run): every state, every transition, and what each records.
+- [Running Ops](runs.md) — the durability backends, what each run status
+  means, what a restart does under `none`, and cancelling a run.
 - [Sensitivity](sensitivity.md) — how data-sensitivity labels are born,
   propagated, and enforced (the basis of ADR-0001 D10).
 
@@ -94,6 +100,8 @@ decision, or a seam rule. A bare *Invariant N* is ADR-0001's.
     it, and asserted in CI at that level? (ADR-0002 invariant 5, D9.)
 14. Which documents did it make stale, and are they updated in the same PR?
     (ADR-0002 invariant 5, D10.)
+15. Does every change of state go through its machine, and does
+    [states](states.md) still match the code? (ADR-0002 D11.)
 
 ## How the open issues map to the ADR
 
@@ -105,8 +113,8 @@ Bare decision and invariant numbers are ADR-0001's.
 | #2 durable Op engine | D2, D5, D8, invariant 5; ADR-0002 D1–D3, D8 | One lifecycle runner with a durability backend (`none`, `dbos`, `temporal`). Gates are declared on the step; recovery must not depend on a caller re-submitting. |
 | #3 model binding | D3, invariant 4 | The hub offers the inventory; the Cog's `resolve` selects; the binding record is the output. |
 | #4 budgets and idle workers | invariant 3 | Duration is a hard pre-check; token/cost is post-interaction accounting. |
-| #5 durable Track | D8; ADR-0002 D3 | Carry binding identity per step and actor per gate decision. Run status comes only from the Track, under every backend. Catalog persistence belongs to #7. |
-| #6 least-privilege grant | invariant 2; ADR-0002 D4, invariant 3 | Namespace-scoped; workers carry no ServiceAccount token. Only the run controller holds workload permissions. |
+| #5 durable Track | D8; ADR-0002 D3 | Event schema v1 ([track](track.md)): binding identity per step, actor per gate decision, a bounded failure record with the key and worker; payloads by reference; in-memory, SQLite and Postgres stores under one conformance suite; the hub's tables from migration 12. Catalog persistence belongs to #7. |
+| #6 the remote location and least-privilege RBAC | invariant 2; ADR-0002 D4, invariant 3 | `location: remote` puts the Kubernetes executor behind the switch #109 adds; a namespace-scoped grant to the controller only; workers carry no ServiceAccount token. |
 | #7 registry and catalog | D6, D9 | The catalog card derives from the manifest; index the full profile as declared. |
 | #8 delegated connector access | "deferred" list | The hub's brokered connectors act as the user; no credential enters the worker. |
 | #9 Guards | seam item 2 | Guards consume the envelope; a Cog's contract checks are inputs to Guards, not Guards. Gates decide. |
@@ -117,10 +125,15 @@ Bare decision and invariant numbers are ADR-0001's.
 | #101 the `none` backend | ADR-0002 D1–D3, invariants 1–2 | In-flight runs end `interrupted` after a restart and are never resumed. |
 | #102 keyed claim | ADR-0002 D1 | One attempt acts once; a recorded failure retries under a new key. |
 | #103 run API | ADR-0002 D4, D7, invariant 3 | The API records intent and reads the Track; it never calls the executor. |
+| #177 a Cog launched from the CLI on a local dev hub | ADR-0002 D4, D9, invariant 3 | `examples/cog-local`, on the first form of the run controller, the run API (behind `cog_runs`) and the CLI's launch and run commands; #121, #103 and #126 build each out. |
+| #121 run controller and run pickup | ADR-0002 D4, invariant 3 | Runs advance in the controller, which alone constructs an executor; pickup under `none`. |
 | #104 DBOS backend | ADR-0002 D1, D3 | Resumes after a restart; status still comes from the Track. |
 | #105 materialize from the artifact | D5, invariant 2 | The worker runs the Cog's own `serve`. |
 | #106 install by digest | D5 | Install runs `check` once; materialize happens per run. |
 | #107 worker SDK | ADR-0002 D5, invariant 4 | Optional for Cogs; the hub never imports it. |
 | #108 Hermes harness Cog | ADR-0002 D5 | The first harness Cog, built on the worker SDK. |
-| #109 local executor, DBOS on SQLite | ADR-0002 D6 | Local execution through the same package. |
+| #109 agent location | ADR-0002 D12, invariant 6 | `location`, `local` or `remote`, beside `backend`: a process on the controller's host first, built; a pod (#6) behind the same switch. A worker's run token is minted here. |
 | #110 Temporal backend | ADR-0002 D1, D3 | The same conformance suites as the other backends. |
+| #125 the `collab-hub` CLI | ADR-0002 D4, D7 | A client over the REST API, authentication first; it imports no hub package. |
+| #126 CLI run commands | ADR-0002 D4, D7 | Every run API endpoint behind a command; later work adds its own commands, not another client. |
+| #130 state machines | ADR-0001 invariant 3; ADR-0002 D3, D11 | One machine per level (install, worker, step attempt, run) on the state pattern; run status is the Track replayed through the run machine. |

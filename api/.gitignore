@@ -1,0 +1,6 @@
+# The admin panel is built by CI and by the Docker image, never committed:
+# a generated bundle in git is a diff nobody can review and a build that
+# depends on whoever last ran it.
+admin-ui/node_modules/
+admin-ui/dist/
+admin-ui/tsconfig.tsbuildinfo

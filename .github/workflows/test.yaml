@@ -16,6 +16,25 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real database, so the live-Postgres tests run here and do not skip:
+    # migrations, row locks and transaction rollbacks are what a fake cannot
+    # show. Trust auth because the container lives for this job only and is
+    # reachable only from the runner; there is no password to hard-code.
+    services:
+      postgres:
+        image: postgres:16.15@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: collab_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      COLLAB_HUB_TEST_POSTGRES_URL: postgresql://postgres@localhost:5432/collab_test
     steps:
       - uses: actions/checkout@v5
         with:
@@ -65,3 +84,40 @@ jobs:
       - name: Run tests
         working-directory: api
         run: uv run --group test pytest
+  admin-ui:
+    # The admin panel's own suite. Separate job rather than a step on the
+    # Python one: the two share no toolchain, and a Node failure should read as
+    # a Node failure rather than as "the API tests did not run".
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: api/admin-ui/package-lock.json
+
+      # `ci` installs exactly what the lockfile pins, and `--ignore-scripts`
+      # runs no package lifecycle hook: nothing in this dependency set needs
+      # one, and CI is where a compromised transitive dependency would most
+      # like to execute.
+      - name: Install
+        working-directory: api/admin-ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Audit
+        working-directory: api/admin-ui
+        run: npm audit --audit-level=low
+
+      - name: Typecheck
+        working-directory: api/admin-ui
+        run: npm run typecheck
+
+      - name: Test
+        working-directory: api/admin-ui
+        run: npm test
+
+      - name: Build
+        working-directory: api/admin-ui
+        run: npm run build

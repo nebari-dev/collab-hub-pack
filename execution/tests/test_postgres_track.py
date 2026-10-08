@@ -11,15 +11,15 @@ import os
 import pytest
 
 from collab_hub_execution import (
-    DurableWorkflowEngine,
     InMemoryCogExecutor,
+    LifecycleRunner,
     OpDefinition,
     OpStep,
-    PauseRequest,
     PostgresTrackStore,
+    Problem,
     ResultEnvelope,
     RunBudget,
-    RunStatus,
+    RunState,
     TrackEvent,
     derive_run_status,
 )
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(not TEST_PG, reason="set TEST_POSTGRES_URL to ru
 def store():
     from psycopg_pool import ConnectionPool
 
-    pool = ConnectionPool(TEST_PG, min_size=1, open=True)
+    pool = ConnectionPool(TEST_PG, min_size=1, max_size=4, open=True)
     with pool.connection() as conn:
         conn.execute("DROP INDEX IF EXISTS collab_track_one_submission")
         conn.execute("DROP TABLE IF EXISTS collab_track_events")
@@ -47,13 +47,15 @@ def test_append_replay_ordering_jsonb_and_status(store):
     store.append(TrackEvent(run_id="r", event_type="submitted"))
     store.append(TrackEvent(run_id="r", event_type="op_submitted", payload={"op": {"steps": 2}}))
     store.append(TrackEvent(run_id="other", event_type="submitted"))
+    store.append(TrackEvent(run_id="r", event_type="run_picked_up"))
     store.append(TrackEvent(run_id="r", event_type="completed"))
 
     events = store.replay("r")
-    assert [e.event_type for e in events] == ["submitted", "op_submitted", "completed"]
+    assert [e.event_type for e in events] == ["submitted", "op_submitted", "run_picked_up", "completed"]
     assert [e.sequence for e in events] == sorted(e.sequence for e in events)  # stable global order
     assert events[1].payload == {"op": {"steps": 2}}  # jsonb round-trip
-    assert derive_run_status(events) is RunStatus.COMPLETED
+    # One run has one submission; the legacy `submitted` row above is only here to test ordering.
+    assert derive_run_status(events[1:]) is RunState.COMPLETED
     assert store.replay("r", after_sequence=events[0].sequence)[0].event_type == "op_submitted"
 
 
@@ -73,29 +75,78 @@ def test_resubmit_recovers_tuple_input_after_postgres_roundtrip(store):
     op = OpDefinition("recover", (OpStep("s", "c", "run", {"items": ("a", "b")}),))
     store.append(TrackEvent(run_id=op.run_id, event_type="op_submitted", payload={"op": _serialize_op(op)}))
     calls = []
-    engine = DurableWorkflowEngine(
+    engine = LifecycleRunner(
         executor=InMemoryCogExecutor({"c": lambda entry, value: calls.append(value) or value}),
         track=store,
     )
-    assert engine.observe(op.run_id) is RunStatus.SUBMITTED
-    assert engine.submit(op) is RunStatus.COMPLETED
+    assert engine.observe(op.run_id) is RunState.SUBMITTED
+    assert engine.submit(op) is RunState.COMPLETED
     assert len(calls) == 1
-    assert engine.submit(op) is RunStatus.COMPLETED
+    assert engine.submit(op) is RunState.COMPLETED
     assert len(calls) == 1
 
 
-def test_pause_accounting_survives_postgres_recovery(store):
+def test_escalation_accounting_survives_postgres_recovery(store):
     def handler(entry, value, *, signal=_NO_SIGNAL):
-        if signal is _NO_SIGNAL:
-            raise PauseRequest("feedback", usage={"tokens": 6})
-        return ResultEnvelope.success(value, usage={"tokens": 6})
+        problems = [Problem("review", "needs another look")] if signal is _NO_SIGNAL else []
+        return ResultEnvelope.success(value, usage={"tokens": 6}, problems=problems)
 
     def engine():
-        return DurableWorkflowEngine(
+        return LifecycleRunner(
             executor=InMemoryCogExecutor({"c": handler}), track=store, budget=RunBudget(max_tokens=15),
         )
 
     op = OpDefinition("accounting", (OpStep("first", "c", "run"), OpStep("second", "c", "run")))
-    assert engine().submit(op) is RunStatus.PAUSED
-    assert engine().signal(op.run_id, "go") is RunStatus.BUDGET_EXCEEDED
-    assert engine()._budget_tracker(op.run_id).tokens == 18
+    assert engine().submit(op) is RunState.WAITING_AT_GATE
+    escalation = engine().open_escalation(op.run_id)["escalation"]
+    # The second step's result crosses the budget and needs review: it is not discarded.
+    assert engine().decide(op.run_id, escalation=escalation, actor="alice", outcome="send_back",
+                           findings=["go"]) is RunState.WAITING_AT_GATE
+    second = engine().open_escalation(op.run_id)["escalation"]
+    assert engine().decide(op.run_id, escalation=second, actor="alice",
+                           outcome="approve") is RunState.BUDGET_EXCEEDED
+    assert engine().budget_tracker(store.replay(op.run_id)).tokens == 18
+
+
+def test_a_live_stream_never_skips_an_event_that_commits_after_a_later_one(store):
+    """Sequences are drawn at insert, rows appear at commit: appends to a run are serialized.
+
+    Without that, a second append could draw sequence N+1 and commit while the
+    first still holds N uncommitted; a reader would see N+1, move its cursor past
+    N, and never see N once it committed.
+    """
+    import threading
+
+    import psycopg
+
+    from collab_hub_execution.track import _run_lock
+
+    first = store.append(TrackEvent(run_id="r", event_type="op_submitted"))
+    # An append in flight: its lock taken and its row inserted with a sequence, not yet committed.
+    held = psycopg.connect(TEST_PG)
+    held.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_run_lock("r"),))
+    held.execute(
+        "INSERT INTO collab_track_events (event_id, run_id, event_type, payload, occurred_at, schema) "
+        "VALUES ('in-flight', 'r', 'run_picked_up', '{}'::jsonb, now(), 1)"
+    )
+    later, done = [], threading.Event()
+
+    def append_later():
+        later.append(store.append(TrackEvent(run_id="r", event_type="completed")))
+        done.set()
+
+    thread = threading.Thread(target=append_later)
+    thread.start()
+    try:
+        # The later append waits rather than drawing a sequence and committing first ...
+        assert not done.wait(0.5)
+        assert store.replay("r", after_sequence=first.sequence) == ()
+        # ... while another run's append does not wait at all.
+        store.append(TrackEvent(run_id="other", event_type="op_submitted"))
+    finally:
+        held.commit()
+        held.close()
+        thread.join(5)
+    seen = store.replay("r", after_sequence=first.sequence)
+    assert [e.event_type for e in seen] == ["run_picked_up", "completed"]
+    assert seen[0].sequence < seen[1].sequence == later[0].sequence

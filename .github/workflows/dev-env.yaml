@@ -10,7 +10,7 @@ name: Dev Environment
 # levels themselves are meant to be used:
 #
 #   level 1  both macOS and Linux, no containers at all      ~1 min
-#   level 2  Linux, Postgres + MinIO                         ~2 min
+#   level 2  Linux, Postgres + the S3 frame store            ~2 min
 #   level 3  Linux, + Keycloak (the one heavy image)         ~3 min
 #   level 4  rendered only -- no cluster, no node image      ~1 min
 #
@@ -24,7 +24,10 @@ on:
     branches: [main]
     paths:
       - "dev/**"
+      - "cli/**"
+      - "execution/**"
       - "scripts/smoke_frames_common.sh"
+      - "scripts/keycloak_login_browser.py"
       - "helm/**"
       - ".github/workflows/dev-env.yaml"
   pull_request: {}   # runs on every PR so it can be a required status check
@@ -72,7 +75,7 @@ jobs:
           fi
           echo "correctly refused"
 
-      - name: make api serves frames with no token
+      - name: make api serves frames and the Cog catalog with no token
         run: |
           set -euo pipefail
           make -C dev api > /tmp/api.log 2>&1 &
@@ -98,6 +101,86 @@ jobs:
 
           # Level 1 keeps frames on disk and everything else in memory.
           test -d dev/.local/frames || { echo "no local frame store"; exit 1; }
+
+          # The Cog catalog read API (#85) answers from the in-memory catalog:
+          # an empty page and an empty compatibility view, not a 503.
+          page=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs)
+          [ "$page" = '{"items":[],"limit":50,"offset":0,"next_offset":null}' ] \
+            || { echo "GET /v1/cogs returned $page"; exit 1; }
+          view=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs/catalog.v1.json)
+          [ "$view" = '{"schemaVersion":1,"repositories":[]}' ] \
+            || { echo "GET /v1/cogs/catalog.v1.json returned $view"; exit 1; }
+
+          # The collab-hub CLI against dev auth: nobody is signed in, and it says so.
+          make -C dev cli
+          export COLLAB_HUB_CONFIG_DIR="$RUNNER_TEMP/collab-hub" COLLAB_HUB_URL=http://127.0.0.1:8000
+          cli/.venv/bin/collab-hub login 2>&1 | grep -q "runs dev auth" \
+            || { echo "login did not say the hub runs dev auth"; exit 1; }
+          cli/.venv/bin/collab-hub whoami --json | python3 -c '
+          import json, sys
+          me = json.load(sys.stdin)
+          assert me["authenticated_by"] == "dev" and me["signed_in"] is False, me
+          assert me["user"] == "dev-user", me
+          print("whoami reports unauthenticated dev auth as", me["user"])'
+          [ "$(cli/.venv/bin/collab-hub cog list --json)" = "[]" ] \
+            || { echo "collab-hub cog list did not report the empty catalog"; exit 1; }
+
+      # The runner on the `none` backend, the fake Cogs answering in process: each fake Op ends where it
+      # should, and a run stopped mid-step is recorded interrupted when the next
+      # host starts, never resumed (ADR-0002 D2).
+      - name: make op runs the fake Ops, and a stopped run is interrupted
+        run: |
+          set -euo pipefail
+          status() { make -s -C dev op OP="$1" | tee /tmp/op-"$1".log | sed -n 's/^status: //p'; }
+          [ "$(status echo)" = COMPLETED ]                || { cat /tmp/op-echo.log; exit 1; }
+          [ "$(status needs-review)" = WAITING_AT_GATE ]  || { cat /tmp/op-needs-review.log; exit 1; }
+          [ "$(status fails)" = FAILED ]                  || { cat /tmp/op-fails.log; exit 1; }
+          [ "$(status spender)" = BUDGET_EXCEEDED ]       || { cat /tmp/op-spender.log; exit 1; }
+
+          # Kill the host during a 30-second step, then start another host. SIGTERM, since a
+          # background job in a non-interactive shell starts with SIGINT ignored.
+          make -s -C dev op OP=slow > /tmp/op-slow.log 2>&1 &
+          for _ in $(seq 1 60); do grep -q '^run slow-' /tmp/op-slow.log && break; sleep 1; done
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/op-slow.log)
+          [ -n "$run" ] || { echo "the slow Op never started"; cat /tmp/op-slow.log; exit 1; }
+          sleep 2
+          pkill -TERM -f "dev/op.py slow"
+          wait || true
+          make -s -C dev op OP=echo | tee /tmp/op-after.log
+          grep -q "^interrupted $run:" /tmp/op-after.log \
+            || { echo "the stopped run was not recorded interrupted"; exit 1; }
+
+      # The `local` agent location: the same fake Cog as a real process, its `serve` task run in the
+      # package's own pixi environment by the local executor. A host killed with SIGKILL runs no
+      # teardown, and still leaves no worker behind: the launcher that holds the worker sees its
+      # pipe to the host close, and kills the worker's process group (ADR-0002 D12).
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: make op LOCATION=local runs a fake Cog as a process, and a killed host leaves no worker
+        run: |
+          set -euo pipefail
+          workers() { pgrep -f 'dev/cogs/[a-z-]*/\.pixi/envs' || true; }
+          make -s -C dev op OP=echo LOCATION=local | tee /tmp/op-local.log
+          grep -q '^status: COMPLETED' /tmp/op-local.log
+          [ "$(grep -c ' worker_started .*location=local' /tmp/op-local.log)" = 2 ] \
+            || { echo "the steps did not run as local worker processes"; exit 1; }
+          [ "$(grep -c ' worker_stopped ' /tmp/op-local.log)" = 2 ]
+          [ -z "$(workers)" ] || { echo "a worker outlived its step"; exit 1; }
+
+          make -s -C dev op OP=slow LOCATION=local > /tmp/op-slow-local.log 2>&1 &
+          for _ in $(seq 1 120); do [ -n "$(workers)" ] && break; sleep 1; done
+          [ -n "$(workers)" ] || { echo "the slow Cog's worker never started"; cat /tmp/op-slow-local.log; exit 1; }
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/op-slow-local.log)
+          pkill -KILL -f "dev/op.py slow"
+          wait || true
+          for _ in $(seq 1 20); do [ -z "$(workers)" ] && break; sleep 1; done
+          [ -z "$(workers)" ] || { echo "a worker outlived its killed host:"; ps -p "$(workers)" -o pid,command; exit 1; }
+          make -s -C dev op OP=echo | tee /tmp/op-after-kill.log
+          grep -q "^interrupted $run:" /tmp/op-after-kill.log \
+            || { echo "the killed host's run was not recorded interrupted"; exit 1; }
 
       - name: make clean removes the scratch state
         run: |
@@ -147,6 +230,29 @@ jobs:
           code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/frame-groups)
           [ "$code" = "200" ] || { echo "frame-groups returned $code, expected 200"; exit 1; }
 
+          # The Cog catalog on Postgres (migration 7): every filter the list
+          # route builds, so the SQL itself runs against a real server here.
+          code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' \
+                   'http://127.0.0.1:8000/v1/cogs?kind=complete&publisher=p&requires=c&provides=x&accepts=a&produces=b&q=50%25_&source_id=s&offset=1')
+          [ "$code" = "200" ] || { echo "filtered /v1/cogs returned $code, expected 200"; exit 1; }
+          view=$(curl -sfS -m 10 http://127.0.0.1:8000/v1/cogs/catalog.v1.json)
+          [ "$view" = '{"schemaVersion":1,"repositories":[]}' ] \
+            || { echo "GET /v1/cogs/catalog.v1.json returned $view"; exit 1; }
+
+          # The Track tables (migration 12) come from the migration registry the
+          # API ran at startup and from nowhere else: the one module of the API
+          # that imports the execution package is the run router, which is
+          # behind the cog_runs feature flag, off here, and keeps its Track in a
+          # SQLite file, so nothing else could have created them.
+          psql='docker compose -f dev/compose.yaml exec -T postgres psql -U collab -d collab -tAc'
+          tables=$($psql "SELECT count(*) FROM pg_tables WHERE tablename IN ('collab_track_events', 'collab_track_payloads')")
+          [ "$tables" = "2" ] || { echo "expected the two Track tables from migrations, found $tables"; exit 1; }
+          applied=$($psql "SELECT max(version) FROM collab_schema_migrations")
+          [ "$applied" -ge 12 ] || { echo "expected migration 12 applied, latest is $applied"; exit 1; }
+          importers=$(grep -rl --include='*.py' "collab_hub_execution" api/src | sort | tr '\n' ' ')
+          [ "$importers" = "api/src/collab_hub_api/routers/runs.py " ] \
+            || { echo "only the run router may import the execution package; found: $importers"; exit 1; }
+
           pkill -f "collab_hub_api" || true
           sleep 2
 
@@ -178,6 +284,33 @@ jobs:
           [ -n "$sub" ] || { echo "token carries no sub claim"; exit 1; }
           echo "authenticated as $sub"
 
+          # The collab-hub CLI signs in the way the desktop does: the apollo-desktop
+          # client, PKCE, a 127.0.0.1 redirect. The "browser" fills the realm's
+          # login form as dev/dev and follows the redirect back to the CLI.
+          make -C dev cli
+          export COLLAB_HUB_CONFIG_DIR="$RUNNER_TEMP/collab-hub"
+          CLI=cli/.venv/bin/collab-hub
+          BROWSER="python3 $PWD/scripts/keycloak_login_browser.py %s" \
+            timeout 120 $CLI --hub http://127.0.0.1:8000 login
+          $CLI whoami --json | python3 -c '
+          import json, sys
+          me = json.load(sys.stdin)
+          assert me["authenticated_by"] == "token" and me["signed_in"] is True, me
+          assert me["email"] == "dev@example.com" and me["token_expires_at"], me
+          print("signed in through the browser flow as", me["email"])'
+          [ "$(stat -c %a "$COLLAB_HUB_CONFIG_DIR/credentials/default.json")" = "600" ] \
+            || { echo "the stored session is readable by others"; exit 1; }
+          $CLI cog list --json > /dev/null
+          $CLI logout
+          [ -z "$(ls -A "$COLLAB_HUB_CONFIG_DIR/credentials")" ] \
+            || { echo "logout left a session on disk"; exit 1; }
+          code=0; $CLI whoami > /dev/null 2>&1 || code=$?
+          [ "$code" = "5" ] || { echo "whoami after logout exited $code, expected 5"; exit 1; }
+
+          # And with a token instead of a browser, as a script would.
+          make -s -C dev token | $CLI --hub http://127.0.0.1:8000 login --with-token
+          $CLI whoami --json | python3 -c 'import json, sys; assert json.load(sys.stdin)["email"] == "dev@example.com"'
+
       - name: Logs on failure
         if: failure()
         run: |
@@ -205,6 +338,10 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v5
+        with:
+          # Pinned: when the latest-release lookup fails the action falls back to
+          # Helm 3, whose schema errors the negative render tests do not expect.
+          version: v4.3.0
 
       - name: The chart renders with the dev values
         run: |
@@ -274,6 +411,13 @@ jobs:
           mappers = clients["apollo-desktop"].get("protocolMappers", [])
           assert any(m["protocolMapper"] == "oidc-audience-mapper" for m in mappers), \
               "apollo-desktop lost its audience mapper"
+
+          # The desktop and the collab-hub CLI sign in through apollo-desktop with
+          # PKCE and a redirect to a 127.0.0.1 port the system picks.
+          desktop = clients["apollo-desktop"]
+          assert desktop["publicClient"] and desktop["standardFlowEnabled"], "apollo-desktop is no public code-flow client"
+          assert desktop["attributes"].get("pkce.code.challenge.method") == "S256", "apollo-desktop lost PKCE S256"
+          assert "http://127.0.0.1:*/*" in desktop["redirectUris"], "apollo-desktop lost its loopback redirect"
           assert "http://localhost:*" in clients["collab-web"]["redirectUris"], \
               "collab-web can no longer follow an API_PORT override"
           print("realm looks right")

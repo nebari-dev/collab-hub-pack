@@ -274,13 +274,15 @@ security:
   # checks in-route, and the app refuses to start if this map does not leave
   # the routes it actually serves public.
   #
-  # They are inert on an install that does not enable the web surface, and
-  # /admin is inert today on every install: no routes are registered under a
-  # prefix until its page ships, so a request there matches nothing in the app
-  # and falls through to the MCP catch-all mounted at "/", which runs its own
-  # McpAuthMiddleware and authenticates on the API axis before the
+  # They are inert on an install that does not enable the web surface: no
+  # routes are registered under them, so a request there matches nothing in
+  # the app and falls through to the MCP catch-all mounted at "/", which runs
+  # its own McpAuthMiddleware and authenticates on the API axis before the
   # sub-application sees it. A prefix declared public that serves nothing is
-  # not a hole.
+  # not a hole. Where the web surface is enabled and organizations come from
+  # membership, /admin now serves the admin panel (/admin/, /admin/assets/*
+  # and its JSON API under /admin/api/*). The panel authenticates itself with
+  # the web session, the CSRF token on every write, and the operator check.
   #
   # /admin is listed ahead of its routes (nebari-dev/collab-hub-pack#91) on
   # purpose. The alternative — each page shipping its own entry — leaves
@@ -298,6 +300,11 @@ security:
       match: exact
       access: public
     - path: /health/db
+      match: exact
+      access: public
+    # How the collab-hub CLI signs in: asked before the client holds a token,
+    # and naming only what the realm's discovery document already publishes.
+    - path: /v1/auth/cli
       match: exact
       access: public
     - path: /web
@@ -368,6 +375,13 @@ frames:
     # only within one issuer, so frames.auth.bearer.issuer / idToken.issuer must
     # be set and agree (the API refuses to start otherwise).
     identityClaim: ""
+    # -- The public realm client the collab-hub CLI signs in with, which
+    # GET /v1/auth/cli hands to the CLI beside the bearer issuer. Empty means
+    # "apollo-desktop": the CLI reuses the desktop's client and its flow,
+    # authorization code with PKCE on a http://127.0.0.1 loopback redirect, so
+    # its tokens carry the audience frames.auth.bearer.audience already checks.
+    # Set it only for a realm whose desktop client has another id.
+    cliClientId: ""
     # -- Where a caller's organization comes from: "" (same as "claims"),
     # "membership", or "single".
     #
@@ -455,6 +469,27 @@ frames:
       regionKey: SES_REGION
       configurationSetKey: SES_CONFIGURATION_SET
       requestTimeoutSeconds: 10
+  invitations:
+    # -- Whether accepting an invitation additionally requires the identity
+    # provider to have verified the accepter's address.
+    #
+    # Gate B is two checks: the address is verified, AND it equals the invited
+    # address. This drops only the first. The argument for dropping it is that
+    # the invitation token already proves mailbox control -- a 256-bit secret
+    # delivered only to the invited address, which is exactly what a
+    # verification link proves.
+    #
+    # What it costs: a forwarded or shared-mailbox invitation becomes usable by
+    # whoever received it, and their account then carries the invited person's
+    # address permanently. Leave it true on any deployment whose invitees arrive
+    # through an identity provider with trustEmail -- there the check is free
+    # and the invitee never sees a verification step.
+    #
+    # Setting this false also requires the realm to stop forcing verification
+    # (Keycloak `verifyEmail=false`), or nothing changes: Keycloak will not
+    # issue a token to an unverified account, so the relaxed check is never
+    # reached.
+    requireVerifiedEmail: true
   serviceAccess:
     # -- Identity-provider group paths an accepted invitation grants. Empty
     # means grant nothing, which is the default and the only safe one: the
@@ -626,3 +661,73 @@ userDirectory:
     clientIdKey: client-id
     # -- Key in existingSecret containing the Keycloak client secret.
     clientSecretKey: client-secret
+
+cogs:
+  # The Cog registry integration: which OCI registries the hub indexes for
+  # Cogs, how it authenticates to them, and how often it sweeps. Everything
+  # under `registry.sources` reaches the API as ONE JSON environment variable
+  # (COLLAB_HUB_API__COGS__REGISTRY_SOURCES); secrets never do. Each source's
+  # `credentials.existingSecret` / `webhook.existingSecret` is mounted as its
+  # own env vars, named deterministically from the source id:
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_USERNAME
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_PASSWORD
+  #   COLLAB_HUB_COGS_SOURCE_<ID>_WEBHOOK_SECRET
+  # where <ID> is the id upper-cased with every character outside [A-Z0-9]
+  # replaced by "_" (harbor-main -> HARBOR_MAIN). The JSON carries only those
+  # *names* (`credentials.password_env` etc.); the API reads the variables at
+  # startup and refuses to start if one is missing or empty. Two ids that map
+  # to the same <ID> fail the render. See docs/cog-registry.md.
+  registry:
+    # -- Registry sources to index, in order. Each entry:
+    #   id: stable identifier stored with every indexed row (lowercase, [a-z0-9._-], max 64)
+    #   kind: "harbor" (enumerate projects via Harbor's REST API, translate its
+    #         webhooks) or "static" (a fixed repository list and/or a
+    #         catalog.v1.json index; generic OCI only)
+    #   url: external registry URL; its host is the identity in <host>/<repo>@<digest>
+    #   apiUrl: optional in-cluster URL for the listing API and OCI endpoints (harbor only)
+    #   tokenUrl: optional in-cluster bearer-token endpoint for the OCI client
+    #   projects: Harbor projects to enumerate (harbor: at least one)
+    #   repositories: OCI repository paths to index (static)
+    #   indexUrl: catalog.v1.json URL listing repositories (static)
+    #   caBundlePath: per-source CA bundle path; defaults to cogs.caBundle when that is set
+    #   requestTimeoutSeconds: HTTP timeout, default 10
+    #   credentials:
+    #     existingSecret: Secret holding the robot/service credential (required if the block is present)
+    #     usernameKey: key in that Secret, default "username"
+    #     passwordKey: key in that Secret, default "password"
+    #   webhook:
+    #     existingSecret: Secret holding the shared webhook secret (harbor only)
+    #     secretKey: key in that Secret, default "secret"
+    # Example:
+    #   - id: harbor-main
+    #     kind: harbor
+    #     url: https://harbor.example.com
+    #     apiUrl: http://harbor-core.harbor.svc.cluster.local:80
+    #     projects: [cogs]
+    #     credentials:
+    #       existingSecret: collab-hub-harbor-robot
+    #     webhook:
+    #       existingSecret: collab-hub-harbor-webhook
+    sources: []
+  caBundle:
+    # -- ConfigMap holding the CA certificate(s) that signed the registries'
+    # gateway-issued certificates (dev clusters run a private CA). Mounted
+    # read-only at /etc/collab-hub/cogs-ca and passed to every source that
+    # does not set its own caBundlePath. Empty means system trust only.
+    configMap: ""
+    # -- Key in that ConfigMap holding the PEM bundle.
+    key: ca.crt
+  index:
+    # -- Whether the indexer sweeps the configured sources. Off leaves the
+    # Cog read API up and static (it serves what the index already holds);
+    # on with zero sources fails the render and the API's startup.
+    enabled: false
+    # -- Seconds between sweeps (10..86400).
+    intervalSeconds: 300
+    # -- Whether a sweep runs when the API starts, before the first interval.
+    runOnStartup: true
+
+# Feature flags for work in progress that is on main but not yet exposed. Every
+# flag is off until it is listed here and set to true; each entry becomes
+# COLLAB_HUB_API__FEATURES__<NAME>. See docs/feature-flags.md.
+features: {}

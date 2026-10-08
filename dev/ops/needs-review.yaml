@@ -1,0 +1,4 @@
+# A step whose answer carries an `error` problem: its default Gate escalates, and the run waits at the Gate.
+steps:
+  - {name: draft, cog: needs-review, entry_point: write, input: {topic: the Track}}
+  - {name: publish, cog: echo, entry_point: run, input: {to: readers}}

@@ -405,10 +405,7 @@ async def test_token_cached_per_scope_and_refreshed_after_expiry(monkeypatch):
         await client.list_tags(REPO)
         await client.get_blob(REPO, sha256(COG_MD), max_bytes=1024)
         assert len(registry.token_requests) == 1
-        assert all(
-            r.headers.get("Authorization") == "Bearer tok-1"
-            for r in registry.requests[-2:]
-        )
+        assert all(r.headers.get("Authorization") == "Bearer tok-1" for r in registry.requests[-2:])
         # Past expiry (minus the safety margin) the token is dropped and re-fetched.
         now[0] += 120 - oci.TOKEN_EXPIRY_MARGIN_SECONDS
         await client.list_tags(REPO)
@@ -448,6 +445,33 @@ async def test_token_response_without_token_is_protocol_error():
     async with client_for(registry) as client:
         with pytest.raises(OCIProtocolError, match="carries no token"):
             await client.list_tags(REPO)
+
+
+@pytest.mark.parametrize(
+    "bad_token",
+    ["caf\u00e9-token", *(f"tok{chr(code)}en" for code in range(0x20)), "tok\x7fen"],
+    ids=lambda t: repr(t),
+)
+async def test_non_header_safe_token_is_a_protocol_error(bad_token):
+    # Every ASCII control character (0x00-0x1F and DEL), not just the CR/LF/TAB
+    # trio, plus the non-ASCII case (round-3 codex: the check rejected all of
+    # them, the test covered three).
+    # Codex-gate MEDIUM finding, reproduced with the real client: a token the
+    # endpoint returns with non-ASCII (or control) characters used to blow up
+    # as UnicodeEncodeError inside httpx's header construction -- outside this
+    # module's wrapping, so an indexer guarding with `except OCIError` never
+    # recorded the artifact and the sweep died. It must be refused as the
+    # protocol error it is, before any header is built.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "auth.example":
+            return httpx.Response(200, json={"token": bad_token})
+        return httpx.Response(401, headers={"WWW-Authenticate": f'Bearer realm="{REALM}"'})
+
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(OCIProtocolError, match="not a valid ASCII header value") as info:
+            await client.list_tags(REPO)
+        # The token itself is a credential; it is never echoed.
+        assert bad_token not in str(info.value)
 
 
 async def test_token_endpoint_server_error_is_protocol_error():
@@ -570,8 +594,9 @@ async def test_get_manifest_malformed_documents():
         b"[]": "not a JSON object",
         json.dumps({"mediaType": MEDIA_TYPE_OCI_MANIFEST, "layers": {}}).encode(): "'layers' is not a list",
         json.dumps({"mediaType": MEDIA_TYPE_OCI_MANIFEST, "layers": ["x"]}).encode(): "not an object",
-        json.dumps({"mediaType": MEDIA_TYPE_OCI_MANIFEST, "layers": [{"digest": sha256(b""), "size": 0}]}).encode():
-            "no mediaType",
+        json.dumps(
+            {"mediaType": MEDIA_TYPE_OCI_MANIFEST, "layers": [{"digest": sha256(b""), "size": 0}]}
+        ).encode(): "no mediaType",
         json.dumps(
             {"mediaType": MEDIA_TYPE_OCI_MANIFEST, "layers": [{"mediaType": "x", "digest": "sha256:zz", "size": 0}]}
         ).encode(): "malformed digest",
@@ -792,9 +817,7 @@ async def test_list_tags_handles_null_tags_and_rejects_malformed():
 
 async def test_list_tags_pagination_bounded_and_same_origin():
     def endless(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, headers={"Link": f'</v2/{REPO}/tags/list?last=x>; rel="next"'}, json={"tags": ["x"]}
-        )
+        return httpx.Response(200, headers={"Link": f'</v2/{REPO}/tags/list?last=x>; rel="next"'}, json={"tags": ["x"]})
 
     async with OCIClient(REGISTRY, transport=httpx.MockTransport(endless)) as client:
         with pytest.raises(OCIProtocolError, match="did not end within"):

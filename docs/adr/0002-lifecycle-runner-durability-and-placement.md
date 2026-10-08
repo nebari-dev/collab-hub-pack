@@ -112,6 +112,40 @@ the glossary, and updating its issue's row in the
 *(Extends the glossary's rule — a term lands in the PR that introduces it — from
 ADRs to code.)*
 
+**D11 — The lifecycle's states are state machines on the state pattern.** Every
+state a Cog's install, a worker, a step attempt and a run can be in is held by
+one machine per level. Each state is a class behind its machine's interface,
+and an event the current state does not accept is refused, naming both, so an
+illegal move fails instead of becoming a status. Transitions are pure — they
+return the next state and the records that report it — so every durability
+backend moves the same machines, and a run's status is its Track replayed
+through the run machine. The states and transitions are in
+[states](../cog-execution/states.md), and a test holds that page to the code. A
+transition table was the alternative; with the pattern each state owns its
+guards and its records, and a state added later is a class added rather than a
+table edited in several places. *(Builds ADR-0001 invariant 3, a tested
+lifecycle state machine, and keeps D3: status comes from the Track, through one
+derivation.)*
+
+**D12 — Agent location is a setting: `local` or `remote`.** Where a Cog's
+worker runs, relative to the run controller, is one configuration value. At
+`local` the worker is a process on the controller's host, running the Cog
+package's `serve` task in the package's own environment, on a loopback port the
+executor chooses. At `remote` it is a workload on a cluster. The lifecycle
+runner drives both through the same executor interface and the same seam, and
+one conformance suite holds every location to the same behaviour. An executor
+holds no lifecycle logic. A `local` worker inherits nothing from its
+controller but what the binding delivers, is reachable on loopback only, and
+cannot outlive its controller: the launcher that starts it kills its process
+group when the controller lets go of it or dies. Each worker has one *run
+token*, minted when it is materialized and expired when it is torn down; only
+its hash is recorded, on the run's Track, so the API and the controller can
+both check it. `local` is for development and the desktop: a `local` worker
+shares its controller's host and network identity, so the trust boundary of
+ADR-0001 D7 does not hold for it, and a Kubernetes hub always runs `remote`.
+*(Preserves ADR-0001 invariant 2, materialization behind the pluggable
+executor, and D2, the seam as the only contract with a worker; builds on D5.)*
+
 ## Backends at a glance
 
 | | `none` | `dbos` | `temporal` |
@@ -138,6 +172,8 @@ These add to ADR-0001's seven. Cite them as "ADR-0002 invariant N".
 4. The hub depends on the seam, never on the worker SDK or on a harness.
 5. A change is runnable from `dev/`, asserted in CI at its level, and
    documented — in the same PR.
+6. No lifecycle logic inside an executor, and `location` is the only switch
+   between them: nothing imports an executor, and a test proves both.
 
 ## Amendments to ADR-0001
 
