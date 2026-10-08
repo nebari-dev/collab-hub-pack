@@ -27,11 +27,12 @@ source holding the same digest, when the first no longer has it).
   registry; removing a version takes its blobs with it at once, unless
   another pullable manifest references them.
 
-  The record is written on the manifest read, which every OCI client makes
-  before it asks for a blob, and it lives in the shared database, so a blob
-  request reaching another replica finds it. A client that asks for a blob
-  of a manifest nobody has ever pulled through the Hub gets ``BLOB_UNKNOWN``
-  until it (or anyone) reads the manifest.
+  The record is written on the first manifest read, which every OCI client
+  makes before it asks for a blob, for every source holding that digest, and
+  it lives in the shared database, so a blob request reaching another replica
+  finds it. Later reads of the same manifest write nothing. A client that
+  asks for a blob of a manifest nobody has ever pulled through the Hub gets
+  ``BLOB_UNKNOWN`` until it (or anyone) reads the manifest.
 
 **Repository names are the backing repository paths**, unchanged, and are
 *not* qualified by source: a client addresses ``<hub>/<repository>@<digest>``
@@ -220,12 +221,17 @@ class CogRegistryFront:
                 self._log_upstream(row.source_id, repository, exc)
                 unavailable = True
                 continue
-            if not is_index_manifest(manifest):
-                # Verified against its digest a moment ago: what it references
-                # is recorded for the blob requests that follow.
-                await run_in_threadpool(
-                    self._store.record_manifest_blobs, row.source_id, repository, digest, manifest_blobs(manifest)
-                )
+            # Verified against its digest a moment ago: what it references is
+            # recorded for the blob requests that follow. For every source
+            # holding the digest, not only the one that answered -- the same
+            # digest is the same manifest, and a blob request can fall back
+            # to another source only if that source has the descriptors too.
+            # Written once: a digest's descriptors never change, so a read of
+            # a manifest already recorded (a client's HEAD, then its GET, then
+            # everybody else's) costs no write at all.
+            pending = [candidate.source_id for candidate in rows if not candidate.blobs_recorded]
+            if pending and not is_index_manifest(manifest):
+                await run_in_threadpool(self._record_blobs, pending, repository, digest, manifest_blobs(manifest))
             return ServedManifest(
                 digest=digest, media_type=manifest.media_type or MEDIA_TYPE_OCI_MANIFEST, body=manifest.raw
             )
@@ -266,6 +272,12 @@ class CogRegistryFront:
         raise BlobUnknown(f"blob {digest} is not known to {repository}")
 
     # -- lookups --------------------------------------------------------------
+
+    def _record_blobs(
+        self, source_ids: Sequence[str], repository: str, digest: str, blobs: Sequence[BlobDescriptor]
+    ) -> None:
+        for source_id in source_ids:
+            self._store.record_manifest_blobs(source_id, repository, digest, blobs)
 
     def _check_name(self, repository: str) -> None:
         if not is_repository_path(repository):

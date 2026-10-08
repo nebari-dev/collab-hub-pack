@@ -66,6 +66,7 @@ from ..cogs.catalog import (
     CogCatalogStore,
     CogCatalogUnavailableError,
 )
+from ..cogs.deadline import BudgetExhausted
 from ..cogs.models import (
     CatalogV1,
     CatalogV1Repository,
@@ -92,6 +93,7 @@ from ..cogs.registry_credentials import (
 )
 from ..cogs.serving import CogRegistryServing
 from ..dependencies import get_cog_catalog_store, get_cog_registry_serving
+from ..frames import error_codes
 from ..frames.auth import AuthContext, NoOrganizationError, get_auth_context, session_id_of
 from ..frames.orgs import PLATFORM_ROLE_OPERATOR
 from ..path_protection import request_path, winning_rule
@@ -189,7 +191,7 @@ def get_listing_caller(request: Request) -> AuthContext | None:
     return caller
 
 
-def _merged(first: dict | None, second: dict | None) -> dict | None:
+def _merged_exclude(first: dict | None, second: dict | None) -> dict | None:
     """Two ``model_dump(exclude=...)`` specs as one."""
 
     if not first or not second:
@@ -197,7 +199,10 @@ def _merged(first: dict | None, second: dict | None) -> dict | None:
     merged = dict(first)
     for key, value in second.items():
         mine = merged.get(key)
-        merged[key] = _merged(mine, value) if isinstance(mine, dict) and isinstance(value, dict) else value
+        if isinstance(mine, dict) and isinstance(value, dict):
+            merged[key] = _merged_exclude(mine, value)
+        elif mine is not True:
+            merged[key] = value
     return merged
 
 
@@ -222,11 +227,14 @@ class Redaction:
         publishing = serving is not None and serving.publisher is not None
         return cls(anonymous=caller is None, publication=publishing and caller is not None)
 
-    def respond(self, model: BaseModel) -> JSONResponse:
+    def respond(self, model: BaseModel, *, omit: dict | None = None) -> JSONResponse:
+        """Apply anonymous, publication and route-specific exclusions together."""
+
         kind = type(model)
         exclude = kind.ANONYMOUS_EXCLUDE if self.anonymous else None
         if not self.publication:
-            exclude = _merged(exclude, getattr(kind, "PUBLICATION_EXCLUDE", None))
+            exclude = _merged_exclude(exclude, getattr(kind, "PUBLICATION_EXCLUDE", None))
+        exclude = _merged_exclude(exclude, omit)
         return JSONResponse(model.model_dump(mode="json", exclude=exclude))
 
 
@@ -609,17 +617,9 @@ def get_cog_reference(
         present=preferred.present,
         locations=[CogLocation.of(row, registry_host, backing=backing) for row in others],
     )
-    anonymous = _auth is None
-    exclude: dict = {"source_id": True} if anonymous else {}
-    location_exclude: dict = dict(CogLocation.ANONYMOUS_EXCLUDE) if anonymous else {}
-    if not backing:
-        # Absent rather than null, so the answer of a Hub that does not serve
-        # pulls is byte-for-byte what it was before the field existed.
-        exclude["backing_reference"] = True
-        location_exclude["backing_reference"] = True
-    if location_exclude:
-        exclude["locations"] = {"__all__": location_exclude}
-    return JSONResponse(answer.model_dump(mode="json", exclude=exclude or None))
+    # Absent rather than null, so the answer of a Hub that does not serve
+    # pulls is byte-for-byte what it was before the field existed.
+    return Redaction.for_caller(_auth).respond(answer, omit=None if backing else CogReference.BACKING_EXCLUDE)
 
 
 @router.get(
@@ -692,6 +692,19 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def cog_registry_credential_not_found_handler(_request: Request, _exc: CogRegistryCredentialNotFoundError):
         return error_response(
             status.HTTP_404_NOT_FOUND, "cog_registry_credential_not_found", "Registry credential not found"
+        )
+
+    @app.exception_handler(BudgetExhausted)
+    async def cog_budget_exhausted_handler(_request: Request, _exc: BudgetExhausted):
+        # A store call that ran out of time before it could reach the
+        # database: a TimeoutError of this module's, not a psycopg error, so
+        # the app's database handlers do not match it. The same answer as a
+        # pool timeout, which is what it is. ``/v2`` maps it itself, into the
+        # registry's error format, before it gets here.
+        return error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            error_codes.DATABASE_UNAVAILABLE,
+            "The frames database is currently unavailable",
         )
 
     @app.exception_handler(RegistryCredentialsUnavailableError)

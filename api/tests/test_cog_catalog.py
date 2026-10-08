@@ -884,8 +884,13 @@ def _exercise_blobs(store) -> None:
     # A failed re-read or a non-Cog verdict revokes them just the same.
     store.upsert(artifact("2", repository="cogs/a", status=STATUS_FAILED, read_errors=("boom",)))
     assert where("cogs/a", blob_x) == [("mirror", digest("1"), 10)]
-    # Back in the registry and reindexed: pullable again, from what was recorded before.
+    # Back in the registry and reindexed: its descriptors went when it was removed (nothing is kept
+    # for a version that is gone), so its blobs are pullable again once its manifest is next read.
     store.upsert(artifact("1", repository="cogs/a", pushed_at=T0 + timedelta(days=1)))
+    assert where("cogs/a", blob_y) == []
+    (back,) = store.find_pullable("cogs/a", (SOURCE,), digest=digest("1"))
+    assert back.blobs_recorded is False
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), described)
     assert where("cogs/a", blob_y) == [(SOURCE, digest("1"), 20)]
 
 
@@ -1197,6 +1202,164 @@ def test_live_a_sweep_and_publishes_of_the_same_digests_do_not_deadlock(live_sto
     sweeper.join(30)
     assert failures == [], [type(failure).__name__ for failure in failures]
     assert all(store.get(digest(seed)).published_by is not None for seed in seeds)
+
+def _exercise_blob_bookkeeping(store, count_rows) -> None:
+    """A lookup says whether a manifest's descriptors are recorded; removal deletes them."""
+
+    blob = digest("x")
+    for name in ("1", "2", "3"):
+        store.upsert(artifact(name, repository="cogs/a", tags=(f"v{name}",)))
+    store.upsert(artifact("1", source_id="mirror", repository="cogs/a"))
+
+    def recorded(**by) -> dict[str, bool]:
+        return {row.source_id: row.blobs_recorded for row in store.find_pullable("cogs/a", BOTH, **by)}
+
+    assert recorded(digest=digest("1")) == {SOURCE: False, "mirror": False}
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), [BlobDescriptor(blob, 10)])
+    # Per source: one source's record says nothing about another's.
+    assert recorded(digest=digest("1")) == {SOURCE: True, "mirror": False}
+    assert recorded(tag="v1")[SOURCE] is True, "a tag lookup says so too"
+    assert recorded(digest=digest("2")) == {SOURCE: False}
+    store.record_manifest_blobs("mirror", "cogs/a", digest("1"), [BlobDescriptor(blob, 10)])
+    both = [BlobDescriptor(blob, 10), BlobDescriptor(digest("y"), 1)]
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("2"), both)
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("3"), [BlobDescriptor(blob, 10)])
+    # Nothing is recorded for a digest that has no artifact row at all.
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("0"), [BlobDescriptor(blob, 10)])
+    assert count_rows() == 5
+
+    # A targeted removal takes that manifest's rows, and only that source's.
+    assert store.mark_removed_one(SOURCE, "cogs/a", digest("1")) is True
+    assert count_rows() == 4
+    # Nothing is recorded for an artifact that is removed: a manifest read that was still
+    # in flight when its version went leaves nothing behind for the version's return.
+    store.record_manifest_blobs(SOURCE, "cogs/a", digest("1"), [BlobDescriptor(blob, 10)])
+    assert count_rows() == 4
+    # A sweep's removal takes the rows of everything it marked; another source's are not its business.
+    assert store.mark_removed(SOURCE, {"cogs/a": [digest("3")]}) == 1
+    assert count_rows() == 2
+    assert [row.manifest_digest for row in store.find_blob("cogs/a", blob, (SOURCE,))] == [digest("3")]
+    assert {row.source_id for row in store.find_blob("cogs/a", blob, BOTH)} == {SOURCE, "mirror"}
+    # Back again: present, and saying truthfully that nothing is recorded for it.
+    store.upsert(artifact("2", repository="cogs/a", tags=("v2",)))
+    assert recorded(digest=digest("2")) == {SOURCE: False}
+    assert store.find_blob("cogs/a", digest("y"), (SOURCE,)) == []
+
+
+def test_blob_bookkeeping_in_memory(store):
+    _exercise_blob_bookkeeping(store, lambda: sum(len(blobs) for blobs in store._blobs.values()))
+    assert set(store._blobs) == {(SOURCE, "cogs/a", digest("3")), ("mirror", "cogs/a", digest("1"))}
+
+
+@live_postgres
+def test_live_blob_bookkeeping(live_store):
+    store, database = live_store
+
+    def rows() -> list[tuple[str, str]]:
+        with database.connection() as conn:
+            found = conn.execute(
+                "SELECT source_id, manifest_digest FROM collab_cog_manifest_blobs ORDER BY source_id, manifest_digest"
+            ).fetchall()
+        return [(row["source_id"], row["manifest_digest"]) for row in found]
+
+    _exercise_blob_bookkeeping(store, lambda: len(rows()))
+    assert sorted(rows()) == sorted([("mirror", digest("1")), (SOURCE, digest("3"))])
+
+
+@live_postgres
+def test_live_a_removal_waits_for_a_recording_in_flight_and_then_deletes_all_of_it(live_store):
+    """Recording holds the artifact's row; a removal cannot slip between two of a manifest's descriptors."""
+
+    store, database = live_store
+    store.upsert(artifact("1", repository="cogs/a"))
+    key = (SOURCE, "cogs/a", digest("1"))
+    removed: list[bool] = []
+    with database.connection() as recorder:
+        # A recording caught mid-statement: the row held shared, one of two descriptors written.
+        recorder.execute(
+            "SELECT 1 FROM collab_cog_artifacts WHERE source_id = %s AND repository = %s AND digest = %s FOR SHARE", key
+        )
+        recorder.execute(
+            "INSERT INTO collab_cog_manifest_blobs (source_id, repository, manifest_digest, blob_digest, size)"
+            " VALUES (%s, %s, %s, %s, 1)",
+            (*key, digest("x")),
+        )
+        removal = threading.Thread(target=lambda: removed.append(store.mark_removed_one(*key)))
+        removal.start()
+        removal.join(timeout=1.0)
+        assert removal.is_alive(), "the removal went ahead while a recording held the row"
+        recorder.execute(
+            "INSERT INTO collab_cog_manifest_blobs (source_id, repository, manifest_digest, blob_digest, size)"
+            " VALUES (%s, %s, %s, %s, 1)",
+            (*key, digest("y")),
+        )
+    removal.join(timeout=30)
+    assert removed == [True]
+    with database.connection() as conn:
+        left = conn.execute("SELECT count(*) AS n FROM collab_cog_manifest_blobs").fetchone()["n"]
+    assert left == 0, "the removal deleted both descriptors, not only the one written before it started"
+    # And a recording that arrives behind the removal writes nothing.
+    store.record_manifest_blobs(*key, [BlobDescriptor(digest("x"), 1), BlobDescriptor(digest("y"), 1)])
+    with database.connection() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM collab_cog_manifest_blobs").fetchone()["n"] == 0
+
+    # The other order, with the store's own recording: it takes the artifact's row, so while a
+    # removal is in flight it waits, and when the removal commits it finds no present row.
+    store.upsert(artifact("2", repository="cogs/a"))
+    other = (SOURCE, "cogs/a", digest("2"))
+    with database.connection() as remover:
+        remover.execute(
+            "UPDATE collab_cog_artifacts SET removed_at = now()"
+            " WHERE source_id = %s AND repository = %s AND digest = %s",
+            other,
+        )
+        recording = threading.Thread(
+            target=lambda: store.record_manifest_blobs(*other, [BlobDescriptor(digest("x"), 1)])
+        )
+        recording.start()
+        recording.join(timeout=1.0)
+        assert recording.is_alive(), "the recording did not wait for the removal holding the row"
+    recording.join(timeout=30)
+    assert not recording.is_alive()
+    with database.connection() as conn:
+        assert conn.execute("SELECT count(*) AS n FROM collab_cog_manifest_blobs").fetchone()["n"] == 0
+
+
+@live_postgres
+def test_live_the_sweeps_cleanup_leaves_a_version_that_came_back_and_skips_a_row_in_use(live_store):
+    store, database = live_store
+
+    def insert(conn, name: str) -> None:
+        conn.execute(
+            "INSERT INTO collab_cog_manifest_blobs (source_id, repository, manifest_digest, blob_digest, size)"
+            " VALUES (%s, 'cogs/a', %s, %s, 1)",
+            (SOURCE, digest(name), digest("x")),
+        )
+
+    def manifests() -> set[str]:
+        with database.connection() as conn:
+            rows = conn.execute("SELECT manifest_digest FROM collab_cog_manifest_blobs").fetchall()
+        return {row["manifest_digest"] for row in rows}
+
+    for name in ("1", "2", "3"):
+        store.upsert(artifact(name, repository="cogs/a"))
+    # Descriptors left behind for removed rows, as an older build (or a failed cleanup) would leave them.
+    with database.connection() as conn:
+        conn.execute("UPDATE collab_cog_artifacts SET removed_at = now() WHERE source_id = %s", (SOURCE,))
+        for name in ("1", "2", "3"):
+            insert(conn, name)
+    # "1" comes back before the cleanup runs; "2" is held by something else (a reindex in flight).
+    store.upsert(artifact("1", repository="cogs/a"))
+    with database.connection() as holder:
+        holder.execute(
+            "SELECT 1 FROM collab_cog_artifacts WHERE source_id = %s AND digest = %s FOR UPDATE", (SOURCE, digest("2"))
+        )
+        started = time.monotonic()
+        store._forget_removed_blobs(SOURCE)
+        assert time.monotonic() - started < 2.0, "the cleanup waited on the held row"
+        assert manifests() == {digest("1"), digest("2")}, "only the removed, unheld row's descriptors went"
+    store._forget_removed_blobs(SOURCE)
+    assert manifests() == {digest("1")}, "the next sweep takes what was skipped; a present version keeps its own"
 
 
 def test_pullable_lookups_in_memory(store):
@@ -1590,6 +1753,50 @@ def test_mark_removed_excludes_the_repositories_it_is_given():
     assert params[1] == SOURCE and params[2] == ["cogs/z"]
 
 
+def test_mark_removed_then_deletes_the_blob_records_of_the_sources_removed_rows():
+    store, conn = _fake_store([[{"n": 2}]])
+    assert store.mark_removed(SOURCE, {"cogs/a": [DIGEST_A]}) == 2
+    _marked, cleanup = conn.queries
+    # Each removed row is locked (and so re-read) before its descriptors go; one in use is left for the next sweep.
+    assert "WHERE a.source_id = %s AND a.removed_at IS NOT NULL" in cleanup[0]
+    assert "FOR UPDATE OF a SKIP LOCKED" in cleanup[0]
+    assert "DELETE FROM collab_cog_manifest_blobs b USING gone" in cleanup[0]
+    assert cleanup[1] == (SOURCE, SOURCE)
+
+
+def test_a_failed_blob_cleanup_neither_fails_nor_undoes_the_removal(caplog):
+    import psycopg
+
+    class _CleanupFails(_FakeConnection):
+        def execute(self, sql, params=None):
+            if "DELETE FROM collab_cog_manifest_blobs" in sql:
+                self.calls.append((" ".join(sql.split()), tuple(params or ())))
+                raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout on db.internal")
+            return super().execute(sql, params)
+
+    conn = _CleanupFails([[{"n": 4}]])
+    store = PostgresCogCatalogStore(_FakeDb(conn))
+    with caplog.at_level("WARNING", logger="frames_server.cogs.catalog"):
+        assert store.mark_removed(SOURCE, {}) == 4, "the removal was recorded and reported"
+    (record,) = [r for r in caplog.records if r.message == "cog_catalog_blob_cleanup_failed"]
+    assert (record.source_id, record.error) == (SOURCE, "QueryCanceled")
+    assert "db.internal" not in caplog.text
+
+
+def test_mark_removed_one_takes_the_blob_records_of_the_row_it_marked():
+    store, conn = _fake_store([[{"digest": DIGEST_A}]])
+    assert store.mark_removed_one(SOURCE, "cogs/a", DIGEST_A) is True
+    _marked, cleanup = conn.queries
+    assert cleanup == (
+        "DELETE FROM collab_cog_manifest_blobs WHERE source_id = %s AND repository = %s AND manifest_digest = %s",
+        (SOURCE, "cogs/a", DIGEST_A),
+    )
+    # Nothing was marked: nothing is deleted.
+    store, conn = _fake_store([[]])
+    assert store.mark_removed_one(SOURCE, "cogs/a", DIGEST_A) is False
+    assert len(conn.queries) == 1
+
+
 def test_mark_removed_answers_zero_without_a_row():
     store, _ = _fake_store([[]])
     assert store.mark_removed(SOURCE, {}) == 0
@@ -1778,6 +1985,7 @@ def test_list_repositories_is_one_present_cog_row_per_path_in_code_point_order()
 
 
 PULLABLE_SQL = "removed_at IS NULL AND status = 'indexed' AND cog_id IS NOT NULL"
+PULLABLE_SQL_A = "a.removed_at IS NULL AND a.status = 'indexed' AND a.cog_id IS NOT NULL"
 
 
 ACCEPTED_ATTEMPT = (
@@ -1894,7 +2102,8 @@ def test_both_writes_of_a_row_decide_its_publisher_the_same_way_and_lock_nothing
 
 
 def test_removal_can_be_limited_to_rows_written_before_a_clock_reading():
-    store, conn = _fake_store([[{"n": 0}], [{"now": T0}], [{"n": 2}]])
+    # Each removal is followed by the blob-descriptor cleanup from the pull path.
+    store, conn = _fake_store([[{"n": 0}], [], [{"now": T0}], [{"n": 2}], []])
     assert store.mark_removed(SOURCE, {}) == 0
     sql, params = conn.queries[0]
     # In the removal statement itself: nothing can be written between a check and the removal.
@@ -1903,9 +2112,10 @@ def test_removal_can_be_limited_to_rows_written_before_a_clock_reading():
     assert "ORDER BY a.repository, a.digest FOR UPDATE OF a" in sql
     assert params[-3:-1] == (None, None)
     assert store.clock() == T0
-    assert conn.queries[1][0] == "SELECT clock_timestamp() AS now"
+    assert "DELETE FROM collab_cog_manifest_blobs" in conn.queries[1][0]
+    assert conn.queries[2][0] == "SELECT clock_timestamp() AS now"
     assert store.mark_removed(SOURCE, {}, written_before=T0) == 2
-    assert conn.queries[2][1][-3:] == (T0, T0, SOURCE)
+    assert conn.queries[3][1][-3:] == (T0, T0, SOURCE)
 
 
 def _artifact_for_upsert() -> CogArtifact:
@@ -1926,22 +2136,25 @@ def test_rows_read_back_carry_the_publication():
 
 def test_find_pullable_is_an_exact_lookup_scoped_to_the_given_sources():
     rows = [
-        {"source_id": SOURCE, "repository": "cogs/a", "digest": DIGEST_A, "tags": ["v1"]},
-        {"source_id": "mirror", "repository": "cogs/a", "digest": DIGEST_A, "tags": None},
+        {"source_id": SOURCE, "repository": "cogs/a", "digest": DIGEST_A, "tags": ["v1"], "blobs_recorded": True},
+        {"source_id": "mirror", "repository": "cogs/a", "digest": DIGEST_A, "tags": None, "blobs_recorded": False},
     ]
     store, conn = _fake_store([rows, rows[:1]])
     assert store.find_pullable("cogs/a", (SOURCE, "mirror"), digest=DIGEST_A) == [
-        PullableArtifact(source_id=SOURCE, repository="cogs/a", digest=DIGEST_A, tags=("v1",)),
+        PullableArtifact(source_id=SOURCE, repository="cogs/a", digest=DIGEST_A, tags=("v1",), blobs_recorded=True),
         PullableArtifact(source_id="mirror", repository="cogs/a", digest=DIGEST_A, tags=()),
     ]
     sql, params = conn.queries[0]
-    assert f"WHERE repository = %s AND digest = %s AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
-    assert "ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC" in sql and sql.endswith("LIMIT %s")
+    assert f"WHERE a.repository = %s AND a.digest = %s AND a.source_id = ANY(%s) AND {PULLABLE_SQL_A}" in sql
+    assert "ORDER BY a.pushed_at DESC NULLS LAST, a.indexed_at DESC" in sql and sql.endswith("LIMIT %s")
+    # Whether the descriptors are recorded comes back with the row: no second query, and no write to find out.
+    assert "EXISTS ( SELECT 1 FROM collab_cog_manifest_blobs b WHERE b.source_id = a.source_id" in sql
+    assert ") AS blobs_recorded" in sql
     assert params == ("cogs/a", DIGEST_A, [SOURCE, "mirror"], MAX_PULL_CANDIDATES)
 
     assert len(store.find_pullable("cogs/a", [SOURCE], tag="v1")) == 1
     sql, params = conn.queries[1]
-    assert f"WHERE repository = %s AND %s = ANY(tags) AND source_id = ANY(%s) AND {PULLABLE_SQL}" in sql
+    assert f"WHERE a.repository = %s AND %s = ANY(a.tags) AND a.source_id = ANY(%s) AND {PULLABLE_SQL_A}" in sql
     assert params == ("cogs/a", "v1", [SOURCE], MAX_PULL_CANDIDATES)
     with pytest.raises(ValueError, match="exactly one"):
         store.find_pullable("cogs/a", [SOURCE])
@@ -1974,8 +2187,15 @@ def test_record_manifest_blobs_is_one_idempotent_insert():
         SOURCE, "cogs/a", DIGEST_A, [BlobDescriptor(DIGEST_B, 12, "text/plain"), BlobDescriptor(digest("c"), 0)]
     )
     ((sql, params),) = conn.queries
-    assert sql.startswith("INSERT INTO collab_cog_manifest_blobs") and sql.endswith("ON CONFLICT DO NOTHING")
-    assert params == (SOURCE, "cogs/a", DIGEST_A, [DIGEST_B, digest("c")], [12, 0], ["text/plain", ""])
+    # One statement that holds the artifact's present row shared while it writes, and writes nothing without one.
+    assert sql.startswith(
+        "WITH present AS ( SELECT 1 FROM collab_cog_artifacts"
+        " WHERE source_id = %s AND repository = %s AND digest = %s AND removed_at IS NULL FOR SHARE )"
+        " INSERT INTO collab_cog_manifest_blobs"
+    )
+    assert "WHERE EXISTS (SELECT 1 FROM present)" in sql and sql.endswith("ON CONFLICT DO NOTHING")
+    key = (SOURCE, "cogs/a", DIGEST_A)
+    assert params == (*key, *key, [DIGEST_B, digest("c")], [12, 0], ["text/plain", ""])
     store.record_manifest_blobs(SOURCE, "cogs/a", DIGEST_A, [])
     assert len(conn.queries) == 1, "an index or an empty manifest writes nothing"
 

@@ -458,6 +458,90 @@ async def test_exchange_answers_the_documented_contract(hub: Hub):
     assert body["secret"] not in secret_hash and len(secret_hash) == 64
 
 
+async def test_an_exchange_verifies_the_hub_token_once(hub: Hub, monkeypatch):
+    """Authentication and the recorded session id read the same verified claims, not two verifications."""
+
+    from collab_hub_api.frames import auth
+
+    decoded: list[str] = []
+    decode = auth.decode_bearer_payload
+    monkeypatch.setattr(auth, "decode_bearer_payload", lambda token: (decoded.append(token), decode(token))[1])
+    body = await hub.exchange()
+    assert len(decoded) == 1
+    assert hub.serving.credentials._credentials[body["id"]][0].session_id == "session-alice"
+    # Per request, never across them: the next request verifies its own token.
+    other = await hub.exchange(BOB)
+    assert len(decoded) == 2
+    assert hub.serving.credentials._credentials[other["id"]][0].session_id is None
+    # A token that fails verification is remembered as failed for the request, not retried into a pass.
+    refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers={"Authorization": "Bearer nope"})
+    assert refused.status_code == 401 and len(decoded) == 3
+
+
+@pytest.mark.parametrize("method", ["POST", "DELETE"])
+async def test_a_spent_budget_on_the_exchange_routes_is_a_503_not_a_500(hub: Hub, monkeypatch, method):
+    """``BudgetExhausted`` is a TimeoutError of the serving code's own; no psycopg handler matches it."""
+
+    from collab_hub_api.cogs.deadline import BudgetExhausted
+
+    def spent(*_args, **_kwargs):
+        raise BudgetExhausted("the request's time budget is spent")
+
+    for name in ("create_credential", "revoke_all", "revoke_credential"):
+        monkeypatch.setattr(hub.serving.credentials, name, spent)
+    urls = ["/v1/cogs/registry-credentials"]
+    if method == "DELETE":
+        urls.append("/v1/cogs/registry-credentials/crc-0123")
+    for url in urls:
+        response = await hub.request(method, url, headers=ALICE)
+        assert response.status_code == 503, (url, response.text)
+        assert response.json()["error"]["code"] == "database_unavailable"
+
+
+def test_a_route_can_omit_more_than_the_anonymous_cut_but_never_less():
+    from collab_hub_api.cogs.models import CogLocation, CogReference
+
+    merged = cogs_router._merged_exclude(CogReference.ANONYMOUS_EXCLUDE, CogReference.BACKING_EXCLUDE)
+    assert merged == {
+        "source_id": True,
+        "backing_reference": True,
+        "locations": {"__all__": {**CogLocation.ANONYMOUS_EXCLUDE, "backing_reference": True}},
+    }
+    # Neither input is changed, and a field one side drops whole stays dropped whole.
+    assert "backing_reference" not in CogReference.ANONYMOUS_EXCLUDE
+    assert "backing_reference" not in CogLocation.ANONYMOUS_EXCLUDE
+    assert cogs_router._merged_exclude({"locations": True}, CogReference.BACKING_EXCLUDE)["locations"] is True
+    assert cogs_router._merged_exclude({}, {}) == {}
+
+
+async def test_the_reference_route_applies_every_anonymous_exclusion_its_models_declare(hub: Hub, monkeypatch):
+    """The route has no cut of its own: a key added to a model's anonymous cut is dropped here too."""
+
+    from collab_hub_api.cogs.models import CogLocation, CogReference
+
+    hub.seed(REPO, ALPHA, "latest")
+    hub.catalog.upsert(catalog_row("mirror/cog-alpha", ALPHA.digest, tags=("latest",)))
+    monkeypatch.setattr(CogLocation, "ANONYMOUS_EXCLUDE", {**CogLocation.ANONYMOUS_EXCLUDE, "pushed_at": True})
+    monkeypatch.setattr(
+        CogReference,
+        "ANONYMOUS_EXCLUDE",
+        {"source_id": True, "present": True, "locations": {"__all__": CogLocation.ANONYMOUS_EXCLUDE}},
+    )
+    url = f"/v1/cogs/example/cog-alpha/versions/{ALPHA.digest}/reference"
+    hub.app.dependency_overrides[cogs_router.get_catalog_caller] = lambda: None
+    answer = (await hub.client.get(url)).json()
+    assert "present" not in answer and "source_id" not in answer and "backing_reference" not in answer
+    assert answer["locations"] and all(
+        "pushed_at" not in location and "source_id" not in location and "backing_reference" not in location
+        for location in answer["locations"]
+    )
+    # A signed-in caller still gets the model whole (less the backing location, which is an operator's).
+    hub.app.dependency_overrides.pop(cogs_router.get_catalog_caller)
+    answer = (await hub.get(url, headers=ALICE)).json()
+    assert answer["present"] is True and "pushed_at" in answer["locations"][0]
+    assert "backing_reference" not in answer
+
+
 async def test_exchange_refuses_unknown_scopes_and_requires_a_hub_session(hub: Hub):
     for body in ({"scope": "publish"}, {"scope": "pull", "extra": 1}):
         refused = await hub.request("POST", "/v1/cogs/registry-credentials", headers=ALICE, json=body)

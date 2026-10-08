@@ -242,9 +242,91 @@ async def test_removing_a_version_takes_its_blobs_unless_another_version_shares_
 
     hub.catalog.mark_removed_one("backing", REPO, second_digest)
     assert [await status(d) for d in (shared, sha256(unique))] == [404, 404]
-    # Back in the registry and reindexed: pullable again, with nothing to re-record.
+    # Back in the registry and reindexed: its descriptors went with the removal, so the blob
+    # is pullable again as soon as the manifest is read, which is what a client does first.
     hub.catalog.upsert(catalog_row(REPO, first.digest, tags=("first",)))
+    assert await status(own) == 404
+    assert (await hub.request("HEAD", f"/v2/{REPO}/manifests/first", headers=headers)).status_code == 200
     assert await status(own) == 200
+
+
+async def test_a_blob_falls_back_to_another_source_holding_the_same_manifest():
+    """One digest in two sources: whichever answers the manifest, both can then be asked for its blobs."""
+
+    from collab_hub_api.cogs.catalog import InMemoryCogCatalogStore
+    from collab_hub_api.cogs.serving import BlobUnknown, UpstreamUnavailable
+
+    bundle = Bundle("shared")
+    config = sha256(bundle.config)
+    blob_status = {"a": 200, "b": 200}
+    asked: list[tuple[str, str]] = []
+
+    def registry(name: str):
+        def handler(request: httpx.Request) -> httpx.Response:
+            kind = "manifest" if "/manifests/" in request.url.path else "blob"
+            asked.append((name, kind))
+            if kind == "manifest":
+                return httpx.Response(200, content=bundle.manifest, headers={"Content-Type": MEDIA_TYPE_OCI_MANIFEST})
+            if blob_status[name] != 200:
+                return httpx.Response(blob_status[name])
+            return httpx.Response(200, content=bundle.config)
+
+        client = OCIClient(f"https://{name}.example", transport=httpx.MockTransport(handler))
+        return type("Source", (), {"id": name, "host": f"{name}.example", "oci": lambda self: client})()
+
+    class Counting(InMemoryCogCatalogStore):
+        writes = 0
+
+        def record_manifest_blobs(self, *args):
+            type(self).writes += 1
+            return super().record_manifest_blobs(*args)
+
+    store = Counting()
+    store.upsert(catalog_row(REPO, bundle.digest, source_id="a", pushed_at=T0))
+    store.upsert(catalog_row(REPO, bundle.digest, source_id="b", pushed_at=T0 - timedelta(days=1)))
+    front = CogRegistryFront(store, [registry("a"), registry("b")], max_blob_bytes=1 << 20)
+
+    assert (await front.manifest(REPO, bundle.digest)).body == bundle.manifest
+    assert asked == [("a", "manifest")], "only the first source was asked for the manifest"
+    # Recorded for both sources, though only one served it: same digest, same descriptors.
+    assert [found.source_id for found in store.find_blob(REPO, config, ("a", "b"))] == ["a", "b"]
+    assert Counting.writes == 2
+
+    # Read again, by tag and by digest: nothing is written a second time.
+    await front.manifest(REPO, "latest")
+    await front.manifest(REPO, bundle.digest)
+    assert Counting.writes == 2
+
+    for status, error in ((404, None), (500, None)):
+        blob_status["a"] = status
+        asked.clear()
+        served = await front.blob(REPO, config)
+        assert b"".join([chunk async for chunk in served.chunks]) == bundle.config
+        await served.aclose()
+        assert asked == [("a", "blob"), ("b", "blob")], status
+    # Both gone is unknown; one gone and one failing is unavailable, not unknown.
+    blob_status.update(a=404, b=404)
+    with pytest.raises(BlobUnknown):
+        await front.blob(REPO, config)
+    blob_status.update(a=404, b=503)
+    with pytest.raises(UpstreamUnavailable):
+        await front.blob(REPO, config)
+
+
+async def test_a_manifest_read_writes_its_descriptors_once(hub: Hub, monkeypatch):
+    """HEAD then GET, then every later pull: one write for the life of the digest."""
+
+    hub.seed(REPO, ALPHA, "latest")
+    headers = await hub.pull_token(REPO)
+    writes: list[str] = []
+    record = hub.catalog.record_manifest_blobs
+    monkeypatch.setattr(
+        hub.catalog, "record_manifest_blobs", lambda *args: (writes.append(args[2]), record(*args))[1]
+    )
+    for method, reference in (("HEAD", "latest"), ("GET", ALPHA.digest), ("GET", "latest"), ("HEAD", ALPHA.digest)):
+        assert (await hub.request(method, f"/v2/{REPO}/manifests/{reference}", headers=headers)).status_code == 200
+    assert writes == [ALPHA.digest]
+    assert (await hub.get(f"/v2/{REPO}/blobs/{sha256(ALPHA.config)}", headers=headers)).content == ALPHA.config
 
 
 async def test_a_reader_that_stops_reading_does_not_keep_the_upstream_open(hub: Hub, monkeypatch):

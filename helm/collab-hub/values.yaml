@@ -697,9 +697,11 @@ cogs:
     #         source also enumerates what is published through the Hub, so a
     #         static one needs neither repositories nor indexUrl.
     #   blobRedirectHosts: hosts a blob redirect from this registry may point at
-    #         (its object storage): exact names or leading-dot suffixes such as
-    #         ".s3.amazonaws.com". Empty means no allowlist; loopback and
-    #         link-local addresses are refused either way.
+    #         (its object storage): exact names or IPv4 addresses, or
+    #         leading-dot suffixes such as ".s3.amazonaws.com". Empty means no
+    #         allowlist; loopback, link-local and metadata addresses are
+    #         refused either way, and a private IP literal is followed only
+    #         when it is listed here.
     #   credentials:
     #     existingSecret: Secret holding the robot/service credential (required if the block is present)
     #     usernameKey: key in that Secret, default "username"
@@ -763,10 +765,15 @@ cogs:
     maxBlobBytes: 1073741824
     # -- Wall-clock limit on one blob response, in seconds (10..21600).
     maxBlobSeconds: 900
-    # -- With api.ingress.kind=HTTPRoute, give the `/v2` rule a request
-    # timeout of maxBlobSeconds (plus a margin) so the gateway does not cut a
-    # large blob short. Needs HTTPRoute `timeouts` (Gateway API v1.2 standard
-    # channel); set false on older CRDs and configure the gateway instead.
+    # -- Give the route that carries `/v2` a request timeout of
+    # maxBlobSeconds (plus a margin) so the gateway does not cut a large blob
+    # short. With api.ingress.kind=HTTPRoute it is `timeouts` on the chart's
+    # own `/v2` rule (Gateway API v1.2 standard channel). With
+    # api.nebariapp.enabled the route is the operator's, so it is an Envoy
+    # Gateway BackendTrafficPolicy on the NebariApp's public route, which
+    # covers every public path and takes the place of a Gateway-level
+    # BackendTrafficPolicy for that route. Set false on older CRDs, or where
+    # the cluster manages that policy, and configure the gateway instead.
     routeTimeout: true
 
   publish:

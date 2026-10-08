@@ -163,6 +163,7 @@ def case_serve_off(r: Rendered) -> None:
     app = kind(r, "NebariApp")
     assert app is not None
     assert [route["pathPrefix"] for route in app["spec"]["routing"]["publicRoutes"]] == ["/v1", "/mcp", "/health"]
+    assert kind(r, "BackendTrafficPolicy") is None
 
 
 def case_serve_nebariapp(r: Rendered) -> None:
@@ -180,6 +181,31 @@ def case_serve_nebariapp(r: Rendered) -> None:
     assert public[-1] == {"pathPrefix": "/v2", "pathType": "PathPrefix"}, public
     assert [route["pathPrefix"] for route in public] == ["/v1", "/mcp", "/health", "/v2"]
     assert kind(r, "HTTPRoute") is None
+    # The route is the operator's and NebariApp carries no timeout, so the
+    # blob time limit reaches the gateway as a policy on the public route,
+    # named the way the operator names it: "<NebariApp name>-public-route".
+    app = kind(r, "NebariApp")
+    policy = kind(r, "BackendTrafficPolicy")
+    assert policy is not None, "no request timeout reaches the route that carries /v2"
+    assert policy["apiVersion"] == "gateway.envoyproxy.io/v1alpha1"
+    assert policy["metadata"]["namespace"] == app["metadata"]["namespace"]
+    assert policy["spec"] == {
+        "targetRefs": [
+            {
+                "group": "gateway.networking.k8s.io",
+                "kind": "HTTPRoute",
+                "name": app["metadata"]["name"] + "-public-route",
+            }
+        ],
+        "timeout": {"http": {"requestTimeout": "930s"}},
+    }, policy["spec"]
+
+
+def case_serve_nebariapp_no_timeout(r: Rendered) -> None:
+    # routeTimeout=false: /v2 is still a public route, and the chart attaches no policy.
+    public = kind(r, "NebariApp")["spec"]["routing"]["publicRoutes"]
+    assert public[-1] == {"pathPrefix": "/v2", "pathType": "PathPrefix"}, public
+    assert kind(r, "BackendTrafficPolicy") is None
 
 
 def case_serve_httproute(r: Rendered) -> None:
@@ -195,6 +221,8 @@ def case_serve_httproute(r: Rendered) -> None:
     assert rules[0]["timeouts"] == {"request": "1830s"}, rules[0]
     assert rules[0]["backendRefs"] == rules[1]["backendRefs"]
     assert rules[1]["matches"] == [{"path": {"type": "PathPrefix", "value": "/"}}] and "timeouts" not in rules[1]
+    # The chart's own route carries the timeout; the Envoy Gateway policy is for the operator's.
+    assert kind(r, "BackendTrafficPolicy") is None
 
 
 def case_serve_httproute_no_timeout(r: Rendered) -> None:
@@ -208,6 +236,7 @@ def case_serve_httproute_no_timeout(r: Rendered) -> None:
 CASES = {
     "serve-off": case_serve_off,
     "serve-nebariapp": case_serve_nebariapp,
+    "serve-nebariapp-no-timeout": case_serve_nebariapp_no_timeout,
     "serve-httproute": case_serve_httproute,
     "serve-httproute-no-timeout": case_serve_httproute_no_timeout,
     "features": case_features,

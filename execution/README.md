@@ -51,6 +51,18 @@ budget epoch; the engine does not offer it until #4 builds epochs.) Budgets are
 not reset by retrying. Duration is checked at step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
+## The run controller and intents
+
+`python -m collab_hub_execution.controller --track FILE --packages DIR --work-dir DIR`
+is the process that advances runs (ADR-0002 D4). It watches a SQLite Track,
+starts each run that was submitted and not picked up, and delivers each request
+to cancel. `collab_hub_execution.intents` is the other half, used by the hub's
+API: `submit()` and `request_cancel()` record what a client asked for, and
+`describe()` and `list_runs()` read runs back, each step with its state and its
+output. Neither half calls the other; the Track is all they share. One
+controller per Track for now: it holds a lock beside the file. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#the-run-controller-and-the-run-api).
+
 ## The lifecycle runner
 
 The lifecycle lives in `LifecycleRunner` (`collab_hub_execution.runner`), as
@@ -240,7 +252,7 @@ independent metering or hard per-request caps.
 
 Where a worker runs is the runner's `location` setting, `local` or `remote`
 (ADR-0002 D12); only `local` is built behind the switch, and `remote` is
-refused until Phase 20:
+refused until Phase 21:
 
 ```python
 LifecycleRunner(track=track, location="local", location_settings={

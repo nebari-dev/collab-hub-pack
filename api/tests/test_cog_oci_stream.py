@@ -326,11 +326,21 @@ async def test_numeric_and_local_host_forms_are_refused_through_the_redirect_pat
 
 def test_redirect_hosts_are_canonical_addresses_or_real_names():
     kind = oci._redirect_host_kind
-    for host in ("storage.example.com", "s3.amazonaws.com", "10.0.4.7", "192.168.1.9", "2001:db8::1", "7f.example"):
+    for host in ("storage.example.com", "s3.amazonaws.com", "8.8.8.8", "2606:4700::1111", "7f.example"):
         assert kind(host) == "ok", host
+    # Not globally routable: followed only to an address the operator listed.
+    for host in ("10.0.4.7", "192.168.1.9", "172.16.0.1", "100.64.1.1", "fd12:3456::1", "::ffff:10.0.0.1"):
+        assert kind(host) == "private", host
     for host in ("minio", "minio.storage.svc.cluster.local", "0x7f.example", "1.2.3.4.example"):
         assert kind(host) == "ok", host
-    for host in ("127.0.0.1", "169.254.169.254", "::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0", "::"):
+    for host in ("127.0.0.1", "169.254.169.254", "::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0", "::", "ff02::1"):
+        assert kind(host) == "forbidden", host
+    # Metadata endpoints no range check names: AWS over IPv6 is unique-local,
+    # Alibaba is carrier-grade NAT space, Azure's is a public address.
+    for host in ("fd00:ec2::254", "100.100.100.200", "168.63.129.16", "192.0.0.192"):
+        assert kind(host) == "forbidden", host
+    # The same destinations written inside an IPv6 literal: IPv4-mapped, NAT64, 6to4.
+    for host in ("::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1", "::ffff:100.100.100.200"):
         assert kind(host) == "forbidden", host
     for host in ("localhost", "a.localhost"):
         assert kind(host) == "forbidden", host
@@ -380,8 +390,8 @@ async def test_a_redirect_never_downgrades_https_to_http():
     assert asked[-1] == "http://storage.example/blob"
 
 
-async def test_private_addresses_and_the_registry_itself_are_allowed_without_an_allowlist():
-    for location in ("https://10.0.4.7/blob", "https://minio.storage.svc.cluster.local/blob", "/v3/elsewhere"):
+async def test_internal_names_and_the_registry_itself_are_allowed_without_an_allowlist():
+    for location in ("https://minio.storage.svc.cluster.local/blob", "/v3/elsewhere"):
         handler, asked = redirecting(location)
         async with policed(handler) as client:
             stream = await client.open_blob(REPO, DIGEST)
@@ -423,7 +433,39 @@ async def test_an_allowlist_is_enforced_strictly_when_set():
     # The allowlist cannot re-admit what is always refused.
     handler, _ = redirecting("https://127.0.0.1/blob")
     async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=("127.0.0.1",)) as client:
-        with pytest.raises(OCIProtocolError, match="loopback or link-local"):
+        with pytest.raises(OCIProtocolError, match="loopback, link-local or metadata"):
+            await client.open_blob(REPO, DIGEST)
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["http://[fd00:ec2::254]/latest/meta-data/", "http://100.100.100.200/latest/meta-data/"],
+)
+async def test_a_metadata_endpoint_outside_the_link_local_range_is_never_followed(location):
+    handler, asked = redirecting(location, registry="http://registry.example")
+    async with policed(handler, "http://registry.example") as client:
+        with pytest.raises(OCIProtocolError, match="loopback, link-local or metadata"):
+            await client.open_blob(REPO, DIGEST)
+    assert len(asked) == 1, "the metadata endpoint was never asked"
+
+
+async def test_a_private_address_is_followed_only_when_the_operator_listed_it():
+    handler, asked = redirecting("https://10.0.4.7/blob")
+    async with policed(handler, REGISTRY) as client:
+        with pytest.raises(OCIProtocolError, match="private address that is not in blob_redirect_hosts"):
+            await client.open_blob(REPO, DIGEST)
+    assert len(asked) == 1
+
+    handler, asked = redirecting("https://10.0.4.7/blob")
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=("10.0.4.7",)) as client:
+        stream = await client.open_blob(REPO, DIGEST)
+        await stream.aclose()
+    assert len(asked) == 2
+
+    # Listed means that address: a suffix entry that happens to end the same way does not admit it.
+    handler, asked = redirecting("https://10.0.4.7/blob")
+    async with OCIClient(REGISTRY, transport=httpx.MockTransport(handler), redirect_hosts=(".4.7",)) as client:
+        with pytest.raises(OCIProtocolError, match="private address"):
             await client.open_blob(REPO, DIGEST)
 
 

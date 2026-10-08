@@ -173,6 +173,8 @@ class PullableArtifact:
     repository: str
     digest: str
     tags: tuple[str, ...] = ()
+    blobs_recorded: bool = False
+    """Whether this manifest's blob descriptors are already recorded (``record_manifest_blobs``)."""
 
 
 @dataclass(frozen=True)
@@ -504,7 +506,9 @@ class CogCatalogStore(ABC):
         Exactly one of ``digest``/``tag`` is given. Newest first (as
         :meth:`list_versions` orders), so the first row carrying a tag is the
         one the tag resolves to; at most :data:`MAX_PULL_CANDIDATES` rows,
-        which for a digest are the sources holding the same content.
+        which for a digest are the sources holding the same content. Each row
+        says whether its blob descriptors are already recorded, so a manifest
+        read writes them once and never again.
         """
 
         raise NotImplementedError
@@ -536,8 +540,18 @@ class CogCatalogStore(ABC):
         """Remember which blobs a manifest references. Idempotent; the content under a digest never changes.
 
         Written by whoever has just *verified* the manifest's bytes against
-        its digest. The rows grant nothing by themselves: :meth:`find_blob`
-        joins them to the pullable rule at read time.
+        its digest, with **all** of its descriptors in one call. The rows
+        grant nothing by themselves: :meth:`find_blob` joins them to the
+        pullable rule at read time.
+
+        Recording and removal are serialized on the artifact's row, which is
+        what lets :attr:`PullableArtifact.blobs_recorded` mean "all of them":
+        nothing is recorded for an artifact that has no present row (a call
+        for one is a no-op), and marking an artifact removed
+        (:meth:`mark_removed`, :meth:`mark_removed_one`) deletes every row
+        recorded for it. A manifest therefore has either all of its
+        descriptors or none, and one that comes back is recorded again by
+        its next manifest read.
         """
 
         raise NotImplementedError
@@ -970,6 +984,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
                 if written_before is not None and row.indexed_at is not None and row.indexed_at >= written_before:
                     continue
                 self._rows[key] = replace(row, removed_at=now)
+                self._blobs.pop(key, None)
                 marked += 1
         return marked
 
@@ -979,6 +994,7 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             if row is None or row.removed_at is not None:
                 return False
             self._rows[(source_id, repository, digest)] = replace(row, removed_at=datetime.now(UTC))
+            self._blobs.pop((source_id, repository, digest), None)
             return True
 
     def clock(self) -> datetime:
@@ -1071,8 +1087,16 @@ class InMemoryCogCatalogStore(CogCatalogStore):
             for row in self._pullable_rows(repository, source_ids)
             if (row.digest == digest if digest is not None else tag in row.tags)
         ]
+        with self._lock:
+            recorded = set(self._blobs)
         return [
-            PullableArtifact(source_id=row.source_id, repository=row.repository, digest=row.digest, tags=row.tags)
+            PullableArtifact(
+                source_id=row.source_id,
+                repository=row.repository,
+                digest=row.digest,
+                tags=row.tags,
+                blobs_recorded=(row.source_id, row.repository, row.digest) in recorded,
+            )
             for row in rows[:MAX_PULL_CANDIDATES]
         ]
 
@@ -1084,9 +1108,14 @@ class InMemoryCogCatalogStore(CogCatalogStore):
         return sorted(tag for tag in tags if after is None or tag > after)[: _tags_limit(limit)]
 
     def record_manifest_blobs(self, source_id, repository, manifest_digest, blobs) -> None:
+        descriptors = list(blobs)
+        key = (source_id, repository, manifest_digest)
         with self._lock:
-            recorded = self._blobs.setdefault((source_id, repository, manifest_digest), {})
-            for blob in blobs:
+            row = self._rows.get(key)
+            if not descriptors or row is None or row.removed_at is not None:
+                return
+            recorded = self._blobs.setdefault(key, {})
+            for blob in descriptors:
                 recorded.setdefault(blob.digest, blob)
 
     def find_blob(self, repository, blob_digest, source_ids) -> list[PullableBlob]:
@@ -1519,12 +1548,60 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 """,
                 (Jsonb(document), source_id, shielded, written_before, written_before, source_id),
             ).fetchone()
+        self._forget_removed_blobs(source_id)
         return int(row["n"]) if row else 0
 
     def clock(self) -> datetime:
         with self._sweep_connection() as conn:
             row = conn.execute("SELECT clock_timestamp() AS now").fetchone()
         return row["now"]
+
+    def _forget_removed_blobs(self, source_id: str) -> None:
+        """Delete the blob descriptors recorded for the removed artifacts of ``source_id``.
+
+        A removed manifest's descriptors serve nothing (:meth:`find_blob`
+        joins them to a present row), so they go where rows stop being
+        present instead of accumulating. Once per source per sweep, never on
+        a request.
+
+        Each removed row is locked before its descriptors are deleted, and
+        the lock re-reads it: a row a reindex has just made present again is
+        left alone, and a reindex that arrives meanwhile waits and then finds
+        the descriptors gone and the row saying so. A row something else
+        holds is skipped and taken by the next sweep. Nothing can be recorded
+        for a removed row (:meth:`record_manifest_blobs`), so what is deleted
+        here is always a manifest's whole set.
+
+        Housekeeping, and a statement of its own after the removal has been
+        recorded: if it fails, the removal stands, the sweep goes on, and
+        the next sweep deletes the same rows.
+        """
+
+        import psycopg
+
+        try:
+            with self._sweep_connection() as conn:
+                conn.execute(
+                    """
+                    WITH gone AS (
+                        SELECT a.repository, a.digest FROM collab_cog_artifacts a
+                        WHERE a.source_id = %s AND a.removed_at IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1 FROM collab_cog_manifest_blobs b
+                              WHERE b.source_id = a.source_id AND b.repository = a.repository
+                                AND b.manifest_digest = a.digest
+                          )
+                        FOR UPDATE OF a SKIP LOCKED
+                    )
+                    DELETE FROM collab_cog_manifest_blobs b USING gone
+                    WHERE b.source_id = %s AND b.repository = gone.repository AND b.manifest_digest = gone.digest
+                    """,
+                    (source_id, source_id),
+                )
+        except psycopg.Error as exc:
+            logger.warning(
+                "cog_catalog_blob_cleanup_failed", extra={"source_id": source_id, "error": type(exc).__name__}
+            )
 
     def mark_removed_one(self, source_id, repository, digest) -> bool:
         # A targeted entry point (webhook delete), never the sweep's: it takes
@@ -1539,6 +1616,17 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 """,
                 (source_id, repository, digest),
             ).fetchone()
+            if row is not None:
+                # Same transaction as the mark, which holds the row: a
+                # recording in flight finished before the mark could start,
+                # and none can begin until this commits.
+                conn.execute(
+                    """
+                    DELETE FROM collab_cog_manifest_blobs
+                    WHERE source_id = %s AND repository = %s AND manifest_digest = %s
+                    """,
+                    (source_id, repository, digest),
+                )
         return row is not None
 
     def sweep_lock(self) -> AbstractContextManager[bool]:
@@ -1671,13 +1759,19 @@ class PostgresCogCatalogStore(CogCatalogStore):
 
     def find_pullable(self, repository, source_ids, *, digest=None, tag=None) -> list[PullableArtifact]:
         _one_of(digest, tag)
-        match = "digest = %s" if digest is not None else "%s = ANY(tags)"
+        match = "a.digest = %s" if digest is not None else "%s = ANY(a.tags)"
         with bounded_connection(self._db) as conn:
             rows = conn.execute(
                 f"""
-                SELECT source_id, repository, digest, tags FROM collab_cog_artifacts
-                WHERE repository = %s AND {match} AND source_id = ANY(%s) AND {_PULLABLE}
-                ORDER BY pushed_at DESC NULLS LAST, indexed_at DESC, source_id, repository, digest
+                SELECT a.source_id, a.repository, a.digest, a.tags,
+                       EXISTS (
+                           SELECT 1 FROM collab_cog_manifest_blobs b
+                           WHERE b.source_id = a.source_id AND b.repository = a.repository
+                             AND b.manifest_digest = a.digest
+                       ) AS blobs_recorded
+                FROM collab_cog_artifacts a
+                WHERE a.repository = %s AND {match} AND a.source_id = ANY(%s) AND {_PULLABLE_A}
+                ORDER BY a.pushed_at DESC NULLS LAST, a.indexed_at DESC, a.source_id, a.repository, a.digest
                 LIMIT %s
                 """,
                 (repository, digest if digest is not None else tag, list(source_ids), MAX_PULL_CANDIDATES),
@@ -1688,6 +1782,7 @@ class PostgresCogCatalogStore(CogCatalogStore):
                 repository=row["repository"],
                 digest=row["digest"],
                 tags=tuple(row["tags"] or ()),
+                blobs_recorded=bool(row["blobs_recorded"]),
             )
             for row in rows
         ]
@@ -1727,15 +1822,31 @@ class PostgresCogCatalogStore(CogCatalogStore):
         with bounded_connection(self._db) as conn:
             # One statement, and a no-op once the manifest has been recorded:
             # what a digest references cannot change.
+            #
+            # Only for an artifact whose row is present, and holding that row
+            # shared while the descriptors go in. Marking it removed updates
+            # the row, so a removal waits for this statement and then deletes
+            # everything it wrote, and a recording that arrives behind a
+            # removal finds no present row and writes nothing. That is what
+            # keeps a manifest's descriptors all-or-none (see the base class).
             conn.execute(
                 """
+                WITH present AS (
+                    SELECT 1 FROM collab_cog_artifacts
+                    WHERE source_id = %s AND repository = %s AND digest = %s AND removed_at IS NULL
+                    FOR SHARE
+                )
                 INSERT INTO collab_cog_manifest_blobs
                     (source_id, repository, manifest_digest, blob_digest, size, media_type)
                 SELECT %s, %s, %s, blob.digest, blob.size, blob.media_type
                 FROM unnest(%s::text[], %s::bigint[], %s::text[]) AS blob(digest, size, media_type)
+                WHERE EXISTS (SELECT 1 FROM present)
                 ON CONFLICT DO NOTHING
                 """,
                 (
+                    source_id,
+                    repository,
+                    manifest_digest,
                     source_id,
                     repository,
                     manifest_digest,

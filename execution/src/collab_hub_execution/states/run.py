@@ -257,9 +257,16 @@ class Run(Context):
     escalations: Mapping[str, int] = field(default_factory=dict)
 
     @classmethod
-    def submit(cls, run_id: str, op: Mapping[str, Any]) -> Transition[Run]:
-        """A new run, and the record of its submission."""
-        return Transition(cls(run_id=run_id), (Record("op_submitted", {"op": dict(op)}),))
+    def submit(cls, run_id: str, op: Mapping[str, Any], *, by: Mapping[str, Any] | None = None,
+               name: str | None = None) -> Transition[Run]:
+        """A new run, and the record of its submission; ``by`` is who submitted it, when a client did, and
+        ``name`` what they called it."""
+        payload: dict[str, Any] = {"op": dict(op)}
+        if by is not None:
+            payload["submitted_by"] = dict(by)
+        if name is not None:
+            payload["name"] = name
+        return Transition(cls(run_id=run_id), (Record("op_submitted", payload),))
 
     def pickup(self) -> Transition[Run]:
         return self.dispatch("pickup")
@@ -388,6 +395,12 @@ _FACTS = frozenset({
     "step_started", "materialized", "ready", "interaction_started", "interaction_usage",
     "idle", "teardown_started", "teardown_failed", "step_completed", "step_failed",
     "worker_started", "worker_stopped",
+    # What a client asked for, written by the API for the controller to deliver; the run moves
+    # when the controller acts on it, which `cancelled` records.
+    "cancel_requested",
+    # A turn of a session Cog: asked by a client through the API, answered through the
+    # controller. Neither moves the run.
+    "turn_requested", "turn_answered", "turn_failed",
 })
 
 # The payload fields that decide where a replayed event leads; a record and its replay must agree on them.

@@ -1029,6 +1029,19 @@ reuse, and re-raising on a later call would be indistinguishable anyway.
 """
 
 
+CREDENTIAL_CLAIMS_SCOPE_KEY = "frames_server_credential_claims"
+"""ASGI scope key holding the verified claims of *this* request's credential.
+
+Same reasoning as :data:`AUTH_CONTEXT_SCOPE_KEY`, one level down: more than
+one caller on a request needs the claims themselves (the auth context, the
+caller identity, the session id recorded with a registry credential), and
+each used to verify the same token again, a JWKS lookup included. The token
+a request carries cannot change during the request, so its verification is
+done once. A token that failed verification is remembered as failed, with
+its 401 message; a request with no credential stores nothing.
+"""
+
+
 def _credential_claims(request: Request) -> tuple[dict, str] | None:
     """The claims of whichever credential this request carries, if any.
 
@@ -1043,6 +1056,16 @@ def _credential_claims(request: Request) -> tuple[dict, str] | None:
     from a surface that authenticates differently from the rest of the app.
     """
 
+    cached = request.scope.get(CREDENTIAL_CLAIMS_SCOPE_KEY)
+    if cached is not None:
+        return cached
+    credential = _decode_credential(request)
+    if credential is not None:
+        request.scope[CREDENTIAL_CLAIMS_SCOPE_KEY] = credential
+    return credential
+
+
+def _decode_credential(request: Request) -> tuple[dict, str] | None:
     id_token = get_id_token(request)
     if id_token:
         try:

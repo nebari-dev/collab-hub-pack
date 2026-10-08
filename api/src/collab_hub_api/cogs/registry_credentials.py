@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
 import threading
 import time
@@ -42,6 +43,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from .deadline import bounded_connection
+
+logger = logging.getLogger("frames_server.cogs.registry_credentials")
 
 SCOPE_PULL = "pull"
 SCOPE_PUBLISH = "publish"
@@ -58,7 +61,32 @@ CREDENTIAL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
 the id goes into ``DELETE /v1/cogs/registry-credentials/{id}`` unescaped."""
 
 SWEEP_INTERVAL_SECONDS = 300.0
-"""How often a read may sweep expired rows; see ``PostgresRegistryCredentialStore._sweep_if_due``."""
+"""How often a process sweeps expired rows; see ``PostgresRegistryCredentialStore._sweep_if_due``."""
+
+SWEEP_BATCH_ROWS = 5000
+"""Most rows one sweep deletes from each table; a full batch makes the next call sweep again."""
+
+SWEEP_TIMEOUT_SECONDS = 5.0
+"""What a sweep may spend waiting for a connection, and again on its statements."""
+
+_SWEEP_STATEMENTS = (
+    # Oldest first, in bounded batches, and never waiting on a row another
+    # transaction holds (another replica's sweep, a mint checking this
+    # credential): what is skipped is taken by the next sweep. Deleting a
+    # credential cascades to its tokens.
+    """
+    DELETE FROM collab_cog_registry_credentials WHERE id IN (
+        SELECT id FROM collab_cog_registry_credentials
+        WHERE expires_at <= now() ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED
+    )
+    """,
+    """
+    DELETE FROM collab_cog_registry_tokens WHERE token_hash IN (
+        SELECT token_hash FROM collab_cog_registry_tokens
+        WHERE expires_at <= now() ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED
+    )
+    """,
+)
 
 CREDENTIAL_ISSUE_LOCK_CLASS = int.from_bytes(b"crc1", "big")
 """First key of the two-key advisory lock that serializes one user's credential issuance.
@@ -169,7 +197,7 @@ class RegistryCredentialStore(ABC):
         ttl_seconds: int,
         org_id: str | None = None,
     ) -> RegistryCredential:
-        """Store a new credential; also drops expired rows and the user's oldest past the cap."""
+        """Store a new credential; also drops the user's expired ones and their oldest past the cap."""
 
         raise NotImplementedError
 
@@ -397,23 +425,54 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
     def __init__(self, db):
         self._db = db
         self._last_sweep = time.monotonic()
+        self._sweep_guard = threading.Lock()
+        self._sweep_thread: threading.Thread | None = None
 
-    def _sweep_if_due(self, conn) -> None:
-        """Delete expired rows, at most once per :data:`SWEEP_INTERVAL_SECONDS` per process.
+    def _sweep_if_due(self) -> None:
+        """Start a sweep of expired rows, at most once per :data:`SWEEP_INTERVAL_SECONDS` per process.
 
-        Writes already sweep; this covers a Hub that has gone quiet, where
-        the last credentials and tokens would otherwise sit expired until
-        the next exchange. Rides a read's connection, so there is no timer.
+        Expired rows are housekeeping, never correctness: every lookup
+        filters on ``expires_at`` itself. So no request deletes them. A call
+        that finds a sweep due only starts one, on a thread and a pooled
+        connection of its own, and carries on; the sweep is outside every
+        request's transaction, ``statement_timeout`` and budget, and a sweep
+        that fails or is slow costs no request anything. There is no timer:
+        a Hub nobody is calling has nobody waiting on the rows either.
         """
 
         now = time.monotonic()
-        if now - self._last_sweep < SWEEP_INTERVAL_SECONDS:
-            return
-        self._last_sweep = now
-        conn.execute("DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()")
-        conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
+        with self._sweep_guard:
+            if now - self._last_sweep < SWEEP_INTERVAL_SECONDS:
+                return
+            if self._sweep_thread is not None and self._sweep_thread.is_alive():
+                return
+            self._last_sweep = now
+            self._sweep_thread = threading.Thread(
+                target=self._sweep, name="cog-registry-credential-sweep", daemon=True
+            )
+            self._sweep_thread.start()
+
+    def _sweep(self) -> None:
+        try:
+            full = False
+            with self._db.connection(timeout=SWEEP_TIMEOUT_SECONDS) as conn:
+                conn.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (str(int(SWEEP_TIMEOUT_SECONDS * 1000)),),
+                )
+                for statement in _SWEEP_STATEMENTS:
+                    full = conn.execute(statement, (SWEEP_BATCH_ROWS,)).rowcount >= SWEEP_BATCH_ROWS or full
+            if full:
+                # More is waiting than one batch took: the next call sweeps again.
+                with self._sweep_guard:
+                    self._last_sweep = float("-inf")
+        except Exception as exc:
+            # Whatever went wrong is retried an interval from now. The class
+            # only: a driver message can carry connection details.
+            logger.warning("cog_registry_credential_sweep_failed", extra={"error": type(exc).__name__})
 
     def create_credential(self, *, credential_id, user_id, secret_hash, scope, session_id, ttl_seconds, org_id=None):
+        self._sweep_if_due()
         with bounded_connection(self._db) as conn:
             # Issuance and pruning for one user are serialized: without this,
             # two concurrent exchanges each prune before the other commits and
@@ -424,11 +483,13 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
                 "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
                 (CREDENTIAL_ISSUE_LOCK_CLASS, user_id),
             )
-            # Housekeeping rides the write that makes it necessary: expired
-            # rows go (their tokens cascade), and so do expired tokens that
-            # never had a credential.
-            conn.execute("DELETE FROM collab_cog_registry_credentials WHERE expires_at <= now()")
-            conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
+            # This user's expired credentials go first (their tokens
+            # cascade), so the cap below counts live ones. Only this user's:
+            # everyone else's are the background sweep's, not this request's.
+            conn.execute(
+                "DELETE FROM collab_cog_registry_credentials WHERE user_id = %s AND expires_at <= now()",
+                (user_id,),
+            )
             row = conn.execute(
                 """
                 INSERT INTO collab_cog_registry_credentials
@@ -487,10 +548,9 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
     def create_token(self, *, token_hash, user_id, credential_id, repositories, ttl_seconds, push_repositories=()):
         names = list(repositories)
         pushable = list(push_repositories)
+        # No table-wide delete on the mint: concurrent pulls must not queue behind housekeeping.
+        self._sweep_if_due()
         with bounded_connection(self._db) as conn:
-            # Tokens minted from a Hub access token have no credential whose
-            # expiry would sweep them, so the mint sweeps.
-            conn.execute("DELETE FROM collab_cog_registry_tokens WHERE expires_at <= now()")
             if credential_id is None:
                 row = conn.execute(
                     """
@@ -525,8 +585,8 @@ class PostgresRegistryCredentialStore(RegistryCredentialStore):
         return _grant_from_row(row) if row else None
 
     def find_token(self, token_hash):
+        self._sweep_if_due()
         with bounded_connection(self._db) as conn:
-            self._sweep_if_due(conn)
             row = conn.execute(
                 """
                 SELECT t.user_id, t.credential_id, t.repositories, t.push_repositories, c.org_id,

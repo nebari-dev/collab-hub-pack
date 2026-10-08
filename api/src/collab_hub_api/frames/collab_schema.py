@@ -820,7 +820,8 @@ COLLAB_SCHEMA_MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             # Which blobs a manifest references: its config and layer
             # descriptors, written once its bytes have been verified against
             # its digest (what a digest references never changes, so rows are
-            # only ever inserted). A blob request names a repository and a
+            # inserted and never updated; the catalog store deletes them when
+            # their artifact is marked removed). A blob request names a repository and a
             # blob digest and nothing else; this is what ties it to a manifest
             # without reading registries at request time. The rows grant
             # nothing alone: a blob is pullable only while a row here joins
