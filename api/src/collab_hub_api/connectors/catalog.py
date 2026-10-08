@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote
 
 from .models import (
     GITHUB_CONNECTOR_ID,
@@ -134,12 +134,10 @@ def connector_link(descriptor: ConnectorDescriptor, section) -> ConnectorLink | 
 
     if section.static_access_token or not section.broker_token_url:
         return None
-    try:
-        path = urlsplit(section.broker_token_url).path
-    except ValueError:
-        # Not a URL at all. The token provider will say so when it is used;
-        # the list must still be served.
-        path = ""
+    # The path is cut from the configured string as written, not through a URL
+    # parser: a parser drops tabs and newlines and rejects some hosts outright,
+    # and either would describe an alias other than the one configured.
+    path = re.split(r"[?#]", section.broker_token_url, maxsplit=1)[0]
     tail = _BROKER_TAIL.search(path)
     if tail is None:
         # Not Keycloak-shaped, so the URL does not name the alias. The provider

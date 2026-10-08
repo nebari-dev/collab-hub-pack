@@ -333,7 +333,9 @@ async def test_a_broker_url_that_is_not_a_url_does_not_sink_the_list(hub):
         # Not Keycloak-shaped: the URL does not name the alias, so the provider key stands in.
         ("https://tokens.example.com/slack", "slack"),
         ("https://kc.example.com/realms/hub/BROKER/acme/TOKEN", "slack"),
-        ("https://[bad/broker/acme/token", "slack"),
+        # Nothing here depends on the rest of the URL being one a parser accepts.
+        ("https://[bad/broker/acme/token", "acme"),
+        ("not a url", "slack"),
     ],
 )
 def test_alias_is_read_from_the_broker_url_or_falls_back_to_the_provider(url, alias):
@@ -345,7 +347,20 @@ def test_alias_is_read_from_the_broker_url_or_falls_back_to_the_provider(url, al
 
 @pytest.mark.parametrize(
     "alias",
-    ["bad%20alias", "", "_leading", "a" * 65, "acme%2Fslack", "acme&kc_action=x", "%C3%A9cole"],
+    [
+        "bad%20alias",
+        "",
+        "_leading",
+        "a" * 65,
+        "acme%2Fslack",
+        "acme&kc_action=x",
+        "%C3%A9cole",
+        # A URL parser would drop these and report `acmeslack`.
+        "acme\tslack",
+        "acme\nslack",
+        "acme\rslack",
+        "acme slack",
+    ],
 )
 def test_an_alias_a_client_would_not_link_is_no_link_rather_than_a_guess(alias):
     """Naming a different provider than the one configured would link the wrong account."""

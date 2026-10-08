@@ -77,7 +77,9 @@ re-asks when told to.
 - Show only what is listed. Do not probe a status route to decide whether a
   connector exists.
 - One connector's trouble does not fail the list: a connector whose status
-  cannot be read is listed with `state: "unavailable"` and a `detail`.
+  read fails outright is listed with `state: "unavailable"` and a `detail`.
+  Each connector otherwise reports provider trouble as its own status route
+  does.
 
 ## What this route does not change
 
