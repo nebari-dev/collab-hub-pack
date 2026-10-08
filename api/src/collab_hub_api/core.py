@@ -285,6 +285,13 @@ def make_app(config: BaseConfig) -> FastAPI:
     # surface and the registry sources it reads from, built on every replica
     # that serves it and independent of whether this process indexes.
     cog_registry_serving = build_cog_registry_serving(config, cog_catalog_store, postgres_pools)
+    # The run API (/v1/runs) is behind a feature flag, and so is its import: it is the one
+    # place the API uses the execution package, which an image need not ship until it is on.
+    run_service = None
+    if config.features.enabled("cog_runs"):
+        from .routers import runs as runs_router
+
+        run_service = runs_router.build_run_service(config.runs)
     if org_source_resolves_membership():
         # Third membership precondition (the env-only ones are checked above):
         # the organization store must have a real backend. Membership is an
@@ -361,6 +368,7 @@ def make_app(config: BaseConfig) -> FastAPI:
             app.state.mcp_server = mcp
             app.state.connectors_config = config.connectors
             app.state.features = config.features
+            app.state.run_service = run_service
             # Process-wide bound on concurrent generic GitHub reads (api_get).
             # Created once here, where the sizing config is in hand and we're
             # already inside the event loop — so the route needs no lazy
@@ -758,6 +766,8 @@ def make_app(config: BaseConfig) -> FastAPI:
         # The OCI read API (#179), at the host root: registry clients address
         # /v2/ there and nowhere else. Absent unless cogs.serve.enabled.
         app.include_router(registry.router)
+    if run_service is not None:
+        app.include_router(runs_router.router, prefix="/v1")
     # Who is calling, and how the collab-hub CLI signs in. /auth/cli is public:
     # the hardened map lists it, since a client asks it before it holds a token.
     app.include_router(identity.router, prefix="/v1")

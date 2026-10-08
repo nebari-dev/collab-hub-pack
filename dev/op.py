@@ -14,7 +14,7 @@ the way a host does: a run a previous `make op` left unfinished — stopped
 mid-step with Ctrl-C — is recorded `interrupted` before the new run starts.
 
 One host at a time: the runner assumes it is the only one advancing the runs on
-its Track, and run pickup (Phase 10 of the plan) is what lets hosts share one.
+its Track, and run pickup (Phase 11 of the plan) is what lets hosts share one.
 Until then a second `make op` on the same Track refuses to start while another
 is running, rather than record `interrupted` for a run the first is still
 advancing, whose later writes would leave that run's Track unreadable.
@@ -107,7 +107,7 @@ def main() -> int:
         fcntl.flock(host, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print(f"another `make op` is running on {track_path}: one host at a time on a Track, until run pickup "
-              "(Phase 10) lets hosts share one", file=sys.stderr)
+              "(Phase 11) lets hosts share one", file=sys.stderr)
         return 1
     SqliteTrackStore.ensure_schema(track_path)
     track = SqliteTrackStore(track_path)

@@ -21,8 +21,8 @@ does.
 | Backend | Setting | Built | A run in flight when its host stops |
 |---|---|---|---|
 | `none` | `backend="none"` (the default) | yes | is recorded `interrupted` when a host starts, and never resumes; a person retries it |
-| `dbos` | `backend="dbos"` | Phase 25 of the plan (#104) | resumes from its last completed step, on Postgres or SQLite |
-| `temporal` | `backend="temporal"` | Phase 31 (#110) | resumes, its steps run as Temporal activities |
+| `dbos` | `backend="dbos"` | Phase 26 of the plan (#104) | resumes from its last completed step, on Postgres or SQLite |
+| `temporal` | `backend="temporal"` | Phase 32 (#110) | resumes, its steps run as Temporal activities |
 
 The setting is the only switch: nothing imports a backend, and a runner
 configured with a backend that is not built yet refuses to start
@@ -39,12 +39,12 @@ and asks the executor to tear it down. An executor holds no lifecycle logic.
 | Location | Setting | Built | A worker is | For |
 |---|---|---|---|---|
 | `local` | `location="local"` | yes | a process on the controller's host: the Cog package's `serve` task, in the package's own pixi environment, on a loopback port | development and the desktop |
-| `remote` | `location="remote"` | Phase 20 of the plan (#6) | a workload on a cluster, reached over the cluster's network | a Kubernetes hub, always |
+| `remote` | `location="remote"` | Phase 21 of the plan (#6) | a workload on a cluster, reached over the cluster's network | a Kubernetes hub, always |
 
 The setting is the only switch: nothing imports an executor, and a runner
 configured with a location that is not built yet refuses to start
 (`LocationNotImplemented`). The Kubernetes executor that exists today is what
-`remote` will select; until Phase 20 it is handed to a runner directly, as the
+`remote` will select; until Phase 21 it is handed to a runner directly, as the
 in-memory executor of the tests is.
 
 **What a local worker is given.** Its environment, and nothing else of its
@@ -74,7 +74,7 @@ that declares a `serve` task and the `pixi.lock` that pins its environment,
 both files of the package itself: a package without its lock, or with a
 symbolic link in place of either, is refused, and pixi runs it `--locked`. It
 is identified on the Track by its name and the sha256 of its manifest and lock, so a development run is never mistaken for a
-published Cog. Resolving a published reference is Phase 21.
+published Cog. Resolving a published reference is Phase 22.
 
 **The run token.** One per worker, minted when it is materialized. The
 controller presents it as a bearer token on `/invoke`; the worker will present
@@ -86,6 +86,80 @@ worker of that run that is still up. It expires when the worker's
 
 `local` is not for a deployed hub: a local worker shares its controller's host
 and network identity, so the isolation a cluster gives a worker does not hold.
+
+## The run controller and the run API
+
+The process that accepts runs is not the one that advances them (ADR-0002 D4).
+
+- **The API** (`/v1/runs`, behind the `cog_runs` [feature flag](../feature-flags.md)) records intent on the
+  Track and reads a run's status from it. It constructs no executor and never
+  calls the controller. The code is `collab_hub_execution.intents`.
+- **The run controller** (`python -m collab_hub_execution.controller`) watches the
+  Track. It starts each run that was submitted and not yet picked up on the
+  lifecycle runner, and delivers each request to cancel, which tears the run's
+  worker down and ends it `CANCELLED`. It alone constructs an executor.
+
+| Route | What it does |
+|---|---|
+| `POST /v1/runs` | Submit an Op: `steps`, each with `name`, `cog`, `entry_point`, `input` and `gate`, and optionally the run's own `name`, a label for listings. Records `op_submitted` with who submitted it, and answers 201 with the run, `SUBMITTED`. A `cog` that is not a package the controller can launch is a 422 naming the packages it can |
+| `GET /v1/runs` | The caller's organization's runs, newest first; `status`, `limit` and `offset` |
+| `GET /v1/runs/{id}` | One run: its status, each step's state, and each completed step's `output` |
+| `GET /v1/runs/launchable` | The Cog packages a step's `cog` may name |
+| `POST /v1/runs/{id}/turns` | Ask a Cog whose step holds a session something: records `turn_requested` with the caller and answers 202 with the turn, `pending`. A run that has ended is a 409 |
+| `GET /v1/runs/{id}/turns/{turn}` | The turn: `pending`, then `answered` with the Cog's text, or `failed` with why |
+| `POST /v1/runs/{id}/cancel` | Records `cancel_requested` with the caller, once, and answers 202. A run that has ended is a 409 naming its status, checked as the request is written |
+
+Every answer names the `backend` and the `location` the run is advanced with,
+so a client never assumes a run survives a restart or that its worker is
+isolated. A step that was running, or waiting at its Gate, when its run ended
+is reported in the state the run ended in. A run belongs to the organization that submitted it; to any other it
+is a 404. The routes are authenticated, like every route the protection map
+does not open.
+
+This is the controller's and the API's first form, enough for one host:
+
+- The Track is a SQLite file both processes open (`runs.track_path` for the
+  API, `--track` for the controller). Postgres, and pickup that two controller
+  replicas can race for, come with the run controller's own phase of the plan.
+- One controller per Track: it holds a lock beside the file, and a second one
+  refuses to start. When it starts, every run a stopped controller left
+  unfinished is recorded `interrupted`.
+- The controller polls the Track. Event streams, payloads by reference, Gate
+  decisions and retry are later phases; until then a run waiting at a Gate can
+  only be cancelled.
+
+**Turns.** Some entry points hold a session: `hello`'s `session` keeps its
+`/invoke` open and answers turns until it is told `bye` or its run is
+terminated. A client asks for a turn through the API; the controller delivers
+waiting turns to the run's live worker, one at a time and in order, on the
+worker's `POST /turn`, and records the answer (`turn_answered`) or why there
+is none (`turn_failed`). A turn asked before the worker is up waits for it; one
+still waiting when the run ends fails with it. Nothing reaches a worker but
+through the controller, and every turn and its answer are on the Track. A
+worker that holds no session answers `/turn` with 404: within 30 seconds of the
+first such answer the controller takes it for a session still opening and tries
+again, after that it fails the turn and leaves the run as it was. A run waiting
+at a Gate takes no turns (409), since nothing can answer them until the Gate is
+decided.
+
+Both processes read a run incrementally (`intents.RunViews`): each read asks
+the Track only for the events after the last one seen, and rebuilds a run's
+view only when it has new ones, so listing runs and watching them cost what
+changed rather than all of their history. A run whose Track cannot be replayed
+is logged once and left out of listings and of the controller's passes; it
+never hides another.
+
+The `collab-hub` CLI is a client of these routes (`cog launch`, `cog list
+--launchable`, `run list`, `run show`, `run watch`, `run say`, `run connect`,
+`run terminate`); `run connect` serves a run as an
+[ACP](https://agentclientprotocol.com) agent, so an ACP client such as Toad
+talks to the Cog turn by turn. `run list` gives, in its `CONNECT` column, the
+command such a client starts for each run that has not ended: ACP is spoken on
+a command's stdin and stdout, so a command, naming the CLI by its path, its
+configuration directory when one was chosen, and the hub, is what a client
+connects with, from any shell.
+[`examples/cog-local`](../../examples/cog-local/README.md) walks through all of
+it on one machine.
 
 ## Statuses
 
@@ -167,6 +241,9 @@ At dev level 1, with no container: `make -C dev op OP=<name>` runs an Op from
 `dev/.local/`, and prints its Track and status. The fake Cogs answer in the
 same process; add `LOCATION=local` (which needs pixi) and each step's worker is
 a real process, whose `worker_started` and `worker_stopped` appear on the
-Track and whose output is under `dev/.local/runs/`. Stop `make op OP=slow` mid-step,
+Track and whose output is under `dev/.local/runs/`. `make -C dev api` and
+`make -C dev controller` are the two processes of the section above, and
+[`examples/cog-local`](../../examples/cog-local/README.md) walks a Cog through
+its whole life on them, signed in through Keycloak: `make demo` there runs it. Stop `make op OP=slow` mid-step,
 and the next `make op` reports the run `interrupted`. See
 [dev/README.md](../../dev/README.md#running-cogs-and-ops).

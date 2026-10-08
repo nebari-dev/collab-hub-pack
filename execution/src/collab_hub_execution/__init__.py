@@ -27,6 +27,7 @@ the Track, executor and backend interfaces separate these concerns, but their
 shapes are still experimental.
 """
 
+from . import intents
 from .backends import DURABILITY_BACKENDS, BackendNotImplemented, DurabilityBackend
 from .binding import (
     BindingResolutionError,
@@ -110,6 +111,7 @@ __all__ = [
     "ModelBinding",
     "ModelCog",
     "AGENT_LOCATIONS",
+    "intents",
     "LocationNotImplemented",
     "DURABILITY_BACKENDS",
     "BackendNotImplemented",

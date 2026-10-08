@@ -5,7 +5,7 @@ is torn down, and is cancelled mid-interaction, identically wherever it runs,
 because the lifecycle runner drives every location through the same executor
 interface and the same seam. The suite runs against ``local``, a real process
 per worker, and against the in-memory executor; ``remote`` joins it with Phase
-20. What only a location with processes can show, that a controller killed with
+21. What only a location with processes can show, that a controller killed with
 ``SIGKILL`` leaves no worker, runs where there are processes.
 """
 

@@ -44,6 +44,12 @@ class Stub:
     revoked: list[dict] = field(default_factory=list)
     publishes_revocation: bool = True
     cogs: list[dict] = field(default_factory=list)
+    runs: list[dict] = field(default_factory=list)  # newest first, as the hub lists them
+    launchable: tuple[str, ...] = ("echo", "slow")
+    turns: list[dict] = field(default_factory=list)
+    hold_turns: bool = False  # leave every turn pending, as a worker that has not answered yet
+    # What a run's status becomes on each later read: a list consumed one status per GET.
+    progress: dict[str, list[str]] = field(default_factory=dict)
     counter: int = 0
     issued: list[dict] = field(default_factory=list)  # every token response, in order
     sso: bool = False  # a browser still signed in to the realm: every sign-in joins the same realm session
@@ -174,6 +180,69 @@ class Stub:
                 if cog["cog_id"] == cog_id:
                     return httpx.Response(200, json={**cog, "versions": [cog]})
             return httpx.Response(404, json={"error": {"code": "cog_not_found", "message": f"No Cog {cog_id}"}})
+        if path == "/v1/runs" and request.method == "POST":
+            submitted = json.loads(request.content)
+            [step] = submitted["steps"]
+            if step["cog"] not in self.launchable:
+                return httpx.Response(422, json={"error": {
+                    "code": "cog_not_launchable",
+                    "message": f"Cannot launch {step['cog']}; the Cogs this hub launches are: "
+                               f"{', '.join(self.launchable)}"}})
+            run = {"id": f"run-{len(self.runs) + 1:012d}", "status": "SUBMITTED", "ended": False,
+                   "steps": [{"name": step["name"], "cog": step["cog"], "entry_point": step["entry_point"],
+                              "state": "pending", "attempt": None, "error": None}],
+                   "submitted_by": user, "submitted_at": "2026-10-02T08:00:00+00:00",
+                   "updated_at": "2026-10-02T08:00:00+00:00", "cancel_requested_by": None, "error": None,
+                   "reason": None, "backend": "none", "location": "local", "_input": step["input"],
+                   "name": submitted.get("name"),
+                   "_gate": step["gate"]}
+            self.runs.insert(0, run)
+            return httpx.Response(201, json=run)
+        if path == "/v1/runs":
+            wanted = request.url.params.get("status")
+            limit, offset = int(request.url.params["limit"]), int(request.url.params["offset"])
+            items = [r for r in self.runs if wanted is None or r["status"] == wanted.upper()]
+            more = offset + limit < len(items)
+            return httpx.Response(200, json={"items": items[offset:offset + limit],
+                                             "next_offset": offset + limit if more else None})
+        if path == "/v1/runs/launchable":
+            return httpx.Response(200, json={"items": list(self.launchable)})
+        if path.startswith("/v1/runs/"):
+            run_id, _, action = path.removeprefix("/v1/runs/").partition("/")
+            run = next((r for r in self.runs if r["id"] == run_id), None)
+            if run is None:
+                return httpx.Response(404, json={"error": {"code": "run_not_found", "message": f"No run {run_id}"}})
+            if action == "turns" and request.method == "POST":
+                if run["ended"]:
+                    return httpx.Response(409, json={"error": {
+                        "code": "run_ended",
+                        "message": f"Run {run_id} takes no turns: the run has ended {run['status']}"}})
+                text = json.loads(request.content)["text"]
+                turn = {"turn": f"{len(self.turns) + 1:012x}", "text": text, "state": "pending", "answer": None,
+                        "error": None, "asked_by": user}
+                self.turns.append(turn)
+                return httpx.Response(202, json=turn)
+            if action.startswith("turns/"):
+                turn = next(t for t in self.turns if t["turn"] == action.removeprefix("turns/"))
+                if turn["state"] == "pending" and not self.hold_turns:
+                    failing = turn["text"] == "fail"
+                    turn.update(state="failed" if failing else "answered",
+                                answer=None if failing else f"you said: {turn['text']}",
+                                error="the worker answered HTTP 500" if failing else None)
+                return httpx.Response(200, json=turn)
+            if action == "cancel":
+                if run["ended"]:
+                    return httpx.Response(409, json={"error": {
+                        "code": "run_ended",
+                        "message": f"Run {run_id} cannot be cancelled: the run has ended {run['status']}"}})
+                run["cancel_requested_by"] = user
+                return httpx.Response(202, json=run)
+            if self.progress.get(run_id):
+                run["status"] = self.progress[run_id].pop(0)
+                run["ended"] = run["status"] not in ("SUBMITTED", "RUNNING", "WAITING_AT_GATE")
+                if run["status"] == "COMPLETED":
+                    run["steps"][0].update(state="completed", output={"greeting": "hi"})
+            return httpx.Response(200, json=run)
         return httpx.Response(404)
 
     def browser(self, approve: bool = True):

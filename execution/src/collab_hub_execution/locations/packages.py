@@ -73,7 +73,7 @@ class DirectoryPackageSource:
         self.allow = None if allow is None else frozenset(allow)
 
     def names(self) -> tuple[str, ...]:
-        """The packages the source can resolve, by name."""
+        """The packages the source can resolve, by name: each one :meth:`resolve` would return."""
         found = set()
         for root in self.roots:
             if not root.is_dir():
@@ -82,7 +82,16 @@ class DirectoryPackageSource:
                 name = manifest.parent.relative_to(root).as_posix()
                 if (self.allow is None or name in self.allow) and _NAME.match(name):
                     found.add(name)
-        return tuple(sorted(found))
+        return tuple(name for name in sorted(found) if self._resolves(name))
+
+    def _resolves(self, name: str) -> bool:
+        # A directory with a manifest is not yet a package that can run: its lock may be missing,
+        # either file a link, or the manifest without a `serve` task.
+        try:
+            self.resolve(name)
+        except (PackageRefused, PackageNotFound):
+            return False
+        return True
 
     def resolve(self, name: str) -> CogPackage:
         if not isinstance(name, str) or not _NAME.match(name) or ".." in name.split("/"):
