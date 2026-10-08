@@ -15,7 +15,9 @@ A connector is listed when both hold:
 - its provider has credentials in the deployment configuration
   (`connectors.<provider>.brokerTokenUrl`, or a static token in development);
 - an operator has not switched the provider off in the admin panel (see
-  [Frames operations](frames-operations.md)).
+  [Frames operations](frames-operations.md)). The panel switches `google`,
+  `slack` and `github`; `notion` has no switch and is listed whenever it is
+  configured.
 
 `[]` means this hub offers no connectors. It is an answer, not an error.
 
@@ -47,7 +49,7 @@ Calendar, Slack, GitHub, Notion.
 | `name` | Display name. |
 | `short_name` | Compact label for menus. |
 | `description` | One sentence on what the connector lets an assistant do. Safe to show a user. |
-| `provider` | The configuration section and operator switch the connector belongs to: `google`, `slack`, `github` or `notion`. Connectors that share a provider share one linked account. |
+| `provider` | The configuration section the connector belongs to, which is also its operator switch where it has one: `google`, `slack`, `github` or `notion`. Connectors that share a provider share one linked account. |
 | `link` | How a user connects it, or `null` when there is nothing for the user to do (a static token serves every caller). |
 | `connect_hint` | A sentence the user should read before they start connecting, or `null`. Slack uses it to say the workspace is chosen on Slack's own screen. Show it next to the connect action, not after a failure. |
 | `connected`, `state`, `scopes`, `detail` | The caller's connection state, as the connector's own status route reports it. `state` is one of `connected`, `not_connected`, `reconnect_required`, `unavailable`. |
@@ -59,7 +61,11 @@ Calendar, Slack, GitHub, Notion.
 service to link the provider named by `alias` to the signed-in account
 (Keycloak client-initiated account linking). `alias` is read from the
 configured broker URL (`.../broker/<alias>/token`), so a realm that named its
-identity provider differently is described as it is. `prompt`, when set, is the
+identity provider differently is described as it is. A broker URL that is not
+shaped that way does not name the alias, and the provider key is used. An alias
+outside letters, digits, `.`, `_` and `-` (starting with a letter or digit, at
+most 64 characters) is not one a client will link, so the entry carries
+`link: null` rather than a guess. `prompt`, when set, is the
 OIDC `prompt` value the link request must carry; the Google connectors set
 `consent` because they widen one linked identity's scopes and Google only
 re-asks when told to.

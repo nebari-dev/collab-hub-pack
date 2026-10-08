@@ -8,16 +8,19 @@ user needs in order to see one and connect it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
 
 import httpx
 import pytest
+from fastapi import HTTPException, status
 from httpx import ASGITransport, AsyncClient
 
 from collab_hub_api.config import Config, ConnectorsConfig
 from collab_hub_api.connectors.catalog import CATALOG, connector_link, is_offered
+from collab_hub_api.connectors.models import ConnectorSummary
 from collab_hub_api.core import make_app
 from collab_hub_api.routers import connectors as connectors_router
 
@@ -184,6 +187,7 @@ async def test_every_entry_carries_what_a_client_renders(hub):
     listed = await _listed(hub(_brokered(*PROVIDERS)))
     by_id = {descriptor.id: descriptor for descriptor in CATALOG}
 
+    assert len(listed) == len(CATALOG)
     for item in listed:
         descriptor = by_id[item["id"]]
         assert item["name"] == descriptor.name
@@ -225,8 +229,12 @@ async def test_only_slack_carries_a_hint_to_read_before_connecting(hub):
     assert set(hints.values()) == {None}
 
 
-async def test_a_static_token_leaves_the_user_nothing_to_link(hub):
-    listed = await _listed(hub({"github": {"static_access_token": "gh-not-a-real-token"}}))
+@pytest.mark.parametrize("broker", ["", BROKER.format(alias="github")], ids=["token-only", "token-and-broker"])
+async def test_a_static_token_leaves_the_user_nothing_to_link(hub, broker):
+    """The token serves every caller, so it wins over a broker configured beside it."""
+
+    section = {"static_access_token": "gh-not-a-real-token", "broker_token_url": broker}
+    listed = await _listed(hub({"github": section}))
 
     assert listed[0]["link"] is None
 
@@ -260,6 +268,56 @@ async def test_a_status_read_that_raises_lists_that_connector_as_unavailable(hub
     assert record.connector == "slack"
 
 
+async def test_a_reader_that_refuses_with_an_http_error_is_also_contained(hub, monkeypatch):
+    async def refuse(request, config):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker is down")
+
+    monkeypatch.setitem(connectors_router._STATUS_READERS, "github", refuse)
+
+    listed = {item["id"]: item for item in await _listed(hub(_brokered(*PROVIDERS)))}
+
+    assert listed["github"]["state"] == "unavailable"
+    assert listed["slack"]["state"] == "connected"
+
+
+async def test_status_reads_run_together_and_only_for_what_is_offered(hub, monkeypatch):
+    """Sequential reads would deadlock here: each waits for the other to start."""
+
+    started = {"slack": asyncio.Event(), "github": asyncio.Event()}
+    asked = []
+
+    def reader(own, other):
+        async def read(request, config):
+            asked.append(own)
+            started[own].set()
+            await asyncio.wait_for(started[other].wait(), timeout=5)
+            return ConnectorSummary(id=own, name=own, connected=True, state="connected")
+
+        return read
+
+    async def never(request, config):
+        asked.append("not offered")
+        raise AssertionError("a connector that is not offered had its status read")
+
+    monkeypatch.setitem(connectors_router._STATUS_READERS, "slack", reader("slack", "github"))
+    monkeypatch.setitem(connectors_router._STATUS_READERS, "github", reader("github", "slack"))
+    for unoffered in ("google-drive", "gmail", "google-calendar", "notion"):
+        monkeypatch.setitem(connectors_router._STATUS_READERS, unoffered, never)
+
+    listed = await _listed(hub(_brokered("slack", "github")))
+
+    assert [item["state"] for item in listed] == ["connected", "connected"]
+    assert sorted(asked) == ["github", "slack"]
+
+
+async def test_a_broker_url_that_is_not_a_url_does_not_sink_the_list(hub):
+    not_a_url = {"slack": {"broker_token_url": "https://[bad/broker/acme/token"}}
+    listed = await _listed(hub({**not_a_url, **_brokered("github")}))
+
+    assert [item["id"] for item in listed] == ["slack", "github"]
+    assert listed[1]["link"]["alias"] == "github"
+
+
 # --- the configuration-derived halves, directly -----------------------------
 
 
@@ -269,10 +327,13 @@ async def test_a_status_read_that_raises_lists_that_connector_as_unavailable(hub
         ("https://kc.example.com/realms/hub/broker/google/token", "google"),
         ("https://kc.example.com/auth/realms/hub/broker/google-workspace/token/", "google-workspace"),
         ("https://kc.example.com/realms/broker/broker/notion_v2/token", "notion_v2"),
-        # Not Keycloak-shaped: fall back to the provider key.
+        ("https://kc.example.com/realms/hub/broker/Acme.Slack/token?x=/broker/other/token", "Acme.Slack"),
+        ("https://kc.example.com/realms/hub/broker/acme%2Dslack/token", "acme-slack"),
+        ("https://kc.example.com/realms/hub/broker/" + "a" * 64 + "/token", "a" * 64),
+        # Not Keycloak-shaped: the URL does not name the alias, so the provider key stands in.
         ("https://tokens.example.com/slack", "slack"),
-        ("https://kc.example.com/realms/hub/broker/bad alias/token", "slack"),
-        ("https://kc.example.com/realms/hub/broker//token", "slack"),
+        ("https://kc.example.com/realms/hub/BROKER/acme/TOKEN", "slack"),
+        ("https://[bad/broker/acme/token", "slack"),
     ],
 )
 def test_alias_is_read_from_the_broker_url_or_falls_back_to_the_provider(url, alias):
@@ -280,6 +341,20 @@ def test_alias_is_read_from_the_broker_url_or_falls_back_to_the_provider(url, al
     section = ConnectorsConfig.model_validate({"slack": {"broker_token_url": url}}).slack
 
     assert connector_link(slack, section).alias == alias
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["bad%20alias", "", "_leading", "a" * 65, "acme%2Fslack", "acme&kc_action=x", "%C3%A9cole"],
+)
+def test_an_alias_a_client_would_not_link_is_no_link_rather_than_a_guess(alias):
+    """Naming a different provider than the one configured would link the wrong account."""
+
+    slack = next(descriptor for descriptor in CATALOG if descriptor.id == "slack")
+    url = f"https://kc.example.com/realms/hub/broker/{alias}/token"
+    section = ConnectorsConfig.model_validate({"slack": {"broker_token_url": url}}).slack
+
+    assert connector_link(slack, section) is None
 
 
 def test_every_catalog_entry_has_a_configuration_section_and_a_status_reader():

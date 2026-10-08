@@ -219,7 +219,8 @@ async def _listed_status(
 
     The status helpers answer provider trouble as a state, but an unexpected
     error in one would otherwise turn the whole list into a 500 and hide every
-    connector that is working.
+    connector that is working. Cancellation is not a failure of one connector
+    and is left to propagate: a request that is going away takes its list along.
     """
 
     try:

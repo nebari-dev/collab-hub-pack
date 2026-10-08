@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .models import (
     GITHUB_CONNECTOR_ID,
@@ -118,20 +118,35 @@ def is_offered(section) -> bool:
 # Keycloak serves a linked identity's token at
 # ``<issuer>/broker/<alias>/token``. The alias is whatever the realm named the
 # identity provider, and a client has to ask to link that same name.
-_BROKER_ALIAS = re.compile(r"/broker/([A-Za-z0-9][A-Za-z0-9._-]{0,63})/token/?$")
+_BROKER_TAIL = re.compile(r"/broker/([^/]*)/token/?$")
+# What a client will accept as an alias. One outside it is not guessed at.
+_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def connector_link(descriptor: ConnectorDescriptor, section) -> ConnectorLink | None:
     """How a user connects *descriptor* on a deployment configured as *section*.
 
-    ``None`` when there is nothing for the user to do: a static token serves
-    every caller already, and takes precedence over a broker when both are set.
+    ``None`` when there is nothing the user can do from here: a static token
+    serves every caller already (and takes precedence over a broker when both
+    are set), and a Keycloak broker URL whose alias a client could not use is
+    reported as no link rather than as a different provider's.
     """
 
     if section.static_access_token or not section.broker_token_url:
         return None
-    match = _BROKER_ALIAS.search(urlsplit(section.broker_token_url).path)
-    # A broker URL that is not Keycloak-shaped still names a provider the realm
-    # must expose; the provider key is the alias every shipped realm uses.
-    alias = match.group(1) if match else descriptor.provider
+    try:
+        path = urlsplit(section.broker_token_url).path
+    except ValueError:
+        # Not a URL at all. The token provider will say so when it is used;
+        # the list must still be served.
+        path = ""
+    tail = _BROKER_TAIL.search(path)
+    if tail is None:
+        # Not Keycloak-shaped, so the URL does not name the alias. The provider
+        # key is the alias every shipped realm uses.
+        return ConnectorLink(alias=descriptor.provider, prompt=descriptor.prompt)
+    # Decoded after the segment is cut out, so an encoded slash stays inside it.
+    alias = unquote(tail.group(1))
+    if not _ALIAS.fullmatch(alias):
+        return None
     return ConnectorLink(alias=alias, prompt=descriptor.prompt)
