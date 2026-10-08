@@ -1,0 +1,12 @@
+# The `hello` Cog as a package. `serve` is the task the run controller starts a worker with,
+# in this environment; `pixi.lock` pins that environment, and is part of what the package is.
+[workspace]
+name = "hello"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64"]
+
+[tasks]
+serve = "python serve.py"
+
+[dependencies]
+python = "3.12.*"

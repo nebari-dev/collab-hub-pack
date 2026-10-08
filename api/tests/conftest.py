@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from collab_hub_api.config import Config
 from collab_hub_api.core import make_app
+from collab_hub_api.frames.codec import undecodable_frame_log
 
 
 @pytest_asyncio.fixture
@@ -80,3 +82,12 @@ async def cors_client(tmp_path, monkeypatch) -> AsyncIterator[AsyncClient]:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
+
+
+@pytest.fixture(autouse=True)
+def _reset_undecodable_frame_log():
+    # The skip log rate-limits per frame id for the process lifetime; tests
+    # reuse frame ids, so each test starts from a clean window.
+    undecodable_frame_log.clear()
+    yield
+    undecodable_frame_log.clear()
