@@ -828,8 +828,9 @@ offered here rather than as broken. `google` covers
 `/v1/connectors/google-drive/status`, `/v1/connectors/gmail/status` and
 `/v1/connectors/google-calendar/status`. A connector that was never switched
 and merely has no credentials still answers 200 `not_connected`. Each such 404
-logs `connector_status_switched_off` with the connector's key, which is what
-separates it in the logs from a 404 for a path nothing serves. This is the
+logs `connector_status_switched_off` with the connector's key at debug level,
+which is what separates it in the logs from a 404 for a path nothing serves;
+it is not logged at info because clients poll these routes. This is the
 switch to use while a provider's OAuth app is not yet usable by this
 deployment's users — still in the provider's verification process, say —
 and to flip back when it is.

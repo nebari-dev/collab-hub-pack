@@ -16,7 +16,7 @@ import json
 import sqlite3
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -55,6 +55,16 @@ class TrackStore(Protocol):
 
     def append(self, event: TrackEvent) -> TrackEvent:
         """Append an event and return it with its assigned sequence."""
+
+    def append_if(self, event: TrackEvent, condition: Callable[[tuple[TrackEvent, ...]], bool]) -> TrackEvent | None:
+        """Append an event only if ``condition`` holds of the run's Track as it is when the event lands.
+
+        The check and the append are one step: no other append to the run comes
+        between them, so what ``condition`` saw is still true of the Track the
+        event joins. Returns the stored event, or ``None`` when ``condition``
+        refused it. This is how a process that does not advance a run writes to
+        its Track without racing the one that does.
+        """
 
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         """Replay events in sequence order."""
@@ -204,6 +214,10 @@ class InMemoryTrackStore:
             self._ids.add(event.event_id)
             return stored
 
+    def append_if(self, event: TrackEvent, condition: Callable[[tuple[TrackEvent, ...]], bool]) -> TrackEvent | None:
+        with self._lock:  # reentrant: the check and the append are under one hold
+            return self.append(event) if condition(self.replay(event.run_id)) else None
+
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         with self._lock:
             return tuple(event for event in self._events.get(run_id, ()) if (event.sequence or 0) > after_sequence)
@@ -296,27 +310,46 @@ class SqliteTrackStore:
         if event.sequence is not None:
             raise ValueError("TrackStore assigns event sequences")
         with self._connect() as connection:
-            try:
-                cursor = connection.execute(
-                    "INSERT INTO collab_track_events (event_id, run_id, event_type, payload, occurred_at, schema) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (event.event_id, event.run_id, event.event_type, json.dumps(event.payload),
-                     event.occurred_at.isoformat(), event.schema),
-                )
-            except sqlite3.IntegrityError as exc:
-                # SQLite names the column, not the index, when a partial unique index refuses a row.
-                if event.event_type == "op_submitted" and "collab_track_events.run_id" in str(exc):
-                    raise OneSubmissionPerRun(f"run {event.run_id!r} was already submitted") from exc
-                raise
-            return replace(event, sequence=cursor.lastrowid)
+            return self._insert(connection, event)
+
+    @staticmethod
+    def _insert(connection: sqlite3.Connection, event: TrackEvent) -> TrackEvent:
+        try:
+            cursor = connection.execute(
+                "INSERT INTO collab_track_events (event_id, run_id, event_type, payload, occurred_at, schema) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (event.event_id, event.run_id, event.event_type, json.dumps(event.payload),
+                 event.occurred_at.isoformat(), event.schema),
+            )
+        except sqlite3.IntegrityError as exc:
+            # SQLite names the column, not the index, when a partial unique index refuses a row.
+            if event.event_type == "op_submitted" and "collab_track_events.run_id" in str(exc):
+                raise OneSubmissionPerRun(f"run {event.run_id!r} was already submitted") from exc
+            raise
+        return replace(event, sequence=cursor.lastrowid)
+
+    def append_if(self, event: TrackEvent, condition: Callable[[tuple[TrackEvent, ...]], bool]) -> TrackEvent | None:
+        if event.sequence is not None:
+            raise ValueError("TrackStore assigns event sequences")
+        with self._connect() as connection:
+            # The write lock is taken before the read: every other writer to the file waits until
+            # this transaction ends, so nothing is appended between the check and the event.
+            connection.execute("BEGIN IMMEDIATE")
+            if not condition(self._select(connection, event.run_id, 0)):
+                return None
+            return self._insert(connection, event)
 
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT sequence, event_id, run_id, event_type, payload, occurred_at, schema "
-                "FROM collab_track_events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
-                (run_id, after_sequence),
-            ).fetchall()
+            return self._select(connection, run_id, after_sequence)
+
+    @staticmethod
+    def _select(connection: sqlite3.Connection, run_id: str, after_sequence: int) -> tuple[TrackEvent, ...]:
+        rows = connection.execute(
+            "SELECT sequence, event_id, run_id, event_type, payload, occurred_at, schema "
+            "FROM collab_track_events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
+            (run_id, after_sequence),
+        ).fetchall()
         return tuple(
             TrackEvent(
                 sequence=row[0], event_id=row[1], run_id=row[2], event_type=row[3],
@@ -437,37 +470,56 @@ class PostgresTrackStore:
         if event.sequence is not None:
             raise ValueError("TrackStore assigns event sequences")
         with self.pool.connection() as connection:
-            # Held until this transaction commits, so no other append to the run
-            # draws a sequence before this row is visible (see the class docstring).
+            return self._insert(connection, event)
+
+    @staticmethod
+    def _insert(connection: Any, event: TrackEvent) -> TrackEvent:
+        # Held until this transaction commits, so no other append to the run
+        # draws a sequence before this row is visible (see the class docstring).
+        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_run_lock(event.run_id),))
+        try:
+            row = connection.execute(
+                """
+                INSERT INTO collab_track_events
+                    (event_id, run_id, event_type, payload, occurred_at, schema)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+                RETURNING sequence
+                """,
+                (event.event_id, event.run_id, event.event_type, json.dumps(event.payload),
+                 event.occurred_at, event.schema),
+            ).fetchone()
+        except Exception as exc:  # noqa: BLE001 - the driver's error class is not imported here
+            if "collab_track_one_submission" in str(exc):
+                raise OneSubmissionPerRun(f"run {event.run_id!r} was already submitted") from exc
+            raise
+        return replace(event, sequence=_column(row, 0, "sequence"))
+
+    def append_if(self, event: TrackEvent, condition: Callable[[tuple[TrackEvent, ...]], bool]) -> TrackEvent | None:
+        if event.sequence is not None:
+            raise ValueError("TrackStore assigns event sequences")
+        with self.pool.connection() as connection:
+            # The run's lock, the one every append to it takes, is held from before the read until
+            # this transaction commits: nothing is appended between the check and the event.
             connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_run_lock(event.run_id),))
-            try:
-                row = connection.execute(
-                    """
-                    INSERT INTO collab_track_events
-                        (event_id, run_id, event_type, payload, occurred_at, schema)
-                    VALUES (%s, %s, %s, %s::jsonb, %s, %s)
-                    RETURNING sequence
-                    """,
-                    (event.event_id, event.run_id, event.event_type, json.dumps(event.payload),
-                     event.occurred_at, event.schema),
-                ).fetchone()
-            except Exception as exc:  # noqa: BLE001 - the driver's error class is not imported here
-                if "collab_track_one_submission" in str(exc):
-                    raise OneSubmissionPerRun(f"run {event.run_id!r} was already submitted") from exc
-                raise
-            return replace(event, sequence=_column(row, 0, "sequence"))
+            if not condition(self._select(connection, event.run_id, 0)):
+                return None
+            return self._insert(connection, event)
 
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         with self.pool.connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT sequence, event_id, run_id, event_type, payload, occurred_at, schema
-                FROM collab_track_events
-                WHERE run_id = %s AND sequence > %s
-                ORDER BY sequence
-                """,
-                (run_id, after_sequence),
-            ).fetchall()
+            return self._select(connection, run_id, after_sequence)
+
+    @staticmethod
+    def _select(connection: Any, run_id: str, after_sequence: int) -> tuple[TrackEvent, ...]:
+        rows = connection.execute(
+            """
+            SELECT sequence, event_id, run_id, event_type, payload, occurred_at, schema
+            FROM collab_track_events
+            WHERE run_id = %s AND sequence > %s
+            ORDER BY sequence
+            """,
+            (run_id, after_sequence),
+        ).fetchall()
         # By name or by position: the hub's shared pool returns mappings (dict_row).
         return tuple(
             TrackEvent(

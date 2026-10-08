@@ -8,7 +8,7 @@ lifecycle logic: it never decides what runs next.
 
 A backend is chosen by configuration, ``none``, ``dbos`` or ``temporal``, through
 :func:`select_backend`, and callers never import one. ``none`` is implemented;
-``dbos`` and ``temporal`` are refused when a runner starts until Phases 25 and 31
+``dbos`` and ``temporal`` are refused when a runner starts until Phases 26 and 32
 of the plan build them, so the configuration shape is fixed now.
 """
 
@@ -22,7 +22,7 @@ T = TypeVar("T")
 DURABILITY_BACKENDS = ("none", "dbos", "temporal")
 """Every value the ``backend`` setting takes, in the order they are built."""
 
-_NOT_YET = {"dbos": "Phase 25 (#104)", "temporal": "Phase 31 (#110)"}
+_NOT_YET = {"dbos": "Phase 26 (#104)", "temporal": "Phase 32 (#110)"}
 
 
 class BackendNotImplemented(NotImplementedError):

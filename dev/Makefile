@@ -124,6 +124,15 @@ DEV_AUTH_ENV := \
 LEVEL1_ENV := \
   COLLAB_HUB_API__COGS__CATALOG__BACKEND=memory
 
+# Level 1 only: the run API (/v1/runs), behind its feature flag, over the SQLite
+# Track `make controller` watches. PACKAGES are the directories a Cog package
+# may be launched from, the same ones the controller is given.
+COGS ?= $(CURDIR)/cogs:$(ROOT)/cogs:$(ROOT)/examples/cog-local/cogs
+RUNS_ENV := \
+  COLLAB_HUB_API__FEATURES__COG_RUNS=true \
+  COLLAB_HUB_API__RUNS__TRACK_PATH=$(LOCAL)/track.sqlite \
+  COLLAB_HUB_API__RUNS__PACKAGES=$(COGS)
+
 # Real bearer verification against the local Keycloak realm.
 #
 # FRAMES_AUTH_IDENTITY_CLAIM=sub matches the production convention: the OIDC
@@ -211,11 +220,11 @@ KC_CONNECTOR_ENV := \
 .DEFAULT_GOAL := help
 .PHONY: help api api-watch api-pg api-oidc api-fakes api-full api-membership \
         api-desktop api-desktop-fakes hosts-check hub-proxy hub-proxy-down desktop-check \
-        services keycloak fakes up down destroy logs ps \
+        postgres services keycloak fakes up down destroy logs ps \
         keycloak-admin realm-import broker-role idp-google idp-github idp-list \
         token sub whoami seed-org psql \
         kind-up kind-cluster kind-image kind-redeploy kind-forward kind-logs \
-        kind-smoke kind-down test lint clean
+        kind-smoke kind-down test lint clean op controller fake-model
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "; \
@@ -231,11 +240,12 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 api: | $(LOCAL)/frames ## The API alone: no containers, dev auth, local-FS frames, in-memory stores
-	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) uv run python -m collab_hub_api
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) $(RUNS_ENV) \
+		uv run --group runs python -m collab_hub_api
 
 api-watch: | $(LOCAL)/frames ## Same as `api` (no containers), restarted on every source change
-	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) \
-		uv run --with watchfiles watchfiles 'python -m collab_hub_api' src
+	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(LEVEL1_ENV) $(RUNS_ENV) \
+		uv run --group runs --with watchfiles watchfiles 'python -m collab_hub_api' src
 
 # ---------------------------------------------------------------------------
 ## Level 1 — running Cogs and Ops
@@ -257,25 +267,53 @@ op: ## Run a fake Op and print its Track (OP=echo|needs-review|fails|slow|spende
 	cd $(ROOT)/execution && LOCATION=$(LOCATION) uv run --quiet --with pyyaml python $(CURDIR)/op.py $(OP) \
 		--backend $(BACKEND) --track $(LOCAL)/track.sqlite
 
+# The process that advances the runs `make api` (or `make api-oidc`) accepts: it
+# watches the same SQLite Track, starts each submitted run's worker as a local
+# process (the Cog package's `serve` task in its own pixi environment), and
+# delivers cancels and turns. No limit on how long an interaction takes: a Cog
+# holding a session stays in one for as long as someone talks to it.
+controller: | $(LOCAL)/frames ## The run controller for `make api`: runs the Cogs launched through /v1/runs as local processes
+	@command -v pixi >/dev/null || { \
+		echo "the controller runs each Cog in its own pixi environment: install pixi (https://pixi.sh)"; exit 1; }
+	cd $(ROOT)/execution && uv run --quiet python -m collab_hub_execution.controller \
+		--track $(LOCAL)/track.sqlite $(foreach dir,$(subst :, ,$(COGS)),--packages $(dir)) \
+		--work-dir $(LOCAL)/runs --backend $(BACKEND) --location local --interaction-timeout 0 \
+		--deliver hermes:COLLAB_MODEL_PROVIDER --deliver hermes:COLLAB_MODEL_BASE_URL \
+		--deliver hermes:COLLAB_MODEL_NAME --deliver hermes:COLLAB_MODEL_API_KEY
+
+# The model the Hermes Cog calls: `make fake-model` by default. Point it at a real
+# OpenAI-compatible endpoint by setting these before `make controller`, or at
+# Claude with COLLAB_MODEL_PROVIDER=anthropic; the key is read from your
+# environment, never from the make command line.
+FAKE_MODEL_PORT ?= 8090
+ifneq ($(COLLAB_MODEL_PROVIDER),anthropic)
+# The fake model's defaults; with Claude the Cog picks its own model unless COLLAB_MODEL_NAME says.
+export COLLAB_MODEL_BASE_URL ?= http://127.0.0.1:$(FAKE_MODEL_PORT)/v1
+export COLLAB_MODEL_NAME ?= fake-model
+endif
+
+fake-model: ## An OpenAI-compatible model that answers without one, for the Hermes Cog (port 8090)
+	python3 $(CURDIR)/fake-model/fake_model.py --port $(FAKE_MODEL_PORT)
+
 # ---------------------------------------------------------------------------
 ## Level 2 — API with real datastores
 # ---------------------------------------------------------------------------
 
-api-pg: services | $(LOCAL)/frames ## Starts Postgres+S3, then the API: history, groups, orgs, tasks
+api-pg: postgres | $(LOCAL)/frames ## Starts Postgres, then the API: history, groups, orgs, tasks
 	cd $(API_DIR) && env $(BASE_ENV) $(DEV_AUTH_ENV) $(PG_ENV) uv run python -m collab_hub_api
 
 # ---------------------------------------------------------------------------
 ## Level 3 — API with Keycloak (real bearer tokens, web surface, connectors)
 # ---------------------------------------------------------------------------
 
-api-oidc: services keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
-	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) uv run python -m collab_hub_api
+api-oidc: postgres keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(RUNS_ENV) uv run --group runs python -m collab_hub_api
 
 # Connector routes exchange the CALLER's bearer with the broker, so the
 # dev-auth shortcut cannot reach them -- it authenticates a subject without
 # ever producing a token to forward. This target therefore runs real Keycloak
 # verification and points only the provider APIs at the fakes.
-api-fakes: services keycloak fakes | $(LOCAL)/frames ## API + Keycloak + fake Google/Slack connector providers
+api-fakes: postgres keycloak fakes | $(LOCAL)/frames ## API + Keycloak + fake Google/Slack connector providers
 	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(FAKE_CONNECTOR_ENV) \
 		uv run python -m collab_hub_api
 
@@ -283,7 +321,7 @@ api-full: services keycloak | $(LOCAL)/frames ## Everything: OIDC + Postgres + S
 	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(S3_ENV) $(WEB_ENV) $(KC_CONNECTOR_ENV) \
 		uv run python -m collab_hub_api
 
-api-membership: services keycloak | $(LOCAL)/frames ## API in multi-tenant mode: organization comes from collab_org_members
+api-membership: postgres keycloak | $(LOCAL)/frames ## API in multi-tenant mode: organization comes from collab_org_members
 	cd $(API_DIR) && env $(BASE_ENV) $(MEMBERSHIP_ENV) $(PG_ENV) $(WEB_ENV) uv run python -m collab_hub_api
 
 # ---------------------------------------------------------------------------
@@ -364,6 +402,9 @@ hub-proxy-down: ## Stop the front door (Keycloak stays up on localhost:8080)
 # ---------------------------------------------------------------------------
 ## Supporting services (docker compose)
 # ---------------------------------------------------------------------------
+
+postgres: ## Start Postgres alone: every API target but api-full keeps frames on the local filesystem
+	$(COMPOSE) up -d --wait postgres
 
 services: ## Start Postgres + the S3 frame store
 	$(COMPOSE) up -d --wait postgres s3

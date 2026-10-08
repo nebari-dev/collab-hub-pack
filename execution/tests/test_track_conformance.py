@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import warnings
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -295,3 +296,42 @@ def test_sqlite_closes_every_connection_it_opens(tmp_path):
         gc.collect()
     unclosed = [w for w in caught if issubclass(w.category, ResourceWarning) and "sqlite3" in str(w.message)]
     assert unclosed == []
+
+
+# --- a conditional append -----------------------------------------------------------------------
+
+
+def test_append_if_appends_only_when_its_condition_holds_of_the_track(store):
+    store.append(_event("op_submitted", op={}))
+    seen = []
+
+    def no_request_yet(events):
+        seen.append([event.event_type for event in events])
+        return not any(event.event_type == "cancel_requested" for event in events)
+
+    first = store.append_if(_event("cancel_requested", actor="a"), no_request_yet)
+    assert first.sequence is not None and first.payload == {"actor": "a"}
+    assert store.append_if(_event("cancel_requested", actor="b"), no_request_yet) is None
+    assert seen == [["op_submitted"], ["op_submitted", "cancel_requested"]]  # the whole run, as it stood
+    assert [event.payload for event in store.replay("r")][1:] == [{"actor": "a"}]
+    with pytest.raises(ValueError, match="assigns event sequences"):
+        store.append_if(replace(_event("cancel_requested"), sequence=7), lambda events: True)
+
+
+def test_append_if_is_one_step_so_racing_callers_cannot_all_pass_the_check(store):
+    store.append(_event("op_submitted", op={}))
+    start, stored = threading.Barrier(8), []
+
+    def ask(n):
+        start.wait()
+        stored.append(store.append_if(
+            _event("cancel_requested", actor=f"actor-{n}"),
+            lambda events: not any(event.event_type == "cancel_requested" for event in events)))
+
+    threads = [threading.Thread(target=ask, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len([event for event in stored if event is not None]) == 1
+    assert [event.event_type for event in store.replay("r")] == ["op_submitted", "cancel_requested"]

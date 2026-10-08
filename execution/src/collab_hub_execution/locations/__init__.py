@@ -10,7 +10,7 @@ A location is chosen by configuration, ``local`` or ``remote``, through
 :func:`select_executor`, and callers never import an executor. ``local`` is
 implemented: the worker is a process on the controller's host. ``remote``, the
 worker as a workload on a cluster, is refused when a runner starts until Phase
-20 of the plan puts it behind this switch, so the configuration shape is fixed
+21 of the plan puts it behind this switch, so the configuration shape is fixed
 now.
 """
 
@@ -23,7 +23,7 @@ from typing import Any
 AGENT_LOCATIONS = ("local", "remote")
 """Every value the ``location`` setting takes, in the order they are built."""
 
-_NOT_YET = {"remote": "Phase 20 (#6)"}
+_NOT_YET = {"remote": "Phase 21 (#6)"}
 
 
 class LocationNotImplemented(NotImplementedError):

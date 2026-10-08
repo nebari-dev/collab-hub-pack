@@ -263,6 +263,18 @@ and reads its Track, and never calls the executor. On the user's machine,
 the local run host plays the same role. (ADR-0002 D4, D6; ADR-0001
 invariant 2; issue #6.)
 
+**Turn.** One exchange with a Cog whose step holds a session: a client's
+text, recorded on the run's Track by the API, delivered by the run controller
+to the Cog's worker (`POST /turn`), and the worker's answer recorded beside it.
+`collab-hub run say` asks one; `collab-hub run connect` turns each prompt of
+an ACP client into one. (`docs/cog-execution/runs.md`.)
+
+**Run intent.** What a client asked of a run, recorded on its Track by the
+API for the run controller to act on: `op_submitted`, `cancel_requested`, and
+`turn_requested`.
+The API writes intent and reads status; it never calls the controller.
+(ADR-0002 D4.)
+
 **Run pickup.** Under `none`, how exactly one run controller starts a
 submitted run: an atomic pickup record. The run then belongs to that
 controller, and ends `interrupted` if the controller stops. `dbos` and
