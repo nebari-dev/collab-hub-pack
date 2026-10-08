@@ -155,8 +155,11 @@ def _offered(connector: str):
     ) -> None:
         if connector in disabled:
             # The access log shows a 404 on a route that plainly exists; this
-            # line is what tells it apart from a path nothing serves.
-            logger.info("connector_status_switched_off", extra={"connector": connector})
+            # line is what tells it apart from a path nothing serves. At debug,
+            # because clients poll status: a switched-off provider would
+            # otherwise add a line per connector, per user, per refresh, and
+            # the response body already says why to whoever is asking.
+            logger.debug("connector_status_switched_off", extra={"connector": connector})
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 f"The {connector} connector is switched off on this hub",

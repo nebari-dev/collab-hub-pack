@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 
 import httpx
@@ -20,7 +21,9 @@ from httpx import ASGITransport, AsyncClient
 
 from collab_hub_api.config import Config, ConnectorsConfig
 from collab_hub_api.core import make_app
+from collab_hub_api.frames.connector_state import CONNECTOR_KEYS
 from collab_hub_api.routers.connectors import get_connectors_config as _get_connectors_config
+from collab_hub_api.routers.connectors import router as connectors_router
 from collab_hub_api.routers.connectors import switched_off_connectors
 
 
@@ -261,7 +264,7 @@ async def test_other_routes_of_a_switched_off_connector_refuse_as_unconfigured(h
 async def test_a_switched_off_status_is_told_apart_from_a_path_nothing_serves(hub, caplog):
     app = hub(Store(disabled={"slack"}))
 
-    with caplog.at_level(logging.INFO, logger="frames_server.connectors"):
+    with caplog.at_level(logging.DEBUG, logger="frames_server.connectors"):
         unrouted = await _get(app, "/v1/connectors/slack/no-such-route")
         assert not [r for r in caplog.records if r.getMessage() == "connector_status_switched_off"]
         switched_off = await _get(app, "/v1/connectors/slack/status")
@@ -270,3 +273,48 @@ async def test_a_switched_off_status_is_told_apart_from_a_path_nothing_serves(hu
     assert unrouted.text != switched_off.text
     (record,) = [r for r in caplog.records if r.getMessage() == "connector_status_switched_off"]
     assert record.connector == "slack"
+    # Clients poll status, so this must not add a line per request at the default level.
+    assert record.levelno == logging.DEBUG
+
+
+async def test_a_switched_off_status_still_asks_for_sign_in_first(hub):
+    """Which connectors a hub has switched off is not told to someone who has not signed in."""
+
+    app = hub(Store(disabled={"slack"}))
+
+    async with _client(app) as client:
+        switched_off = await client.get("/v1/connectors/slack/status")
+        switched_on = await client.get("/v1/connectors/github/status")
+
+    assert switched_off.status_code == switched_on.status_code == 401
+    assert switched_off.json() == switched_on.json()
+
+
+# Status routes of connectors that have no switch. A connector added here is a
+# decision that its status may answer 200 while everything switchable is off.
+_NOT_SWITCHABLE = {"notion"}
+
+
+async def test_every_status_route_the_router_serves_honours_the_switch(hub):
+    """The 404 is wired per route, so a new connector's status route could forget it.
+
+    The routes are read from the router rather than listed here: a status route
+    added later is checked without anyone remembering to add it to a test.
+    """
+
+    served = sorted(
+        match.group(1)
+        for route in connectors_router.routes
+        if "GET" in getattr(route, "methods", ())
+        and (match := re.fullmatch(r"/connectors/([^/{}]+)/status", route.path))
+    )
+    assert set(ALL_STATUS_ROUTES) | _NOT_SWITCHABLE == set(served), "STATUS_ROUTES in this file is out of date"
+
+    app = hub(Store(disabled=set(CONNECTOR_KEYS)))
+    answered = {}
+    async with _client(app) as client:
+        for connector in served:
+            response = await client.get(f"/v1/connectors/{connector}/status", headers=_auth_header())
+            answered[connector] = response.status_code
+
+    assert answered == {connector: 200 if connector in _NOT_SWITCHABLE else 404 for connector in served}
