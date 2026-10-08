@@ -51,6 +51,18 @@ budget epoch; the engine does not offer it until #4 builds epochs.) Budgets are
 not reset by retrying. Duration is checked at step boundaries; it does not interrupt an interaction already in progress.
 Token and cost accounting happens after an interaction and can overshoot.
 
+## The run controller and intents
+
+`python -m collab_hub_execution.controller --track FILE --packages DIR --work-dir DIR`
+is the process that advances runs (ADR-0002 D4). It watches a SQLite Track,
+starts each run that was submitted and not picked up, and delivers each request
+to cancel. `collab_hub_execution.intents` is the other half, used by the hub's
+API: `submit()` and `request_cancel()` record what a client asked for, and
+`describe()` and `list_runs()` read runs back, each step with its state and its
+output. Neither half calls the other; the Track is all they share. One
+controller per Track for now: it holds a lock beside the file. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#the-run-controller-and-the-run-api).
+
 ## The lifecycle runner
 
 The lifecycle lives in `LifecycleRunner` (`collab_hub_execution.runner`), as
@@ -238,6 +250,34 @@ independent metering or hard per-request caps.
 
 ## Workers
 
+Where a worker runs is the runner's `location` setting, `local` or `remote`
+(ADR-0002 D12); only `local` is built behind the switch, and `remote` is
+refused until Phase 21:
+
+```python
+LifecycleRunner(track=track, location="local", location_settings={
+    "packages": ["dev/cogs"],      # directories Cog packages are found under
+    "allow": ["echo"],             # the names that may run; every package when omitted
+    "work_dir": "dev/.local/runs", # each worker's stdout and stderr, per run
+})
+```
+
+A local worker is the package's `serve` task (`pixi.toml`, `[tasks]`), run in
+the package's own pixi environment on a loopback port the executor chooses. It
+is told where to listen (`COLLAB_COG_HOST`, `COLLAB_COG_PORT`), which Cog and
+run it is (`COLLAB_COG_ID`, `COLLAB_RUN_ID`) and its run token
+(`COLLAB_RUN_TOKEN`), which the controller presents as a bearer token on
+`/invoke`. What a binding delivers is asked per worker (`deliver`, a function of
+the Cog, the run and the instance) and reaches that worker alone. A package
+needs its `pixi.lock`, and neither it nor the manifest may be a symbolic link.
+It inherits nothing else of the controller's environment, and it is
+killed with its whole process group at teardown, or when the controller dies.
+The Track records `worker_started` (where it ran, and the hash of its token)
+and `worker_stopped`. An executor may still be handed to the runner directly
+(`executor=`), which is how the in-memory executor of the tests and the
+Kubernetes executor are used today. See
+[`docs/cog-execution/runs.md`](../docs/cog-execution/runs.md#agent-locations).
+
 A step that is sent back receives its original `input` and, separately, the
 findings as `signal`. The field is absent until a send back; an empty list of
 findings is still a signal. In-memory handlers that are sent back need a
@@ -258,3 +298,6 @@ request; an HTTP failure does not prove that a side effect did not occur.
 Run `uv run --group test pytest` from this directory. Set `TEST_POSTGRES_URL`
 to a disposable database to include the Postgres tests; they recreate Track
 tables. The kind workflow also exercises the worker transport and resume path.
+The location tests start real worker processes from the fake Cog packages of
+`dev/cogs/`, under the test interpreter; the one that runs a package in its
+pixi environment is skipped unless `pixi` is on `PATH`.

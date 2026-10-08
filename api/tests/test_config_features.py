@@ -49,7 +49,7 @@ def test_an_unparseable_value_is_refused(value):
 
 
 def test_an_unregistered_name_in_configuration_is_refused():
-    with pytest.raises(ValidationError, match="unknown feature flag 'cogs_iu'; registered flags: cogs_ui"):
+    with pytest.raises(ValidationError, match="unknown feature flag 'cogs_iu'; registered flags: (.+, )?cogs_ui"):
         FeaturesConfig.model_validate({"cogs_iu": "true"})
 
 
