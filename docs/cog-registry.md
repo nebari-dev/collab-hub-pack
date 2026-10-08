@@ -349,7 +349,7 @@ cogs:
     tokenTtlSeconds: 300        # 30..3600
     maxBlobBytes: 1073741824    # 1 GiB
     maxBlobSeconds: 900         # 10..21600
-    routeTimeout: true          # HTTPRoute only
+    routeTimeout: true          # HTTPRoute or NebariApp public route
 ```
 
 | Chart value | Setting (`COLLAB_HUB_API__COGS__SERVE__…`) | Meaning |
@@ -430,8 +430,8 @@ the database could not answer; retry).
 
 ### Registry credentials
 
-A client never presents its Hub token to `/v2/` and never stores it as a
-registry login. It exchanges its session for a **registry credential**:
+A client that stores a registry login never stores its Hub access or
+refresh token there. It exchanges its session for a **registry credential**:
 
 | Route | Answers |
 | --- | --- |
@@ -447,8 +447,9 @@ All three need an ordinary Hub sign-in and answer 404
   signing key to configure or rotate. `id` is one URL-safe path segment
   matching `[A-Za-z0-9][A-Za-z0-9_-]{0,127}` (today `crc-` and 24 hex
   digits), and `username` is the same string.
-- **Pull-only.** It can be turned into pull tokens and nothing else; a token
-  request that asks for `push` is granted `pull`.
+- **Pull-only.** It can be turned into pull tokens and nothing else. Token
+  requests ignore `push`; a repository is granted only when its requested
+  actions include `pull`.
 - **Short-lived.** It stops at `expires_at` (`credentialTtlSeconds`, fifteen
   minutes by default), and so does every token minted from it, whatever
   `tokenTtlSeconds` says. Exchange a fresh one before each install, and size
@@ -477,8 +478,12 @@ to revoke each credential they hold when they are done with it and at
 sign-out, and not to rely on the revoke-all route), and its lifetime,
 fifteen minutes by default.
 
-Expired rows are deleted by the next exchange or mint, and by a read at most
-every five minutes, so a Hub that goes quiet does not keep them.
+Expired rows never authorize a request. An exchange deletes only that
+caller's expired credentials. Credential and token lookups and mints can
+start a background sweep, at most every five minutes per process, on its own
+pooled connection in bounded batches. Cleanup does not run in the request's
+transaction. A quiet Hub can retain expired rows until another call starts
+the sweep; that does not extend their validity.
 
 The token endpoint also accepts a Hub credential the API already accepts (a
 bearer access token, the gateway's cookie) in place of Basic auth, for a
@@ -488,6 +493,19 @@ with `DELETE /v1/cogs/registry-credentials`. The read API itself takes pull
 tokens only.
 
 ### What is served
+
+**The v1 catalog is shared across the Hub.** An authenticated caller admitted
+by the catalog's existing auth check may pull every present, indexed Cog in
+the configured sources. On membership-resolving deployments, membership in
+any Hub organization is sufficient; a platform operator can also be admitted
+without an organization. Claims-sourced deployments use the organization
+claims accepted at sign-in, bounded by credential and token lifetimes.
+There is no per-Cog or per-organization read visibility rule in this version.
+Repository-scoped pull tokens limit the repositories named by a token; they
+do not establish organization isolation. Configure sources for a shared
+catalog, not for packages that must be hidden from other admitted Hub users.
+This is the v1 access rule, not a promise of isolation pending another change.
+Any later visibility policy must apply consistently to discovery and pulls.
 
 **Only what the catalog would show.** Authorization is the rule
 `GET /v1/cogs` applies: a caller the Hub authenticates sees the whole
