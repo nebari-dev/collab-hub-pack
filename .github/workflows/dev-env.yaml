@@ -125,7 +125,7 @@ jobs:
           [ "$(cli/.venv/bin/collab-hub cog list --json)" = "[]" ] \
             || { echo "collab-hub cog list did not report the empty catalog"; exit 1; }
 
-      # The runner on the `none` backend, in process: each fake Op ends where it
+      # The runner on the `none` backend, the fake Cogs answering in process: each fake Op ends where it
       # should, and a run stopped mid-step is recorded interrupted when the next
       # host starts, never resumed (ADR-0002 D2).
       - name: make op runs the fake Ops, and a stopped run is interrupted
@@ -149,6 +149,38 @@ jobs:
           make -s -C dev op OP=echo | tee /tmp/op-after.log
           grep -q "^interrupted $run:" /tmp/op-after.log \
             || { echo "the stopped run was not recorded interrupted"; exit 1; }
+
+      # The `local` agent location: the same fake Cog as a real process, its `serve` task run in the
+      # package's own pixi environment by the local executor. A host killed with SIGKILL runs no
+      # teardown, and still leaves no worker behind: the launcher that holds the worker sees its
+      # pipe to the host close, and kills the worker's process group (ADR-0002 D12).
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: make op LOCATION=local runs a fake Cog as a process, and a killed host leaves no worker
+        run: |
+          set -euo pipefail
+          workers() { pgrep -f 'dev/cogs/[a-z-]*/\.pixi/envs' || true; }
+          make -s -C dev op OP=echo LOCATION=local | tee /tmp/op-local.log
+          grep -q '^status: COMPLETED' /tmp/op-local.log
+          [ "$(grep -c ' worker_started .*location=local' /tmp/op-local.log)" = 2 ] \
+            || { echo "the steps did not run as local worker processes"; exit 1; }
+          [ "$(grep -c ' worker_stopped ' /tmp/op-local.log)" = 2 ]
+          [ -z "$(workers)" ] || { echo "a worker outlived its step"; exit 1; }
+
+          make -s -C dev op OP=slow LOCATION=local > /tmp/op-slow-local.log 2>&1 &
+          for _ in $(seq 1 120); do [ -n "$(workers)" ] && break; sleep 1; done
+          [ -n "$(workers)" ] || { echo "the slow Cog's worker never started"; cat /tmp/op-slow-local.log; exit 1; }
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/op-slow-local.log)
+          pkill -KILL -f "dev/op.py slow"
+          wait || true
+          for _ in $(seq 1 20); do [ -z "$(workers)" ] && break; sleep 1; done
+          [ -z "$(workers)" ] || { echo "a worker outlived its killed host:"; ps -p "$(workers)" -o pid,command; exit 1; }
+          make -s -C dev op OP=echo | tee /tmp/op-after-kill.log
+          grep -q "^interrupted $run:" /tmp/op-after-kill.log \
+            || { echo "the killed host's run was not recorded interrupted"; exit 1; }
 
       - name: make clean removes the scratch state
         run: |
@@ -208,14 +240,18 @@ jobs:
             || { echo "GET /v1/cogs/catalog.v1.json returned $view"; exit 1; }
 
           # The Track tables (migration 12) come from the migration registry the
-          # API ran at startup and from nowhere else: the API never imports the
-          # execution package, so nothing else could have created them.
+          # API ran at startup and from nowhere else: the one module of the API
+          # that imports the execution package is the run router, which is
+          # behind the cog_runs feature flag, off here, and keeps its Track in a
+          # SQLite file, so nothing else could have created them.
           psql='docker compose -f dev/compose.yaml exec -T postgres psql -U collab -d collab -tAc'
           tables=$($psql "SELECT count(*) FROM pg_tables WHERE tablename IN ('collab_track_events', 'collab_track_payloads')")
           [ "$tables" = "2" ] || { echo "expected the two Track tables from migrations, found $tables"; exit 1; }
           applied=$($psql "SELECT max(version) FROM collab_schema_migrations")
           [ "$applied" -ge 12 ] || { echo "expected migration 12 applied, latest is $applied"; exit 1; }
-          if grep -rq "collab_hub_execution" api/src; then echo "the API must not import the execution package"; exit 1; fi
+          importers=$(grep -rl --include='*.py' "collab_hub_execution" api/src | sort | tr '\n' ' ')
+          [ "$importers" = "api/src/collab_hub_api/routers/runs.py " ] \
+            || { echo "only the run router may import the execution package; found: $importers"; exit 1; }
 
           pkill -f "collab_hub_api" || true
           sleep 2

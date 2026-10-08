@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -40,6 +41,7 @@ from .backends import DurabilityBackend, select_backend
 from .envelope import EnvelopeInvalid, ResultEnvelope
 from .gates import DEFAULT_APPROVERS, Gate, GateOutcome, envelope_digest, escalation_id
 from .lifecycle import BudgetExceeded, BudgetTracker, RunBudget
+from .locations import select_executor
 from .ops import (
     _NO_SIGNAL,
     CogExecutor,
@@ -51,8 +53,10 @@ from .ops import (
     _deserialize_op,
     _serialize_op,
 )
-from .states import RUN, Run, RunState, Transition, Worker
+from .states import RUN, InvalidTransition, Run, RunState, Transition, Worker
 from .track import PAYLOAD_INLINE_MAX_BYTES, SCHEMA_VERSION, TrackEvent, TrackStore, upgrade
+
+_log = logging.getLogger(__name__)
 
 # A failure's message on the Track is bounded, so a stack trace or a model's
 # answer cannot turn the accountability record into a log.
@@ -202,6 +206,8 @@ class Attempt:
     outcome: tuple[str, Any] = ("broken", "Unknown")
     failure_reason: str | None = None
     teardown_error: str | None = None
+    started: bool = False
+    """A ``worker_started`` was recorded for the worker, so its teardown records ``worker_stopped``."""
     released: bool = False
     """Whoever tears the worker down has claimed it: the teardown step, or ``cancel()`` from another
     thread. Set under the runner's lock, so the worker is torn down once."""
@@ -281,14 +287,20 @@ class LifecycleRunner(WorkflowEngine):
     def __init__(
         self,
         *,
-        executor: CogExecutor,
+        executor: CogExecutor | None = None,
         track: TrackStore,
         budget: RunBudget | None = None,
         max_revisions: int | None = None,
         payload_inline_max_bytes: int = PAYLOAD_INLINE_MAX_BYTES,
         backend: str = "none",
+        location: str | None = None,
+        location_settings: Mapping[str, Any] | None = None,
     ) -> None:
-        self.executor = executor
+        if (executor is None) == (location is None):
+            raise ValueError("a runner takes a location, 'local' or 'remote', or an executor handed to it; not both")
+        # The configuration value is the only switch; a location not built yet is refused here.
+        self.executor: CogExecutor = executor if location is None else select_executor(
+            location, **(location_settings or {}))
         self.track = track
         self.budget = budget
         self.max_revisions = max_revisions
@@ -463,10 +475,10 @@ class LifecycleRunner(WorkflowEngine):
         recorded ``interrupted`` rather than left looking alive, and continues only
         when a person retries it (ADR-0002 D2). A run this host is advancing right
         now is left alone. Returns the runs it interrupted. A durable backend
-        resumes its runs instead, which Phases 25 and 31 build.
+        resumes its runs instead, which Phases 26 and 32 build.
 
         Every unfinished run on the Track is taken as this host's, the single
-        owner the runner assumes; run pickup by a controller (Phase 10) narrows
+        owner the runner assumes; run pickup by a controller (Phase 11) narrows
         this to the runs the starting controller picked up.
         """
         if self.backend.durable:
@@ -483,7 +495,23 @@ class LifecycleRunner(WorkflowEngine):
                         interrupted.append(run_id)
             except RunBusy:
                 continue
+            except InvalidTransition as exc:
+                # A Track the machine cannot replay is passed over, as a controller's pass passes over
+                # it: one such run never keeps a host from starting, and nothing is written to it.
+                _log.warning("run %s cannot be read, and is left as it is: %s", run_id, exc)
         return tuple(interrupted)
+
+    def live_worker(self, run_id: str) -> CogWorker | None:
+        """The worker this host has invoked for the run and not yet let go of; ``None`` otherwise.
+
+        What a session Cog's turns are delivered to while its step is in flight.
+        """
+        with self._lock:
+            advancing = self._advancing.get(run_id)
+            attempt = advancing.attempt if advancing is not None else None
+            if attempt is None or not attempt.invoked or attempt.released or attempt.worker is None:
+                return None
+            return attempt.worker
 
     def cancel(self, run_id: str, *, actor: str) -> RunState:
         """End a run ``cancelled``, recording who cancelled it, and tear its worker down.
@@ -849,6 +877,13 @@ class LifecycleRunner(WorkflowEngine):
         step = attempt.step
         attempt.worker = self.executor.materialize(step.cog, op.run_id, attempt.instance)
         attempt.cog_worker = now.record(Worker.materialize(step.cog, step=step.name, digest=step.digest))
+        token_digest = getattr(attempt.worker, "run_token_digest", None)
+        if token_digest is not None:
+            # Where the worker is, and the hash of its run token: the token itself is never recorded.
+            now.append("worker_started", {
+                "step": step.name, "attempt": attempt.number, "instance": attempt.instance,
+                **getattr(attempt.worker, "details", {}), "run_token_sha256": token_digest})
+            attempt.started = True
         attempt.cog_worker = now.record(attempt.cog_worker.ready())
 
     @step_function
@@ -896,8 +931,16 @@ class LifecycleRunner(WorkflowEngine):
         what is left of it, and if that fails the run's `failed` record says so.
         ``TORN_DOWN`` is never recorded, so the runner does not move the worker there.
         A worker ``cancel()`` already tore down is not torn down again; its machine
-        records why it stopped.
+        records why it stopped. A worker whose start was recorded has its stop
+        recorded once it is gone, which is when its run token expires.
         """
+        error = self._tear_down(now, attempt)
+        if error is None and attempt.started:
+            now.append("worker_stopped", {"step": attempt.step.name, "attempt": attempt.number,
+                                          "instance": attempt.instance})
+        return error
+
+    def _tear_down(self, now: _Pass, attempt: Attempt) -> str | None:
         cog_worker = attempt.cog_worker
         with self._lock:
             by_cancel, attempt.released = attempt.released, True

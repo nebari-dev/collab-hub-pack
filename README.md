@@ -78,9 +78,17 @@ flowchart LR
   the backend that resumes runs; see
   [`docs/cog-execution/runs.md`](docs/cog-execution/runs.md).
 - **One host per Track.** Until run pickup (#121), a host takes every
-  unfinished run on its Track as its own when it starts.
+  unfinished run on its Track as its own when it starts, so one run controller
+  runs per Track.
+- **The run API is behind a feature flag.** `/v1/runs` and the run controller
+  are a first form, for one machine: a SQLite Track, workers as local
+  processes, and the `cog_runs` flag off by default. See
+  [`examples/cog-local`](examples/cog-local/README.md).
 
 ## Local development
+
+To see a Cog run before anything else, [`examples/cog-local`](examples/cog-local/README.md)
+launches one from the `collab-hub` CLI on your own machine, with no container.
 
 Everything is driven from [`dev/`](dev/), which runs the pack on your machine
 in four levels — from a bare process with no dependencies, up to real
