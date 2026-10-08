@@ -2,6 +2,7 @@
 #
 # Started through dev/Makefile, never by hand:
 #
+#   make postgres   postgres                    (no profile)
 #   make services   postgres + s3               (no profile)
 #   make keycloak   + keycloak                  (profile: auth)
 #   make fakes      + fake Google/Slack         (profile: fakes)

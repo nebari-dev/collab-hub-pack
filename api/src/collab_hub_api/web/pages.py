@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import html
 import logging
+from urllib.parse import quote
 
 from fastapi.responses import HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -422,13 +423,20 @@ def authorization_unavailable_page(*, root_path: str = "") -> str:
     )
 
 
-def signed_out_page(*, root_path: str = "") -> str:
+def signed_out_page(*, root_path: str = "", next_path: str | None = None) -> str:
+    """The page after sign-out. *next_path*, already sanitized by the caller,
+    rides on the sign-in link so signing in again returns to where the person
+    left, such as the admin panel."""
+
+    signin = f"{root_path}/web/signin"
+    if next_path:
+        signin += f"?next={quote(next_path, safe='')}"
     return render_page(
         title="Signed out",
         body=(
             "<h1>Signed out</h1>"
             "<p>Your session on this browser has ended.</p>"
-            f'<p><a href="{html.escape(root_path)}/web/signin">Sign in again</a></p>'
+            f'<p><a href="{html.escape(signin)}">Sign in again</a></p>'
         ),
         root_path=root_path,
     )
