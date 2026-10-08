@@ -480,9 +480,9 @@ fifteen minutes by default.
 
 Expired rows never authorize a request. An exchange deletes only that
 caller's expired credentials. Credential and token lookups and mints can
-start a background sweep, at most every five minutes per process, on its own
-pooled connection in bounded batches. Cleanup does not run in the request's
-transaction. A quiet Hub can retain expired rows until another call starts
+start a background sweep on its own pooled connection in bounded batches.
+The usual interval is five minutes per process; a full batch makes the next
+call retry sooner. Cleanup does not run in the request's transaction. A quiet Hub can retain expired rows until another call starts
 the sweep; that does not extend their validity.
 
 The token endpoint also accepts a Hub credential the API already accepts (a
@@ -610,6 +610,11 @@ the client is never redirected. (Redirecting
 blobs to a signed URL would take that traffic off the Hub at the price of
 showing clients the storage host; streaming is the default and the only
 mode today.)
+
+A source removed from configuration no longer has a sweep to collect its
+stored blob descriptors. Those descriptors grant no pulls for that source,
+but their retention needs a separate cleanup policy; tracked in
+[#193](https://github.com/nebari-dev/collab-hub-pack/issues/193).
 
 ### Redirects
 
