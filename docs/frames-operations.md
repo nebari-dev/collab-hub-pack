@@ -822,7 +822,8 @@ The status routes are the exception, because `not_connected` tells a client
 to offer the user a connection that cannot succeed. While a connector is
 switched off, its status routes answer 404 with
 `{"detail": "The <connector> connector is switched off on this hub"}` and
-`GET /v1/connectors` leaves its entries out, so a client shows it as not
+`GET /v1/connectors` leaves its entries out (see
+[connector discovery](connector-discovery.md)), so a client shows it as not
 offered here rather than as broken. `google` covers
 `/v1/connectors/google-drive/status`, `/v1/connectors/gmail/status` and
 `/v1/connectors/google-calendar/status`. A connector that was never switched
