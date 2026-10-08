@@ -32,6 +32,7 @@ Calendar, Slack, GitHub, Notion.
   "description": "Search and read files from the connected Google Drive.",
   "provider": "google",
   "link": {"type": "identity_provider", "alias": "google", "prompt": "consent"},
+  "connect_hint": null,
   "connected": false,
   "state": "not_connected",
   "scopes": [],
@@ -48,6 +49,7 @@ Calendar, Slack, GitHub, Notion.
 | `description` | One sentence on what the connector lets an assistant do. Safe to show a user. |
 | `provider` | The configuration section and operator switch the connector belongs to: `google`, `slack`, `github` or `notion`. Connectors that share a provider share one linked account. |
 | `link` | How a user connects it, or `null` when there is nothing for the user to do (a static token serves every caller). |
+| `connect_hint` | A sentence the user should read before they start connecting, or `null`. Slack uses it to say the workspace is chosen on Slack's own screen. Show it next to the connect action, not after a failure. |
 | `connected`, `state`, `scopes`, `detail` | The caller's connection state, as the connector's own status route reports it. `state` is one of `connected`, `not_connected`, `reconnect_required`, `unavailable`. |
 | `account` | The linked account or workspace where the connector knows it (GitHub login, Notion workspace name), otherwise `""`. |
 

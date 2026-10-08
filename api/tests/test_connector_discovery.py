@@ -217,6 +217,14 @@ async def test_google_connectors_ask_for_consent_again_and_the_others_do_not(hub
     }
 
 
+async def test_only_slack_carries_a_hint_to_read_before_connecting(hub):
+    listed = await _listed(hub(_brokered(*PROVIDERS)))
+
+    hints = {item["id"]: item["connect_hint"] for item in listed}
+    assert hints.pop("slack").startswith("Before authorizing Slack, confirm the workspace")
+    assert set(hints.values()) == {None}
+
+
 async def test_a_static_token_leaves_the_user_nothing_to_link(hub):
     listed = await _listed(hub({"github": {"static_access_token": "gh-not-a-real-token"}}))
 

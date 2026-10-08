@@ -91,6 +91,7 @@ class ConnectorListing(ConnectorSummary):
     description: str
     provider: str
     link: ConnectorLink | None = None
+    connect_hint: str | None = None
     account: str = ""
 
 

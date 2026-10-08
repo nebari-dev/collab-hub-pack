@@ -201,6 +201,7 @@ async def list_connectors(
             description=descriptor.description,
             provider=descriptor.provider,
             link=connector_link(descriptor, section),
+            connect_hint=descriptor.connect_hint,
             connected=found.connected,
             state=found.state,
             scopes=found.scopes,

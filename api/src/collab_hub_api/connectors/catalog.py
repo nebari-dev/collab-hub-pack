@@ -44,6 +44,8 @@ class ConnectorDescriptor:
     """
     prompt: str | None = None
     """An OIDC ``prompt`` the link request must carry, where one is needed."""
+    connect_hint: str | None = None
+    """What a user should know before they start connecting, where it matters."""
 
 
 CATALOG: tuple[ConnectorDescriptor, ...] = (
@@ -79,6 +81,10 @@ CATALOG: tuple[ConnectorDescriptor, ...] = (
         short_name="Slack",
         description="Search and read messages from connected Slack channels.",
         provider="slack",
+        connect_hint=(
+            "Before authorizing Slack, confirm the workspace you want to connect on Slack's authorization "
+            "screen. Your email address does not select it automatically."
+        ),
     ),
     ConnectorDescriptor(
         id=GITHUB_CONNECTOR_ID,
