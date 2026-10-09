@@ -242,6 +242,22 @@ ca_bundle_path, and nothing outside the pod needs to know it.
 {{- end -}}
 
 {{/*
+The origin clients reach the Hub's own registry (`/v2/`) at (issue #179):
+cogs.serve.publicUrl when set, else https://<host> of whichever routing object
+the chart creates. Empty when none can be derived, which cogs-validations.yaml
+refuses while cogs.serve.enabled.
+*/}}
+{{- define "collab-hub.cogs-serve-public-url" -}}
+{{- if .Values.cogs.serve.publicUrl -}}
+{{- .Values.cogs.serve.publicUrl -}}
+{{- else if and .Values.api.nebariapp.enabled .Values.api.nebariapp.hostname -}}
+{{- printf "https://%s" .Values.api.nebariapp.hostname -}}
+{{- else if and .Values.api.ingress.enabled .Values.api.ingress.host -}}
+{{- printf "https://%s" .Values.api.ingress.host -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 The environment variable a source's Secret key is mounted under. Takes
 (dict "id" <source id> "suffix" <USERNAME|PASSWORD|WEBHOOK_SECRET>). The id is
 upper-cased and every character outside [A-Z0-9] becomes "_", so the name is
@@ -273,6 +289,7 @@ toJson sorts keys, so the rendering is deterministic.
 {{- with .repositories }}{{ $_ := set $source "repositories" . }}{{ end -}}
 {{- with .indexUrl }}{{ $_ := set $source "index_url" . }}{{ end -}}
 {{- with (default $caBundlePath .caBundlePath) }}{{ $_ := set $source "ca_bundle_path" . }}{{ end -}}
+{{- with .blobRedirectHosts }}{{ $_ := set $source "blob_redirect_hosts" . }}{{ end -}}
 {{- if hasKey . "requestTimeoutSeconds" }}{{ $_ := set $source "request_timeout_seconds" .requestTimeoutSeconds }}{{ end -}}
 {{- $credentials := .credentials | default dict -}}
 {{- if $credentials.existingSecret -}}
