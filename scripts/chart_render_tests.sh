@@ -45,6 +45,13 @@ check "ci fixture: harbor + static, Secrets attached, CA mounted read-only" fixt
 check "sources with the indexer off: JSON renders, tuning vars do not" static-only $STATIC
 check "three sources: each credential attached to its own source" three-sources -f "$TESTDATA/cogs-three-sources.yaml"
 check "middle source removed and order reversed: attachments follow the id" reordered -f "$TESTDATA/cogs-reordered.yaml"
+NEBARIAPP='--set api.nebariapp.enabled=true --set api.nebariapp.hostname=hub.example.com'
+HTTPROUTE='--set api.ingress.enabled=true --set api.ingress.kind=HTTPRoute --set api.ingress.host=hub.example.com --set api.ingress.parentRefs[0].name=gateway --set server.forwardedAllowIps[0]=10.0.0.0/8'
+check "serving off: no serve variables, the gateway's public routes untouched" serve-off $STATIC $NEBARIAPP
+check "serving on behind the Nebari gateway: URL derived, /v2 made a public route with a timeout policy" serve-nebariapp $STATIC $NEBARIAPP --set cogs.serve.enabled=true
+check "serving on behind the Nebari gateway with routeTimeout off: no policy" serve-nebariapp-no-timeout $STATIC $NEBARIAPP --set cogs.serve.enabled=true --set cogs.serve.routeTimeout=false
+check "serving on behind an HTTPRoute: explicit URL, integer limits, /v2 rule with a timeout" serve-httproute $STATIC $HTTPROUTE --set cogs.serve.enabled=true --set cogs.serve.publicUrl=https://hub.example.com:8443 --set cogs.serve.maxBlobBytes=5368709120 --set cogs.serve.maxBlobSeconds=1800 --set cogs.serve.credentialTtlSeconds=600
+check "serving on with routeTimeout off: no /v2 rule, no timeout" serve-httproute-no-timeout $STATIC $HTTPROUTE --set cogs.serve.enabled=true --set cogs.serve.routeTimeout=false
 check "feature flags: each entry renders as its variable" features --set features.cogs_ui=true --set features.new_thing=false
 refused() { # <label> <needle> <helm args...>: the chart must refuse to render, naming <needle>
   local label="$1" needle="$2" out
