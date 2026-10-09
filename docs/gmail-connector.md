@@ -55,11 +55,12 @@ alternative exists. The response reports `body_format` (`plain_text`, `html`,
 agent can distinguish converted HTML and omitted attachments from an empty
 message body without exposing attachment contents. A read omits the message's
 `snippet` only when the returned `text` (after `max_chars`) already
-contains it, allowing only for Gmail's HTML escaping, whitespace and invisible
-formatting characters. Otherwise the snippet is kept: Gmail may build it from a
-part the read did not select, such as an HTML body behind a plain-text stub,
-and `max_chars` may cut the text short. Search hits always keep their snippet,
-since search returns no body.
+contains it, allowing only for Gmail's HTML escaping, whitespace, invisible
+formatting characters and accent encoding (an accented letter stored as one
+character or as a letter plus a combining accent). Otherwise the snippet is
+kept: Gmail may build it from a part the read did not select, such as an HTML
+body behind a plain-text stub, and `max_chars` may cut the text short. Search
+hits always keep their snippet, since search returns no body.
 
 Search responses include `next_page_token` and `result_size_estimate`. To fetch
 the next page, repeat the same request fields and pass `next_page_token` as
