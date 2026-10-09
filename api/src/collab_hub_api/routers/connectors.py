@@ -105,7 +105,28 @@ router = APIRouter(prefix="/connectors", tags=["connectors"])
 logger = logging.getLogger("frames_server.connectors")
 
 
-def get_connectors_config(request: Request) -> ConnectorsConfig:
+def switched_off_connectors(request: Request) -> frozenset[str]:
+    """The connectors an operator has switched off, read once per request.
+
+    A store that cannot answer disables nothing. Failing closed here would take
+    every connector down over a database blip, which is a far worse outcome
+    than briefly honouring a switch late.
+    """
+
+    store = getattr(request.app.state, "connector_store", None)
+    if store is None:
+        return frozenset()
+    try:
+        return frozenset(store.disabled())
+    except Exception:
+        logger.warning("connector_state_unavailable")
+        return frozenset()
+
+
+def get_connectors_config(
+    request: Request,
+    disabled: frozenset[str] = Depends(switched_off_connectors),
+) -> ConnectorsConfig:
     """This deployment's connector configuration, minus anything switched off.
 
     The switch is applied here rather than in each handler because every
@@ -113,22 +134,38 @@ def get_connectors_config(request: Request) -> ConnectorsConfig:
     route that can forget. A disabled connector arrives with its credentials
     blanked, so it reads as unconfigured to code that already handles that --
     see :mod:`..frames.connector_state`.
-
-    A store that cannot answer disables nothing. Failing closed here would take
-    every connector down over a database blip, which is a far worse outcome
-    than briefly honouring a switch late.
     """
 
-    config = request.app.state.connectors_config
-    store = getattr(request.app.state, "connector_store", None)
-    if store is None:
-        return config
-    try:
-        disabled = store.disabled()
-    except Exception:
-        logger.warning("connector_state_unavailable")
-        return config
-    return apply_disabled(config, disabled)
+    return apply_disabled(request.app.state.connectors_config, disabled)
+
+
+def _offered(connector: str):
+    """Answer 404 on a status route whose connector is switched off.
+
+    Blanked credentials alone make status read ``not_connected``, which a
+    client renders as something the user can connect -- and here they cannot.
+    A 404 says what is true: this hub does not offer the connector. It is
+    limited to a connector that was explicitly switched off; one that was
+    simply never configured keeps answering ``not_connected`` as before.
+    """
+
+    def dependency(
+        _auth=Depends(get_auth_context),
+        disabled: frozenset[str] = Depends(switched_off_connectors),
+    ) -> None:
+        if connector in disabled:
+            # The access log shows a 404 on a route that plainly exists; this
+            # line is what tells it apart from a path nothing serves. At debug,
+            # because clients poll status: a switched-off provider would
+            # otherwise add a line per connector, per user, per refresh, and
+            # the response body already says why to whoever is asking.
+            logger.debug("connector_status_switched_off", extra={"connector": connector})
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"The {connector} connector is switched off on this hub",
+            )
+
+    return Depends(dependency)
 
 
 @router.get("", response_model=list[ConnectorSummary])
@@ -136,18 +173,22 @@ async def list_connectors(
     request: Request,
     _auth=Depends(get_auth_context),
     config: ConnectorsConfig = Depends(get_connectors_config),
+    disabled: frozenset[str] = Depends(switched_off_connectors),
 ) -> list[ConnectorSummary]:
-    return [
-        await _google_drive_status(request, config),
-        await _gmail_status(request, config),
-        await _google_calendar_status(request, config),
-        await _slack_status(request, config),
-        await _github_status(request, config),
-        await _notion_status(request, config),
-    ]
+    # A switched-off connector is left out rather than listed as
+    # ``not_connected``, to agree with the 404 its own status route gives.
+    statuses = (
+        ("google", _google_drive_status),
+        ("google", _gmail_status),
+        ("google", _google_calendar_status),
+        ("slack", _slack_status),
+        ("github", _github_status),
+        ("notion", _notion_status),
+    )
+    return [await read(request, config) for connector, read in statuses if connector not in disabled]
 
 
-@router.get("/google-drive/status", response_model=GoogleDriveStatus)
+@router.get("/google-drive/status", response_model=GoogleDriveStatus, dependencies=[_offered("google")])
 async def google_drive_status(
     request: Request,
     _auth=Depends(get_auth_context),
@@ -213,7 +254,7 @@ async def read_google_drive_file(
     return DriveReadResponse(file=file, text=text, truncated=truncated)
 
 
-@router.get("/gmail/status", response_model=GmailStatus)
+@router.get("/gmail/status", response_model=GmailStatus, dependencies=[_offered("google")])
 async def gmail_status(
     request: Request,
     _auth=Depends(get_auth_context),
@@ -282,7 +323,7 @@ async def read_gmail_message(
     )
 
 
-@router.get("/google-calendar/status", response_model=GoogleCalendarStatus)
+@router.get("/google-calendar/status", response_model=GoogleCalendarStatus, dependencies=[_offered("google")])
 async def google_calendar_status(
     request: Request,
     _auth=Depends(get_auth_context),
@@ -352,7 +393,7 @@ async def read_google_calendar_event(
     return CalendarReadResponse(event=event, truncated=truncated)
 
 
-@router.get("/slack/status", response_model=SlackStatus)
+@router.get("/slack/status", response_model=SlackStatus, dependencies=[_offered("slack")])
 async def slack_status(
     request: Request,
     _auth=Depends(get_auth_context),
@@ -495,7 +536,7 @@ async def read_slack_thread(
     )
 
 
-@router.get("/github/status", response_model=GitHubStatus)
+@router.get("/github/status", response_model=GitHubStatus, dependencies=[_offered("github")])
 async def github_status(
     request: Request,
     _auth=Depends(get_auth_context),
