@@ -36,7 +36,9 @@ table). CI's `test` job starts a Postgres service and sets it, so those tests
 run there.
 
 The admin panel is a Vite and React app in [`api/admin-ui/`](api/admin-ui/)
-with its own Vitest suite. It needs Node (CI uses Node 24):
+with its own Vitest suite. The same project builds the registration pages (the
+invitation-acceptance page) from `api/admin-ui/registration/` as a separate
+bundle. It needs Node (CI uses Node 24):
 
 ```sh
 cd api/admin-ui

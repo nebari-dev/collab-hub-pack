@@ -171,6 +171,19 @@ button.link:disabled { color: var(--ink-soft); cursor: default; text-decoration:
   color: inherit;
 }
 
+/* Several fields in one form: each label after a row stands off from it. */
+.invite .invite-row + label { margin-top: 0.9rem; }
+/* The organization picker takes the row; the role picker beside it keeps to
+   its own width. */
+.invite .invite-pick { flex: 1; }
+.invite .invite-pick select { width: 100%; }
+.invite .rolepick select { padding-top: 0.45rem; padding-bottom: 0.45rem; }
+
+/* A heading with its filter on the same line: the list's title on the left,
+   what narrows it on the right. */
+.listing-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 2rem 0 0.75rem; }
+.listing-head h3 { margin: 0; }
+
 button.primary {
   font: inherit;
   background: var(--accent);

@@ -341,7 +341,7 @@ def test_migration_creates_the_track_schema():
         statement for version, statements in COLLAB_SCHEMA_MIGRATIONS if version < 12 for statement in statements
     )
     assert "collab_track" not in earlier
-    assert LATEST_COLLAB_SCHEMA_VERSION == 12
+    assert LATEST_COLLAB_SCHEMA_VERSION == 13
 
 
 def test_rerunning_the_migration_applies_nothing():
@@ -386,6 +386,7 @@ PINNED_CHECKSUMS = {
     10: "cad0ef7844a3458f9aa0528f4edf5d418300cdd40b22a65fd4ecd1e6e0a29e6b",
     11: "4269a363932920da48b77be6cb6b02fe7ab933b4ab0478f0a722bb08244adbb1",
     12: "b4d98654df15a5f52a16273f77cae95daa5d597aa1f7ff1e78b830ce9cc2cabd",
+    13: "15564c060339f3896f7e10a77fc063ff59e2817316fd4e7b54d2fdbb96d74068",
 }
 
 
