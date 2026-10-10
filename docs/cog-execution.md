@@ -7,7 +7,9 @@ commands behind the `make` targets of
 [`examples/cog-local`](../examples/cog-local/README.md), which runs the same
 steps against a hub on your own machine.
 
-`<HUB_URL>` below is the hub's address, such as `https://hub.example.com`.
+`<HUB_URL>` below is the hub's address, such as `https://hub.example.com`; keep
+the quotes around it in a command, or the shell reads `<` and `>` as
+redirections.
 
 ## What you need
 
@@ -45,22 +47,26 @@ To pick up later changes on `main`, install again with `--force-reinstall`
 ## 2. Sign in
 
 ```sh
-collab-hub login --hub <HUB_URL>
+collab-hub --hub "<HUB_URL>" login
 collab-hub whoami
 ```
 
 `login` opens your browser at the hub's realm, the way the Collab desktop
 signs in, and stores the session for the profile; the hub's URL is remembered
-with it, so the commands below need no `--hub`. Other ways to sign in:
+with it, so the commands below need no `--hub`. `--hub`, like `--profile`, is
+an option of `collab-hub` itself, so it comes before the command. Other ways to sign in:
 
 | Situation | Command |
 |---|---|
-| No browser on this machine | `collab-hub login --hub <HUB_URL> --no-browser` prints the URL to open elsewhere |
-| Signing in over SSH | `collab-hub login --hub <HUB_URL> --port 8765`, with that port forwarded (`ssh -L 8765:127.0.0.1:8765 ...`) |
-| A script, with a token from the realm | `... \| collab-hub login --hub <HUB_URL> --with-token` |
-| Another hub beside this one | `--profile NAME` on every command, or `COLLAB_HUB_PROFILE=NAME` |
+| No browser on this machine | `collab-hub --hub "<HUB_URL>" login --no-browser` prints the URL to open elsewhere |
+| Signing in over SSH | `collab-hub --hub "<HUB_URL>" login --port 8765`, with that port forwarded (`ssh -L 8765:127.0.0.1:8765 ...`) |
+| A script, with a token from the realm | `... \| collab-hub --hub "<HUB_URL>" login --with-token` |
+| Another hub beside this one | `collab-hub --profile NAME ...` on every command, or `COLLAB_HUB_PROFILE=NAME` |
 
-`collab-hub logout` ends the session at the realm and forgets it here.
+`collab-hub logout` ends a browser sign-in's session at the realm, revokes its
+refresh token, and forgets it here. A token given to `login --with-token` is
+only forgotten here: the CLI cannot revoke it, and it stays valid until it
+expires.
 
 ## 3. Run a Cog
 
@@ -114,7 +120,8 @@ collab-hub cog launch hello --input '{"name": "Ada"}' --watch
 packages its controller is given, which `cog list --launchable` shows. A name
 it cannot launch is refused with the names it can.
 
-Every command takes `--json`, for scripts. `run watch` and `cog launch --watch`
+Every command but `run connect` takes `--json`, for scripts; `run connect`'s
+stdout carries the ACP protocol and nothing else. `run watch` and `cog launch --watch`
 exit with the run's outcome: 0 completed, 1 failed, 3 interrupted, 4 waiting
 at a Gate, 6 cancelled ([`cli/README.md`](../cli/README.md)).
 
