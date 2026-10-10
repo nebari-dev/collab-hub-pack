@@ -12,13 +12,14 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
 from .ops import OpDefinition, _deserialize_op, _serialize_op
 from .states import InvalidTransition, Run, RunState
+from .states.run import DECISIONS
 from .track import SCHEMA_VERSION, TrackEvent, TrackStore, upgrade
 
 CANCEL_REQUESTED = "cancel_requested"
@@ -112,6 +113,10 @@ class RunView:
     reason: str | None = None
     name: str | None = None
     """What the client called the run when it submitted it, if anything: a label, never an id."""
+    controller: str | None = None
+    """The controller that picked the run up, which alone advances it; ``None`` until one does."""
+    decision: Mapping[str, Any] | None = None
+    """A decision on the open Gate that a client asked for and the controller has not delivered yet."""
 
     @property
     def status(self) -> str:
@@ -165,7 +170,8 @@ def _view(run_id: str, events: tuple[TrackEvent, ...]) -> RunView | None:
         steps=tuple(StepView(name=step.name, cog=step.cog, **steps[step.name]) for step in op.steps),
         submitted_by=dict(submission.payload.get("submitted_by") or {}), name=submission.payload.get("name"),
         submitted_at=submission.occurred_at, updated_at=events[-1].occurred_at,
-        cancel_requested_by=cancel_requested_by, error=error, reason=reason,
+        cancel_requested_by=cancel_requested_by, error=error, reason=reason, controller=run.controller,
+        decision=pending_decision(events) if run.state is RunState.WAITING_AT_GATE else None,
     )
 
 
@@ -363,3 +369,77 @@ def answer_turn(track: TrackStore, run_id: str, turn: str, *, text: str | None =
         _append(track, run_id, TURN_ANSWERED, {"turn": turn, "text": text})
     else:
         _append(track, run_id, TURN_FAILED, {"turn": turn, "error": error})
+
+
+# --- decisions: a person answering a Gate ---------------------------------------------------------
+#
+# A run waiting at a Gate waits on one escalation. A client asks for a decision on it here; the
+# controller that owns the run delivers it to its runner, which records `gate_decided` and advances
+# the run, or the controller records why it could not (`decision_refused`).
+
+DECISION_REQUESTED, DECISION_REFUSED = "decision_requested", "decision_refused"
+
+
+class StaleDecision(ValueError):
+    """A decision on an escalation the run no longer waits on, or while another one is still pending."""
+
+
+def pending_decision(events: Iterable[TrackEvent]) -> dict[str, Any] | None:
+    """The decision asked for on the run's open escalation and not yet delivered; ``None`` when there is none.
+
+    A decision is delivered when its escalation is decided, refused, or ends the
+    run (a send back past the revision limit fails it).
+    """
+    pending = None
+    for event in events:
+        if event.event_type == DECISION_REQUESTED:
+            pending = dict(event.payload)
+        elif event.event_type in ("gate_decided", DECISION_REFUSED, "failed") and pending is not None \
+                and event.payload.get("escalation") == pending.get("escalation"):
+            pending = None
+    return pending
+
+
+def request_decision(track: TrackStore, run_id: str, *, escalation: str, outcome: str, actor: str,
+                     findings: Sequence[Any] = ()) -> RunView:
+    """Record that ``actor`` decided on the escalation a run waits at: ``approve``, ``send_back`` or ``reject``.
+
+    The controller that owns the run delivers it. ``LookupError`` for a run
+    never submitted, :class:`RunEnded` for one that has ended,
+    :class:`StaleDecision` for one not waiting on that escalation, or already
+    holding a decision on it. The check and the append are one step on the
+    Track, so of two people deciding at once, one decision is recorded.
+    """
+    if outcome not in DECISIONS:
+        raise ValueError(f"a decision is one of {', '.join(sorted(DECISIONS))}, not {outcome!r}")
+    if not actor:
+        raise ValueError("a decision names its actor")
+    if isinstance(findings, (str, bytes)) or not isinstance(findings, Sequence):
+        # The runner's own rule, checked before the intent is recorded: one string, a mapping or a set
+        # would be recorded as its characters, its keys, or an arbitrary order.
+        raise ValueError("findings are a sequence of findings, not one string, mapping or set")
+
+    def open_on_it(events: tuple[TrackEvent, ...]) -> bool:
+        events = tuple(upgrade(event) for event in events)
+        run = Run.replay(events)
+        return (run is not None and run.state is RunState.WAITING_AT_GATE and run.open_escalation == escalation
+                and pending_decision(events) is None)
+
+    request = TrackEvent(run_id=run_id, event_type=DECISION_REQUESTED, schema=SCHEMA_VERSION, payload={
+        "escalation": escalation, "outcome": outcome, "actor": actor, "findings": list(findings)})
+    recorded = track.append_if(request, open_on_it)
+    view = describe(track, run_id)
+    if view is None:
+        raise LookupError(f"no run {run_id!r} on the Track")
+    if recorded is None:
+        if view.state.ended:
+            raise RunEnded(view.state, DECISION_REQUESTED, f"the run has ended {view.status}")
+        if view.decision is not None:
+            raise StaleDecision(f"a decision on run {run_id!r} is already waiting to be delivered")
+        raise StaleDecision(f"run {run_id!r} is {view.status}, and does not wait on escalation {escalation!r}")
+    return view
+
+
+def refuse_decision(track: TrackStore, run_id: str, *, escalation: str, error: str) -> None:
+    """The controller's record of a decision its runner did not take, and why."""
+    _append(track, run_id, DECISION_REFUSED, {"escalation": escalation, "error": error[:1024]})

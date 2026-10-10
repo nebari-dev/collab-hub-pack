@@ -150,6 +150,46 @@ jobs:
           grep -q "^interrupted $run:" /tmp/op-after.log \
             || { echo "the stopped run was not recorded interrupted"; exit 1; }
 
+      # Run pickup (Phase 11): `make submit` records an Op on the Track and nothing else, the way the run
+      # API does, and the controller, another process, picks it up and runs it. A controller killed with
+      # SIGKILL leaves its run looking alive, until it starts again and records it interrupted.
+      - name: make controller picks up what make submit records, and a killed controller's run is interrupted
+        run: |
+          set -euo pipefail
+          # Stopped, and gone, before the next step: a controller left running would pick up its runs.
+          stop_controllers() {
+            pkill -TERM -f "[c]ollab_hub_execution.controller" || true
+            for _ in $(seq 1 30); do pgrep -f "[c]ollab_hub_execution.controller" > /dev/null || return 0; sleep 1; done
+            pkill -KILL -f "[c]ollab_hub_execution.controller" || true
+          }
+          trap stop_controllers EXIT
+          start() {
+            make -s -C dev controller ENVIRONMENT=host HEALTH_PORT=18990 >> /tmp/controller.log 2>&1 &
+            for _ in $(seq 1 90); do curl -sf -m 2 -o /dev/null http://127.0.0.1:18990/readyz && return 0; sleep 1; done
+            echo "the controller never got ready"; cat /tmp/controller.log; exit 1
+          }
+          start
+          status() { make -s -C dev submit OP="$1" | tee /tmp/submit-"$1".log | sed -n 's/^status: //p'; }
+          [ "$(status echo)" = COMPLETED ]                || { cat /tmp/submit-echo.log; exit 1; }
+          [ "$(status needs-review)" = WAITING_AT_GATE ]  || { cat /tmp/submit-needs-review.log; exit 1; }
+          [ "$(status fails)" = FAILED ]                  || { cat /tmp/submit-fails.log; exit 1; }
+          grep -q '^picked up by: dev$' /tmp/submit-echo.log || { echo "the controller did not pick it up"; exit 1; }
+
+          make -s -C dev submit OP=slow > /tmp/submit-slow.log 2>&1 &
+          follower=$!
+          for _ in $(seq 1 60); do grep -q '^run slow-' /tmp/submit-slow.log && break; sleep 1; done
+          run=$(sed -n 's/^run \(slow-[0-9a-f]*\) .*/\1/p' /tmp/submit-slow.log)
+          [ -n "$run" ] || { echo "the slow Op was never submitted"; cat /tmp/submit-slow.log; exit 1; }
+          sleep 3
+          pkill -KILL -f "[c]ollab_hub_execution.controller"
+          sleep 1
+          start
+          wait "$follower" || true
+          grep -q '^status: INTERRUPTED$' /tmp/submit-slow.log \
+            || { echo "the killed controller's run did not end interrupted"; cat /tmp/submit-slow.log; exit 1; }
+          grep -q "interrupted $run: this controller stopped" /tmp/controller.log \
+            || { echo "the restarted controller did not record it"; cat /tmp/controller.log; exit 1; }
+
       # The `local` agent location: the same fake Cog as a real process, its `serve` task run in the
       # package's own pixi environment by the local executor. A host killed with SIGKILL runs no
       # teardown, and still leaves no worker behind: the launcher that holds the worker sees its
@@ -256,6 +296,40 @@ jobs:
           pkill -f "collab_hub_api" || true
           sleep 2
 
+      # Two controllers on one Postgres Track (Phase 11): of two picking up one run, one starts it. The
+      # Track's tables come from the hub's migrations, which `make api-pg` ran in the step before.
+      - name: Level 2 -- two controllers on one Postgres Track never both start a run
+        run: |
+          set -euo pipefail
+          make -C dev postgres
+          export TRACK=postgresql://collab:collab@127.0.0.1:5432/collab
+          # Stopped, and gone, before the next step: a controller left running would pick up its runs.
+          stop_controllers() {
+            pkill -TERM -f "[c]ollab_hub_execution.controller" || true
+            for _ in $(seq 1 30); do pgrep -f "[c]ollab_hub_execution.controller" > /dev/null || return 0; sleep 1; done
+            pkill -KILL -f "[c]ollab_hub_execution.controller" || true
+          }
+          trap stop_controllers EXIT
+          for id in one two; do
+            port=$([ "$id" = one ] && echo 18991 || echo 18992)
+            make -s -C dev controller ENVIRONMENT=host CONTROLLER_ID=$id HEALTH_PORT=$port > /tmp/controller-$id.log 2>&1 &
+            for _ in $(seq 1 90); do curl -sf -m 2 -o /dev/null http://127.0.0.1:$port/readyz && break; sleep 1; done
+            curl -sf -m 2 -o /dev/null http://127.0.0.1:$port/readyz \
+              || { echo "controller $id never got ready"; cat /tmp/controller-$id.log; exit 1; }
+          done
+          followers=()
+          for n in $(seq 1 8); do
+            make -s -C dev submit OP=echo > /tmp/submit-pg-$n.log 2>&1 &
+            followers+=($!)
+          done
+          wait "${followers[@]}"
+          [ "$(grep -h '^status: ' /tmp/submit-pg-*.log | sort | uniq -c | awk '{print $1, $3}')" = "8 COMPLETED" ] \
+            || { grep -h '^status: ' /tmp/submit-pg-*.log; exit 1; }
+          grep -h '^picked up by: ' /tmp/submit-pg-*.log | sort | uniq -c
+          psql='docker compose -f dev/compose.yaml exec -T postgres psql -U collab -d collab -tAc'
+          twice=$($psql "SELECT count(*) FROM (SELECT run_id FROM collab_track_events WHERE event_type = 'run_picked_up' GROUP BY run_id HAVING count(*) > 1) AS twice")
+          [ "$twice" = "0" ] || { echo "$twice runs were picked up twice"; exit 1; }
+
       - name: Level 3 -- real Keycloak bearer tokens
         run: |
           set -euo pipefail
@@ -316,6 +390,7 @@ jobs:
         run: |
           tail -60 /tmp/api-pg.log 2>/dev/null || true
           tail -60 /tmp/api-oidc.log 2>/dev/null || true
+          tail -40 /tmp/controller-one.log /tmp/controller-two.log 2>/dev/null || true
           make -C dev ps || true
           timeout 15 make -C dev logs || true
 

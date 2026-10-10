@@ -244,7 +244,11 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "httpx", specifier = ">=0.28.0" }]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28.0" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'postgres'", specifier = ">=3.1" },
+]
+provides-extras = ["postgres"]
 
 [package.metadata.requires-dev]
 test = [
