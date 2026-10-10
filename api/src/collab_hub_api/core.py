@@ -14,7 +14,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.routing import Route, get_route_path
 
 from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
 from .config import (
@@ -151,8 +150,8 @@ def _unavailable_response(exc: Exception, database_errors: tuple[type[Exception]
 class McpAuthMiddleware(BaseHTTPMiddleware):
     """Authenticate MCP traffic, which never reaches the outer app's handlers.
 
-    The MCP app is mounted, so nothing registered on the outer FastAPI app
-    applies to it: every outcome of the credential check has to be turned into
+    The MCP app is a separate ASGI app routed at its own path, so nothing
+    registered on the outer FastAPI app applies to it: every outcome of the credential check has to be turned into
     a response right here. Responses use the same ``{"error": {"code", ...}}``
     envelope as the HTTP API, because a plain-text body would erase exactly the
     distinctions that matter — ``no_organization`` against a plain refusal, and
@@ -330,7 +329,7 @@ def make_app(config: BaseConfig) -> FastAPI:
     mcp_app = mcp.streamable_http_app()
     # MCP traffic authenticates through the same get_auth_context, which
     # records seen users and resolves membership off the owning app's state —
-    # the mounted MCP app has its own state object, so give it both stores.
+    # the MCP app has its own state object, so give it both stores.
     mcp_app.state.usage_store = usage_store
     mcp_app.state.org_store = org_store
 
@@ -646,12 +645,11 @@ def make_app(config: BaseConfig) -> FastAPI:
     # every unmatched path, so they never reached a handler at all (#67).
     @app.exception_handler(StarletteHTTPException)
     async def frames_http_exception_handler(request: Request, exc: StarletteHTTPException):
-        # The raw URL path (main's rule, kept so nothing it enveloped loses the
-        # envelope) or the app-relative path the router matched on, by the
-        # router's own segment-aware rule: behind a proxy that keeps the
-        # `server.root_path` prefix, the raw path alone never looks like an
-        # API path.
-        if not (_api_path(request.url.path) or _api_path(get_route_path(request.scope))):
+        # Classified by request_path, the app-relative path the router matched
+        # on, exactly as _unauthorized_response classifies a middleware 401:
+        # one rule, so a refusal has the same body whichever layer raised it,
+        # under a `server.root_path` prefix included.
+        if not _api_path(request_path(request)):
             return await http_exception_handler(request, exc)
         code = {
             status.HTTP_401_UNAUTHORIZED: error_codes.UNAUTHORIZED,
@@ -918,14 +916,12 @@ def make_app(config: BaseConfig) -> FastAPI:
     # McpAuthMiddleware answered a bare 401 for a trailing-slash typo like
     # `/v1/usage/summary/` (which should redirect), and MCP's plain-text 404
     # answered unmatched paths that owe callers the frames error envelope
-    # (#67). `streamable_http_app()` builds one route per served path, so MCP
-    # keeps the `/mcp` address (its `streamable_http_path`) that clients, the
-    # docs and the chart's ingress already use, while everything else falls
-    # through to this app's own redirect/404 handling. Each route delegates to
-    # `mcp_app` whole, so its middleware stack — McpAuthMiddleware included —
-    # still wraps every MCP request.
-    for mcp_route in mcp_app.routes:
-        app.router.routes.append(Route(mcp_route.path, endpoint=mcp_app, name=mcp_route.name))
+    # (#67). MCP keeps the `/mcp` address (its `streamable_http_path`) that
+    # clients, the docs and the chart's ingress already use, while everything
+    # else falls through to this app's own redirect/404 handling. The route
+    # delegates to `mcp_app` whole, so its middleware stack — McpAuthMiddleware
+    # included — still wraps every MCP request.
+    app.add_route(mcp.settings.streamable_http_path, mcp_app)
 
     if config.web.enabled:
         # Everything this function registers has now been registered, so this

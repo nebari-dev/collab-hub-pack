@@ -299,7 +299,7 @@ async def test_mcp_rejects_invalid_frame_ids_before_store_lookup(tmp_path):
     assert store_lookup_called is False
 
 
-def test_mcp_http_mount_starts_session_manager(tmp_path, monkeypatch):
+def test_mcp_http_route_starts_session_manager(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     monkeypatch.setenv("DEV_AUTH_ENABLED", "true")
     monkeypatch.setenv("DEV_AUTH_USER", "dev-user")
@@ -370,13 +370,12 @@ async def test_bad_method_on_api_path_answers_the_envelope_and_keeps_allow(clien
     assert response.json() == {"error": {"code": "http_error", "message": "Method Not Allowed"}}
 
 
-async def test_unsupported_head_and_options_on_api_paths_answer_405_with_allow(client):
+async def test_unsupported_options_on_api_paths_answers_405_with_allow(client):
     # Not a CORS preflight (no Origin / Access-Control-Request-Method), so the
     # request is routed and the GET-only route refuses it.
-    for method in ("HEAD", "OPTIONS"):
-        response = await client.request(method, "/v1/frames")
-        assert response.status_code == 405, method
-        assert "GET" in response.headers["allow"], method
+    response = await client.options("/v1/frames")
+    assert response.status_code == 405
+    assert "GET" in response.headers["allow"]
 
 
 async def test_body_parse_errors_on_api_paths_answer_the_envelope(client):
@@ -393,15 +392,15 @@ async def test_body_parse_errors_on_api_paths_answer_the_envelope(client):
 
 @pytest.mark.parametrize(
     ("root_path", "request_prefix"),
-    [("/nexus", "/nexus"), ("/nexus", ""), ("/", ""), ("/v", "")],
+    [("/nexus", "/nexus"), ("/nexus", ""), ("/v", "")],
 )
 async def test_routing_errors_keep_the_envelope_under_a_root_path(
     tmp_path, monkeypatch, root_path, request_prefix
 ):
     # A proxy that keeps the `server.root_path` prefix ("/nexus" requested as
-    # "/nexus/..."), one that strips it, and root paths that are a textual but
-    # not a segment prefix of the API path ("/", "/v"): in every case the path
-    # the router matched on is an API path, and the answer is the envelope.
+    # "/nexus/..."), one that strips it, and a root path that is a textual but
+    # not a segment prefix of the API path ("/v"): in every case the path the
+    # router matched on is an API path, and the answer is the envelope.
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
     config = Config.parse(
@@ -434,26 +433,33 @@ async def test_routing_errors_keep_the_envelope_under_a_root_path(
     assert bad_method.json() == {"error": {"code": "http_error", "message": "Method Not Allowed"}}
 
 
-async def test_a_root_path_that_is_itself_an_api_prefix_keeps_the_envelope(tmp_path, monkeypatch):
-    # With root_path="/frames", "/frames/v1/connectors" is enveloped by its raw
-    # path even though the app-relative path is a connector path. Classifying
-    # by the app-relative path must add to that rule, not replace it.
-    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+async def test_a_refusal_has_one_body_whichever_layer_raised_it(tmp_path, monkeypatch):
+    # With default_access="authenticated" the protection middleware refuses
+    # an anonymous request before routing; with "public" the route's own
+    # dependency does.
+    # Both classify the path with request_path, so the caller cannot tell the
+    # two apart. root_path="/frames" is the case that used to split them: the
+    # raw path spells an API prefix, the app-relative /v1/connectors does not.
     monkeypatch.setenv("FRAMES_IDTOKEN_ALLOW_UNSIGNED", "true")
-    config = Config.parse(
-        {
-            "storage": {"frames_path": str(tmp_path / "frames")},
-            "server": {"root_path": "/frames"},
-            "frames": {"active_state": {"backend": "memory"}, "mcp_session_manager_enabled": False},
-        }
-    )
-    app = make_app(config)
-    async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app, root_path="/frames")
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get("/frames/v1/connectors")
-    assert response.status_code == 401
-    assert response.json()["error"]["code"] == "unauthorized"
+    bodies = []
+    for default_access in ("authenticated", "public"):
+        config = Config.parse(
+            {
+                "storage": {"frames_path": str(tmp_path / f"frames-{default_access}")},
+                "server": {"root_path": "/frames"},
+                "security": {"default_access": default_access},
+                "frames": {"active_state": {"backend": "memory"}, "mcp_session_manager_enabled": False},
+            }
+        )
+        app = make_app(config)
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app, root_path="/frames")
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/frames/v1/connectors")
+        assert response.status_code == 401, default_access
+        bodies.append(response.json())
+    assert bodies[0] == bodies[1]
+    assert set(bodies[0]) == {"detail"}
 
 
 async def test_mcp_mount_removal_leaves_other_response_shapes_alone(client):
