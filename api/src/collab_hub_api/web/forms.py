@@ -90,10 +90,9 @@ def media_type(request: Request) -> str:
     ``application/x-www-form-urlencoded; charset=UTF-8`` and the same type in
     capitals both compare equal to :data:`FORM_CONTENT_TYPE` (media types are
     case-insensitive), while a type that merely *begins* with it —
-    ``application/x-www-form-urlencoded-not-really`` — does not (#71). The
-    same exact compare the invitation redemption endpoint uses for its JSON
-    gate, spelled once here for every management page and for
-    :func:`~.authz.require_csrf`'s form fallback.
+    ``application/x-www-form-urlencoded-not-really`` — does not (#71). Spelled
+    once here for every management page, for :func:`~.authz.require_csrf`'s
+    form fallback, and for the invitation redemption endpoint's JSON gate.
     """
 
     return request.headers.get("content-type", "").split(";", 1)[0].strip().lower()

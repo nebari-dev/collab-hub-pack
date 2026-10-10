@@ -770,16 +770,26 @@ async def test_anything_but_the_form_type_is_refused_unread(tmp_path, idp, path,
     refuse it is the type gate.
     """
 
+    pulled = 0
+
     app, service, _ = build_app(tmp_path, idp, rows=[an_invitation(invitation_id="inv-9")])
     async with web_client(app) as client:
         await signed_in(client, idp)
         page = await client.get(ADMIN_INVITATIONS_PATH)
         body = {"csrf_token": csrf_from(page.text), EMAIL_FIELD: INVITEE, INVITATION_ID_FIELD: "inv-9"}
+
+        async def form_body():
+            nonlocal pulled
+            pulled += 1
+            yield urlencode(body).encode()
+
         # None sends no Content-Type at all; httpx adds none for raw content.
         headers = {} if content_type is None else {"Content-Type": content_type}
-        response = await client.post(path, content=urlencode(body), headers=headers)
+        response = await client.post(path, content=form_body(), headers=headers)
         assert (content_type is None) == ("content-type" not in response.request.headers)
     assert response.status_code == admin_router.UNSUPPORTED_MEDIA_TYPE, response.text
+    # Refused before the read, not after it: the server pulled nothing.
+    assert pulled == 0
     assert response.headers.get("connection") == "close"
     assert service.issue_calls == [] and service.revoke_calls == []
 
