@@ -120,6 +120,22 @@ def test_rules_match_against_the_path_below_a_url_prefix():
     assert request_path(Request(scope)) == "/metrics"
 
 
+@pytest.mark.parametrize("root_path", ["/", "/w/", "/w//"])
+def test_a_root_path_ending_in_a_slash_is_refused_at_load(root_path):
+    # The router strips root_path only on a segment boundary, so "/w/" is never
+    # stripped from /w/metrics: every rule would go unmatched, which under
+    # enforcement is a 401 on every request, the probes included. Both spellings
+    # also turn the pages' "{root_path}/web" links into "//web". A value with no
+    # working reading is a misconfiguration to stop on, not one to resolve.
+    with pytest.raises(ValidationError, match="root_path must not end with"):
+        Config.model_validate({"server": {"root_path": root_path}})
+
+
+@pytest.mark.parametrize("root_path", ["", "/w", "/a/b"])
+def test_a_root_path_prefix_is_accepted(root_path):
+    assert Config.model_validate({"server": {"root_path": root_path}}).server.root_path == root_path
+
+
 # --- the resolved path is the routed path (issue #69) --------------------
 #
 # Each case is (root_path, request path, how the app is reached). The path the
@@ -139,9 +155,10 @@ ROUTED_PATH_CASES = [
     # Not inside /w at all: a character-wise strip yields "x/metrics".
     pytest.param("/w", "/wx/metrics", "direct", id="prefix-lookalike-segment"),
     pytest.param("/w", "/w/", "direct", id="prefix-with-trailing-slash-request"),
-    # A root_path configured with a trailing slash is not stripped from
-    # /w/metrics by the router (the next character is not a separator), so
-    # the map must not strip it either.
+    # ServerConfig refuses a root_path ending in a slash, so these two scopes
+    # cannot come from configuration. They stay because the map must agree
+    # with the router on any scope: the router does not strip "/w/" from
+    # /w/metrics (the next character is not a separator), so neither may it.
     pytest.param("/w/", "/w/metrics", "direct", id="trailing-slash-root-path"),
     pytest.param("/w/", "/w//metrics", "direct", id="trailing-slash-root-path-double-slash"),
     pytest.param("/prefix", "/prefix/metrics", "mounted", id="mounted-prefix"),

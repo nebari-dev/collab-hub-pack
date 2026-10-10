@@ -213,7 +213,8 @@ server:
   # logs. Prefer naming the proxy's CIDR above.
   trustAnyProxy: false
   # -- ASGI root path, when the app is served under a URL prefix rather than
-  # at the root of its host.
+  # at the root of its host. A prefix such as "/hub": it must not end with a
+  # slash, and "/" is not a root path (leave it empty).
   rootPath: ""
 
 security:
