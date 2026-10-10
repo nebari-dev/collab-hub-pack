@@ -213,7 +213,8 @@ server:
   # logs. Prefer naming the proxy's CIDR above.
   trustAnyProxy: false
   # -- ASGI root path, when the app is served under a URL prefix rather than
-  # at the root of its host.
+  # at the root of its host. A prefix such as "/hub": it must not end with a
+  # slash, and "/" is not a root path (leave it empty).
   rootPath: ""
 
 security:
@@ -276,11 +277,9 @@ security:
   #
   # They are inert on an install that does not enable the web surface: no
   # routes are registered under them, so a request there matches nothing in
-  # the app and falls through to the MCP catch-all mounted at "/", which runs
-  # its own McpAuthMiddleware and authenticates on the API axis before the
-  # sub-application sees it. A prefix declared public that serves nothing is
-  # not a hole. Where the web surface is enabled and organizations come from
-  # membership, /admin now serves the admin panel (/admin/, /admin/assets/*
+  # the app and answers a plain 404. A prefix declared public that serves
+  # nothing is not a hole. Where the web surface is enabled and organizations
+  # come from membership, /admin now serves the admin panel (/admin/, /admin/assets/*
   # and its JSON API under /admin/api/*). The panel authenticates itself with
   # the web session, the CSRF token on every write, and the operator check.
   #
