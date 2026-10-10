@@ -358,9 +358,13 @@ class CogIndexer:
                 for source in self._sources:
                     await self._sweep_source(source, summary, view)
                 COG_INDEX_SWEEPS.labels(result="completed").inc()
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                # A shutdown mid-sweep, not a failure of the sweep.
+                COG_INDEX_SWEEPS.labels(result="cancelled").inc()
+                cancelled = True
+                raise
+            except BaseException:
                 COG_INDEX_SWEEPS.labels(result="failed").inc()
-                cancelled = isinstance(exc, asyncio.CancelledError)
                 raise
             finally:
                 # The release goes behind whatever the sweep thread is still

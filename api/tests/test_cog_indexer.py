@@ -844,12 +844,34 @@ def cogs_block(*sources: dict, enabled: bool = True, **index) -> dict:
 STATIC_SOURCE = {"id": "s", "kind": "static", "url": URL, "repositories": ["cogs/x"]}
 
 
-def test_build_cog_indexing_is_none_without_the_block_or_when_disabled():
+def test_build_cog_indexing_is_none_without_sources_or_without_a_store():
     from collab_hub_api.config import build_cog_indexing
 
     assert build_cog_indexing(Config.parse(), InMemoryCogCatalogStore()) is None
+    # Sources but no database, sweeping off: nothing an indexer could write.
     disabled = Config.parse({"cogs": cogs_block(STATIC_SOURCE, enabled=False)})
-    assert build_cog_indexing(disabled, InMemoryCogCatalogStore()) is None
+    assert build_cog_indexing(disabled, UnavailableCogCatalogStore()) is None
+
+
+def test_build_cog_indexing_builds_a_sweepless_indexer_when_indexing_is_off():
+    from collab_hub_api.config import build_cog_catalog_store, build_cog_indexing, build_postgres_pools
+
+    # What every API replica is given (the chart renders enabled=false on
+    # them, issue #148): the sources and the targeted entry points, no loop.
+    # The one-connection pool the sweeping process refuses is fine here.
+    config = Config.parse(
+        {
+            "frames": {"postgres": {"url": "postgresql://shared/db", "pool": {"max_size": 1, "min_size": 1}}},
+            "cogs": cogs_block(STATIC_SOURCE, enabled=False),
+        }
+    )
+    store = build_cog_catalog_store(config, build_postgres_pools(config))
+
+    indexing = build_cog_indexing(config, store)
+
+    assert indexing is not None and indexing.sweeps is False
+    assert [s.id for s in indexing.indexer.sources] == ["s"]
+    indexing.indexer.close()
 
 
 def test_build_cog_indexing_builds_sources_and_reads_the_loop_parameters():
@@ -859,7 +881,7 @@ def test_build_cog_indexing_builds_sources_and_reads_the_loop_parameters():
 
     indexing = build_cog_indexing(config, InMemoryCogCatalogStore())
 
-    assert indexing is not None
+    assert indexing is not None and indexing.sweeps is True
     assert indexing.interval_seconds == 42.0 and indexing.run_on_startup is False
     assert [s.id for s in indexing.indexer.sources] == ["s"]
 
@@ -891,14 +913,14 @@ def test_build_cog_indexing_refuses_the_unavailable_store():
         build_cog_indexing(config, UnavailableCogCatalogStore())
 
 
-async def test_app_exposes_the_store_and_no_indexer_when_indexing_is_off(config, monkeypatch):
+async def test_app_exposes_the_store_and_no_indexer_without_sources(config, monkeypatch):
     from collab_hub_api.core import make_app
 
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     app = make_app(config)
     async with app.router.lifespan_context(app):
-        # No shared Postgres in the test config: the store refuses (503 at
-        # the API), and nothing sweeps.
+        # No shared Postgres and no sources in the test config: the store
+        # refuses (503 at the API), and there is nothing to build an indexer on.
         assert isinstance(app.state.cog_catalog_store, UnavailableCogCatalogStore)
         assert app.state.cog_indexer is None and app.state.cog_registry_sources == []
 
@@ -1065,6 +1087,49 @@ async def test_app_runs_the_indexer_in_its_lifespan_and_closes_sources_on_shutdo
     assert registry_source._closed, "the lifespan closes the registry clients it built"
 
 
+async def test_an_api_replica_holds_the_indexer_without_sweeping(tmp_path, monkeypatch):
+    # The chart renders cogs.index.enabled=false on every API replica (issue
+    # #148), and those are the only pods a Service reaches: the indexer and
+    # its targeted entry points have to exist there, with no sweep loop.
+    from collab_hub_api import config as config_module
+    from collab_hub_api.core import make_app
+
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    config = Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {
+                "active_state": {"backend": "memory"},
+                "history": {"backend": "memory"},
+                "usage": {"backend": "memory"},
+                "mcp_session_manager_enabled": False,
+            },
+            "tasks": {"backend": "memory"},
+            "cogs": cogs_block(STATIC_SOURCE, enabled=False),
+        }
+    )
+    store = InMemoryCogCatalogStore()
+    monkeypatch.setattr(config_module, "build_cog_catalog_store", lambda *_: store)
+    monkeypatch.setattr("collab_hub_api.core.build_cog_catalog_store", lambda *_: store)
+
+    app = make_app(config)
+    async with app.router.lifespan_context(app):
+        indexer = app.state.cog_indexer
+        assert isinstance(indexer, CogIndexer)
+        (registry_source,) = app.state.cog_registry_sources
+        assert "cog-index" not in {t.get_name() for t in asyncio.all_tasks()}, "an API replica must never sweep"
+        # A targeted entry point works here: no sweep lock, the shared pool.
+        assert await indexer.mark_removed("s", "cogs/x", "sha256:" + "0" * 64) is False
+        with pytest.raises(KeyError):
+            await indexer.mark_removed("unknown", "cogs/x", "sha256:" + "0" * 64)
+        assert not registry_source._closed
+    assert indexer.last_summary is None, "nothing swept"
+    assert registry_source._closed, "the lifespan closes the registry clients it built"
+    for executor in (indexer._executor, indexer._sweep_thread):
+        with pytest.raises(RuntimeError, match="shutdown"):
+            executor.submit(lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Cancellation: a cancelled sweep releases its lock or dies with its session
 # (issue #148 -- the drain, its deadline and the thread hand-off are gone)
@@ -1164,12 +1229,18 @@ async def test_cancellation_during_a_write_queues_the_release_behind_it_without_
     # could be overtaken by a release on another thread).
     indexer, store, _ = evented_indexer()
     store.release_write.clear()
+    cancelled_before = counter(COG_INDEX_SWEEPS, result="cancelled")
+    failed_before = counter(COG_INDEX_SWEEPS, result="failed")
 
     task = asyncio.create_task(indexer.sweep())
     await asyncio.to_thread(store.write_started.wait, 10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
+
+    # A shutdown mid-sweep is its own result, not a failed sweep.
+    assert counter(COG_INDEX_SWEEPS, result="cancelled") == cancelled_before + 1
+    assert counter(COG_INDEX_SWEEPS, result="failed") == failed_before
 
     await asyncio.sleep(0.1)
     assert store.events == ["entered"], "no release while the abandoned write is still running"
@@ -1232,18 +1303,28 @@ async def test_a_release_the_sweep_is_waiting_for_survives_a_cancel_while_it_is_
     # running, when the cancel lands.
     indexer, store, _ = evented_indexer()
     blocker = threading.Event()
+    blocker_running = threading.Event()
+    release_queued = threading.Event()
     queue_release = indexer._queue_release
 
+    def block() -> None:
+        blocker_running.set()
+        blocker.wait(10)
+
     def queue_behind_a_blocker(lock, entering):
-        indexer._sweep_thread.submit(blocker.wait, 10)
-        return queue_release(lock, entering)
+        indexer._sweep_thread.submit(block)
+        release = queue_release(lock, entering)
+        release_queued.set()
+        return release
 
     indexer._queue_release = queue_behind_a_blocker  # type: ignore[method-assign]
     task = asyncio.create_task(indexer.sweep())
     # The sweep has written both Cogs and is now waiting on its release,
     # which sits in the queue behind the running blocker.
     await _until(lambda: store.events == ["entered", "write_done", "write_done"])
-    await _until(lambda: indexer._sweep_thread._work_queue.qsize() == 1)
+    # The one sweep thread is inside the blocker, so the release submitted
+    # after it can only be queued.
+    await _until(lambda: blocker_running.is_set() and release_queued.is_set())
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)

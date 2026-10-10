@@ -276,9 +276,11 @@ def make_app(config: BaseConfig) -> FastAPI:
     # The Cog catalog (issue #84) rides the same collab_ migration (version
     # 7) and is always built so the catalog read API is up whether or not
     # this process sweeps registries. The indexer -- and the registry
-    # sources it owns -- exist only when cogs.index.enabled (issue #87),
-    # which the chart sets on its one-replica indexer workload alone and
-    # never on the API replicas (issue #148).
+    # sources it owns -- is built wherever sources are configured, so the
+    # API replicas hold its targeted entry points; only its sweep loop
+    # waits on cogs.index.enabled (issue #87), which the chart sets on its
+    # one-replica indexer workload alone and never on the API replicas
+    # (issue #148).
     cog_catalog_store = build_cog_catalog_store(config, postgres_pools)
     cog_indexing = build_cog_indexing(config, cog_catalog_store)
     # The run API (/v1/runs) is behind a feature flag, and so is its import: it is the one
@@ -379,13 +381,13 @@ def make_app(config: BaseConfig) -> FastAPI:
             # cap (max_waiting) stays a monitored deferral, not a blind one.
             app.state.github_api_get_waiters = 0
             # For the catalog API (#85) and the webhook receiver (#86):
-            # the store is always there; the indexer and its sources only
-            # in the sweeping process (the chart's indexer workload).
+            # the store is always there; the indexer and its sources
+            # wherever sources are configured, sweeping or not.
             app.state.cog_catalog_store = cog_catalog_store
             app.state.cog_indexer = cog_indexing.indexer if cog_indexing is not None else None
             app.state.cog_registry_sources = cog_indexing.indexer.sources if cog_indexing is not None else []
             cog_index_task: asyncio.Task | None = None
-            if cog_indexing is not None:
+            if cog_indexing is not None and cog_indexing.sweeps:
                 indexer = cog_indexing.indexer
 
                 def _settle_cog_index_task(task: asyncio.Task) -> None:
@@ -469,6 +471,10 @@ def make_app(config: BaseConfig) -> FastAPI:
                         )
                     else:
                         _settle_cog_index_task(cog_index_task)
+                elif cog_indexing is not None:
+                    # No loop ran here (an API replica): nothing to settle,
+                    # only the targeted pool to stop.
+                    cog_indexing.indexer.close()
                 if cog_indexing is not None:
                     for source in cog_indexing.indexer.sources:
                         with suppress(Exception):

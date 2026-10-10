@@ -1208,13 +1208,14 @@ as present, so removal stays correct. Safety rules operators should know:
 - **Single flight is the deployment's shape; the lock is a belt.** With
   `cogs.index.enabled` the chart renders a dedicated **indexer** Deployment
   (`<release>-indexer`, issue #148): the API image and settings, `replicas:
-  1` (the render refuses any other count), `strategy: Recreate` and no
+  1` (fixed in the template, not a value), `strategy: Recreate` and no
   Service — so a rolling update of the API never starts a sweep, and a
   rollout of the indexer never overlaps two. The API replicas render
   `cogs.index.enabled=false` whatever the values say, and keep serving the
-  read API (the lock-less targeted entry points a webhook receiver will
-  call are built only where indexing is enabled today; wiring them onto the
-  API replicas without a sweep loop is issue #86's). Under that shape a sweep
+  read API. That switch gates the sweep loop alone: every process with
+  sources and the catalog database builds the indexer, so the API replicas
+  hold its lock-less targeted entry points for the webhook receiver (issue
+  #86) to call. Under that shape a sweep
   still takes the session-level advisory lock
   `pg_try_advisory_lock(<"cogidx_1">)` on one pooled connection for its
   whole duration (outside any transaction, so a minutes-long sweep pins no
@@ -1300,7 +1301,8 @@ as present, so removal stays correct. Safety rules operators should know:
 Every sweep logs one `cog_index_sweep` line (indexed / skipped / retagged /
 non_cog / failed / removed / sources_failed / duration) and exports the same
 counts as `frames_server_cog_index_artifacts_total{outcome}`,
-`frames_server_cog_index_sweeps_total{result}` and
+`frames_server_cog_index_sweeps_total{result}` (`completed`, `locked_out`,
+`failed`, or `cancelled` for a sweep a shutdown interrupted) and
 `frames_server_cog_index_sweep_duration_seconds`. Per-artifact failures are
 stored in the row's `read_errors` and never abort the sweep.
 

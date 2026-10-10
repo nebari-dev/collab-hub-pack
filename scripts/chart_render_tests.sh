@@ -63,6 +63,10 @@ refused "feature flags: a dashed name is refused" "cogs-ui" --set features.cogs-
 refused "feature flags: a name with a double underscore is refused" "cogs__ui" --set features.cogs__ui=true
 refused "feature flags: an uppercase name is refused" "Cogs_ui" --set features.Cogs_ui=true
 
+# The indexer's replica count is fixed in the template (issue #148): there is
+# no value to set, so the schema refuses one.
+refused "indexer: a replica count is not a value" "replicas" $STATIC --set cogs.index.enabled=true --set cogs.indexer.replicas=2
+
 # --- negative: every refused configuration, from one fixture ------------------
 # scripts/testdata/chart/cogs-negative-cases.yaml holds each refusal once, in
 # two forms: the chart values and the settings the chart renders from them.

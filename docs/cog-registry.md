@@ -142,7 +142,6 @@ cogs:
     intervalSeconds: 300
     runOnStartup: true
   indexer:
-    replicas: 1         # must be 1; the render refuses anything else
     resources: {}       # empty = api.deployment.resources
 ```
 
@@ -154,15 +153,14 @@ Service, no ingress, and an `emptyDir` in place of the API's frames-storage
 claim. That is the one process that sweeps (#84). The API replicas always
 receive `cogs.index.enabled=false`, whatever the values say, and go on
 serving the read API (#85); a rolling update of the API therefore never
-starts a sweep. (The indexer's lock-less targeted entry points, which the
-webhook receiver (#86) will call, are today built only where indexing is
-enabled — giving the API replicas a sweep-less indexer for them is #86's
-work.) Single flight is a property of this shape; the
+starts a sweep. `enabled` gates the sweep loop and nothing else: every
+process with sources and the catalog database builds the indexer, so the
+API replicas hold its lock-less targeted entry points, which the webhook
+receiver (#86) will call. Single flight is a property of this shape; the
 sweep's advisory lock in the database is only a belt under it (see
 [frames-operations.md](frames-operations.md#the-cog-catalog-collab_cog_artifacts)).
-`indexer.replicas` exists so the invariant is stated in values and enforced:
-any value but `1` fails the render. Pause sweeping with `enabled: false`,
-not with a replica count.
+The replica count is fixed at `1` in the template and is not a value. Pause
+sweeping with `enabled: false`.
 
 Sources may be configured while the indexer is off — and they are still
 rendered and validated: the source JSON, the Secret-backed env vars and the
