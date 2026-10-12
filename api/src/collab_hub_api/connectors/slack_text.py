@@ -9,11 +9,14 @@ import unicodedata
 # ellipsis, so a label alone cannot recover its target (#143). Only http and https
 # targets are kept; any other scheme (javascript:, data:, file:, tel:, slack://, ...)
 # is reduced to its label or ``[link]``, and so is an http(s) target containing
-# whitespace, control or format characters, ``<``, ``>``, or quotes. URLs inside a
-# label are replaced with ``[link]`` so a label cannot pass off another URL as the
-# target. Links were once stripped entirely to work around an
-# Apollo renderer crash on link-shaped text (apollo-desktop#365); that crash was
-# fixed in apollo-desktop PR #414.
+# whitespace, control or format characters, ``<``, ``>``, or quotes. Plain URLs
+# typed into the message get the same character check and become ``[link]`` when it
+# fails. URLs inside a label are replaced with ``[link]`` and the real target is
+# always shown after the label, so a label cannot hide where a link goes; a label
+# without a scheme or ``www.`` (such as ``paypal.com/login``) is still shown as
+# written. Links were once stripped entirely to work around an Apollo renderer crash
+# on link-shaped text (apollo-desktop#365); that crash was fixed in apollo-desktop
+# PR #414.
 
 _LINK_PLACEHOLDER = "[link]"
 _TRAILING_PUNCTUATION = ").,;:!?]}>\"'"
@@ -23,8 +26,11 @@ _TRAILING_PUNCTUATION = ").,;:!?]}>\"'"
 # ``<...>`` is always Slack markup, never literal user text.
 _SLACK_ENTITY = re.compile(r"<(?P<target>[^<>|]*)(?:\|(?P<label>[^<>]*))?>")
 _HTTP_SCHEME = re.compile(r"https?://", re.IGNORECASE)
-# URLs inside a link label.
+# URLs typed into the message, or inside a link label.
 _PLAIN_URL = re.compile(r"(?:https?://|www\.)[^\s<>|]+", re.IGNORECASE)
+# One pass over the message: entities are rendered and plain URLs are checked only
+# in the text between them, so a rendered entity is never processed twice.
+_SLACK_TOKEN = re.compile(f"(?P<entity>{_SLACK_ENTITY.pattern})|(?P<plain>{_PLAIN_URL.pattern})", re.IGNORECASE)
 _UNSAFE_URL_CHARACTERS = frozenset("<>\"'")
 # Control (Cc) and format (Cf) characters: the latter include bidi overrides such as
 # U+202E and zero-width characters such as U+200B, which can disguise a URL.
@@ -35,8 +41,13 @@ def _http_target(target: str) -> str | None:
     """Return the exact http(s) URL for a link target, or ``None`` to neutralize it."""
     if not _HTTP_SCHEME.match(target):
         return None
-    # Slack escapes ``&`` in message text, including inside link targets.
-    url = target.replace("&amp;", "&")
+    return _safe_url(target)
+
+
+def _safe_url(url: str) -> str | None:
+    """Return ``url`` with ``&amp;`` unescaped, or ``None`` if it has an unsafe character."""
+    # Slack escapes ``&`` in message text, including inside URLs.
+    url = url.replace("&amp;", "&")
     for char in url:
         if char.isspace() or char in _UNSAFE_URL_CHARACTERS or unicodedata.category(char) in _UNSAFE_URL_CATEGORIES:
             return None
@@ -77,16 +88,28 @@ def _render_entity(match: re.Match[str]) -> str:
 
 
 def _neutralize_urls(label: str) -> str:
-    return _PLAIN_URL.sub(_render_plain_url, label)
+    return _PLAIN_URL.sub(lambda match: _LINK_PLACEHOLDER + _split_trailing(match.group(0))[1], label)
+
+
+def _split_trailing(url: str) -> tuple[str, str]:
+    """Split trailing punctuation (``)``, ``.``, closing quotes, ...) off a matched URL."""
+    end = len(url)
+    while end and url[end - 1] in _TRAILING_PUNCTUATION:
+        end -= 1
+    return url[:end], url[end:]
 
 
 def _render_plain_url(match: re.Match[str]) -> str:
-    url = match.group(0)
-    trailing = ""
-    while url and url[-1] in _TRAILING_PUNCTUATION:
-        trailing = url[-1] + trailing
-        url = url[:-1]
-    return _LINK_PLACEHOLDER + trailing
+    # Strip trailing punctuation first, so a closing quote is not taken as part of
+    # the URL and rejected as unsafe.
+    url, trailing = _split_trailing(match.group(0))
+    return (_safe_url(url) or _LINK_PLACEHOLDER) + trailing
+
+
+def _render_token(match: re.Match[str]) -> str:
+    if match.group("entity") is not None:
+        return _render_entity(match)
+    return _render_plain_url(match)
 
 
 def sanitize_slack_text(text: str) -> str:
@@ -95,8 +118,9 @@ def sanitize_slack_text(text: str) -> str:
     User/channel mentions keep their human-readable form (``@name``, ``#general``).
     An http(s) link keeps its exact target, after its label when the label differs
     (``label (url)``); any other link is replaced with its label, or ``[link]`` when
-    there is none. Plain URLs typed into the message are left as they are.
+    there is none. Plain URLs typed into the message are kept with ``&amp;``
+    unescaped, or replaced with ``[link]`` when they contain an unsafe character.
     """
     if not text:
         return text
-    return _SLACK_ENTITY.sub(_render_entity, text)
+    return _SLACK_TOKEN.sub(_render_token, text)

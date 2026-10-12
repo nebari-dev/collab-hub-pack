@@ -1504,6 +1504,40 @@ def test_sanitize_slack_text_unescapes_only_amp_in_http_targets():
     assert sanitize_slack_text("<https://x.test/a?q=&lt;b&gt;>") == "https://x.test/a?q=&lt;b&gt;"
 
 
+def test_sanitize_slack_text_unescapes_amp_in_plain_urls():
+    assert sanitize_slack_text("see https://x.test/a?b=1&amp;c=2 now") == "see https://x.test/a?b=1&c=2 now"
+    assert sanitize_slack_text("see www.x.test/a?b=1&amp;c=2.") == "see www.x.test/a?b=1&c=2."
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://go\u200bod.test/x",
+        "https://good.test\u202e/gpj.exe",
+        "https://x.test/a\x00b",
+        'https://x.test/a"onmouseover="b',
+        "https://x.test/a'b",
+        "www.go\u200bod.test/x",
+    ],
+)
+def test_sanitize_slack_text_neutralizes_plain_urls_with_unsafe_characters(url):
+    assert sanitize_slack_text(f"go {url} now") == "go [link] now"
+    assert sanitize_slack_text(f"go ({url}).") == "go ([link])."
+
+
+def test_sanitize_slack_text_strips_trailing_punctuation_before_checking_plain_urls():
+    assert sanitize_slack_text('"see https://x.test/a"') == '"see https://x.test/a"'
+    assert sanitize_slack_text("'see https://x.test/a'.") == "'see https://x.test/a'."
+
+
+def test_sanitize_slack_text_does_not_reprocess_rendered_entity_urls():
+    # The entity target is unescaped once; a second pass would turn &amp; into &.
+    assert sanitize_slack_text("<https://x.test/a?q=&amp;amp;>") == "https://x.test/a?q=&amp;"
+    assert sanitize_slack_text("<https://x.test/a?q=&amp;amp;|doc>") == "doc (https://x.test/a?q=&amp;)"
+    # A plain URL right next to an entity is checked on its own.
+    assert sanitize_slack_text("https://a.test/x&amp;y<https://b.test/z|b>") == "https://a.test/x&yb (https://b.test/z)"
+
+
 def test_sanitize_slack_text_shows_target_when_label_is_a_different_url():
     # A URL in the label must not pass itself off as the target.
     assert sanitize_slack_text("open <https://evil.test/x|https://good.test/y>") == "open [link] (https://evil.test/x)"
@@ -1541,10 +1575,12 @@ def test_sanitize_slack_text_link_edge_cases():
 # Issue #143: Slack shortens long link labels with an ellipsis, so the visible label
 # alone cannot recover the target. The exact http(s) targets must reach the model.
 _TRUNCATED_LABEL_TEXT = (
-    "docs <https://gitlab.example/group/project/-/issues/12|gitlab.example/group/…/12> and https://example.test/y"
+    "docs <https://gitlab.example/group/project/-/issues/12|gitlab.example/group/…/12>"
+    " and https://example.test/y?a=1&amp;b=2"
 )
 _TRUNCATED_LABEL_RENDERED = (
-    "docs gitlab.example/group/…/12 (https://gitlab.example/group/project/-/issues/12) and https://example.test/y"
+    "docs gitlab.example/group/…/12 (https://gitlab.example/group/project/-/issues/12)"
+    " and https://example.test/y?a=1&b=2"
 )
 
 
