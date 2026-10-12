@@ -1458,6 +1458,76 @@ def test_sanitize_slack_text_keeps_http_targets_and_preserves_mentions():
     assert sanitize_slack_text("") == ""
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        "javascript:alert(1)",
+        "JavaScript:alert(1)",
+        "data:text/html;base64,PHNjcmlwdD4=",
+        "vbscript:msgbox(1)",
+        "file:///etc/passwd",
+        "tel:+15551212",
+        "slack://channel?team=T1&amp;id=C1",
+        "ftp://x.test/a",
+        "x.test/a",
+    ],
+)
+def test_sanitize_slack_text_neutralizes_non_http_targets(target):
+    assert sanitize_slack_text(f"go <{target}|here> now") == "go here now"
+    assert sanitize_slack_text(f"go <{target}> now") == "go [link] now"
+    # A URL-shaped label must not stand in for a target that was dropped.
+    assert sanitize_slack_text(f"go <{target}|https://good.test/y> now") == "go [link] now"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://x.test/a b",
+        "https://x.test/a\tb",
+        "https://x.test/a\x00b",
+        "https://x.test/a\x7fb",
+        'https://x.test/a"onmouseover="b',
+        "https://x.test/a'b",
+    ],
+)
+def test_sanitize_slack_text_neutralizes_http_targets_with_unsafe_characters(target):
+    assert sanitize_slack_text(f"go <{target}|here> now") == "go here now"
+    assert sanitize_slack_text(f"go <{target}> now") == "go [link] now"
+
+
+def test_sanitize_slack_text_unescapes_only_amp_in_http_targets():
+    assert sanitize_slack_text("<https://x.test/a?b=1&amp;c=2|query>") == "query (https://x.test/a?b=1&c=2)"
+    # &lt; / &gt; stay escaped, so they never become angle brackets in the URL.
+    assert sanitize_slack_text("<https://x.test/a?q=&lt;b&gt;>") == "https://x.test/a?q=&lt;b&gt;"
+
+
+def test_sanitize_slack_text_shows_target_when_label_is_a_different_url():
+    assert (
+        sanitize_slack_text("open <https://evil.test/x|https://good.test/y>")
+        == "open https://good.test/y (https://evil.test/x)"
+    )
+
+
+def test_sanitize_slack_text_link_edge_cases():
+    # Slack auto-links a pasted URL as <url|url>, or <url|host> for a bare domain.
+    assert sanitize_slack_text("auto <https://x.test/a|https://x.test/a>") == "auto https://x.test/a"
+    assert sanitize_slack_text("auto <http://www.x.test|www.x.test>") == "auto http://www.x.test"
+    assert sanitize_slack_text("auto <https://x.test/|X.test>.") == "auto https://x.test/."
+    # Trailing punctuation stays outside the link, typed or auto-linked.
+    assert sanitize_slack_text("see <https://x.test/a>, then <https://x.test/b>).") == (
+        "see https://x.test/a, then https://x.test/b)."
+    )
+    assert sanitize_slack_text("(see https://x.test/a)!") == "(see https://x.test/a)!"
+    assert sanitize_slack_text("visit www.x.test/a.") == "visit www.x.test/a."
+    # The scheme is matched case-insensitively and the target is kept as written.
+    assert sanitize_slack_text("<HTTPS://a.test/x>") == "HTTPS://a.test/x"
+    assert sanitize_slack_text("<HTTPS://a.test/x|doc>") == "doc (HTTPS://a.test/x)"
+    assert sanitize_slack_text("<https://a.test/x|see (this)>") == "see (this) (https://a.test/x)"
+    long_url = "https://x.test/" + "a" * 4000 + "?q=" + "b" * 4000
+    assert sanitize_slack_text(f"long <{long_url}|x.test/aaa…>") == f"long x.test/aaa… ({long_url})"
+    assert sanitize_slack_text(f"long {long_url}") == f"long {long_url}"
+
+
 # Issue #143: Slack shortens long link labels with an ellipsis, so the visible label
 # alone cannot recover the target. The exact http(s) targets must reach the model.
 _TRUNCATED_LABEL_TEXT = (
