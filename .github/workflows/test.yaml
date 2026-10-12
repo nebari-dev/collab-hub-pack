@@ -12,6 +12,7 @@ on:
       - "api/**"
       - ".github/workflows/test.yaml"
   pull_request: {}   # runs on every PR so it can be a required status check
+  merge_group: {}    # and on each merge-queue group; a required check that never reports there blocks the queue
 
 jobs:
   test:

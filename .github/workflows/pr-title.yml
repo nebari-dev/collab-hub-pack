@@ -11,6 +11,9 @@ name: PR Title
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  # A merge-queue group has no PR title, but a required check that never
+  # reports on the group blocks the queue, so the job runs there and passes.
+  merge_group: {}
 
 permissions:
   contents: read
@@ -21,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check title
+        if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
         run: |
