@@ -1405,7 +1405,7 @@ async def test_slack_read_forwards_friendly_time_fields_as_slack_params(tmp_path
     assert seen["latest"].startswith("1719791999.")
 
 
-async def test_slack_read_sanitizes_link_shaped_message_text(tmp_path, monkeypatch):
+async def test_slack_read_renders_link_entities_with_exact_targets(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
     monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
 
@@ -1442,23 +1442,157 @@ async def test_slack_read_sanitizes_link_shaped_message_text(tmp_path, monkeypat
             )
 
     assert read.status_code == 200
-    assert read.json()["messages"][0]["text"] == "docs here and [link]"
-    assert "http://" not in read.text
-    assert "https://" not in read.text
+    assert read.json()["messages"][0]["text"] == "docs here (https://intranet.test/x) and https://example.test/y"
+    assert read.json()["content_trust"] == "external_untrusted"
 
 
-def test_sanitize_slack_text_neutralizes_links_and_preserves_mentions():
-    assert sanitize_slack_text("see <https://x.test/a|the doc>") == "see the doc"
-    assert sanitize_slack_text("bare <https://x.test/a>") == "bare [link]"
-    assert sanitize_slack_text("go to https://x.test/a, now") == "go to [link], now"
-    assert sanitize_slack_text("visit www.x.test") == "visit [link]"
-    # Slack auto-links a pasted URL as <url|url>; the label must not leak the URL.
-    assert sanitize_slack_text("auto <https://x.test/a|https://x.test/a>") == "auto [link]"
+def test_sanitize_slack_text_keeps_http_targets_and_preserves_mentions():
+    assert sanitize_slack_text("see <https://x.test/a|the doc>") == "see the doc (https://x.test/a)"
+    assert sanitize_slack_text("bare <https://x.test/a>") == "bare https://x.test/a"
+    assert sanitize_slack_text("go to https://x.test/a, now") == "go to https://x.test/a, now"
     assert sanitize_slack_text("hi <@U1> in <#C1|general>") == "hi @U1 in #general"
     assert sanitize_slack_text("heads up <!here> and <!subteam^S1|frontend>") == "heads up @here and @frontend"
     assert sanitize_slack_text("email <mailto:bob@x.test|Bob>") == "email Bob"
+    assert sanitize_slack_text("email <mailto:bob@x.test>") == "email bob@x.test"
     assert sanitize_slack_text("plain text, no links") == "plain text, no links"
     assert sanitize_slack_text("") == ""
+
+
+# Issue #143: Slack shortens long link labels with an ellipsis, so the visible label
+# alone cannot recover the target. The exact http(s) targets must reach the model.
+_TRUNCATED_LABEL_TEXT = (
+    "docs <https://gitlab.example/group/project/-/issues/12|gitlab.example/group/…/12> and https://example.test/y"
+)
+_TRUNCATED_LABEL_TARGETS = (
+    "https://gitlab.example/group/project/-/issues/12",
+    "https://example.test/y",
+)
+
+
+def _assert_exact_slack_targets_preserved(body: dict, message: dict) -> None:
+    serialized = json.dumps(message, ensure_ascii=False)
+    for target in _TRUNCATED_LABEL_TARGETS:
+        assert target in serialized
+    assert "gitlab.example/group/…/12" in message["text"]
+    assert body["content_trust"] == "external_untrusted"
+    assert body["security_notice"]
+
+
+async def test_slack_read_preserves_exact_link_targets(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        if request.url.path.endswith("/conversations.history"):
+            return Response(
+                200,
+                json={
+                    "ok": True,
+                    "messages": [{"ts": "1783041900.111000", "user": "U0002", "text": _TRUNCATED_LABEL_TEXT}],
+                    "has_more": False,
+                },
+            )
+        return Response(404)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(slack_connector_config(tmp_path))
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            read = await client.post(
+                "/v1/connectors/slack/channels/C0001/read",
+                headers=auth_header(),
+                json={"limit": 10},
+            )
+
+    assert read.status_code == 200
+    _assert_exact_slack_targets_preserved(read.json(), read.json()["messages"][0])
+
+
+async def test_slack_thread_read_preserves_exact_link_targets(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/conversations.info"):
+            return Response(200, json={"ok": True, "channel": {"id": "C0001", "is_channel": True}})
+        if request.url.path.endswith("/conversations.replies"):
+            return Response(
+                200,
+                json={
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1783041866.494000", "user": "U0001", "text": "root", "reply_count": 1},
+                        {
+                            "ts": "1783041900.111000",
+                            "user": "U0002",
+                            "text": _TRUNCATED_LABEL_TEXT,
+                            "thread_ts": "1783041866.494000",
+                        },
+                    ],
+                    "has_more": False,
+                },
+            )
+        return Response(404)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(slack_connector_config(tmp_path))
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            thread = await client.post(
+                "/v1/connectors/slack/channels/C0001/threads/1783041866.494000/read",
+                headers=auth_header(),
+                json={"limit": 10},
+            )
+
+    assert thread.status_code == 200
+    _assert_exact_slack_targets_preserved(thread.json(), thread.json()["messages"][1])
+
+
+async def test_slack_search_preserves_exact_link_targets(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search.messages"):
+            return Response(
+                200,
+                json={
+                    "ok": True,
+                    "messages": {
+                        "matches": [
+                            {
+                                "ts": "1783041900.111000",
+                                "user": "U0002",
+                                "text": _TRUNCATED_LABEL_TEXT,
+                                "channel": {"id": "C0001", "name": "proposals", "is_channel": True},
+                            }
+                        ],
+                        "paging": {"page": 1, "pages": 1},
+                    },
+                },
+            )
+        return Response(404)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(slack_connector_config(tmp_path))
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            search = await client.post(
+                "/v1/connectors/slack/search",
+                headers=auth_header(),
+                json={"query": "docs", "limit": 5},
+            )
+
+    assert search.status_code == 200
+    _assert_exact_slack_targets_preserved(search.json(), search.json()["hits"][0])
 
 
 async def test_google_drive_client_limits_download_before_decoding(monkeypatch):
