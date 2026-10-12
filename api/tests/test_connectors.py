@@ -847,7 +847,7 @@ def _slack_api_handler(request: httpx.Request, seen_authorization: list[str]) ->
                         "id": "C0001",
                         "name": "proposals",
                         "is_private": False,
-                        "topic": {"value": "Proposal work"},
+                        "topic": {"value": "Proposal work: <https://wiki.test/proposals?a=1&amp;b=2>"},
                         "num_members": 12,
                     }
                 ],
@@ -955,6 +955,7 @@ async def test_slack_endpoints_cover_channels_dms_search_and_reads(tmp_path, mon
     assert channels.status_code == 200
     assert channels.json()["channels"][0]["id"] == "C0001"
     assert channels.json()["channels"][0]["name"] == "proposals"
+    assert channels.json()["channels"][0]["topic"] == "Proposal work: https://wiki.test/proposals?a=1&b=2"
 
     assert dms.status_code == 200
     dm_payload = dms.json()["dms"]
@@ -1486,6 +1487,8 @@ def test_sanitize_slack_text_neutralizes_non_http_targets(target):
         "https://x.test/a\tb",
         "https://x.test/a\x00b",
         "https://x.test/a\x7fb",
+        "https://good.test\u202e/gpj.exe",
+        "https://go\u200bod.test/x",
         'https://x.test/a"onmouseover="b',
         "https://x.test/a'b",
     ],
@@ -1502,9 +1505,11 @@ def test_sanitize_slack_text_unescapes_only_amp_in_http_targets():
 
 
 def test_sanitize_slack_text_shows_target_when_label_is_a_different_url():
+    # A URL in the label must not pass itself off as the target.
+    assert sanitize_slack_text("open <https://evil.test/x|https://good.test/y>") == "open [link] (https://evil.test/x)"
     assert (
-        sanitize_slack_text("open <https://evil.test/x|https://good.test/y>")
-        == "open https://good.test/y (https://evil.test/x)"
+        sanitize_slack_text("open <https://evil.test/x|click (https://good.test/y)>")
+        == "open click ([link]) (https://evil.test/x)"
     )
 
 
@@ -1513,6 +1518,11 @@ def test_sanitize_slack_text_link_edge_cases():
     assert sanitize_slack_text("auto <https://x.test/a|https://x.test/a>") == "auto https://x.test/a"
     assert sanitize_slack_text("auto <http://www.x.test|www.x.test>") == "auto http://www.x.test"
     assert sanitize_slack_text("auto <https://x.test/|X.test>.") == "auto https://x.test/."
+    # A label differing from the target only in case is the same link.
+    assert sanitize_slack_text("<https://x.test/a|HTTPS://X.TEST/A>") == "https://x.test/a"
+    assert sanitize_slack_text("<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>") == (
+        "Foo (https://en.wikipedia.org/wiki/Foo_(bar))"
+    )
     # Trailing punctuation stays outside the link, typed or auto-linked.
     assert sanitize_slack_text("see <https://x.test/a>, then <https://x.test/b>).") == (
         "see https://x.test/a, then https://x.test/b)."
@@ -1533,17 +1543,13 @@ def test_sanitize_slack_text_link_edge_cases():
 _TRUNCATED_LABEL_TEXT = (
     "docs <https://gitlab.example/group/project/-/issues/12|gitlab.example/group/…/12> and https://example.test/y"
 )
-_TRUNCATED_LABEL_TARGETS = (
-    "https://gitlab.example/group/project/-/issues/12",
-    "https://example.test/y",
+_TRUNCATED_LABEL_RENDERED = (
+    "docs gitlab.example/group/…/12 (https://gitlab.example/group/project/-/issues/12) and https://example.test/y"
 )
 
 
 def _assert_exact_slack_targets_preserved(body: dict, message: dict) -> None:
-    serialized = json.dumps(message, ensure_ascii=False)
-    for target in _TRUNCATED_LABEL_TARGETS:
-        assert target in serialized
-    assert "gitlab.example/group/…/12" in message["text"]
+    assert message["text"] == _TRUNCATED_LABEL_RENDERED
     assert body["content_trust"] == "external_untrusted"
     assert body["security_notice"]
 

@@ -8,8 +8,10 @@ import unicodedata
 # every link, so the model can cite or follow it: Slack shortens long labels with an
 # ellipsis, so a label alone cannot recover its target (#143). Only http and https
 # targets are kept; any other scheme (javascript:, data:, file:, tel:, slack://, ...)
-# is reduced to its label or ``[link]``, and so is an http(s) target carrying
-# characters a URL never needs. Links were once stripped entirely to work around an
+# is reduced to its label or ``[link]``, and so is an http(s) target containing
+# whitespace, control or format characters, ``<``, ``>``, or quotes. URLs inside a
+# label are replaced with ``[link]`` so a label cannot pass off another URL as the
+# target. Links were once stripped entirely to work around an
 # Apollo renderer crash on link-shaped text (apollo-desktop#365); that crash was
 # fixed in apollo-desktop PR #414.
 
@@ -21,9 +23,12 @@ _TRAILING_PUNCTUATION = ").,;:!?]}>\"'"
 # ``<...>`` is always Slack markup, never literal user text.
 _SLACK_ENTITY = re.compile(r"<(?P<target>[^<>|]*)(?:\|(?P<label>[^<>]*))?>")
 _HTTP_SCHEME = re.compile(r"https?://", re.IGNORECASE)
-# URLs inside the label of a link whose target is not kept.
+# URLs inside a link label.
 _PLAIN_URL = re.compile(r"(?:https?://|www\.)[^\s<>|]+", re.IGNORECASE)
 _UNSAFE_URL_CHARACTERS = frozenset("<>\"'")
+# Control (Cc) and format (Cf) characters: the latter include bidi overrides such as
+# U+202E and zero-width characters such as U+200B, which can disguise a URL.
+_UNSAFE_URL_CATEGORIES = frozenset({"Cc", "Cf"})
 
 
 def _http_target(target: str) -> str | None:
@@ -33,7 +38,7 @@ def _http_target(target: str) -> str | None:
     # Slack escapes ``&`` in message text, including inside link targets.
     url = target.replace("&amp;", "&")
     for char in url:
-        if char.isspace() or char in _UNSAFE_URL_CHARACTERS or unicodedata.category(char) == "Cc":
+        if char.isspace() or char in _UNSAFE_URL_CHARACTERS or unicodedata.category(char) in _UNSAFE_URL_CATEGORIES:
             return None
     return url
 
@@ -61,14 +66,18 @@ def _render_entity(match: re.Match[str]) -> str:
         # Auto-links repeat the target as the label (<https://x.test|x.test>).
         if not label or _comparable_url(label) == _comparable_url(url):
             return url
-        return f"{label} ({url})"
+        return f"{_neutralize_urls(label)} ({url})"
     # Any other target (mailto, tel, javascript, slack action links, unsafe http)
-    # keeps only its label, with URLs in the label neutralized too.
+    # keeps only its label.
     if label:
-        return _PLAIN_URL.sub(_render_plain_url, label)
+        return _neutralize_urls(label)
     if target.lower().startswith("mailto:"):
         return target[len("mailto:") :] or _LINK_PLACEHOLDER
     return _LINK_PLACEHOLDER
+
+
+def _neutralize_urls(label: str) -> str:
+    return _PLAIN_URL.sub(_render_plain_url, label)
 
 
 def _render_plain_url(match: re.Match[str]) -> str:
