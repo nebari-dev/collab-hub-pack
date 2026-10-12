@@ -119,7 +119,7 @@ class Hub:
                            "it may predate this version of collab-hub and need upgrading")
         if response.status_code == 401:
             if self.session is None:
-                raise AuthError(f"not signed in to {self.url}; run `collab-hub login --hub {self.url}`")
+                raise AuthError(f"not signed in to {self.url}; run `collab-hub --hub {self.url} login`")
             raise AuthError(f"{self.url} refused the session ({error_message(response)}); "
                             "run `collab-hub login` again")
         if response.status_code >= 400:

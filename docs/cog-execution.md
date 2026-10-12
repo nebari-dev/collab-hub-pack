@@ -19,6 +19,16 @@ redirections.
   ([`cog-execution/runs.md`](cog-execution/runs.md#the-run-controller-and-the-run-api)).
   Without the flag, `/v1/runs` answers 404; without a controller, a launched
   run stays `SUBMITTED`.
+
+  **The published API image cannot serve these yet.** The image
+  (`ghcr.io/nebari-dev/collab-hub-pack/api`) does not ship the execution
+  package the run API imports, so with `cog_runs` on it fails at startup, and
+  the Helm chart runs no controller ([`feature-flags.md`](feature-flags.md)).
+  Today these steps work against a hub run from a checkout of this repository:
+  [`dev/`](../dev/README.md#running-cogs-and-ops), or
+  [`examples/cog-local`](../examples/cog-local/README.md). The image and the
+  chart gain both in later phases of
+  [`COG_EXECUTION.md`](../COG_EXECUTION.md).
 - An account in the hub's realm.
 - To chat with a Cog from a terminal interface:
   [Toad](https://github.com/batrachianai/toad), an ACP client
@@ -59,7 +69,7 @@ an option of `collab-hub` itself, so it comes before the command. Other ways to 
 | Situation | Command |
 |---|---|
 | No browser on this machine | `collab-hub --hub "<HUB_URL>" login --no-browser` prints the URL to open elsewhere |
-| Signing in over SSH | `collab-hub --hub "<HUB_URL>" login --port 8765`, with that port forwarded (`ssh -L 8765:127.0.0.1:8765 ...`) |
+| Signing in over SSH | `collab-hub --hub "<HUB_URL>" login --no-browser --port 8765`, with that port forwarded (`ssh -L 8765:127.0.0.1:8765 ...`) |
 | A script, with a token from the realm | `... \| collab-hub --hub "<HUB_URL>" login --with-token` |
 | Another hub beside this one | `collab-hub --profile NAME ...` on every command, or `COLLAB_HUB_PROFILE=NAME` |
 
@@ -78,7 +88,7 @@ Each step is one of `examples/cog-local`'s `make` targets.
 | Launch one, holding a session | `make launch` | `collab-hub cog launch hermes --entry session --gate never --name hermes-demo` |
 | See it running | `make list` | `collab-hub run list` |
 | One run, each step | | `collab-hub run show RUN` |
-| Say something to it | `make say TEXT="..."` | `collab-hub run say RUN what can you do?` |
+| Say something to it | `make say TEXT="..."` | `collab-hub run say RUN "what can you do?"` |
 | Chat with it from Toad | `make connect` | `toad acp "collab-hub run connect RUN"` |
 | Stop it | `make stop` | `collab-hub run terminate RUN` |
 

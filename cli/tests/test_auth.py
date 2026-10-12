@@ -200,6 +200,14 @@ def test_without_a_session_a_real_hub_is_exit_5(stub, cli):
     result = cli("--hub", HUB, "whoami")
     assert result.exit_code == 5
     assert f"not signed in to {HUB}" in result.stderr
+    # The hint is a command the CLI accepts: `--hub` belongs to `collab-hub`, before `login`.
+    assert f"run `collab-hub --hub {HUB} login`" in result.stderr
+
+
+def test_without_a_hub_the_hint_puts_hub_before_the_command(cli, monkeypatch):
+    monkeypatch.delenv("COLLAB_HUB_URL", raising=False)
+    result = cli("whoami")
+    assert result.exit_code != 0 and "`collab-hub --hub URL login`" in result.stderr
 
 
 def test_a_command_with_no_hub_is_a_usage_error(stub, cli):
