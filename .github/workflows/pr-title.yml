@@ -11,8 +11,9 @@ name: PR Title
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
-  # A merge-queue group has no PR title, but a required check that never
-  # reports on the group blocks the queue, so the job runs there and passes.
+  # On a merge-queue group the check reads the squash commit that will land
+  # on main, which is what semantic-release parses, so a title edited at
+  # merge time or taken from a single-commit PR cannot slip past it.
   merge_group: {}
 
 permissions:
@@ -24,19 +25,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check title
-        if: github.event_name == 'pull_request'
         env:
-          TITLE: ${{ github.event.pull_request.title }}
+          TITLE: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_commit.message || github.event.pull_request.title }}
         run: |
           set -euo pipefail
+          TITLE="${TITLE%%$'\n'*}"   # a commit message's first line is its title
           # type(optional-scope)!: description  — types cover the release
           # mapping (feat = minor, fix/perf = patch, ! or BREAKING CHANGE =
           # major) plus the non-releasing housekeeping types.
           pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-zA-Z0-9_./-]+\))?!?: .+'
           if printf '%s' "$TITLE" | grep -Eq "$pattern"; then
-            echo "PR title is conventional: $TITLE"
+            echo "Title is conventional: $TITLE"
           else
-            echo "::error::PR title is not a conventional commit: '$TITLE'"
+            echo "::error::Title is not a conventional commit: '$TITLE'"
             echo "Expected: type(scope)?: description — e.g. 'feat(agents): add hub model labels'."
             echo "Types: feat fix perf refactor docs test build ci chore style revert."
             exit 1
