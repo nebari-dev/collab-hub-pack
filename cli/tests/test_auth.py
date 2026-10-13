@@ -222,3 +222,33 @@ def test_an_unreachable_hub_is_exit_1(stub, cli, monkeypatch):
     monkeypatch.setattr(hub, "transport", httpx.MockTransport(refuse))
     result = cli("--hub", HUB, "whoami")
     assert result.exit_code == 1 and "cannot reach the hub" in result.stderr
+
+
+LAUNCHPAD = ('<!doctype html><html lang="en"><head><meta charset="UTF-8" />'
+             "<title>Nebari | Launchpad</title></head><body><div id=\"root\"></div></body></html>")
+
+
+@pytest.mark.parametrize("args", [("login",), ("whoami",), ("cog", "list"), ("run", "list")])
+def test_a_web_app_in_front_of_the_hub_is_named_not_a_traceback(cli, monkeypatch, args):
+    # A portal that serves its page at every path answers 200 with HTML: the URL is not the hub's API.
+    import httpx
+
+    from collab_hub_cli import hub
+
+    page = httpx.MockTransport(lambda request: httpx.Response(200, html=LAUNCHPAD))
+    monkeypatch.setattr(hub, "transport", page)
+    result = cli("--hub", "https://portal.example.org", *args)
+    assert result.exit_code == 1  # EXIT_HUB: the hub failed, as any other hub failure
+    assert "https://portal.example.org is not a Collab Hub API" in result.stderr, result.output
+    assert 'a web page titled "Nebari | Launchpad"' in result.stderr and "Traceback" not in result.output
+
+
+def test_a_token_endpoint_that_answers_without_tokens_is_a_realm_error():
+    import httpx
+
+    from collab_hub_cli import oidc
+
+    http = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, html=LAUNCHPAD)))
+    metadata = {"token_endpoint": "https://realm.example.org/token"}
+    with pytest.raises(oidc.RealmError, match="answered without tokens"):
+        oidc.refresh(http, metadata, "apollo-desktop", "refresh-token")

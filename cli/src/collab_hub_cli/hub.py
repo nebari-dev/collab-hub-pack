@@ -7,6 +7,7 @@ expires. A request the hub refuses as unauthenticated is an :class:`AuthError`
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -29,6 +30,19 @@ class HubError(Exception):
 
 def http_client() -> httpx.Client:
     return httpx.Client(transport=transport, timeout=TIMEOUT_SECONDS)
+
+
+def not_the_hub(url: str, path: str, response: httpx.Response) -> str:
+    """Why an answer that is not JSON means ``url`` is not a Collab Hub API, and what answered instead.
+
+    A web app in front of the hub — a portal serving the same page at every
+    path — answers 200 with HTML, which says nothing about the hub.
+    """
+    kind = response.headers.get("content-type", "").split(";")[0].strip() or "no content type"
+    title = re.search(r"<title[^>]*>\s*([^<]{1,120}?)\s*</title>", response.text, re.IGNORECASE)
+    what = f'a web page titled "{title.group(1)}"' if title else kind
+    return (f"{url} is not a Collab Hub API: it answered {path} with {what} (HTTP {response.status_code}), "
+            "not the hub's JSON. Check the hub's address: the API's own host, not a web app in front of it")
 
 
 def error_message(response: httpx.Response) -> str:
@@ -126,8 +140,16 @@ class Hub:
             raise HubError(error_message(response))
         return response
 
+    def request_json(self, method: str, path: str, **kwargs: Any) -> Any:
+        """A request whose answer is the hub's JSON; anything else means the URL is not the hub's API."""
+        response = self.request(method, path, **kwargs)
+        try:
+            return response.json()
+        except ValueError:
+            raise HubError(not_the_hub(self.url, path, response)) from None
+
     def get_json(self, path: str, **kwargs: Any) -> Any:
-        return self.request("GET", path, **kwargs).json()
+        return self.request_json("GET", path, **kwargs)
 
     def pages(self, path: str, params: dict[str, Any], limit: int = 200) -> Iterator[dict]:
         """Every item of a paged listing (``items`` + ``next_offset``), following pages to the end."""

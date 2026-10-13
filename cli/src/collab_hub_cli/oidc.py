@@ -113,6 +113,18 @@ def session_id(token: str | None) -> str | None:
     return sid if isinstance(sid, str) and sid else None
 
 
+def _token_body(response: httpx.Response, endpoint: str) -> dict:
+    """The token endpoint's JSON answer; a realm error otherwise, never a traceback."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or "access_token" not in body:
+        raise RealmError(f"the realm's token endpoint {endpoint} answered without tokens "
+                         f"({response.headers.get('content-type', 'no content type')})")
+    return body
+
+
 def _tokens(body: dict) -> Tokens:
     expires_in = body.get("expires_in")
     return Tokens(
@@ -235,7 +247,7 @@ def browser_login(
         if response.status_code >= 500:
             raise RealmError(f"the realm failed to exchange the sign-in code: HTTP {response.status_code}")
         raise AuthError(f"the realm refused the sign-in code: {code} {detail}".rstrip())
-    return _tokens(response.json())
+    return _tokens(_token_body(response, metadata["token_endpoint"]))
 
 
 def refresh(http: httpx.Client, metadata: dict, client_id: str, refresh_token: str) -> Tokens:
@@ -249,7 +261,7 @@ def refresh(http: httpx.Client, metadata: dict, client_id: str, refresh_token: s
         # A realm restarting or a proxy error page: the session may be fine, so keep it.
         raise RealmError(f"the realm could not renew the session right now (HTTP {response.status_code}, {code}); "
                          "try again")
-    tokens = _tokens(response.json())
+    tokens = _tokens(_token_body(response, metadata["token_endpoint"]))
     # A realm that does not rotate refresh tokens omits the new one: keep the old.
     return Tokens(tokens.access_token, tokens.refresh_token or refresh_token, tokens.expires_at)
 
