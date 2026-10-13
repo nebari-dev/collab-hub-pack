@@ -119,7 +119,8 @@ def _token_body(response: httpx.Response, endpoint: str) -> dict:
         body = response.json()
     except ValueError:
         body = None
-    if not isinstance(body, dict) or "access_token" not in body:
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
         raise RealmError(f"the realm's token endpoint {endpoint} answered without tokens "
                          f"({response.headers.get('content-type', 'no content type')})")
     return body

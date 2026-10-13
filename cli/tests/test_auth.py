@@ -252,3 +252,44 @@ def test_a_token_endpoint_that_answers_without_tokens_is_a_realm_error():
     metadata = {"token_endpoint": "https://realm.example.org/token"}
     with pytest.raises(oidc.RealmError, match="answered without tokens"):
         oidc.refresh(http, metadata, "apollo-desktop", "refresh-token")
+
+
+@pytest.mark.parametrize("args", [("login",), ("whoami",), ("run", "list")])
+def test_a_web_server_refusing_with_a_page_is_not_the_hub_either(cli, monkeypatch, args):
+    # A conventional HTML 404 (or 401) from a host that is not the hub: named the same way as a 200 page.
+    import httpx
+
+    from collab_hub_cli import hub
+
+    page = httpx.MockTransport(lambda request: httpx.Response(
+        404, html="<html><head><title>404 Not Found</title></head><body>nginx</body></html>"))
+    monkeypatch.setattr(hub, "transport", page)
+    result = cli("--hub", "https://www.example.org", *args)
+    assert result.exit_code == 1
+    assert 'https://www.example.org is not a Collab Hub API' in result.stderr, result.output
+    assert 'a web page titled "404 Not Found" (HTTP 404)' in result.stderr
+
+
+def test_a_proxy_error_page_in_front_of_a_failing_hub_keeps_its_status(cli, monkeypatch):
+    # A 5xx page says the hub behind the proxy is failing, not that the address is wrong.
+    import httpx
+
+    from collab_hub_cli import hub
+
+    page = httpx.MockTransport(lambda request: httpx.Response(
+        502, html="<html><head><title>502 Bad Gateway</title></head></html>"))
+    monkeypatch.setattr(hub, "transport", page)
+    result = cli("--hub", "https://hub.example.org", "whoami")
+    assert result.exit_code == 1 and "HTTP 502" in result.stderr and "not a Collab Hub API" not in result.stderr
+
+
+@pytest.mark.parametrize("token", [None, "", 42])
+def test_a_token_endpoint_with_an_unusable_access_token_is_a_realm_error(token):
+    import httpx
+
+    from collab_hub_cli import oidc
+
+    http = httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"access_token": token, "refresh_token": "r"})))
+    with pytest.raises(oidc.RealmError, match="answered without tokens"):
+        oidc.refresh(http, {"token_endpoint": "https://realm.example.org/token"}, "apollo-desktop", "refresh-token")

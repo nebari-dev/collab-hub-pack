@@ -32,6 +32,11 @@ def http_client() -> httpx.Client:
     return httpx.Client(transport=transport, timeout=TIMEOUT_SECONDS)
 
 
+def _is_html(response: httpx.Response) -> bool:
+    return response.headers.get("content-type", "").split(";")[0].strip().lower() in ("text/html",
+                                                                                       "application/xhtml+xml")
+
+
 def not_the_hub(url: str, path: str, response: httpx.Response) -> str:
     """Why an answer that is not JSON means ``url`` is not a Collab Hub API, and what answered instead.
 
@@ -127,6 +132,11 @@ class Hub:
             response = self.http.request(method, f"{self.url}{path}", headers=headers, **kwargs)
         except httpx.HTTPError as exc:
             raise HubError(f"cannot reach the hub at {self.url}: {exc}") from exc
+        if 400 <= response.status_code < 500 and _is_html(response):
+            # The hub refuses in JSON, always: a refusal that is a web page comes from a web server or
+            # a portal at this URL, not the hub. A 5xx page is left as it is: a proxy's error page in
+            # front of a hub that is failing says nothing about the address.
+            raise HubError(not_the_hub(self.url, path, response))
         if not authenticate and response.status_code in (401, 404):
             # Asked without credentials, so a 401 is not about a session: the hub has no such public route.
             raise HubError(f"{self.url} does not offer {path} (HTTP {response.status_code}); "
