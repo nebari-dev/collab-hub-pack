@@ -24,7 +24,7 @@ redirections.
   (`ghcr.io/nebari-dev/collab-hub-pack/api`) does not ship the execution
   package the run API imports, so with `cog_runs` on it fails at startup, and
   the Helm chart runs no controller ([`feature-flags.md`](feature-flags.md)).
-  Today these steps work against a hub run from a checkout of this repository:
+  These steps work against a hub run from a checkout of this repository:
   [`dev/`](../dev/README.md#running-cogs-and-ops), or
   [`examples/cog-local`](../examples/cog-local/README.md). The image and the
   chart gain both in later phases of
