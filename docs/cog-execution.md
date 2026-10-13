@@ -54,6 +54,34 @@ pipx install "git+https://github.com/nebari-dev/collab-hub-pack.git@main#subdire
 To pick up later changes on `main`, install again with `--force-reinstall`
 (pip), `--reinstall` (uv), or `pipx reinstall collab-hub-cli`.
 
+### From a clone of the repository
+
+To install from a checkout instead, for a branch other than `main` or to
+change the CLI:
+
+```sh
+git clone https://github.com/nebari-dev/collab-hub-pack.git
+cd collab-hub-pack
+pip install -e cli
+collab-hub --help
+```
+
+`-e` installs it in editable mode, so the installed CLI is the clone's
+`cli/` itself: `git pull`, or `git switch` to another branch, and the next
+`collab-hub` runs that code without installing again. Install again only when
+`cli/pyproject.toml` changes its dependencies. The same as a tool of its own:
+
+```sh
+uv tool install --editable ./cli
+```
+
+Or run it from the clone without installing it, as `examples/cog-local`
+does; uv builds the environment on first use:
+
+```sh
+uv run --project cli collab-hub --help
+```
+
 ## 2. Sign in
 
 ```sh
