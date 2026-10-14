@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import secrets
 import threading
 import time
@@ -123,7 +124,24 @@ def _token_body(response: httpx.Response, endpoint: str) -> dict:
     if not isinstance(token, str) or not token:
         raise RealmError(f"the realm's token endpoint {endpoint} answered without tokens "
                          f"({response.headers.get('content-type', 'no content type')})")
+    refresh = body.get("refresh_token")
+    if refresh is not None and (not isinstance(refresh, str) or not refresh):
+        raise RealmError(f"the realm's token endpoint {endpoint} answered with a refresh_token that is not one")
+    if body.get("expires_in") is not None and _seconds(body["expires_in"]) is None:
+        raise RealmError(f"the realm's token endpoint {endpoint} answered with an expires_in that is not a "
+                         "number of seconds")
     return body
+
+
+def _seconds(value: object) -> float | None:
+    """A token's lifetime in seconds (RFC 6749: a number; some realms send it as a string of digits)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
 
 
 def _tokens(body: dict) -> Tokens:
@@ -131,7 +149,7 @@ def _tokens(body: dict) -> Tokens:
     return Tokens(
         access_token=body["access_token"],
         refresh_token=body.get("refresh_token"),
-        expires_at=clock() + float(expires_in) if expires_in else None,
+        expires_at=clock() + _seconds(expires_in) if expires_in else None,
     )
 
 
