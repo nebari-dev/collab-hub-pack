@@ -188,6 +188,8 @@ make connect ──▶ Toad ──ACP──▶ collab-hub run connect ──POST
 make stop      ──▶ POST /v1/runs/{id}/cancel ──▶ API ──▶ Track ──▶ controller stops the Cog and Hermes
 ```
 
+The Track is the hub's own Postgres, the database the API runs on, as on a deployed hub: the API's migrations create its tables, and `make controller` waits for the API before it starts watching it.
+
 The Hermes Cog is [`cogs/hermes`](../../cogs/hermes/README.md) at the root of the repository: a worker that serves the hub's seam and drives Hermes over ACP, and a pixi package that pins Hermes Agent. Its README says what it does with tools, its model and its home directory.
 
 This directory also has [`cogs/hello`](cogs/hello), the smallest Cog that holds a session, with no model at all. Launch it with `make launch COG=hello`; it answers `help`, `sum 1 2 3`, `whoami` and a few more. It is the one to copy to write a Cog of your own: change `Session.answer` in `serve.py`, run `pixi lock`, and launch it by its directory's name. The controller finds Cogs in `cogs/` at the root, here, and in `dev/cogs`.

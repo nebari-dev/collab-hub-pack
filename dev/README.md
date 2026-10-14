@@ -1144,8 +1144,9 @@ The API records the submission and nothing else; the controller reads it from
 the Track, runs the Cog package's `serve` task in its own pixi environment, and
 records what happened; the CLI reads the run back through the API. `run list`,
 `run show` and `run terminate` are the other commands.
-`make api-oidc` serves the run API too, with real sign-in through Keycloak,
-and `make controller` works beside either. [`examples/cog-local`](../examples/cog-local/README.md)
+`make api-oidc` serves the run API too, with real sign-in through Keycloak, on
+the hub's own Postgres, so its controller is `make controller
+TRACK=postgresql://collab:collab@127.0.0.1:5432/collab`. [`examples/cog-local`](../examples/cog-local/README.md)
 walks a Cog through its whole life on them — sign in, launch, list, talk to it
 from Toad over ACP, stop it — and `make -C ../examples/cog-local demo` runs it
 end to end and checks it.

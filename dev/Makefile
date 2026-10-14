@@ -127,7 +127,7 @@ LEVEL1_ENV := \
 # The run API (/v1/runs). PACKAGES are the directories a Cog package may be
 # launched from, the same ones the controller is given. At level 1 its Track is
 # the SQLite file `make controller` watches; at level 2 (`make api-pg`, no
-# TRACK_PATH) it is the hub's own Postgres, as on a deployed hub.
+# TRACK_PATH), and at level 3 (`make api-oidc`), it is the hub's own Postgres, as on a deployed hub.
 COGS ?= $(CURDIR)/cogs:$(ROOT)/cogs:$(ROOT)/examples/cog-local/cogs
 RUNS_PACKAGES_ENV := COLLAB_HUB_API__RUNS__PACKAGES=$(COGS)
 RUNS_ENV := \
@@ -340,7 +340,7 @@ api-pg: postgres | $(LOCAL)/frames ## Starts Postgres, then the API: history, gr
 # ---------------------------------------------------------------------------
 
 api-oidc: postgres keycloak | $(LOCAL)/frames ## API verifying real Keycloak bearer tokens (no dev-auth shortcut)
-	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(RUNS_ENV) uv run python -m collab_hub_api
+	cd $(API_DIR) && env $(BASE_ENV) $(OIDC_ENV) $(PG_ENV) $(RUNS_PACKAGES_ENV) uv run python -m collab_hub_api
 
 # Connector routes exchange the CALLER's bearer with the broker, so the
 # dev-auth shortcut cannot reach them -- it authenticates a subject without

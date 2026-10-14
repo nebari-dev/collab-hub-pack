@@ -375,6 +375,10 @@ async def _stream(service: RunService, run_id: str, after: int, request: Request
             continue  # read again at once: more may have landed while these were sent
         view = await asyncio.to_thread(_view_of, service, run_id)
         if view is None or view.state.ended:
+            # The run's end may have landed between the read above and this one: read once more, and
+            # send `end` only when nothing is left to send.
+            if await asyncio.to_thread(service.track.replay, run_id, after_sequence=after):
+                continue
             yield f"event: end\ndata: {json.dumps({'status': view.status if view else None})}\n\n"
             return
         await asyncio.sleep(STREAM_POLL_SECONDS)

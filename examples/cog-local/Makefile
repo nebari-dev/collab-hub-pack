@@ -119,8 +119,12 @@ model: ## The fake model Hermes calls, on port 8090 (foreground); not needed wit
 api: ## The hub's API, verifying the realm's tokens (foreground)
 	$(MAKE) -C $(DEV) api-oidc API_PORT=$(PORT)
 
+# The controller watches the hub's own database, the Track the API records runs in. Its tables come
+# from the API's migrations, so the controller starts once the API answers.
+TRACK ?= postgresql://collab:collab@127.0.0.1:5432/collab
 controller: ## The run controller, which starts each Cog as a local process (foreground)
-	$(MAKE) -C $(DEV) controller
+	@until curl -sf $(COLLAB_HUB_URL)/health > /dev/null; do sleep 1; done
+	$(MAKE) -C $(DEV) controller TRACK=$(TRACK)
 
 start: | $(LOCAL) ## The fake model (if used), the API and the controller in the background; logs in .local/
 	@echo "  Hermes's model: $(MODEL_SOURCE)$(if $(filter claude,$(MODEL_SOURCE)), ($(CLAUDE_MODEL)))"

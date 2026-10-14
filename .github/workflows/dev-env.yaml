@@ -186,7 +186,7 @@ jobs:
           assert runs.get('$echo_run') == 'COMPLETED', runs
           print('GET /v1/runs lists', len(runs), 'runs')"
           # The finished run's events, as a stream: every event, then `end`.
-          timeout 30 make -s -C dev run-events RUN="$echo_run" > /tmp/events-echo.log
+          make -s -C dev run-events RUN="$echo_run" > /tmp/events-echo.log  # it closes once the run has ended
           grep -q '^event: completed$' /tmp/events-echo.log && grep -q '^event: end$' /tmp/events-echo.log \
             || { echo "the event stream did not end with the run"; cat /tmp/events-echo.log; exit 1; }
 
@@ -197,9 +197,14 @@ jobs:
           for _ in $(seq 1 60); do grep -q '^run run-' /tmp/submit-slow.log && break; sleep 1; done
           run=$(sed -n 's/^run \(run-[0-9a-f]*\) .*/\1/p' /tmp/submit-slow.log)
           [ -n "$run" ] || { echo "the slow Op was never launched"; cat /tmp/submit-slow.log; exit 1; }
-          for _ in $(seq 1 60); do
-            curl -sf "http://127.0.0.1:8000/v1/runs/$run/events" | grep -q '"interaction_started"' && break; sleep 1
-          done
+          # Mid-step, proven: the worker's interaction started, or the step fails here.
+          mid_step() {
+            for _ in $(seq 1 60); do
+              curl -sf "http://127.0.0.1:8000/v1/runs/$1/events" | grep -q '"interaction_started"' && return 0; sleep 1
+            done
+            echo "run $1 never reached its step's interaction"; exit 1
+          }
+          mid_step "$run"
           curl -sf -X POST "http://127.0.0.1:8000/v1/runs/$run/cancel" > /dev/null
           wait "$follower" || true
           grep -q '^status: CANCELLED$' /tmp/submit-slow.log \
@@ -213,9 +218,7 @@ jobs:
           for _ in $(seq 1 60); do grep -q '^run run-' /tmp/submit-killed.log && break; sleep 1; done
           run=$(sed -n 's/^run \(run-[0-9a-f]*\) .*/\1/p' /tmp/submit-killed.log)
           [ -n "$run" ] || { echo "the slow Op was never launched"; cat /tmp/submit-killed.log; exit 1; }
-          for _ in $(seq 1 60); do
-            curl -sf "http://127.0.0.1:8000/v1/runs/$run/events" | grep -q '"interaction_started"' && break; sleep 1
-          done
+          mid_step "$run"
           pkill -KILL -f "[c]ollab_hub_execution.controller"
           sleep 1
           start

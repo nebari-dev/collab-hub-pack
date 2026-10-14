@@ -579,3 +579,30 @@ async def test_without_a_track_path_runs_are_recorded_in_the_hubs_own_database(t
             for table in COLLAB_TABLES:
                 conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         database.close()
+
+
+async def test_the_stream_sends_the_runs_last_event_even_when_it_lands_as_the_end_is_noticed(
+        runs_client, controller):
+    # The race: the read after the last event sent comes back empty, then the run reads as ended,
+    # its final event having landed between the two. The stream reads once more before `end`.
+    run = (await runs_client.post("/v1/runs", json=ECHO)).json()
+    settle(controller)
+    service = runs_client._transport.app.state.run_service
+    events = service.track.replay(run["id"])
+    before_last = events[-2].sequence
+    real = service.track.replay
+    late = {"once": True}
+
+    def replay(run_id, *, after_sequence=0):
+        if after_sequence == before_last and late["once"]:
+            late["once"] = False
+            return ()  # the final event has not landed yet, as far as this read can tell
+        return real(run_id, after_sequence=after_sequence)
+
+    service.track.replay = replay
+    try:
+        streamed = await runs_client.get(f"/v1/runs/{run['id']}/events",
+                                         headers={"Accept": "text/event-stream", "Last-Event-ID": str(before_last)})
+    finally:
+        service.track.replay = real
+    assert [kind for _, kind, _ in _sse(streamed.text)] == [events[-1].event_type, "end"]
