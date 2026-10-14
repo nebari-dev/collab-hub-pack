@@ -930,6 +930,33 @@
             }
           },
           "additionalProperties": false
+        },
+        "sharepoint": {
+          "type": "object",
+          "properties": {
+            "brokerTokenUrl": {
+              "type": "string"
+            },
+            "apiBaseUrl": {
+              "type": "string"
+            },
+            "requestTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1
+            },
+            "downloadTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1
+            },
+            "maxDownloadBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "includePersonalOnedrive": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

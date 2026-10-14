@@ -803,6 +803,7 @@ async def test_list_connectors_includes_all_read_only_connectors(tmp_path, monke
         "slack",
         "github",
         "notion",
+        "sharepoint",
     ]
 
 

@@ -1,0 +1,844 @@
+from __future__ import annotations
+
+import base64
+import json
+from contextlib import asynccontextmanager
+from datetime import date
+
+import httpx
+import pytest
+from httpx import ASGITransport, AsyncClient, Response
+from pydantic import ValidationError
+
+from collab_hub_api.config import Config
+from collab_hub_api.connectors.models import (
+    SHAREPOINT_READONLY_SCOPES,
+    SharePointReadRequest,
+    SharePointSearchRequest,
+)
+from collab_hub_api.connectors.sharepoint_client import _kql, _site_from_web_url, _strip_search_markup
+from collab_hub_api.connectors.sharepoint_text import PdfExtractionError, extract_pdf_text
+from collab_hub_api.core import make_app
+
+STATIC_TOKEN = "eyJ-static-graph-token-alice"
+DRIVE_ID = "b!abc123-XYZ_456"
+ITEM_ID = "01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K"
+GRAPH = "https://graph.test/v1.0"
+DOWNLOAD_HOST = "https://easiyest.sharepoint.test"
+SITE_URL = "https://easiyest.sharepoint.test/sites/Marketing/Shared%20Documents"
+PERSONAL_URL = "https://easiyest-my.sharepoint.test/personal/francis_easiyest/Documents"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+@pytest.fixture(autouse=True)
+def _allow_unsigned_bearer(monkeypatch):
+    monkeypatch.setenv("FRAMES_UNSAFE_AUTH_ENABLED", "true")
+    monkeypatch.setenv("FRAMES_BEARER_ALLOW_UNSIGNED", "true")
+
+
+def _jwt(payload: dict) -> str:
+    def encode(part: dict) -> str:
+        raw = json.dumps(part, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}."
+
+
+def _auth_header() -> dict[str, str]:
+    token = _jwt({"preferred_username": "alice", "org_id": "org-a", "workspace_id": "workspace-a"})
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _config(tmp_path, **sharepoint) -> Config:
+    sharepoint_config = {
+        "static_access_token": STATIC_TOKEN,
+        "api_base_url": GRAPH,
+        **sharepoint,
+    }
+    return Config.parse(
+        {
+            "storage": {"frames_path": str(tmp_path / "frames")},
+            "frames": {"active_state": {"backend": "memory"}, "mcp_session_manager_enabled": False},
+            "connectors": {"sharepoint": sharepoint_config},
+        }
+    )
+
+
+@asynccontextmanager
+async def _client(app):
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+
+
+def _install_mock_client(monkeypatch, handler) -> None:
+    original_async_client = httpx.AsyncClient
+
+    def mock_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
+
+
+# --- Graph shapes -----------------------------------------------------------
+
+
+def _resource(
+    item_id: str,
+    name: str,
+    *,
+    drive_id: str = DRIVE_ID,
+    web_url: str | None = None,
+    size: int = 1234,
+    modified: str = "2026-10-06T10:00:00Z",
+    mime: str = DOCX_MIME,
+    folder: bool = False,
+) -> dict:
+    resource = {
+        "@odata.type": "#microsoft.graph.driveItem",
+        "id": item_id,
+        "name": name,
+        "size": size,
+        "webUrl": web_url if web_url is not None else f"{SITE_URL}/{name}",
+        "lastModifiedDateTime": modified,
+        "lastModifiedBy": {"user": {"displayName": "Shayla McMillan", "email": "shayla@easiyest.test"}},
+        "parentReference": {"driveId": drive_id, "siteId": "easiyest.sharepoint.test,guid1,guid2"},
+    }
+    if folder:
+        resource["folder"] = {"childCount": 3}
+    else:
+        resource["file"] = {"mimeType": mime}
+    return resource
+
+
+def _hit(resource: dict, summary: str = "") -> dict:
+    return {"hitId": resource["id"], "rank": 1, "summary": summary, "resource": resource}
+
+
+def _search_response(hits: list[dict], *, total: int | None = None, more: bool = False) -> dict:
+    return {
+        "value": [
+            {
+                "searchTerms": ["x"],
+                "hitsContainers": [
+                    {"hits": hits, "total": len(hits) if total is None else total, "moreResultsAvailable": more}
+                ],
+            }
+        ]
+    }
+
+
+def _graph_error(status: int, message: str) -> Response:
+    return Response(
+        status,
+        json={"error": {"code": "someCode", "message": message, "innerError": {"request-id": "SECRET-REQ-ID"}}},
+    )
+
+
+def _ok_handler(request: httpx.Request) -> Response:
+    path = request.url.path
+    if path.endswith("/me"):
+        return Response(
+            200,
+            json={"displayName": "Francis Happy", "userPrincipalName": "francis@easiyest.onmicrosoft.com"},
+        )
+    if path.endswith("/search/query"):
+        return Response(200, json=_search_response([]))
+    return _graph_error(404, "Item not found")
+
+
+def _minimal_pdf(text: str) -> bytes:
+    """A hand-built one-page PDF with ``text`` in Helvetica, enough for PDFium."""
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    content = f"BT /F1 24 Tf 72 700 Td ({escaped}) Tj ET".encode("latin-1")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def _read_handler(resource: dict, *, content: bytes = b"", converted: bytes | None = None, convert_status: int = 200):
+    """Metadata + download handler: ``/content`` 302s to another host like Graph does."""
+    seen: dict = {"download_authorization": None, "download_calls": 0, "convert_params": None}
+
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if request.url.host == "easiyest.sharepoint.test":
+            seen["download_authorization"] = request.headers.get("Authorization")
+            if path.endswith("/converted"):
+                return Response(200, content=converted or b"", headers={"Content-Type": "application/pdf"})
+            return Response(200, content=content, headers={"Content-Type": "application/octet-stream"})
+        if path.endswith("/content"):
+            seen["download_calls"] += 1
+            if request.url.params.get("format") == "pdf":
+                seen["convert_params"] = dict(request.url.params)
+                if convert_status != 200:
+                    return _graph_error(convert_status, "InputFormatNotSupported")
+                return Response(302, headers={"Location": f"{DOWNLOAD_HOST}/download/converted"})
+            return Response(302, headers={"Location": f"{DOWNLOAD_HOST}/download/raw"})
+        if f"/items/{ITEM_ID}" in path:
+            return Response(200, json=resource)
+        return _ok_handler(request)
+
+    return handler, seen
+
+
+# --- request model bounds -------------------------------------------------
+
+
+def test_sharepoint_search_request_bounds() -> None:
+    request = SharePointSearchRequest(query="plan", limit=25, time_zone="America/New_York", sort="modified")
+    assert request.limit == 25
+    assert request.time_zone == "America/New_York"
+    with pytest.raises(ValidationError):
+        SharePointSearchRequest(query="plan", limit=26)
+    with pytest.raises(ValidationError):
+        SharePointSearchRequest(query="plan", time_zone="Mars/Phobos")
+    with pytest.raises(ValidationError):
+        SharePointSearchRequest(query="plan", since_date="2026-02-01", until_date="2026-01-01")
+    with pytest.raises(ValidationError):
+        SharePointSearchRequest(query="plan", sort="newest")
+    # An empty query needs a date window ("what changed yesterday"); on its own it is refused.
+    with pytest.raises(ValidationError):
+        SharePointSearchRequest(query="")
+    assert SharePointSearchRequest(query="", days_back=1).days_back == 1
+
+
+def test_sharepoint_read_request_bounds() -> None:
+    assert SharePointReadRequest().max_chars == 12_000
+    with pytest.raises(ValidationError):
+        SharePointReadRequest(max_chars=0)
+    with pytest.raises(ValidationError):
+        SharePointReadRequest(max_chars=50_001)
+
+
+# --- pure helpers ---------------------------------------------------------
+
+
+def test_kql_wraps_words_and_appends_date_clause() -> None:
+    assert _kql("roadmap", None, None) == "(roadmap)"
+    assert _kql("", None, None) == "*"
+    assert _kql("", date(2026, 10, 1), None) == "LastModifiedTime>=2026-10-01"
+    assert (
+        _kql("q3 plan", date(2026, 10, 1), date(2026, 10, 7))
+        == "(q3 plan) AND LastModifiedTime>=2026-10-01 AND LastModifiedTime<=2026-10-07"
+    )
+    # Parentheses in the user's words cannot close the group early; an odd quote is dropped.
+    assert _kql('x) OR "y', date(2026, 10, 1), None) == "(x OR y) AND LastModifiedTime>=2026-10-01"
+
+
+def test_strip_search_markup_and_site_name() -> None:
+    assert _strip_search_markup("<c0>Marketing</c0> plan &amp; budget<ddd/>") == "Marketing plan & budget ..."
+    assert _site_from_web_url(f"{SITE_URL}/plan.docx") == ("Marketing", False)
+    assert _site_from_web_url("https://t.sharepoint.test/teams/Eng%20Team/Docs/a.txt") == ("Eng Team", False)
+    assert _site_from_web_url(f"{PERSONAL_URL}/draft.docx") == ("", True)
+    assert _site_from_web_url("") == ("", False)
+
+
+def test_extract_pdf_text_bounds_and_rejects_garbage() -> None:
+    assert extract_pdf_text(_minimal_pdf("Hello SharePoint"), max_chars=100, max_pages=10) == (
+        "Hello SharePoint",
+        False,
+    )
+    text, truncated = extract_pdf_text(_minimal_pdf("Hello SharePoint"), max_chars=5, max_pages=10)
+    assert (text, truncated) == ("Hello", True)
+    with pytest.raises(PdfExtractionError):
+        extract_pdf_text(b"this is not a pdf at all", max_chars=100, max_pages=10)
+
+
+# --- status ---------------------------------------------------------------
+
+
+async def test_sharepoint_status_connected_reports_account(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            captured["probe"] = json.loads(request.content)
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["connected"] is True
+    assert body["state"] == "connected"
+    assert body["account"] == "Francis Happy"
+    assert body["scopes"] == SHAREPOINT_READONLY_SCOPES
+    assert STATIC_TOKEN not in response.text
+    # Capability probe: a bounded one-result search, not just /me (contract 4).
+    assert captured["probe"]["requests"][0]["size"] == 1
+    assert captured["probe"]["requests"][0]["entityTypes"] == ["driveItem"]
+
+
+async def test_sharepoint_status_not_connected_without_token_source(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _ok_handler)
+    app = make_app(_config(tmp_path, static_access_token="", broker_token_url=""))
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    body = response.json()
+    assert body["connected"] is False
+    assert body["state"] == "not_connected"
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_sharepoint_status_reconnect_when_token_rejected(tmp_path, monkeypatch, status_code):
+    # A token that brokers but cannot read (consent revoked, expired) must report
+    # reconnect_required, not connected (contract 4).
+    def handler(request: httpx.Request) -> Response:
+        return _graph_error(status_code, "Access token has expired or is not yet valid.")
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    body = response.json()
+    assert body["connected"] is False
+    assert body["state"] == "reconnect_required"
+    assert "SECRET-REQ-ID" not in response.text
+
+
+async def test_sharepoint_status_unavailable_on_server_error(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/me"):
+            return _graph_error(500, "boom")
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    body = response.json()
+    assert body["connected"] is False
+    assert body["state"] == "unavailable"
+
+
+async def test_sharepoint_static_token_wins_over_broker(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        assert "broker" not in request.url.path, "static token must short-circuit the broker"
+        assert request.headers.get("Authorization") == f"Bearer {STATIC_TOKEN}"
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, broker_token_url="https://keycloak.test/broker/microsoft/token"))
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    assert response.json()["state"] == "connected"
+
+
+# --- search ---------------------------------------------------------------
+
+
+async def test_sharepoint_search_returns_hits_and_drops_urls(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            captured["body"] = json.loads(request.content)
+            return Response(
+                200,
+                json=_search_response(
+                    [
+                        _hit(
+                            _resource(ITEM_ID, "Q3 Marketing Plan.docx"),
+                            summary="<c0>Marketing</c0> plan for Q3 see www.evil.example<ddd/>",
+                        ),
+                        _hit(_resource("02FOLDER", "Archive", folder=True)),
+                    ],
+                    total=2,
+                ),
+            )
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "marketing plan"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["content_trust"] == "external_untrusted"
+    assert body["total"] == 2
+    assert body["next_page_token"] == ""
+    first, folder = body["hits"]
+    assert first["id"] == ITEM_ID
+    assert first["drive_id"] == DRIVE_ID
+    assert first["name"] == "Q3 Marketing Plan.docx"
+    assert first["site_name"] == "Marketing"
+    assert first["mime_type"] == DOCX_MIME
+    assert first["size"] == 1234
+    assert first["last_modified_by"] == "Shayla McMillan"
+    assert first["last_modified"].startswith("2026-10-06T10:00:00")
+    assert first["is_folder"] is False
+    # Highlight/ellipsis markup is gone and the link inside the snippet is masked.
+    assert first["summary"] == "Marketing plan for Q3 see [link] ..."
+    assert folder["is_folder"] is True
+    # Request shape: driveItem only, offset paging, the user's words in their own group.
+    sent = captured["body"]["requests"][0]
+    assert sent["entityTypes"] == ["driveItem"]
+    assert sent["query"]["queryString"] == "(marketing plan)"
+    assert sent["from"] == 0
+    assert sent["size"] == 10
+    assert "sortProperties" not in sent
+    # No URL, OData link, email, or markup leaks through anywhere in the response.
+    assert "sharepoint.test" not in response.text
+    assert "@odata" not in response.text
+    assert "webUrl" not in response.text
+    assert "shayla@" not in response.text
+    assert "<c0>" not in response.text
+    assert STATIC_TOKEN not in response.text
+
+
+async def test_sharepoint_search_sort_modified_and_date_window(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            captured["body"] = json.loads(request.content)
+            return Response(
+                200,
+                json=_search_response(
+                    [
+                        _hit(_resource(ITEM_ID, "Recent.docx", modified="2026-10-06T10:00:00Z")),
+                        _hit(_resource("03OLD", "Ancient.docx", modified="2020-01-01T10:00:00Z")),
+                    ]
+                ),
+            )
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/sharepoint/search",
+            headers=_auth_header(),
+            json={
+                "query": "",
+                "since_date": "2026-10-01",
+                "until_date": "2026-10-07",
+                "time_zone": "UTC",
+                "sort": "modified",
+            },
+        )
+    assert response.status_code == 200
+    sent = captured["body"]["requests"][0]
+    assert sent["query"]["queryString"] == "LastModifiedTime>=2026-10-01 AND LastModifiedTime<=2026-10-07"
+    assert sent["sortProperties"] == [{"name": "lastModifiedDateTime", "isDescending": True}]
+    # A hit Graph returned from outside the window is dropped Hub-side as well.
+    assert [hit["name"] for hit in response.json()["hits"]] == ["Recent.docx"]
+
+
+async def test_sharepoint_search_days_back_uses_callers_zone(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            captured["body"] = json.loads(request.content)
+            return Response(200, json=_search_response([]))
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/connectors/sharepoint/search",
+            headers=_auth_header(),
+            json={
+                "query": "x) OR LastModifiedTime>=1900-01-01 AND (y",
+                "days_back": 7,
+                "time_zone": "Pacific/Auckland",
+            },
+        )
+    assert response.status_code == 200
+    query_string = captured["body"]["requests"][0]["query"]["queryString"]
+    # The user's parentheses were neutralised: the outer date clause is still ANDed on.
+    assert query_string.startswith("(x OR LastModifiedTime>=1900-01-01 AND y) AND LastModifiedTime>=")
+    assert query_string.count("(") == 1
+
+
+async def test_sharepoint_search_excludes_personal_onedrive_by_default(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            return Response(
+                200,
+                json=_search_response(
+                    [
+                        _hit(_resource(ITEM_ID, "Team plan.docx")),
+                        _hit(_resource("04PERSONAL", "My draft.docx", web_url=f"{PERSONAL_URL}/My%20draft.docx")),
+                    ]
+                ),
+            )
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "plan"})
+    assert [hit["name"] for hit in response.json()["hits"]] == ["Team plan.docx"]
+
+    app = make_app(_config(tmp_path, include_personal_onedrive=True))
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "plan"})
+    hits = response.json()["hits"]
+    assert [hit["name"] for hit in hits] == ["Team plan.docx", "My draft.docx"]
+    assert hits[1]["site_name"] == "OneDrive"
+
+
+async def test_sharepoint_search_page_token_roundtrip_and_rejections(tmp_path, monkeypatch):
+    offsets: list[int] = []
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.path.endswith("/search/query"):
+            sent = json.loads(request.content)["requests"][0]
+            offsets.append(sent["from"])
+            hits = [
+                _hit(_resource(f"0{index}ITEM", f"file{index}.txt", mime="text/plain")) for index in range(sent["size"])
+            ]
+            return Response(200, json=_search_response(hits, total=50, more=True))
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "file", "limit": 5}
+        )
+        token = first.json()["next_page_token"]
+        assert token
+        second = await client.post(
+            "/v1/connectors/sharepoint/search",
+            headers=_auth_header(),
+            json={"query": "file", "limit": 5, "page_token": token},
+        )
+        assert second.status_code == 200
+        # The same token with a different query is a stale cursor.
+        stale = await client.post(
+            "/v1/connectors/sharepoint/search",
+            headers=_auth_header(),
+            json={"query": "other", "limit": 5, "page_token": token},
+        )
+        garbage = await client.post(
+            "/v1/connectors/sharepoint/search",
+            headers=_auth_header(),
+            json={"query": "file", "limit": 5, "page_token": "not-a-token"},
+        )
+    assert offsets == [0, 5]
+    assert stale.status_code == 422
+    assert garbage.status_code == 422
+    assert "SharePoint continuation token" in garbage.json()["detail"]
+
+
+async def test_sharepoint_search_graph_400_is_422_and_hides_inner_error(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _graph_error(400, "The specified query is invalid.")
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "x"})
+    assert response.status_code == 422
+    assert "The specified query is invalid." in response.json()["detail"]
+    assert "SECRET-REQ-ID" not in response.text
+
+
+async def test_sharepoint_search_throttled_surfaces_retry_after(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return Response(429, json={"error": {"message": "Too many requests"}}, headers={"Retry-After": "7"})
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "x"})
+    assert response.status_code == 429
+    assert response.headers.get("Retry-After") == "7"
+
+
+async def test_sharepoint_search_provider_timeout_is_502(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "x"})
+    assert response.status_code == 502
+
+
+# --- read -----------------------------------------------------------------
+
+
+def _read_path(item_id: str = ITEM_ID, drive_id: str = DRIVE_ID) -> str:
+    return f"/v1/connectors/sharepoint/drives/{drive_id}/items/{item_id}/read"
+
+
+async def test_sharepoint_read_text_file_follows_redirect_without_token(tmp_path, monkeypatch):
+    handler, seen = _read_handler(
+        _resource(ITEM_ID, "readme.txt", mime="text/plain"), content=b"Hello\r\n\r\n\r\nWorld www.evil.example\r\n"
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["content_trust"] == "external_untrusted"
+    assert body["item"]["name"] == "readme.txt"
+    assert body["item"]["drive_id"] == DRIVE_ID
+    assert body["item"]["site_name"] == "Marketing"
+    assert body["text"] == "Hello\n\nWorld [link]"
+    assert body["truncated"] is False
+    assert body["unsupported"] is False
+    # Graph 302s to the download host; the Graph token must not follow it there.
+    assert seen["download_authorization"] is None
+    assert STATIC_TOKEN not in response.text
+    assert "sharepoint.test" not in response.text
+
+
+async def test_sharepoint_read_text_file_truncates(tmp_path, monkeypatch):
+    handler, _seen = _read_handler(_resource(ITEM_ID, "notes.md", mime="text/markdown"), content=b"0123456789" * 10)
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={"max_chars": 5})
+    body = response.json()
+    assert body["text"] == "01234"
+    assert body["truncated"] is True
+
+
+async def test_sharepoint_read_docx_converts_to_pdf_and_extracts_text(tmp_path, monkeypatch):
+    handler, seen = _read_handler(
+        _resource(ITEM_ID, "Q3 Marketing Plan.docx"), converted=_minimal_pdf("Hello SharePoint")
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unsupported"] is False
+    assert "Hello SharePoint" in body["text"]
+    assert seen["convert_params"] == {"format": "pdf"}
+    assert seen["download_authorization"] is None
+
+
+async def test_sharepoint_read_pdf_downloads_as_is(tmp_path, monkeypatch):
+    handler, seen = _read_handler(
+        _resource(ITEM_ID, "policy.pdf", mime="application/pdf"), content=_minimal_pdf("Policy text")
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    body = response.json()
+    assert "Policy text" in body["text"]
+    assert seen["convert_params"] is None
+
+
+@pytest.mark.parametrize(
+    ("resource", "expected"),
+    [
+        (_resource(ITEM_ID, "logo.png", mime="image/png"), "cannot be read as text"),
+        (_resource(ITEM_ID, "Archive", folder=True), "folder"),
+        (_resource(ITEM_ID, "huge.docx", size=10**9), "read limit"),
+    ],
+    ids=["image", "folder", "too-large"],
+)
+async def test_sharepoint_read_unsupported_types_return_metadata_without_download(
+    tmp_path, monkeypatch, resource, expected
+):
+    handler, seen = _read_handler(resource)
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unsupported"] is True
+    assert expected in body["unsupported_reason"]
+    assert body["text"] == ""
+    assert body["item"]["name"] == resource["name"]
+    assert seen["download_calls"] == 0
+
+
+async def test_sharepoint_read_conversion_failure_is_unsupported_not_502(tmp_path, monkeypatch):
+    handler, _seen = _read_handler(_resource(ITEM_ID, "weird.docx"), convert_status=415)
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["unsupported"] is True
+    assert "InputFormatNotSupported" in body["unsupported_reason"]
+    assert "SECRET-REQ-ID" not in response.text
+
+
+async def test_sharepoint_read_image_only_pdf_is_unsupported(tmp_path, monkeypatch):
+    # A valid PDF with no text layer (a scan) extracts to nothing: say so.
+    handler, _seen = _read_handler(_resource(ITEM_ID, "scan.pdf", mime="application/pdf"), content=_minimal_pdf(""))
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    body = response.json()
+    assert body["unsupported"] is True
+    assert "No text could be extracted" in body["unsupported_reason"]
+
+
+@pytest.mark.parametrize(
+    ("drive_id", "item_id"),
+    [("b!good", "bad id with spaces"), ("drive/with/slash", ITEM_ID), ("b!good", "item!bang")],
+)
+async def test_sharepoint_read_rejects_bad_ids(tmp_path, monkeypatch, drive_id, item_id):
+    _install_mock_client(monkeypatch, _ok_handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            f"/v1/connectors/sharepoint/drives/{httpx.URL(path=drive_id).path}/items/{httpx.URL(path=item_id).path}/read",
+            headers=_auth_header(),
+            json={},
+        )
+    assert response.status_code in {404, 422}
+
+
+async def test_sharepoint_read_not_found_is_404_with_guidance(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _graph_error(404, "The resource could not be found.")
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 404
+    assert "not be visible to your linked Microsoft account" in response.json()["detail"]
+
+
+async def test_sharepoint_read_upstream_error_is_502(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        return _graph_error(500, "boom")
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 502
+    assert "SECRET-REQ-ID" not in response.text
+
+
+async def test_sharepoint_read_transport_error_is_502(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        raise httpx.ConnectTimeout("t", request=request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 502
+
+
+# --- broker mappings --------------------------------------------------------
+
+BROKER_URL = "https://keycloak.test/realms/nebari/broker/microsoft/token"
+
+
+def _broker_config(tmp_path, broker_status: int):
+    def handler(request: httpx.Request) -> Response:
+        if "broker" in request.url.path:
+            if broker_status == 200:
+                return Response(200, json={"access_token": "eyJ-brokered", "refresh_token": "rt", "expires_in": 3599})
+            return Response(broker_status, json={"error": "broker"})
+        assert request.headers.get("Authorization") == "Bearer eyJ-brokered"
+        return _ok_handler(request)
+
+    return _config(tmp_path, static_access_token="", broker_token_url=BROKER_URL), handler
+
+
+async def test_sharepoint_brokered_token_is_used_for_graph(tmp_path, monkeypatch):
+    config, handler = _broker_config(tmp_path, 200)
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(config)
+    async with _client(app) as client:
+        response = await client.get("/v1/connectors/sharepoint/status", headers=_auth_header())
+    assert response.json()["state"] == "connected"
+    assert "eyJ-brokered" not in response.text
+
+
+@pytest.mark.parametrize(("broker_status", "expected"), [(404, 409), (401, 409), (403, 503), (500, 503)])
+async def test_sharepoint_search_broker_errors_map(tmp_path, monkeypatch, broker_status, expected):
+    config, handler = _broker_config(tmp_path, broker_status)
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(config)
+    async with _client(app) as client:
+        response = await client.post("/v1/connectors/sharepoint/search", headers=_auth_header(), json={"query": "x"})
+    assert response.status_code == expected
+
+
+async def test_sharepoint_read_refuses_non_https_download_on_another_host(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if request.url.host == "evil.example":
+            raise AssertionError("the download must never follow a plain-http redirect to another host")
+        if path.endswith("/content"):
+            return Response(302, headers={"Location": "http://evil.example/download/raw"})
+        if f"/items/{ITEM_ID}" in path:
+            return Response(200, json=_resource(ITEM_ID, "readme.txt", mime="text/plain"))
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 502
+    assert "non-https" in response.json()["detail"]
+
+
+async def test_sharepoint_read_allows_plain_http_download_on_the_configured_origin(tmp_path, monkeypatch):
+    # A local fake Graph (smoke tests) redirects to itself over http; that is the
+    # configured endpoint, so it is trusted without weakening the https rule.
+    def handler(request: httpx.Request) -> Response:
+        path = request.url.path
+        if path.endswith("/download/raw"):
+            return Response(200, content=b"plain http on the configured origin")
+        if path.endswith("/content"):
+            return Response(302, headers={"Location": "http://graph.local:8976/download/raw"})
+        if f"/items/{ITEM_ID}" in path:
+            return Response(200, json=_resource(ITEM_ID, "readme.txt", mime="text/plain"))
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, api_base_url="http://graph.local:8976/v1.0"))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    assert response.status_code == 200
+    assert response.json()["text"] == "plain http on the configured origin"
+
+
+async def test_sharepoint_routes_require_hub_bearer(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _ok_handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        status_response = await client.get("/v1/connectors/sharepoint/status")
+        search_response = await client.post("/v1/connectors/sharepoint/search", json={"query": "x"})
+        read_response = await client.post(_read_path(), json={})
+    assert status_response.status_code == 401
+    assert search_response.status_code == 401
+    assert read_response.status_code == 401
