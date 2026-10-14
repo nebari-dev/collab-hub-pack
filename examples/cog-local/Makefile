@@ -66,7 +66,7 @@ $(LOCAL):
 env: ## Install what the example uses: the CLI, the hub, Toad, pixi, and Hermes's environment
 	@command -v uv >/dev/null || { echo "install uv first: https://docs.astral.sh/uv/getting-started/installation/"; exit 1; }
 	cd $(ROOT)/cli && uv sync --quiet
-	cd $(ROOT)/api && uv sync --quiet --group runs
+	cd $(ROOT)/api && uv sync --quiet
 	cd $(ROOT)/execution && uv sync --quiet
 	uv tool install --quiet -U batrachian-toad --python 3.14
 	@command -v pixi >/dev/null || { echo "installing pixi (https://pixi.sh)"; curl -fsSL https://pixi.sh/install.sh | bash; }

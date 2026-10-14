@@ -211,6 +211,6 @@ The Cog's own output, Hermes's included, is under `../../dev/.local/runs/`, and 
 
 - **Hermes's tools.** Hermes runs with none here: it answers, and does nothing else, not even read a file. Giving it tools through the hub, and asking you in Toad before it uses one, is later work.
 - **A restart.** The controller runs on the `none` backend, which keeps nothing: stop it while Hermes runs and the run is recorded `INTERRUPTED` when a controller starts again.
-- **A deployed hub.** The run API is behind the `cog_runs` feature flag, off by default, and Hermes here is a process on the controller's machine. On a cluster a Cog runs as a pod, a later phase of [`COG_EXECUTION.md`](../../COG_EXECUTION.md).
+- **A deployed hub.** Its API serves the run API, but the chart runs no controller and has no Cog packages to launch, and Hermes here is a process on the controller's machine. On a cluster a Cog runs as a pod, a later phase of [`COG_EXECUTION.md`](../../COG_EXECUTION.md).
 
 More: [`docs/cog-execution/runs.md`](../../docs/cog-execution/runs.md) for the run API and the controller, [`cli/README.md`](../../cli/README.md) for every CLI command.

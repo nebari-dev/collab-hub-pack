@@ -304,7 +304,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | merged, #174 |
 | 10 | #177 | Hermes as a Cog, launched from the `collab-hub` CLI on a local hub and talked to from Toad: an example | `feat/cog-local-example` | 6, 9 | M | merged, #178 |
 | 11 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9, 10 | M | in review, #186 |
-| 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | not started |
+| 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | in review |
 | 13 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 9 | M | not started |
 | 14 | #108 | Publish a Hermes harness Cog, launched by the hub as a local process | `feat/hermes-acp-harness` | 9, 12, 13 | M | not started |
 | 15 | #126, first half | Launch, list and terminate Cogs from the `collab-hub` CLI | `feat/cli-launch` | 6, 10, 12 | S | not started |
@@ -618,7 +618,7 @@ The primary goal, as soon as the controller runs a `local` worker: the slice of 
 One limit of this milestone is stated rather than discovered. Every step has a Gate, and the default escalates on an `error` problem, but deciding an escalation arrives with Phase 17. Until then a run whose step escalates waits at its Gate and can only be terminated. So the dev `hermes` Op (`dev/ops/hermes.yaml`) declares `gate: never`, and `collab-hub cog launch` takes `--gate` (Phase 15), which keeps M4's demonstration from stopping at a Gate nobody can yet decide.
 
 #### Phase 12 — The hub run API: launch, list and terminate
-**Issue** #103, first half · **Branch** `feat/cog-run-launch` · **Depends on** Phases 10, 11 · **Size** M
+**Issue** #103, first half · **Branch** `feat/cog-run-launch` · **Depends on** Phases 10, 11 · **Size** M · **Status** in review
 
 State a Cog for execution, see what is running, stop it — as endpoints Collab and any other client can use. Decisions, payloads and retry follow in Phase 17. Phase 10 built the first slice behind the `cog_runs` feature flag: submit, list, read and cancel, over a SQLite Track. This phase adds the event stream, serves the routes on the Track a deployment uses — Postgres, which the controller reads since Phase 11 — ships the execution package in the image, with the controller's entrypoint, and retires the flag.
 
@@ -630,13 +630,16 @@ State a Cog for execution, see what is running, stop it — as endpoints Collab 
 - The response to a submission names the durability backend and the location it will run under, so a client never assumes a `none` run survives a restart (decision 3) or that a `local` worker is isolated (decision 11).
 - The API writes intent and reads the Track and never calls the executor, enforced by an import-boundary test.
 
-*Dev and CI* — `make op` submits through `POST /v1/runs`; `make run-events RUN=` streams a run. CI: `level-1` launches the `echo` and `slow` fake Cogs over HTTP, sees both in `GET /v1/runs`, cancels `slow` mid-step and asserts it ends `cancelled` with no worker process left. *Docs* — `docs/standalone-deployment.md` *Protection map* gains `/v1/runs/**`; `runs.md` gains the API.
+- **Where the Track is.** The API's Track is the hub's own database (`frames.postgres.url`), its tables from the hub's migrations, the same Track a controller on Postgres reads (Phase 11); `runs.track_path` names a SQLite file instead, for a hub without Postgres (dev level 1). With neither, every run route answers 503 `runs_unavailable`, the way the Cog catalog answers without a database. Each run names `picked_up_by`, the controller that advances it.
+- **The flag retired.** `cog_runs` moves to the retired flags, and the execution package becomes a dependency of the API: the image installs it from the repository root, with the controller's entrypoint `collab-hub-run-controller`, so the controller runs from the same image. A deployed hub then serves the run API and launches nothing: the chart gives it no Cog packages and runs no controller until Phase 21 (the `remote` location), and catalog Cogs become launchable by digest in Phase 23.
+
+*Dev and CI* — `make submit` launches a fake Op through `POST /v1/runs` and follows it (`make op` stays the one-process host of Phase 11); `make run-events RUN=` streams a run; `make api-pg` serves the run API on the hub's Postgres. CI: `level-1` launches the `echo` and `slow` fake Cogs over HTTP, sees them in `GET /v1/runs`, streams a run's events to its end, cancels `slow` mid-step and asserts it ends `cancelled` with no worker process left; `levels-2-3` runs the run API on Postgres with two controllers. `build-images.yaml` builds on `execution/` changes too. *Docs* — `docs/standalone-deployment.md` *Protection map* gains `/v1/runs/**`; `runs.md` gains the events route and where the Track is; `feature-flags.md` retires `cog_runs`.
 
 *Acceptance*
-- [ ] At level 1, a client launches a fake Cog, lists it, streams its events and sees it complete using only these endpoints.
-- [ ] Cancelling a run mid-step ends it `cancelled` with its actor on the Track, and leaves no worker behind.
-- [ ] A step naming a Cog the controller cannot launch is refused at submit with 422.
-- [ ] A member of another organization can neither see nor cancel a run, and unauthenticated requests are refused under the hardened path map.
+- [x] At level 1, a client launches a fake Cog, lists it, streams its events and sees it complete using only these endpoints.
+- [x] Cancelling a run mid-step ends it `cancelled` with its actor on the Track, and leaves no worker behind.
+- [x] A step naming a Cog the controller cannot launch is refused at submit with 422.
+- [x] A member of another organization can neither see nor cancel a run, and unauthenticated requests are refused under the hardened path map.
 
 #### Phase 13 — Worker SDK and harness-neutral adapters
 **Issue** #107 · **Branch** `feat/cog-worker-sdk` · **Depends on** Phases 2, 9 · **Size** M
