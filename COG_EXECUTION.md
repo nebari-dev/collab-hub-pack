@@ -304,7 +304,7 @@ Each phase is one pull request from the branch it names, numbered in build order
 | 9 | #109 | Agent location: run a Cog as a local process first, a pod behind the same switch | `feat/cog-agent-location` | 8 | M | merged, #174 |
 | 10 | #177 | Hermes as a Cog, launched from the `collab-hub` CLI on a local hub and talked to from Toad: an example | `feat/cog-local-example` | 6, 9 | M | merged, #178 |
 | 11 | #121 | Run controller and run pickup | `feat/cog-run-controller` | 8, 9, 10 | M | in review, #186 |
-| 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | in review |
+| 12 | #103, first half | The hub run API: launch, list and terminate runs | `feat/cog-run-launch` | 10, 11 | M | in review, #202 |
 | 13 | #107 | Add a Worker SDK with Harness adapters, ACP first | `feat/cog-worker-sdk` | 2, 9 | M | not started |
 | 14 | #108 | Publish a Hermes harness Cog, launched by the hub as a local process | `feat/hermes-acp-harness` | 9, 12, 13 | M | not started |
 | 15 | #126, first half | Launch, list and terminate Cogs from the `collab-hub` CLI | `feat/cli-launch` | 6, 10, 12 | S | not started |
@@ -618,7 +618,7 @@ The primary goal, as soon as the controller runs a `local` worker: the slice of 
 One limit of this milestone is stated rather than discovered. Every step has a Gate, and the default escalates on an `error` problem, but deciding an escalation arrives with Phase 17. Until then a run whose step escalates waits at its Gate and can only be terminated. So the dev `hermes` Op (`dev/ops/hermes.yaml`) declares `gate: never`, and `collab-hub cog launch` takes `--gate` (Phase 15), which keeps M4's demonstration from stopping at a Gate nobody can yet decide.
 
 #### Phase 12 — The hub run API: launch, list and terminate
-**Issue** #103, first half · **Branch** `feat/cog-run-launch` · **Depends on** Phases 10, 11 · **Size** M · **Status** in review
+**Issue** #103, first half · **Branch** `feat/cog-run-launch` · **Depends on** Phases 10, 11 · **Size** M · **Status** in review, #202
 
 State a Cog for execution, see what is running, stop it — as endpoints Collab and any other client can use. Decisions, payloads and retry follow in Phase 17. Phase 10 built the first slice behind the `cog_runs` feature flag: submit, list, read and cancel, over a SQLite Track. This phase adds the event stream, serves the routes on the Track a deployment uses — Postgres, which the controller reads since Phase 11 — ships the execution package in the image, with the controller's entrypoint, and retires the flag.
 
