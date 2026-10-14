@@ -96,11 +96,19 @@ class RunService:
 
 
 def build_run_service(config: RunsConfig, postgres_url: str | None, pools: PostgresPools) -> RunService:
-    """The run service: on ``runs.track_path`` when set, else on the hub's own database, else on none.
+    """The run service: on the hub's own database, else on ``runs.track_path``, else on none.
+
+    Both at once is refused: a hub with a database keeps its runs there, never
+    in a file of the pod's own.
 
     On Postgres the Track's tables come from the hub's migrations, as every
     other table of the hub does, so nothing is created here.
     """
+    if config.track_path and postgres_url:
+        # A pod-local SQLite file would win over the hub's database, and vanish with the pod.
+        raise RuntimeError(
+            "runs.track_path is for a hub without Postgres: this hub has a database (frames.postgres.url), "
+            "which is its Track; unset COLLAB_HUB_API__RUNS__TRACK_PATH")
     track: TrackStore | None = None
     if config.track_path:
         SqliteTrackStore.ensure_schema(config.track_path)
@@ -241,9 +249,44 @@ class RunEventPage(BaseModel):
     """Pass as ``after`` for the events that follow, when there are more than this page holds."""
 
 
-# Where a local worker is on the controller's host: what the controller needs to reap it, and
-# nothing a client acts on, so the run API leaves it out of the events it serves.
-HOST_DETAILS = frozenset({"pid", "pgid", "logs"})
+# What the run API serves of each event's payload, by event type: an allowlist, so a field a
+# controller records later reaches clients only once it is named here. Where a local worker is on the
+# controller's host (its pid, process group and log directory) is never among them: the controller
+# needs it to reap the worker, and no client acts on it. An event type not listed is served with an
+# empty payload.
+_STEP = {"step", "attempt"}
+_OUTCOME = {"problems", "binding"}
+SERVED_FIELDS: dict[str, frozenset[str]] = {name: frozenset(fields) for name, fields in {
+    "op_submitted": {"op", "submitted_by", "name"},
+    "run_picked_up": {"controller"},
+    "gate_escalated": _STEP | {"reason", "escalation", "envelope", "usage", "approvers", "gate"},
+    "gate_decided": {"step", "outcome", "escalation", "actor", "value", "envelope_digest"},
+    "completed": set(),
+    "failed": {"step", "error", "reason", "worker_error", "revise_limit", "escalation", "actor", "value",
+               "envelope_digest"} | _OUTCOME,
+    "budget_exceeded": {"step", "dimension", "reason"},
+    "cancelled": {"actor"},
+    "interrupted": {"backend"},
+    "retry_requested": {"from_status", "attempt", "budget_epoch", "controller"},
+    "step_started": _STEP | {"cog", "digest"},
+    "interaction_usage": _STEP | {"usage"},
+    "step_completed": _STEP | {"cog", "digest", "usage", "frames", "escalation", "payload", "payload_ref"} | _OUTCOME,
+    "step_failed": _STEP | {"key", "cog", "digest", "error", "message", "teardown_error"} | _OUTCOME,
+    "worker_started": _STEP | {"instance", "location", "package", "run_token_sha256"},
+    "worker_stopped": _STEP | {"instance", "reaped"},
+    "materialized": {"cog", "digest"},
+    "ready": {"cog"},
+    "interaction_started": {"step", "entry_point"},
+    "idle": {"step"},
+    "teardown_started": {"step", "reason"},
+    "teardown_failed": {"step", "error"},
+    "cancel_requested": {"actor"},
+    "turn_requested": {"turn", "text", "actor"},
+    "turn_answered": {"turn", "text"},
+    "turn_failed": {"turn", "error"},
+    "decision_requested": {"escalation", "outcome", "actor", "findings"},
+    "decision_refused": {"escalation", "error"},
+}.items()}
 STREAM_POLL_SECONDS = 0.5
 STREAM_KEEPALIVE_SECONDS = 15.0
 
@@ -251,7 +294,8 @@ STREAM_KEEPALIVE_SECONDS = 15.0
 def _event(event: TrackEvent) -> RunEvent:
     event = upgrade(event)
     return RunEvent(sequence=event.sequence or 0, type=event.event_type, occurred_at=event.occurred_at.isoformat(),
-                    payload={key: value for key, value in event.payload.items() if key not in HOST_DETAILS})
+                    payload={key: value for key, value in event.payload.items()
+                             if key in SERVED_FIELDS.get(event.event_type, frozenset())})
 
 
 def _status(view: intents.RunView, service: RunService, *, outputs: bool = False) -> RunStatus:
@@ -356,43 +400,37 @@ async def run_events(
         start = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
         return StreamingResponse(_stream(service, run_id, start, request), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-    events = await asyncio.to_thread(service.track.replay, run_id, after_sequence=after)
+    # One more than the page holds: whether there is a next page, without reading the rest.
+    events = await asyncio.to_thread(service.track.replay, run_id, after_sequence=after, limit=limit + 1)
     page = events[:limit]
     return RunEventPage(items=[_event(event) for event in page],
                         next_after=(page[-1].sequence if len(events) > limit else None))
 
 
 async def _stream(service: RunService, run_id: str, after: int, request: Request) -> AsyncIterator[str]:
+    """The run's events as they land, then `end`: one incremental read of the run per tick drives both,
+    and the view it gives is of the events it gives, so a run that reads as ended has sent its last."""
     quiet = 0.0
     while not await request.is_disconnected():
-        events = await asyncio.to_thread(service.track.replay, run_id, after_sequence=after)
+        try:
+            events, view = await asyncio.to_thread(service.views.after, run_id, after)
+        except intents.RunUnreadable:
+            events, view = (), None
         for event in events:
             served = _event(event)
             after = served.sequence
             yield f"id: {served.sequence}\nevent: {served.type}\ndata: {served.model_dump_json()}\n\n"
+        if view is None or view.state.ended:
+            yield f"event: end\ndata: {json.dumps({'status': view.status if view else None})}\n\n"
+            return
         if events:
             quiet = 0.0
             continue  # read again at once: more may have landed while these were sent
-        view = await asyncio.to_thread(_view_of, service, run_id)
-        if view is None or view.state.ended:
-            # The run's end may have landed between the read above and this one: read once more, and
-            # send `end` only when nothing is left to send.
-            if await asyncio.to_thread(service.track.replay, run_id, after_sequence=after):
-                continue
-            yield f"event: end\ndata: {json.dumps({'status': view.status if view else None})}\n\n"
-            return
         await asyncio.sleep(STREAM_POLL_SECONDS)
         quiet += STREAM_POLL_SECONDS
         if quiet >= STREAM_KEEPALIVE_SECONDS:
             quiet = 0.0
             yield ": keep-alive\n\n"  # a comment: proxies keep an idle stream open
-
-
-def _view_of(service: RunService, run_id: str) -> intents.RunView | None:
-    try:
-        return service.views.view(run_id)
-    except intents.RunUnreadable:
-        return None
 
 
 @router.post("/{run_id}/cancel", status_code=status.HTTP_202_ACCEPTED, response_model=RunStatus)

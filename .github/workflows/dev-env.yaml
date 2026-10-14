@@ -319,9 +319,8 @@ jobs:
 
           # The Track tables (migration 12) come from the migration registry the
           # API ran at startup and from nowhere else: the one module of the API
-          # that imports the execution package is the run router, which is
-          # behind the cog_runs feature flag, off here, and keeps its Track in a
-          # SQLite file, so nothing else could have created them.
+          # that imports the execution package is the run router, which reads
+          # and writes the Track on this database and never creates a table.
           psql='docker compose -f dev/compose.yaml exec -T postgres psql -U collab -d collab -tAc'
           tables=$($psql "SELECT count(*) FROM pg_tables WHERE tablename IN ('collab_track_events', 'collab_track_payloads')")
           [ "$tables" = "2" ] || { echo "expected the two Track tables from migrations, found $tables"; exit 1; }
