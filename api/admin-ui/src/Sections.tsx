@@ -3,7 +3,7 @@ import { useState } from "react";
 
 import { ConnectorIcon, ModelIcon } from "./BrandIcon";
 import { postJson } from "./api";
-import { invitationNotice } from "./invitations";
+import { invitationNotice, organizationLabel, organizationNotice } from "./invitations";
 import { Pager, useDebounced, usePages } from "./paging";
 import type { Resource } from "./api";
 import { useResource } from "./useResource";
@@ -481,6 +481,12 @@ export function Usage() {
   return (
     <>
       <p>Activity across every organization on this hub.</p>
+      <p>
+        Someone is counted here once they have used the hub from the desktop app or the API as a
+        member of an organization, and an organization is listed once one of its members has. The
+        Users screen lists every account the identity provider holds, including people who have
+        never used the hub, so it can show a larger number.
+      </p>
       <div className="figures">
         <Figure Icon={UsersIcon} value={users} label="people have used this hub" />
         <Figure Icon={Activity} value={events} label="recorded actions" />
@@ -533,27 +539,81 @@ interface InvitationRow {
   status: string;
   created_at: string | null;
   expires_at: string | null;
+  org_id: string | null;
+  organization: string | null;
+  role: string;
 }
+
+interface OrganizationRow {
+  id: string;
+  name: string | null;
+  members: number;
+  created_at: string | null;
+}
+
+/** The picker's value while no organization has been chosen yet. */
+const NOT_CHOSEN = "";
+/** The picker's value that opens the create-an-organization row. */
+const CREATE_ORGANIZATION = "__create__";
 
 export function Invitations({ csrfToken }: { csrfToken: string }) {
   const [reload, setReload] = useState(0);
+  const [organizationsReload, setOrganizationsReload] = useState(0);
+  const [shown, setShown] = useState("");
   const pages = usePages();
+  const query = [
+    pages.cursor === null ? "" : `offset=${pages.cursor}`,
+    shown === "" ? "" : `org_id=${encodeURIComponent(shown)}`,
+  ]
+    .filter(Boolean)
+    .join("&");
   const resource = useResource<{ invitations: InvitationRow[]; next_offset: number | null }>(
-    pages.cursor === null ? "api/invitations" : `api/invitations?offset=${pages.cursor}`,
+    query ? `api/invitations?${query}` : "api/invitations",
     reload,
   );
+  const organizations = useResource<{ organizations: OrganizationRow[] }>("api/organizations", organizationsReload);
   const [email, setEmail] = useState("");
+  const [target, setTarget] = useState(NOT_CHOSEN);
+  const [role, setRole] = useState<"member" | "owner">("member");
+  const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ text: string; bad: boolean } | null>(null);
 
-  async function send(event: React.FormEvent) {
-    event.preventDefault();
-    const address = email.trim();
-    if (!address) return;
+  const address = email.trim();
+  const known = organizations?.state === "ok" ? organizations.data.organizations : [];
+  // Every invitation names an organization. With none to choose from yet the
+  // picker opens on creating one, which is the only thing to do.
+  const picked = target === NOT_CHOSEN && organizations?.state === "ok" && known.length === 0 ? CREATE_ORGANIZATION : target;
+  const creating = picked === CREATE_ORGANIZATION;
+  const intoExisting = picked !== NOT_CHOSEN && !creating;
+
+  async function createOrganization() {
+    const name = newName.trim();
+    if (!name) return;
 
     setBusy(true);
     setNotice(null);
-    const result = await postJson("api/invitations", { email: address }, csrfToken);
+    const result = await postJson("api/organizations", { name }, csrfToken);
+    setBusy(false);
+
+    if (result.state === "ok") {
+      const created = (result.data as { organization: { id: string; name: string } }).organization;
+      setTarget(created.id);
+      setNewName("");
+      setOrganizationsReload((n) => n + 1);
+      setNotice({ text: `${created.name} created. Now invite its first owner.`, bad: false });
+    } else {
+      setNotice(organizationNotice(result));
+    }
+  }
+
+  async function send(event: React.FormEvent) {
+    event.preventDefault();
+    if (!address || !intoExisting) return;
+
+    setBusy(true);
+    setNotice(null);
+    const result = await postJson("api/invitations", { email: address, org_id: picked, role }, csrfToken);
     setBusy(false);
 
     if (result.state === "ok") setEmail("");
@@ -575,11 +635,61 @@ export function Invitations({ csrfToken }: { csrfToken: string }) {
   return (
     <>
       <p>
-        Invite someone to this deployment. Accepting creates their organization with them as its
-        owner.
+        Invite people into an organization: one that exists, or one you create here first. The first
+        person you invite as an owner runs it from then on.
       </p>
 
       <form className="invite" onSubmit={send}>
+        <label htmlFor="invite-organization">Organization</label>
+        <div className="invite-row">
+          <span className="rolepick invite-pick">
+            <select
+              id="invite-organization"
+              value={picked}
+              onChange={(event) => setTarget(event.target.value)}
+              disabled={busy}
+            >
+              <option value={NOT_CHOSEN} disabled>
+                Choose an organization
+              </option>
+              {known.map((org) => (
+                <option key={org.id} value={org.id}>
+                  {organizationLabel(org)}
+                </option>
+              ))}
+              <option value={CREATE_ORGANIZATION}>Create an organization…</option>
+            </select>
+          </span>
+        </div>
+        {organizations?.state === "ok" || organizations === null ? null : (
+          <Failure resource={organizations} subject="the organizations" />
+        )}
+
+        {creating && (
+          <>
+            <label htmlFor="invite-organization-name">Organization name</label>
+            <div className="invite-row">
+              <input
+                id="invite-organization-name"
+                type="text"
+                autoComplete="off"
+                placeholder="Acme Labs"
+                value={newName}
+                onChange={(event) => setNewName(event.target.value)}
+                disabled={busy}
+              />
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || !newName.trim()}
+                onClick={() => void createOrganization()}
+              >
+                Create organization
+              </button>
+            </div>
+          </>
+        )}
+
         <label htmlFor="invite-email">Email address</label>
         <div className="invite-row">
           <input
@@ -591,7 +701,18 @@ export function Invitations({ csrfToken }: { csrfToken: string }) {
             onChange={(event) => setEmail(event.target.value)}
             disabled={busy}
           />
-          <button type="submit" className="primary" disabled={busy || !email.trim()}>
+          <span className="rolepick">
+            <select
+              aria-label="Role in the organization"
+              value={role}
+              onChange={(event) => setRole(event.target.value as "member" | "owner")}
+              disabled={busy || !intoExisting}
+            >
+              <option value="member">Member</option>
+              <option value="owner">Owner</option>
+            </select>
+          </span>
+          <button type="submit" className="primary" disabled={busy || !intoExisting || !address}>
             Send invitation
           </button>
         </div>
@@ -599,7 +720,26 @@ export function Invitations({ csrfToken }: { csrfToken: string }) {
 
       {notice && <p className={notice.bad ? "bad" : "good"}>{notice.text}</p>}
 
-      <h3>Issued invitations</h3>
+      <div className="listing-head">
+        <h3>Issued invitations</h3>
+        <span className="rolepick">
+          <select
+            aria-label="Show invitations for"
+            value={shown}
+            onChange={(event) => {
+              setShown(event.target.value);
+              pages.reset();
+            }}
+          >
+            <option value="">All organizations</option>
+            {known.map((org) => (
+              <option key={org.id} value={org.id}>
+                {org.name ?? "Unnamed organization"}
+              </option>
+            ))}
+          </select>
+        </span>
+      </div>
       <InvitationList resource={resource} busy={busy} onRevoke={revoke} />
       {resource?.state === "ok" && <Pager pages={pages} next={resource.data.next_offset} />}
     </>
@@ -628,6 +768,8 @@ function InvitationList({
       <thead>
         <tr>
           <th>Invited</th>
+          <th>Organization</th>
+          <th>Role</th>
           <th>State</th>
           <th>Expires</th>
           <th />
@@ -637,6 +779,12 @@ function InvitationList({
         {invitations.map((invitation) => (
           <tr key={invitation.id}>
             <td>{invitation.email}</td>
+            <td>
+              {invitation.org_id === null
+                ? "New, created when they accept"
+                : (invitation.organization ?? "Unnamed organization")}
+            </td>
+            <td>{invitation.role}</td>
             <td>{invitation.status}</td>
             <td className="mono">{invitation.expires_at?.slice(0, 10) ?? "—"}</td>
             <td>

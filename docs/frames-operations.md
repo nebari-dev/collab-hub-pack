@@ -1046,11 +1046,15 @@ One row per action, and the action names the *consequential* thing:
   idempotent no-op and writes **no** row: a revoke that changed nothing is not
   an action.
 - `invitation.redeem` — accepted into an **existing** organization.
-- `org.create` — accepted an org-creating invitation, with the **accepter** as
-  actor. This is the one asymmetry worth knowing: such an acceptance produces
-  an `org.create` row and *not* an `invitation.redeem` row, because creating
-  the organization is the consequential act. The invitation is still named, in
-  `detail.invitation_id`. To follow one invitation end to end, query on that:
+- `org.create` — an organization came to exist. Two ways: an org-creating
+  invitation was accepted, with the **accepter** as actor, or an operator
+  created a named organization up front from the admin panel, with the
+  operator as actor. This is the one asymmetry worth knowing: such an
+  acceptance produces an `org.create` row and *not* an `invitation.redeem`
+  row, because creating the organization is the consequential act. The
+  invitation is still named, in `detail.invitation_id`; an organization
+  created up front has no invitation to name, and its detail says
+  `named_at_creation`. To follow one invitation end to end, query on that:
 
 ```sql
 SELECT at, actor, action, org_id, detail

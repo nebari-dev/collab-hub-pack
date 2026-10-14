@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient
+from registration_bundle import built_dist
 from starlette.routing import Mount, Route, WebSocketRoute
 
 from collab_hub_api.config import WEB_SESSION_LIFETIME_CEILING_SECONDS, Config
@@ -510,7 +511,7 @@ async def test_full_sign_in_mints_a_session_and_lands_on_next(tmp_path, idp):
 
         overview = await client.get("/web")
         assert overview.status_code == 200
-        assert "Alice Example" in overview.text
+        assert "Hi, Alice." in overview.text
         assert "Sign out" in overview.text
 
 
@@ -2345,8 +2346,9 @@ def test_the_documents_honour_a_root_path() -> None:
 
 async def test_the_guard_leaves_the_public_allowlist_reachable(tmp_path, idp):
     # The allowlist is what the guard consults instead of route structure, so
-    # sign-in must still work with no session at all.
-    app = make_web_app(tmp_path, idp)
+    # sign-in must still work with no session at all. Built with the
+    # registration bundle, so the invitation page answers as it does deployed.
+    app = make_web_app(tmp_path, idp, web={"admin_ui_dist": str(built_dist(tmp_path))})
     async with web_client(app) as client:
         for path in sorted(PUBLIC_WEB_PATHS):
             response = await client.get(path)
@@ -3007,6 +3009,40 @@ def test_the_csrf_offence_names_the_methods_it_refused(tmp_path, idp):
     assert "GET" not in reasons[0]
 
 
+@pytest.mark.parametrize("methods", [["POST"], ["GET", "PUT"], ["DELETE"]])
+def test_a_public_asset_path_is_exempt_only_for_reads(tmp_path, idp, methods):
+    """The public asset prefix makes a file readable without a session, nothing more.
+
+    A route under it that answers anything but GET or HEAD would be an
+    anonymous write that no allowlist line was reviewed for, so the lint
+    names it, the same way it names any other route with no session.
+    """
+
+    router = APIRouter()
+
+    @router.api_route("/invite/assets/{filename}", methods=methods)
+    async def anonymous_write(filename: str):
+        return {"ok": True}
+
+    app = make_web_app(tmp_path, idp)
+    register_ahead_of_the_mcp_mount(app, router)
+    reasons = [reason for route, reason in offending_web_routes(app.routes) if route.endpoint is anonymous_write]
+    assert len(reasons) == 1
+    assert "/invite/assets/{filename}" in reasons[0]
+
+
+def test_reading_a_public_asset_needs_no_allowlist_line(tmp_path, idp):
+    router = APIRouter()
+
+    @router.api_route("/invite/assets/{filename}", methods=["GET", "HEAD"])
+    async def asset(filename: str):
+        return {"ok": True}
+
+    app = make_web_app(tmp_path, idp)
+    register_ahead_of_the_mcp_mount(app, router)
+    assert [r for r, _ in offending_web_routes(app.routes) if r.endpoint is asset] == []
+
+
 def test_a_post_carrying_require_csrf_passes_the_check(tmp_path, idp):
     router = session_gated_router()
 
@@ -3090,6 +3126,10 @@ def test_the_shipped_csrf_exemptions_are_exactly_the_reviewed_one():
             "/web/org/invitations/revoke",
             # #44's first-invite naming POST: same page, same predicate.
             "/web/org/invitations/name",
+            # The theme switch on the signed-in frame: parses its own form and
+            # checks the token over those fields, so the dependency walk
+            # cannot see it either.
+            "/web/theme",
         }
     )
     # Spelled literally above and compared against the constant here: #90's
@@ -3139,19 +3179,24 @@ def test_the_exemption_is_load_bearing_not_a_vacuous_pass(tmp_path, idp):
         verify_web_route_protection(app.routes)
 
 
-def test_signout_is_the_only_state_changing_route_and_it_is_gated(tmp_path, idp):
+def test_the_state_changing_routes_are_gated(tmp_path, idp):
+    """Sign-out declares the CSRF dependency; the theme switch checks the token
+    in-route over the form it parses itself, and is registered as doing so."""
+
     from collab_hub_api.web.authz import route_enforces_csrf, route_unsafe_methods
+    from collab_hub_api.web.surface import CSRF_ENFORCED_IN_ROUTE
 
     app = make_web_app(tmp_path, idp)
-    mutating = [
-        route
+    mutating = {
+        route.path: route
         for route in app.routes
         if isinstance(route, APIRoute)
         and route.path.startswith("/web")
         and route_unsafe_methods(route)
-    ]
-    assert [route.path for route in mutating] == ["/web/signout"]
-    assert route_enforces_csrf(mutating[0])
+    }
+    assert sorted(mutating) == ["/web/signout", "/web/theme"]
+    assert route_enforces_csrf(mutating["/web/signout"])
+    assert "/web/theme" in CSRF_ENFORCED_IN_ROUTE
 
 
 # --- second-reader finding 2: the guard covers three prefixes, the map check one --
@@ -3576,7 +3621,7 @@ def test_the_shipped_exemption_names_a_route_that_really_is_mounted(tmp_path, id
     # POST, and does not declare the dependency — every condition that makes
     # the entry both necessary and accurate.
     from collab_hub_api.web.authz import route_enforces_csrf, route_unsafe_methods
-    from collab_hub_api.web.surface import ACCEPT_REDEEM_PATH, CSRF_ENFORCED_IN_ROUTE
+    from collab_hub_api.web.surface import ACCEPT_REDEEM_PATH, CSRF_ENFORCED_IN_ROUTE, THEME_PATH
 
     app = make_web_app(tmp_path, idp)
     mounted = {
@@ -3584,11 +3629,13 @@ def test_the_shipped_exemption_names_a_route_that_really_is_mounted(tmp_path, id
         for route in app.routes
         if isinstance(route, APIRoute) and route.path in CSRF_ENFORCED_IN_ROUTE
     }
-    assert set(mounted) == {ACCEPT_REDEEM_PATH}
-    route = mounted[ACCEPT_REDEEM_PATH]
-    assert on_web_surface(ACCEPT_REDEEM_PATH, WEB_SURFACE_PREFIXES)
-    assert route_unsafe_methods(route) == {"POST"}
-    assert not route_enforces_csrf(route)
+    # The theme switch is mounted on every deployment too, and the same four
+    # conditions hold for it.
+    assert set(mounted) == {ACCEPT_REDEEM_PATH, THEME_PATH}
+    for path, route in mounted.items():
+        assert on_web_surface(path, WEB_SURFACE_PREFIXES)
+        assert route_unsafe_methods(route) == {"POST"}
+        assert not route_enforces_csrf(route)
     assert stale_csrf_exemptions(app.routes) == []
 
 
