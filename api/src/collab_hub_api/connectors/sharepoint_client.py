@@ -208,7 +208,12 @@ class SharePointClient:
         try:
             text, truncated = await self._read_text(item, max_chars)
         except SharePointUnsupportedItem as exc:
-            return SharePointReadResponse(item=item, unsupported=True, unsupported_reason=str(exc))
+            # The reason can carry a MIME type or Graph's own message: mask
+            # link shapes in it like every other text field (code-aware, so a
+            # dotted MIME type survives).
+            return SharePointReadResponse(
+                item=item, unsupported=True, unsupported_reason=sanitize_github_api_text(str(exc))
+            )
         return SharePointReadResponse(item=item, text=text, truncated=truncated)
 
     def _search_hit(
@@ -223,7 +228,11 @@ class SharePointClient:
         if personal and not self.include_personal_onedrive:
             return None
         item = _item_metadata(resource)
-        if item.last_modified is not None and (lower is not None or upper is not None):
+        if lower is not None or upper is not None:
+            # A hit with no usable modified time cannot be placed in the window,
+            # so it is dropped rather than trusted to Graph's own filtering.
+            if item.last_modified is None:
+                return None
             modified_day = item.last_modified.astimezone(zone).date()
             if lower is not None and modified_day < lower:
                 return None

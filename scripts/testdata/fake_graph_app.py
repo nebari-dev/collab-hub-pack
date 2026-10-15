@@ -30,9 +30,9 @@ TXT_ID = "01FAKETXT00000000000000000000002"
 PNG_ID = "01FAKEPNG00000000000000000000003"
 PERSONAL_ID = "01FAKEPERSONAL000000000000000004"
 SITE_URL = "https://fake.sharepoint.example/sites/Marketing/Shared%20Documents"
-PERSONAL_URL = "https://fake-my.sharepoint.example/personal/francis/Documents"
+PERSONAL_URL = "https://fake-my.sharepoint.example/personal/alice/Documents"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-TXT_BODY = b"Q3 marketing notes\r\n\r\nAction item: Francis sends the report by Friday.\r\nSee www.evil.example\r\n"
+TXT_BODY = b"Q3 marketing notes\r\n\r\nAction item: Alice sends the report by Friday.\r\nSee www.evil.example\r\n"
 
 SEEN_AUTHORIZATION_ON_DOWNLOAD: list[str | None] = []
 
@@ -54,7 +54,7 @@ def _resource(
         "webUrl": web_url,
         "lastModifiedDateTime": "2026-10-06T10:00:00Z",
         "lastModifiedBy": {
-            "user": {"displayName": "Shayla McMillan", "email": "shayla@fake.example"}
+            "user": {"displayName": "Bob Example", "email": "bob@fake.example"}
         },
         "parentReference": {
             "driveId": DRIVE_ID,

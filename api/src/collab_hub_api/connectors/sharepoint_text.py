@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 # PDF text extraction for the SharePoint read route.
 #
@@ -16,6 +17,11 @@ import asyncio
 # thread with a deadline. Scanned pages (images, no text layer) extract to
 # nothing; OCR is deliberately out of scope for the Hub.
 
+# PDFium is not thread-safe (pypdfium2's "Incompatibility with Threading"): two
+# parses at once in one process can crash it, even on different documents. The
+# Hub serves many people from one process, so every parse holds this lock.
+_PDFIUM_LOCK = threading.Lock()
+
 
 class PdfExtractionError(RuntimeError):
     """The bytes could not be parsed as a PDF."""
@@ -27,6 +33,11 @@ def extract_pdf_text(data: bytes, *, max_chars: int, max_pages: int) -> tuple[st
     Returns ``(text, truncated)``. ``truncated`` is True when pages were left
     unread or the assembled text exceeded ``max_chars`` and was cut.
     """
+    with _PDFIUM_LOCK:
+        return _extract_pdf_text(data, max_chars=max_chars, max_pages=max_pages)
+
+
+def _extract_pdf_text(data: bytes, *, max_chars: int, max_pages: int) -> tuple[str, bool]:
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:  # pragma: no cover - dependency is pinned in pyproject
@@ -87,8 +98,9 @@ async def extract_pdf_text_async(
     """Run :func:`extract_pdf_text` off the event loop with a deadline.
 
     PDFium is synchronous; a worker thread keeps the API responsive. A deadline
-    that fires raises ``TimeoutError`` to the caller (the thread finishes its
-    bounded work in the background; the page cap keeps that finite).
+    that fires raises ``TimeoutError`` to the caller, but the thread keeps the
+    PDFium lock until its page-capped parse ends, so a later read queues behind
+    it rather than overlapping it; the page cap keeps that wait finite.
     """
     async with asyncio.timeout(timeout_seconds):
         return await asyncio.to_thread(extract_pdf_text, data, max_chars=max_chars, max_pages=max_pages)

@@ -9,7 +9,7 @@
       "storeToken": true,
       "addReadTokenRoleOnCreate": true,
       "trustEmail": false,
-      "linkOnly": false,
+      "linkOnly": true,
       "firstBrokerLoginFlowAlias": "first broker login",
       "config": {
         "clientId": "REPLACE_WITH_ENTRA_APPLICATION_CLIENT_ID",

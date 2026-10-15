@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import sys
+import threading
+import time
+import types
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 import pytest
@@ -11,22 +16,23 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config
+from collab_hub_api.connectors import sharepoint_client
 from collab_hub_api.connectors.models import (
     SHAREPOINT_READONLY_SCOPES,
     SharePointReadRequest,
     SharePointSearchRequest,
 )
 from collab_hub_api.connectors.sharepoint_client import _kql, _site_from_web_url, _strip_search_markup
-from collab_hub_api.connectors.sharepoint_text import PdfExtractionError, extract_pdf_text
+from collab_hub_api.connectors.sharepoint_text import PdfExtractionError, extract_pdf_text, extract_pdf_text_async
 from collab_hub_api.core import make_app
 
 STATIC_TOKEN = "eyJ-static-graph-token-alice"
 DRIVE_ID = "b!abc123-XYZ_456"
 ITEM_ID = "01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K"
 GRAPH = "https://graph.test/v1.0"
-DOWNLOAD_HOST = "https://easiyest.sharepoint.test"
-SITE_URL = "https://easiyest.sharepoint.test/sites/Marketing/Shared%20Documents"
-PERSONAL_URL = "https://easiyest-my.sharepoint.test/personal/francis_easiyest/Documents"
+DOWNLOAD_HOST = "https://contoso.sharepoint.test"
+SITE_URL = "https://contoso.sharepoint.test/sites/Marketing/Shared%20Documents"
+PERSONAL_URL = "https://contoso-my.sharepoint.test/personal/alice_contoso/Documents"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
@@ -102,8 +108,8 @@ def _resource(
         "size": size,
         "webUrl": web_url if web_url is not None else f"{SITE_URL}/{name}",
         "lastModifiedDateTime": modified,
-        "lastModifiedBy": {"user": {"displayName": "Shayla McMillan", "email": "shayla@easiyest.test"}},
-        "parentReference": {"driveId": drive_id, "siteId": "easiyest.sharepoint.test,guid1,guid2"},
+        "lastModifiedBy": {"user": {"displayName": "Bob Example", "email": "bob@contoso.test"}},
+        "parentReference": {"driveId": drive_id, "siteId": "contoso.sharepoint.test,guid1,guid2"},
     }
     if folder:
         resource["folder"] = {"childCount": 3}
@@ -141,7 +147,7 @@ def _ok_handler(request: httpx.Request) -> Response:
     if path.endswith("/me"):
         return Response(
             200,
-            json={"displayName": "Francis Happy", "userPrincipalName": "francis@easiyest.onmicrosoft.com"},
+            json={"displayName": "Alice Example", "userPrincipalName": "alice@contoso.onmicrosoft.com"},
         )
     if path.endswith("/search/query"):
         return Response(200, json=_search_response([]))
@@ -179,7 +185,7 @@ def _read_handler(resource: dict, *, content: bytes = b"", converted: bytes | No
 
     def handler(request: httpx.Request) -> Response:
         path = request.url.path
-        if request.url.host == "easiyest.sharepoint.test":
+        if request.url.host == "contoso.sharepoint.test":
             seen["download_authorization"] = request.headers.get("Authorization")
             if path.endswith("/converted"):
                 return Response(200, content=converted or b"", headers={"Content-Type": "application/pdf"})
@@ -281,7 +287,7 @@ async def test_sharepoint_status_connected_reports_account(tmp_path, monkeypatch
     body = response.json()
     assert body["connected"] is True
     assert body["state"] == "connected"
-    assert body["account"] == "Francis Happy"
+    assert body["account"] == "Alice Example"
     assert body["scopes"] == SHAREPOINT_READONLY_SCOPES
     assert STATIC_TOKEN not in response.text
     # Capability probe: a bounded one-result search, not just /me (contract 4).
@@ -386,7 +392,7 @@ async def test_sharepoint_search_returns_hits_and_drops_urls(tmp_path, monkeypat
     assert first["site_name"] == "Marketing"
     assert first["mime_type"] == DOCX_MIME
     assert first["size"] == 1234
-    assert first["last_modified_by"] == "Shayla McMillan"
+    assert first["last_modified_by"] == "Bob Example"
     assert first["last_modified"].startswith("2026-10-06T10:00:00")
     assert first["is_folder"] is False
     # Highlight/ellipsis markup is gone and the link inside the snippet is masked.
@@ -403,7 +409,7 @@ async def test_sharepoint_search_returns_hits_and_drops_urls(tmp_path, monkeypat
     assert "sharepoint.test" not in response.text
     assert "@odata" not in response.text
     assert "webUrl" not in response.text
-    assert "shayla@" not in response.text
+    assert "bob@" not in response.text
     assert "<c0>" not in response.text
     assert STATIC_TOKEN not in response.text
 
@@ -420,6 +426,8 @@ async def test_sharepoint_search_sort_modified_and_date_window(tmp_path, monkeyp
                     [
                         _hit(_resource(ITEM_ID, "Recent.docx", modified="2026-10-06T10:00:00Z")),
                         _hit(_resource("03OLD", "Ancient.docx", modified="2020-01-01T10:00:00Z")),
+                        _hit(_resource("04FUTURE", "Future.docx", modified="2026-10-09T10:00:00Z")),
+                        _hit(_resource("05UNDATED", "Undated.docx", modified="")),
                     ]
                 ),
             )
@@ -443,7 +451,8 @@ async def test_sharepoint_search_sort_modified_and_date_window(tmp_path, monkeyp
     sent = captured["body"]["requests"][0]
     assert sent["query"]["queryString"] == "LastModifiedTime>=2026-10-01 AND LastModifiedTime<=2026-10-07"
     assert sent["sortProperties"] == [{"name": "lastModifiedDateTime", "isDescending": True}]
-    # A hit Graph returned from outside the window is dropped Hub-side as well.
+    # Hits Graph returned from outside the window (too old, too new) and a hit
+    # with no modified time are all dropped Hub-side as well.
     assert [hit["name"] for hit in response.json()["hits"]] == ["Recent.docx"]
 
 
@@ -456,6 +465,14 @@ async def test_sharepoint_search_days_back_uses_callers_zone(tmp_path, monkeypat
             return Response(200, json=_search_response([]))
         return _ok_handler(request)
 
+    # 20:00 UTC on Oct 15 is already Oct 16 in Auckland, so "7 days back" in the
+    # caller's zone is Oct 9; computed from UTC it would be Oct 8.
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 15, 20, 0, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(sharepoint_client, "datetime", FrozenDatetime)
     _install_mock_client(monkeypatch, handler)
     app = make_app(_config(tmp_path))
     async with _client(app) as client:
@@ -470,8 +487,9 @@ async def test_sharepoint_search_days_back_uses_callers_zone(tmp_path, monkeypat
         )
     assert response.status_code == 200
     query_string = captured["body"]["requests"][0]["query"]["queryString"]
-    # The user's parentheses were neutralised: the outer date clause is still ANDed on.
-    assert query_string.startswith("(x OR LastModifiedTime>=1900-01-01 AND y) AND LastModifiedTime>=")
+    # The user's parentheses were neutralised, the outer date clause is still
+    # ANDed on, and the day comes from the caller's zone, not UTC.
+    assert query_string == "(x OR LastModifiedTime>=1900-01-01 AND y) AND LastModifiedTime>=2026-10-09"
     assert query_string.count("(") == 1
 
 
@@ -706,10 +724,19 @@ async def test_sharepoint_read_image_only_pdf_is_unsupported(tmp_path, monkeypat
 
 @pytest.mark.parametrize(
     ("drive_id", "item_id"),
-    [("b!good", "bad id with spaces"), ("drive/with/slash", ITEM_ID), ("b!good", "item!bang")],
+    [("b!good", "bad id with spaces"), ("b!good", "item!bang"), ("drive~tilde", ITEM_ID)],
+    ids=["item-with-spaces", "item-with-bang", "drive-with-tilde"],
 )
-async def test_sharepoint_read_rejects_bad_ids(tmp_path, monkeypatch, drive_id, item_id):
-    _install_mock_client(monkeypatch, _ok_handler)
+async def test_sharepoint_read_rejects_bad_ids_before_any_graph_call(tmp_path, monkeypatch, drive_id, item_id):
+    # These reach the route (unlike a slash, which is a routing 404), so the
+    # id validators must answer 422 themselves and Graph must see no request.
+    graph_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> Response:
+        graph_calls.append(request.url.path)
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
     app = make_app(_config(tmp_path))
     async with _client(app) as client:
         response = await client.post(
@@ -717,7 +744,20 @@ async def test_sharepoint_read_rejects_bad_ids(tmp_path, monkeypatch, drive_id, 
             headers=_auth_header(),
             json={},
         )
-    assert response.status_code in {404, 422}
+    assert response.status_code == 422
+    assert graph_calls == []
+
+
+async def test_sharepoint_read_with_a_slash_in_the_id_is_a_routing_404(tmp_path, monkeypatch):
+    _install_mock_client(monkeypatch, _ok_handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(
+            f"/v1/connectors/sharepoint/drives/drive/with/slash/items/{ITEM_ID}/read",
+            headers=_auth_header(),
+            json={},
+        )
+    assert response.status_code == 404
 
 
 async def test_sharepoint_read_not_found_is_404_with_guidance(tmp_path, monkeypatch):
@@ -842,3 +882,54 @@ async def test_sharepoint_routes_require_hub_bearer(tmp_path, monkeypatch):
     assert status_response.status_code == 401
     assert search_response.status_code == 401
     assert read_response.status_code == 401
+
+
+# --- extraction safeguards --------------------------------------------------
+
+
+async def test_pdf_reads_never_parse_two_documents_at_once(monkeypatch):
+    # PDFium is not thread-safe: overlapping reads must queue, never overlap.
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+
+    class FakeDocument:
+        def __init__(self, _data):
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+
+        def __len__(self):
+            return 0
+
+        def close(self):
+            nonlocal active
+            with guard:
+                active -= 1
+
+    monkeypatch.setitem(
+        sys.modules, "pypdfium2", types.SimpleNamespace(PdfDocument=FakeDocument, PdfiumError=RuntimeError)
+    )
+    await asyncio.gather(
+        *[extract_pdf_text_async(b"%PDF-", max_chars=10, max_pages=1, timeout_seconds=5) for _ in range(4)]
+    )
+    assert peak == 1
+
+
+async def test_sharepoint_read_masks_links_inside_converted_documents(tmp_path, monkeypatch):
+    # Document text is untrusted: a link inside a converted Word file must come
+    # back masked, like every other connector text field.
+    handler, _seen = _read_handler(
+        _resource(ITEM_ID, "Q3 Marketing Plan.docx"),
+        converted=_minimal_pdf("See https://evil.example/x for the plan"),
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    body = response.json()
+    assert body["unsupported"] is False
+    assert "evil.example" not in response.text
+    assert "[link]" in body["text"]

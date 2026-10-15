@@ -503,7 +503,7 @@ idp-microsoft: ## Create the Microsoft IdP for SharePoint (MICROSOFT_CLIENT_ID= 
 		--realm master --user $(KC_ADMIN) --password $(KC_ADMIN_PW)
 	$(KCADM) create identity-provider/instances -r $(REALM) \
 		-s alias=microsoft -s displayName=Microsoft -s providerId=microsoft -s enabled=true \
-		-s storeToken=true -s addReadTokenRoleOnCreate=true -s hideOnLogin=true \
+		-s storeToken=true -s addReadTokenRoleOnCreate=true -s hideOnLogin=true -s linkOnly=true \
 		-s 'config.clientId=$(MICROSOFT_CLIENT_ID)' \
 		-s 'config.clientSecret=$(MICROSOFT_CLIENT_SECRET)' \
 		-s 'config.tenantId=$(MICROSOFT_TENANT_ID)' \

@@ -177,10 +177,9 @@ carries `content_trust: "external_untrusted"`.
 Each environment (dev, the public hub, prod) needs its **own** Entra app with
 that environment's callback URL, its own credential Secret, the identity
 provider in that environment's Keycloak, and the Hub pointed at the broker.
-The GitHub connector set the pattern (`nexus.internal.openteams.app#30` for
-dev, `collab.openteams.app#96`/`#97` for the public hub); SharePoint follows it
-with these three changes in the cluster repo, applied by whoever operates that
-cluster:
+The GitHub connector set the pattern in the dev and public-hub cluster
+repositories; SharePoint follows it with these three changes in the cluster
+repo, applied by whoever operates that cluster:
 
 1. **Credential Secret** (created by hand, never committed), with a third key
    for the tenant because the app is single-tenant:
@@ -204,7 +203,7 @@ cluster:
      echo "Configuring Microsoft identity provider (SharePoint connector)..."
      # Built-in Microsoft provider; tenantId is required because the Entra app is
      # single-tenant (the provider defaults to the multi-tenant 'common' endpoint).
-     # Delegated read-only Graph scopes only; see nebari-nexus-pack docs/sharepoint-connector.md.
+     # Delegated read-only Graph scopes only; see collab-hub-pack docs/sharepoint-connector.md.
      MICROSOFT_IDP_FILE=$(mktemp)
      cat > "$MICROSOFT_IDP_FILE" <<EOF
    {

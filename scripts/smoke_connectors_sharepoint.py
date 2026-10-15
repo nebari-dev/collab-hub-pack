@@ -106,7 +106,7 @@ async def smoke_sharepoint_connector(
         read_txt.raise_for_status()
         txt_payload = read_txt.json()
         assert txt_payload["unsupported"] is False
-        assert "Action item: Francis sends the report by Friday." in txt_payload["text"]
+        assert "Action item: Alice sends the report by Friday." in txt_payload["text"]
         assert "evil.example" not in read_txt.text
         assert FAKE_GRAPH_TOKEN not in read_txt.text
 
