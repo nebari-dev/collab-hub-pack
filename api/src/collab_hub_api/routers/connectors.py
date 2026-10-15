@@ -162,11 +162,11 @@ def _offered(connector: str):
         disabled: frozenset[str] = Depends(switched_off_connectors),
     ) -> None:
         if connector in disabled:
-            # The access log shows a 404 on a route that plainly exists; this
-            # line is what tells it apart from a path nothing serves. At debug,
-            # because clients poll status: a switched-off provider would
-            # otherwise add a line per connector, per user, per refresh, and
-            # the response body already says why to whoever is asking.
+            # The access log shows a 404 on a route that plainly exists; the
+            # response body tells it apart from a path nothing serves, and so
+            # does this line when debug logging is on. At debug, because
+            # clients poll status: a switched-off provider would otherwise add
+            # a line per connector, per user, per refresh.
             logger.debug("connector_status_switched_off", extra={"connector": connector})
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,

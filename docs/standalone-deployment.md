@@ -358,7 +358,10 @@ server:
   records in its logs and audit trail.
 - **`rootPath`** is for serving the app under a URL prefix. The protection map
   is matched against paths with the prefix stripped, so rules stay written
-  against the app's own paths.
+  against the app's own paths. Write it with a leading slash and without a
+  trailing one (`/hub`, not `hub` or `/hub/`, and never `/`): the chart and the
+  app both refuse the others, because the router would not strip them and
+  every rule would go unmatched or every route 404.
 
 These were previously reachable only by smuggling `extraEnv` entries.
 `api.deployment.extraEnv` still renders last and therefore still wins, so an
