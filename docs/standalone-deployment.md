@@ -249,10 +249,8 @@ audience is people with no account on this deployment yet.
 
 Both entries are **inert on an install that does not enable the web surface**.
 No routes are registered under either prefix, so a request there matches
-nothing in the app and falls through to the MCP catch-all mounted at `/`, which
-runs its own `McpAuthMiddleware` and authenticates on the API axis before the
-sub-application sees it. A prefix declared public that serves nothing is not a
-hole. Unhardened installs never see these entries at all: the chart passes
+nothing in the app and answers a plain 404. A prefix declared public that
+serves nothing is not a hole. Unhardened installs never see these entries at all: the chart passes
 `PATHS="[]"` and `DEFAULT_ACCESS="public"` when `security.enforce` resolves
 false.
 
@@ -358,7 +356,9 @@ server:
   records in its logs and audit trail.
 - **`rootPath`** is for serving the app under a URL prefix. The protection map
   is matched against paths with the prefix stripped, so rules stay written
-  against the app's own paths.
+  against the app's own paths. Write it without a trailing slash (`/hub`, not
+  `/hub/`, and never `/`): the chart and the app both refuse one, because the
+  router would not strip it and every rule would go unmatched.
 
 These were previously reachable only by smuggling `extraEnv` entries.
 `api.deployment.extraEnv` still renders last and therefore still wins, so an

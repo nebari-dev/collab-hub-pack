@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .cogs.indexer import INDEXER_SHUTDOWN_TIMEOUT_SECONDS
@@ -149,8 +150,8 @@ def _unavailable_response(exc: Exception, database_errors: tuple[type[Exception]
 class McpAuthMiddleware(BaseHTTPMiddleware):
     """Authenticate MCP traffic, which never reaches the outer app's handlers.
 
-    The MCP app is mounted, so nothing registered on the outer FastAPI app
-    applies to it: every outcome of the credential check has to be turned into
+    The MCP app is a separate ASGI app routed at its own path, so nothing
+    registered on the outer FastAPI app applies to it: every outcome of the credential check has to be turned into
     a response right here. Responses use the same ``{"error": {"code", ...}}``
     envelope as the HTTP API, because a plain-text body would erase exactly the
     distinctions that matter — ``no_organization`` against a plain refusal, and
@@ -328,7 +329,7 @@ def make_app(config: BaseConfig) -> FastAPI:
     mcp_app = mcp.streamable_http_app()
     # MCP traffic authenticates through the same get_auth_context, which
     # records seen users and resolves membership off the owning app's state —
-    # the mounted MCP app has its own state object, so give it both stores.
+    # the MCP app has its own state object, so give it both stores.
     mcp_app.state.usage_store = usage_store
     mcp_app.state.org_store = org_store
 
@@ -561,8 +562,7 @@ def make_app(config: BaseConfig) -> FastAPI:
         # response on its paths — including ones no handler of that surface
         # produced: redirects, 405s, the path-protection middleware's own
         # refusals, the guard's own sign-in redirects, an exception escaping a
-        # page, and whatever the mounted MCP catch-all answers for an
-        # unmatched /web path (issue #86).
+        # page, and the router's own 404 for an unmatched /web path.
         app.add_middleware(WebSecurityHeadersMiddleware, prefixes=WEB_SURFACE_PREFIXES)
 
     @app.get("/", include_in_schema=False)
@@ -638,16 +638,29 @@ def make_app(config: BaseConfig) -> FastAPI:
     async def metrics() -> Response:
         return metrics_response()
 
-    @app.exception_handler(HTTPException)
-    async def frames_http_exception_handler(request: Request, exc: HTTPException):
-        if not _api_path(request.url.path):
+    # Registered against Starlette's HTTPException, the base class of FastAPI's:
+    # routing itself raises the base class for an unmatched path or a bad
+    # method, and those errors owe API callers the same envelope as the ones
+    # our handlers raise. While the MCP app was mounted at "/" it answered
+    # every unmatched path, so they never reached a handler at all (#67).
+    @app.exception_handler(StarletteHTTPException)
+    async def frames_http_exception_handler(request: Request, exc: StarletteHTTPException):
+        # Classified by request_path, the app-relative path the router matched
+        # on, exactly as _unauthorized_response classifies a middleware 401:
+        # one rule, so a refusal has the same body whichever layer raised it,
+        # under a `server.root_path` prefix included.
+        if not _api_path(request_path(request)):
             return await http_exception_handler(request, exc)
         code = {
             status.HTTP_401_UNAUTHORIZED: error_codes.UNAUTHORIZED,
             status.HTTP_403_FORBIDDEN: error_codes.FORBIDDEN,
             status.HTTP_404_NOT_FOUND: error_codes.NOT_FOUND,
         }.get(exc.status_code, error_codes.HTTP_ERROR)
-        return frames.error_response(exc.status_code, code, str(exc.detail))
+        response = frames.error_response(exc.status_code, code, str(exc.detail))
+        if exc.headers:
+            # Keeps the `Allow` header Starlette attaches to its 405s.
+            response.headers.update(exc.headers)
+        return response
 
     @app.exception_handler(NoOrganizationError)
     async def no_organization_handler(_request: Request, exc: NoOrganizationError):
@@ -898,7 +911,17 @@ def make_app(config: BaseConfig) -> FastAPI:
     verify_protected_routes(app)
 
     mcp_app.add_middleware(McpAuthMiddleware, authenticate=get_auth_context)
-    app.mount("/", mcp_app)
+    # Register the MCP app at exactly the paths it serves instead of mounting it
+    # at "/". A catch-all mount matched every path this app does not route, so
+    # McpAuthMiddleware answered a bare 401 for a trailing-slash typo like
+    # `/v1/usage/summary/` (which should redirect), and MCP's plain-text 404
+    # answered unmatched paths that owe callers the frames error envelope
+    # (#67). MCP keeps the `/mcp` address (its `streamable_http_path`) that
+    # clients, the docs and the chart's ingress already use, while everything
+    # else falls through to this app's own redirect/404 handling. The route
+    # delegates to `mcp_app` whole, so its middleware stack — McpAuthMiddleware
+    # included — still wraps every MCP request.
+    app.add_route(mcp.settings.streamable_http_path, mcp_app)
 
     if config.web.enabled:
         # Everything this function registers has now been registered, so this
