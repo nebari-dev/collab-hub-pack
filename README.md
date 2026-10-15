@@ -124,7 +124,7 @@ production build.
 
 ## Documentation
 
-Setup and reference docs — connector setup, Frames, operations, the
+Setup and reference docs — connector setup, [connector discovery](docs/connector-discovery.md), Frames, operations, the
 [Cog registry](docs/cog-registry.md), [feature flags](docs/feature-flags.md) — live in [`docs/`](docs/).
 
 The basis for Cog and Op execution — vocabulary, the Op–Cog seam, the
