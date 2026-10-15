@@ -130,6 +130,7 @@ STATUS_ROUTES = {
     "google": ["google-drive", "gmail", "google-calendar"],
     "slack": ["slack"],
     "github": ["github"],
+    "sharepoint": ["sharepoint"],
 }
 ALL_STATUS_ROUTES = [route for routes in STATUS_ROUTES.values() for route in routes]
 

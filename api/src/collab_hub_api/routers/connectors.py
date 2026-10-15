@@ -40,6 +40,7 @@ from collab_hub_api.connectors.models import (
     GOOGLE_DRIVE_CONNECTOR_ID,
     NOTION_CONNECTOR_ID,
     NOTION_READONLY_CAPABILITIES,
+    SHAREPOINT_CONNECTOR_ID,
     SHAREPOINT_READONLY_SCOPES,
     SLACK_CONNECTOR_ID,
     SLACK_READONLY_SCOPES,
@@ -996,7 +997,7 @@ async def query_notion_database(
     return NotionDatabaseQueryResponse(rows=rows, next_page_token=next_page_token)
 
 
-@router.get("/sharepoint/status", response_model=SharePointStatus)
+@router.get("/sharepoint/status", response_model=SharePointStatus, dependencies=[_offered("sharepoint")])
 async def sharepoint_status(
     request: Request,
     _auth=Depends(get_auth_context),
@@ -1560,5 +1561,6 @@ _STATUS_READERS = {
     SLACK_CONNECTOR_ID: _slack_status,
     GITHUB_CONNECTOR_ID: _github_status,
     NOTION_CONNECTOR_ID: _notion_status,
+    SHAREPOINT_CONNECTOR_ID: _sharepoint_status,
 }
 """The status read behind each catalog entry, keyed by connector id."""
