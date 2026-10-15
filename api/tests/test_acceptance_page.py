@@ -1558,15 +1558,19 @@ def _post_body_over_socket(
 def _read_one_response(sock: socket.socket, buffered: bytes) -> tuple[bytes, bytes] | None:
     """One ``Content-Length``-framed response off ``sock``, or None at EOF.
 
-    Returns ``(response, leftover)``. None means no complete response arrived
-    on this socket — end-of-file, a reset, or the socket timeout — which is
-    what the keep-alive controls must fail on, whichever of those it was.
+    Returns ``(response, leftover)``. None means the server ended the
+    connection before a complete response — end-of-file or a reset — which is
+    what the keep-alive controls must fail on. A socket timeout is raised
+    instead: a server that leaves the connection open and never answers has
+    not closed it, and the failure should say so.
     """
 
     data = buffered
     while b"\r\n\r\n" not in data:
         try:
             chunk = sock.recv(65536)
+        except TimeoutError:
+            raise
         except OSError:
             return None
         if not chunk:
@@ -1585,6 +1589,8 @@ def _read_one_response(sock: socket.socket, buffered: bytes) -> tuple[bytes, byt
     while len(rest) < size:
         try:
             chunk = sock.recv(65536)
+        except TimeoutError:
+            raise
         except OSError:
             return None
         if not chunk:
@@ -1597,8 +1603,8 @@ def _requests_over_one_socket(base_url: str, requests: list[bytes]) -> list[byte
     """Send ``requests`` one after another on **one** raw socket.
 
     Returns the responses that were served, in order; a list shorter than
-    ``requests`` means the connection did not serve the next one (closed,
-    reset, or timed out).
+    ``requests`` means the server closed or reset the connection before
+    serving the next one. A server that never answers raises ``TimeoutError``.
     A raw socket rather than an HTTP client because a client library quietly
     opens a fresh connection when the server closes one, so "the second
     request was served" proves nothing about reuse there. Here there is only
