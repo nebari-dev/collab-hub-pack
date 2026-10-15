@@ -134,14 +134,22 @@ def _token_body(response: httpx.Response, endpoint: str) -> dict:
 
 
 def _seconds(value: object) -> float | None:
-    """A token's lifetime in seconds (RFC 6749: a number; some realms send it as a string of digits)."""
-    if isinstance(value, bool):
+    """A token's lifetime in seconds, or ``None`` when it is not one.
+
+    RFC 6749 sends ``expires_in`` as a number; some realms send a string of
+    ASCII digits, which is accepted too, and nothing else is (no sign, no
+    decimal point, no other script's digits). A value too large to be a float
+    is refused rather than raised.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
-    if isinstance(value, str) and value.isdigit():
-        value = int(value)
-    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
-        return float(value)
-    return None
+    if isinstance(value, str) and not (value.isascii() and value.isdigit()):
+        return None
+    try:
+        seconds = float(int(value) if isinstance(value, str) else value)
+    except (ValueError, OverflowError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _tokens(body: dict) -> Tokens:
@@ -149,7 +157,7 @@ def _tokens(body: dict) -> Tokens:
     return Tokens(
         access_token=body["access_token"],
         refresh_token=body.get("refresh_token"),
-        expires_at=clock() + _seconds(expires_in) if expires_in else None,
+        expires_at=clock() + _seconds(expires_in) if expires_in is not None else None,
     )
 
 
