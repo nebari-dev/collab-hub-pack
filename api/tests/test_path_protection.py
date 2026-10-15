@@ -131,6 +131,14 @@ def test_a_root_path_ending_in_a_slash_is_refused_at_load(root_path):
         Config.model_validate({"server": {"root_path": root_path}})
 
 
+@pytest.mark.parametrize("root_path", ["w", "a/b"])
+def test_a_root_path_without_a_leading_slash_is_refused_at_load(root_path):
+    # A request path always starts with a slash, so "w" is never a prefix of
+    # one: nothing is stripped and every route 404s.
+    with pytest.raises(ValidationError, match="root_path must start with"):
+        Config.model_validate({"server": {"root_path": root_path}})
+
+
 @pytest.mark.parametrize("root_path", ["", "/w", "/a/b"])
 def test_a_root_path_prefix_is_accepted(root_path):
     assert Config.model_validate({"server": {"root_path": root_path}}).server.root_path == root_path
