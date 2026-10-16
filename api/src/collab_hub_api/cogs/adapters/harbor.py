@@ -36,6 +36,7 @@ from ..registry import (
     CogRegistrySourceConfig,
     OCIClientFactory,
     RegistryEvent,
+    RegistryRepositoryNotFound,
     RegistrySourceAuthError,
     RegistrySourceError,
     RegistrySourceProtocolError,
@@ -87,6 +88,7 @@ class HarborRegistrySource:
         *,
         oci_client_factory: OCIClientFactory,
         http_transport: httpx.AsyncBaseTransport | None = None,
+        restrict_redirects: bool = False,
     ) -> None:
         self.id = config.id
         self.host = registry_host(config.url)
@@ -117,6 +119,9 @@ class HarborRegistrySource:
             ca_bundle_path=config.ca_bundle_path or None,
             timeout_seconds=config.request_timeout_seconds,
             transport=http_transport,
+            redirect_hosts=tuple(config.blob_redirect_hosts),
+            restrict_redirects=restrict_redirects,
+            name=config.id,
         )
         self._closed = False
 
@@ -243,7 +248,8 @@ class HarborRegistrySource:
                 f"source {self.id!r}: the registry API refused the configured credential for {path} (HTTP {status})"
             )
         if status == 404:
-            raise RegistrySourceError(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
+            kind = RegistryRepositoryNotFound if path.endswith("/artifacts") else RegistrySourceError
+            raise kind(f"source {self.id!r}: {path} does not exist on the registry (HTTP 404)")
         raise RegistrySourceProtocolError(f"source {self.id!r}: {path} answered HTTP {status}")
 
     # -- webhooks --------------------------------------------------------------
