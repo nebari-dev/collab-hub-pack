@@ -313,9 +313,9 @@ class GitHubClient:
     ):
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
-        # Empty == the token's full visibility. When set, the generic api_get
-        # read is confined to these org logins (and the curated search too, once
-        # PR #76 lands its _build_query enforcement — this branch scopes api_get).
+        # Empty == the token's full visibility. When set, BOTH surfaces are
+        # confined to these org logins: the curated search (_build_query) and the
+        # generic api_get read (_enforce_api_get_org_scope).
         self.allowed_orgs = allowed_orgs or []
         # Case-folded lookup set, computed once (GitHub logins are case-
         # insensitive); allowed_orgs is kept raw for display in refusal messages.
@@ -754,9 +754,35 @@ class GitHubClient:
 
     def _build_query(self, query: str, repo: str) -> str:
         parts = [query.strip()]
-        if repo.strip():
-            parts.append(f"repo:{repo.strip()}")
+        repo = repo.strip()
+        if repo:
+            # An explicit repo: is a narrower scope than the allowlist, but it is
+            # still caller-supplied, so it must itself live inside the allowlist
+            # -- otherwise a caller could bypass the allowlist entirely by naming
+            # a repo in an org the deployment never approved.
+            if self._allowed_orgs_normalized and not self._repo_owner_allowed(repo):
+                raise GitHubSearchError(
+                    f"repo {repo!r} is outside the configured GitHub org allowlist "
+                    f"({', '.join(self.allowed_orgs)})"
+                )
+            parts.append(f"repo:{repo}")
+        elif self.allowed_orgs:
+            # Repeating ``org:`` qualifiers ORs them in GitHub issue search, so
+            # results stay confined to the configured org allowlist.
+            parts.extend(f"org:{org}" for org in self.allowed_orgs)
         return " ".join(part for part in parts if part)
+
+    def _repo_owner_allowed(self, repo: str) -> bool:
+        """Whether ``repo``'s ``owner/name`` owner segment is in the allowlist.
+
+        GitHub logins are case-insensitive, so the owner is folded against the
+        already-normalized allowlist. A malformed ``repo`` with no ``/`` is
+        treated as its own (never-matching) owner rather than raising here --
+        GitHub's own 422 on an invalid qualifier is the existing, already-handled
+        error path for that.
+        """
+        owner = repo.split("/", 1)[0].strip().lower()
+        return owner in self._allowed_orgs_normalized
 
     async def _get_response(
         self, path: str, *, operation: str, params: dict[str, str] | None = None
