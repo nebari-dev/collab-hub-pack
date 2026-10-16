@@ -216,7 +216,8 @@ class InMemoryTrackStore:
 
     def append_if(self, event: TrackEvent, condition: Callable[[tuple[TrackEvent, ...]], bool]) -> TrackEvent | None:
         with self._lock:  # reentrant: the check and the append are under one hold
-            return self.append(event) if condition(self.replay(event.run_id)) else None
+            # The store's own events, as SQLite and Postgres read theirs inside the transaction.
+            return self.append(event) if condition(tuple(self._events.get(event.run_id, ()))) else None
 
     def replay(self, run_id: str, *, after_sequence: int = 0) -> tuple[TrackEvent, ...]:
         with self._lock:

@@ -67,7 +67,15 @@ flowchart LR
   api --> frames[Frames store<br/>S3 / Postgres]
   api --> conn[Connectors<br/>Slack / Google]
   api --> dir[User directory<br/>Keycloak]
+  api -->|records intent,<br/>reads status| track[(Track<br/>Postgres / SQLite)]
+  controller[Run controllers<br/>one or more] -->|picks up runs,<br/>records progress| track
+  controller -->|starts and tears down| workers[Cog workers<br/>local processes]
 ```
+
+The API never calls a run controller and never starts a worker: it records what
+a client asked for on the Track, and the controllers act on it. Of several
+controllers, one picks up each run
+([`docs/cog-execution/runs.md`](docs/cog-execution/runs.md#the-run-controller-and-the-run-api)).
 
 ## Known limitations
 
@@ -77,13 +85,10 @@ flowchart LR
   starts again, and continues only when someone retries it. `dbos` (#104) is
   the backend that resumes runs; see
   [`docs/cog-execution/runs.md`](docs/cog-execution/runs.md).
-- **One host per Track.** Until run pickup (#121), a host takes every
-  unfinished run on its Track as its own when it starts, so one run controller
-  runs per Track.
-- **The run API is behind a feature flag.** `/v1/runs` and the run controller
-  are a first form, for one machine: a SQLite Track, workers as local
-  processes, and the `cog_runs` flag off by default. See
-  [`examples/cog-local`](examples/cog-local/README.md).
+- **The run API is behind a feature flag.** `/v1/runs` keeps its Track in a
+  SQLite file, workers run as local processes, and the `cog_runs` flag is off
+  by default; the run controller also runs on Postgres, with several replicas.
+  See [`examples/cog-local`](examples/cog-local/README.md).
 
 ## Local development
 
