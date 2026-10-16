@@ -105,6 +105,8 @@ connectors:
     downloadTimeoutSeconds: 30    # file download and Office -> PDF conversion
     maxDownloadBytes: 26214400    # 25 MiB; larger files are reported as unsupported, never fetched
     includePersonalOnedrive: false
+    extractionTimeoutSeconds: 30     # a parse past this is killed; the file reads as unsupported
+    extractionMemoryLimitBytes: 268435456  # 256 MiB worker ceiling; stay inside the pod's 512Mi
 ```
 
 These map to `COLLAB_HUB_API__CONNECTORS__SHAREPOINT__*` env vars in the API
@@ -146,13 +148,19 @@ carries `content_trust: "external_untrusted"`.
   (real URLs and emails masked, dotted names like `report.docx` kept).
 - **Document text is produced in the Hub**, not the desktop: Graph converts
   Office files to PDF server-side; the Hub extracts text with PDFium
-  (`pypdfium2`, the same engine apollo-desktop's OCR sidecar uses). Bounds:
-  `maxDownloadBytes` before download (streamed through `read_capped`), 200 pages,
-  `max_chars`, and `downloadTimeoutSeconds` on the parse. Scanned, image-only
-  PDFs extract to nothing and are reported as unsupported; OCR is out of scope.
-- `/content` answers `302` to a pre-authenticated download host; httpx follows
-  it, drops `Authorization` across origins (asserted by tests), and the final hop
-  must be https.
+  (`pypdfium2`, the same engine apollo-desktop's OCR sidecar uses). The parse
+  never runs in the API process: each one runs in a separate worker process
+  (`sharepoint_pdf_worker`), one at a time, under `extractionTimeoutSeconds`
+  (the worker is killed and reaped when it overruns) and
+  `extractionMemoryLimitBytes` (an address-space ceiling set inside the worker
+  before PDFium loads, plus a CPU ceiling as a second line). An adverse file
+  costs one dead worker and an `unsupported` answer; the Hub keeps serving.
+  Other bounds: `maxDownloadBytes` before download (streamed through
+  `read_capped`), 200 pages, and `max_chars`. Scanned, image-only PDFs extract
+  to nothing and are reported as unsupported; OCR is out of scope.
+- `/content` answers `302` to a pre-authenticated download host. The Hub follows
+  it by hand: each hop must be https (or the configured Graph origin, for local
+  fakes), and the Graph token is sent only on the first request (asserted by tests).
 
 ## Deployment checklist
 

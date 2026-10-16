@@ -1292,6 +1292,8 @@ def _new_sharepoint_client(token: str, config: ConnectorsConfig) -> SharePointCl
         download_timeout_seconds=config.sharepoint.download_timeout_seconds,
         max_download_bytes=config.sharepoint.max_download_bytes,
         include_personal_onedrive=config.sharepoint.include_personal_onedrive,
+        extraction_timeout_seconds=config.sharepoint.extraction_timeout_seconds,
+        extraction_memory_limit_bytes=config.sharepoint.extraction_memory_limit_bytes,
     )
 
 

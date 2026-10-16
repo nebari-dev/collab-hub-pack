@@ -799,6 +799,13 @@ class SharePointConnectorConfig(BaseModel):
     # Largest file the read route will download before extracting text. Larger
     # files are reported as unsupported with their metadata, never fetched.
     max_download_bytes: int = Field(default=25 * 1024 * 1024, ge=1)
+    # Text extraction runs in a separate worker process, one at a time. A parse
+    # that overruns this deadline is killed, and one that needs more memory
+    # than this ceiling fails inside the worker; either way the file is
+    # reported as unsupported and the API keeps serving. The ceiling must stay
+    # inside the pod's memory headroom (the chart's default limit is 512Mi).
+    extraction_timeout_seconds: float = 30.0
+    extraction_memory_limit_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     # Search covers SharePoint document libraries. The user's personal OneDrive
     # is reachable with the same scopes; it is excluded unless a hub opts in,
     # so a daily digest never surfaces someone's private drafts by default.

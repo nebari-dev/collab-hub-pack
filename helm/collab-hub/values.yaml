@@ -658,6 +658,13 @@ connectors:
     # -- Largest file (bytes) the read route downloads before extracting text.
     # Larger files are reported as unsupported with their metadata.
     maxDownloadBytes: 26214400
+    # -- Text extraction runs in a separate worker process, one at a time. A
+    # parse that overruns this deadline is killed and the file is reported as
+    # unsupported; the API keeps serving.
+    extractionTimeoutSeconds: 30
+    # -- Memory ceiling (bytes) for that worker. Keep it inside the pod's
+    # headroom: the chart's default memory limit is 512Mi.
+    extractionMemoryLimitBytes: 268435456
     # -- Whether search also returns files from each user's personal OneDrive.
     # Off: SharePoint document libraries only, so a daily digest never surfaces
     # someone's private drafts by default.

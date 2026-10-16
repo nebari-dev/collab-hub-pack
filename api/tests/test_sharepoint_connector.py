@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import sys
-import threading
 import time
 import types
+import zlib
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
@@ -16,7 +17,7 @@ from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
 
 from collab_hub_api.config import Config
-from collab_hub_api.connectors import sharepoint_client
+from collab_hub_api.connectors import sharepoint_client, sharepoint_pdf_worker, sharepoint_text
 from collab_hub_api.connectors.models import (
     SHAREPOINT_READONLY_SCOPES,
     SharePointReadRequest,
@@ -179,7 +180,14 @@ def _minimal_pdf(text: str) -> bytes:
     return bytes(out)
 
 
-def _read_handler(resource: dict, *, content: bytes = b"", converted: bytes | None = None, convert_status: int = 200):
+def _read_handler(
+    resource: dict,
+    *,
+    content: bytes = b"",
+    converted: bytes | None = None,
+    convert_status: int = 200,
+    convert_message: str = "InputFormatNotSupported",
+):
     """Metadata + download handler: ``/content`` 302s to another host like Graph does."""
     seen: dict = {"download_authorization": None, "download_calls": 0, "convert_params": None}
 
@@ -195,7 +203,7 @@ def _read_handler(resource: dict, *, content: bytes = b"", converted: bytes | No
             if request.url.params.get("format") == "pdf":
                 seen["convert_params"] = dict(request.url.params)
                 if convert_status != 200:
-                    return _graph_error(convert_status, "InputFormatNotSupported")
+                    return _graph_error(convert_status, convert_message)
                 return Response(302, headers={"Location": f"{DOWNLOAD_HOST}/download/converted"})
             return Response(302, headers={"Location": f"{DOWNLOAD_HOST}/download/raw"})
         if f"/items/{ITEM_ID}" in path:
@@ -887,34 +895,28 @@ async def test_sharepoint_routes_require_hub_bearer(tmp_path, monkeypatch):
 # --- extraction safeguards --------------------------------------------------
 
 
-async def test_pdf_reads_never_parse_two_documents_at_once(monkeypatch):
-    # PDFium is not thread-safe: overlapping reads must queue, never overlap.
+async def test_pdf_parses_never_overlap(monkeypatch):
+    # One parse at a time across the API process: with a memory ceiling per
+    # worker, that is also the bound on what extraction can cost the pod at once.
     active = 0
     peak = 0
-    guard = threading.Lock()
 
-    class FakeDocument:
-        def __init__(self, _data):
-            nonlocal active, peak
-            with guard:
-                active += 1
-                peak = max(peak, active)
-            time.sleep(0.05)
+    async def fake_worker(data, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return "text", False
 
-        def __len__(self):
-            return 0
-
-        def close(self):
-            nonlocal active
-            with guard:
-                active -= 1
-
-    monkeypatch.setitem(
-        sys.modules, "pypdfium2", types.SimpleNamespace(PdfDocument=FakeDocument, PdfiumError=RuntimeError)
+    monkeypatch.setattr(sharepoint_text, "_run_worker", fake_worker)
+    results = await asyncio.gather(
+        *[
+            extract_pdf_text_async(b"%PDF-", max_chars=10, max_pages=1, timeout_seconds=5, memory_limit_bytes=1 << 20)
+            for _ in range(4)
+        ]
     )
-    await asyncio.gather(
-        *[extract_pdf_text_async(b"%PDF-", max_chars=10, max_pages=1, timeout_seconds=5) for _ in range(4)]
-    )
+    assert results == [("text", False)] * 4
     assert peak == 1
 
 
@@ -933,3 +935,229 @@ async def test_sharepoint_read_masks_links_inside_converted_documents(tmp_path, 
     assert body["unsupported"] is False
     assert "evil.example" not in response.text
     assert "[link]" in body["text"]
+
+
+# --- adverse documents stay inside their worker's budget ---------------------
+
+
+def _flate_pdf(pages: int, content: bytes) -> bytes:
+    """``pages`` page objects sharing one FlateDecode content stream of ``content``.
+
+    Small on disk, large when inflated: the shape of a file that is cheap to
+    upload and expensive to parse.
+    """
+    compressed = zlib.compress(content, 9)
+    kids = b" ".join(f"{4 + index} 0 R".encode() for index in range(pages))
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [" + kids + b"] /Count " + str(pages).encode() + b" >>",
+        b"<< /Length "
+        + str(len(compressed)).encode()
+        + b" /Filter /FlateDecode >>\nstream\n"
+        + compressed
+        + b"\nendstream",
+    ]
+    objects += [b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 3 0 R >>"] * pages
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def _memory_hungry_pdf() -> bytes:
+    """One page whose content stream inflates to 32 MiB of path operators."""
+    return _flate_pdf(1, b"0 0 m 1 1 l S\n" * (32 * 1024 * 1024 // 14))
+
+
+def _slow_pdf() -> bytes:
+    """200 pages sharing an 8 MiB content stream: a long parse that yields no text."""
+    return _flate_pdf(200, b"q Q\n" * (8 * 1024 * 1024 // 4))
+
+
+def _spy_on_workers(monkeypatch) -> list:
+    workers: list = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spying_exec(*args, **kwargs):
+        process = await real_exec(*args, **kwargs)
+        workers.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spying_exec)
+    return workers
+
+
+@pytest.mark.parametrize("adverse", [_memory_hungry_pdf, _slow_pdf], ids=["memory-hungry", "slow"])
+async def test_sharepoint_read_of_an_adverse_pdf_fails_within_budget_and_the_hub_keeps_serving(
+    tmp_path, monkeypatch, adverse
+):
+    # The parse runs in a worker with a memory ceiling and a deadline. Whatever
+    # the file does to PDFium, the route answers "unsupported" inside the budget,
+    # the worker is gone (killed or finished, and reaped), the API answered other
+    # requests meanwhile, and the next ordinary read works.
+    workers = _spy_on_workers(monkeypatch)
+    served = {"content": adverse()}
+    assert len(served["content"]) < 100 * 1024  # cheap to upload
+    resource = _resource(ITEM_ID, "report.pdf", mime="application/pdf", size=len(served["content"]))
+
+    def handler(request: httpx.Request) -> Response:
+        if request.url.host == "contoso.sharepoint.test":
+            return Response(200, content=served["content"], headers={"Content-Type": "application/pdf"})
+        if request.url.path.endswith("/content"):
+            return Response(302, headers={"Location": f"{DOWNLOAD_HOST}/download/report.pdf"})
+        if f"/items/{ITEM_ID}" in request.url.path:
+            return Response(200, json=resource)
+        return _ok_handler(request)
+
+    _install_mock_client(monkeypatch, handler)
+    budget = 3.0
+    app = make_app(_config(tmp_path, extraction_timeout_seconds=budget, extraction_memory_limit_bytes=64 * 1024 * 1024))
+    async with _client(app) as client:
+        started = time.monotonic()
+        read = asyncio.create_task(client.post(_read_path(), headers=_auth_header(), json={}))
+        await asyncio.sleep(0.5)  # let the worker start
+        health = await asyncio.wait_for(client.get("/health"), 5)  # the API answers while the parse runs
+        response = await read
+        elapsed = time.monotonic() - started
+        assert health.status_code == 200
+        assert response.status_code == 200
+        body = response.json()
+        assert body["unsupported"] is True
+        assert body["item"]["name"] == "report.pdf"
+        assert elapsed < budget + 15
+        assert workers and all(process.returncode is not None for process in workers)
+
+        served["content"] = _minimal_pdf("Policy text")
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    body = response.json()
+    assert body["unsupported"] is False
+    assert "Policy text" in body["text"]
+
+
+async def test_sharepoint_read_kills_and_reaps_a_stalled_worker(tmp_path, monkeypatch):
+    # A worker that never answers is ended by the deadline, not waited on forever.
+    workers = _spy_on_workers(monkeypatch)
+    monkeypatch.setattr(
+        sharepoint_text,
+        "worker_command",
+        lambda **_kwargs: [sys.executable, "-c", "import sys, time; sys.stdin.buffer.read(); time.sleep(60)"],
+    )
+    handler, _seen = _read_handler(
+        _resource(ITEM_ID, "policy.pdf", mime="application/pdf"), content=_minimal_pdf("Policy text")
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path, extraction_timeout_seconds=1))
+    started = time.monotonic()
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    elapsed = time.monotonic() - started
+    body = response.json()
+    assert body["unsupported"] is True
+    assert "took too long" in body["unsupported_reason"]
+    assert elapsed < 10
+    assert len(workers) == 1
+    assert workers[0].returncode is not None
+
+
+async def test_sharepoint_unsupported_reason_masks_links_from_graph(tmp_path, monkeypatch):
+    handler, _seen = _read_handler(
+        _resource(ITEM_ID, "weird.docx"),
+        convert_status=415,
+        convert_message="Unsupported source; see https://aka.ms/graph-convert",
+    )
+    _install_mock_client(monkeypatch, handler)
+    app = make_app(_config(tmp_path))
+    async with _client(app) as client:
+        response = await client.post(_read_path(), headers=_auth_header(), json={})
+    body = response.json()
+    assert body["unsupported"] is True
+    assert "aka.ms" not in response.text
+    assert "[link]" in body["unsupported_reason"]
+
+
+# --- the worker process itself ------------------------------------------------
+
+
+def test_worker_main_answers_text_or_an_error_on_stdout(monkeypatch, capsys):
+    limits = []
+    monkeypatch.setattr(sharepoint_pdf_worker, "_apply_limits", lambda memory, cpu: limits.append((memory, cpu)))
+
+    def feed(data: bytes) -> None:
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(data)))
+
+    feed(_minimal_pdf("Hello worker"))
+    assert sharepoint_pdf_worker.main(["worker", "100", "5", "1048576", "7"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"text": "Hello worker", "truncated": False}
+    assert limits == [(1048576, 7)]  # applied before the parse, from argv
+
+    feed(b"not a pdf")
+    assert sharepoint_pdf_worker.main(["worker", "100", "5", "1048576", "7"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"error": "not a readable PDF"}
+
+    def exhausted(data, **_kwargs):
+        raise MemoryError
+
+    monkeypatch.setattr(sharepoint_text, "extract_pdf_text", exhausted)
+    feed(_minimal_pdf("Hello worker"))
+    assert sharepoint_pdf_worker.main(["worker", "100", "5", "1048576", "7"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"error": "the file needs more memory than a read is allowed"}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no rlimits")
+def test_worker_limits_stay_under_the_hard_ceiling(monkeypatch):
+    import resource
+
+    applied = {}
+    monkeypatch.setattr(
+        resource,
+        "getrlimit",
+        lambda kind: (resource.RLIM_INFINITY, 1000 if kind == resource.RLIMIT_AS else resource.RLIM_INFINITY),
+    )
+    monkeypatch.setattr(resource, "setrlimit", lambda kind, pair: applied.__setitem__(kind, pair))
+    sharepoint_pdf_worker._apply_limits(5000, 3)
+    assert applied[resource.RLIMIT_AS] == (1000, 1000)  # asked above the hard limit: clamp, never fail
+    assert applied[resource.RLIMIT_CPU] == (3, resource.RLIM_INFINITY)
+
+
+@pytest.mark.parametrize(
+    ("reply", "error"),
+    [
+        ("print('nope')", "no result"),
+        ("print('[]')", "no result"),
+        ("print('{\"text\": 5}')", "no result"),
+        ('print(\'{"error": "broken"}\')', "broken"),
+        ("import sys; sys.exit(3)", "within the extraction limits"),
+    ],
+)
+async def test_a_misbehaving_worker_reply_reads_as_unsupported(monkeypatch, reply, error):
+    monkeypatch.setattr(sharepoint_text, "worker_command", lambda **_kwargs: [sys.executable, "-c", reply])
+    with pytest.raises(PdfExtractionError, match=error):
+        await extract_pdf_text_async(b"%PDF-", max_chars=10, max_pages=1, timeout_seconds=5, memory_limit_bytes=1 << 20)
+
+
+async def test_a_worker_that_floods_stdout_is_cut_off_before_the_deadline(monkeypatch):
+    # The reply ceiling, not the deadline, ends a flood: the API never buffers it.
+    flood = "import sys; sys.stdout.write('x' * (9 * 1024 * 1024)); sys.stdout.flush(); sys.stdin.buffer.read()"
+    monkeypatch.setattr(sharepoint_text, "worker_command", lambda **_kwargs: [sys.executable, "-c", flood])
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await extract_pdf_text_async(
+            b"%PDF-", max_chars=10, max_pages=1, timeout_seconds=30, memory_limit_bytes=1 << 20
+        )
+    assert time.monotonic() - started < 10  # cut off by the ceiling, not by the deadline or the reap cap
+
+
+async def test_a_reply_larger_than_one_pipe_read_is_assembled_whole(monkeypatch):
+    big = "import json, sys; sys.stdin.buffer.read(); print(json.dumps({'text': 'y' * 300000, 'truncated': True}))"
+    monkeypatch.setattr(sharepoint_text, "worker_command", lambda **_kwargs: [sys.executable, "-c", big])
+    text, truncated = await extract_pdf_text_async(
+        b"%PDF-", max_chars=250000, max_pages=1, timeout_seconds=30, memory_limit_bytes=1 << 20
+    )
+    assert (len(text), truncated) == (250000, True)

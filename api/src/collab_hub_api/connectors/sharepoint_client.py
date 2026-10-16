@@ -128,6 +128,8 @@ class SharePointClient:
         download_timeout_seconds: float = 30.0,
         max_download_bytes: int = 25 * 1024 * 1024,
         include_personal_onedrive: bool = False,
+        extraction_timeout_seconds: float = 30.0,
+        extraction_memory_limit_bytes: int = 256 * 1024 * 1024,
     ):
         self.access_token = access_token
         self.api_base_url = api_base_url.rstrip("/")
@@ -135,6 +137,8 @@ class SharePointClient:
         self.download_timeout_seconds = download_timeout_seconds
         self.max_download_bytes = max_download_bytes
         self.include_personal_onedrive = include_personal_onedrive
+        self.extraction_timeout_seconds = extraction_timeout_seconds
+        self.extraction_memory_limit_bytes = extraction_memory_limit_bytes
 
     async def verify_access(self) -> SharePointAccessCheck:
         # Two-step capability probe (contract 4): /me proves the token brokers;
@@ -291,7 +295,8 @@ class SharePointClient:
                 data,
                 max_chars=max_chars,
                 max_pages=_MAX_PDF_PAGES,
-                timeout_seconds=self.download_timeout_seconds,
+                timeout_seconds=self.extraction_timeout_seconds,
+                memory_limit_bytes=self.extraction_memory_limit_bytes,
             )
         except PdfExtractionError as exc:
             raise SharePointUnsupportedItem(f"The file could not be read as a PDF ({exc}).") from exc

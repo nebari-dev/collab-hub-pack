@@ -953,6 +953,14 @@
               "type": "integer",
               "minimum": 1
             },
+            "extractionTimeoutSeconds": {
+              "type": "number",
+              "minimum": 1
+            },
+            "extractionMemoryLimitBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
             "includePersonalOnedrive": {
               "type": "boolean"
             }
